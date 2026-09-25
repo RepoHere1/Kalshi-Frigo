@@ -1,13 +1,25 @@
 {
   "$schema": "https://railway.app/railway.schema.json",
   "build": {
-    "builder": "NIXPACKS"
+    "builder": "NIXPACKS",
+    "env": {
+      "PYTHONUNBUFFERED": "1"
+    }
   },
   "deploy": {
     "startCommand": "python web_dashboard.py",
     "healthcheckPath": "/health",
     "healthcheckTimeout": 30,
     "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 10
+    "restartPolicyMaxRetries": 10,
+    "numWorkers": 1
+  },
+  "environments": {
+    "production": {
+      "envVars": {
+        "PYTHONUNBUFFERED": "1",
+        "PORT": {"binding": "dynamic"}
+      }
+    }
   }
 }
