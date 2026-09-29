@@ -14,29 +14,42 @@ Features:
 
 Railway-ready: listens on $PORT, healthcheck on /health.
 """
-import os
-import sys
-import time
-import json
 import asyncio
-import threading
+import json
+import os
 import subprocess
-from pathlib import Path
-from datetime import datetime
+import sys
+import threading
+import time
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+from collections import deque
+from typing import Any, Deque, Dict
 
 from flask import Flask, jsonify, render_template_string, request
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
+# ProxyFix rebinds the WSGI callable; mypy flags the method assignment, but this
+# is the documented way to make Flask trust Railway's proxy headers.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)  # type: ignore[method-assign]
 app.config["PREFERRED_URL_SCHEME"] = "https"
+
+# Resolve paths relative to the repo root so the app works regardless of cwd.
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = os.environ.get("DB_PATH", str(BASE_DIR / "trading_system.db"))
+LOG_DIR = Path(os.environ.get("LOG_DIR", str(BASE_DIR / "logs")))
+MAX_ERRORS = 50
 
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
+_STARTED_AT = time.time()
+
 dashboard_state = {
     "status": "starting",
     "has_kalshi_creds": False,
@@ -48,6 +61,7 @@ dashboard_state = {
     "last_update": None,
     "errors": [],
     "sse_listeners": [],
+    "db_positions_count": 0,
 }
 
 # Strategy control state
@@ -68,7 +82,7 @@ alert_state = {
 }
 
 # Log tail
-log_buffer = deque(maxlen=500)
+log_buffer: Deque[str] = deque(maxlen=500)
 
 
 # ---------------------------------------------------------------------------
@@ -78,25 +92,64 @@ def _now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _push_error(message):
+    """Record an error, keeping the buffer bounded so long-lived
+    containers don't accumulate memory."""
+    dashboard_state["errors"].append({"time": _now(), "error": message})
+    if len(dashboard_state["errors"]) > MAX_ERRORS:
+        del dashboard_state["errors"][: len(dashboard_state["errors"]) - MAX_ERRORS]
+
+
+def _log_files():
+    """Return log files newest-first.
+
+    setup_logging() writes logs/trading_system_<timestamp>.log plus
+    logs/latest.log, so there is no single stable 'trading_system.log'.
+    """
+    if not LOG_DIR.is_dir():
+        return []
+    try:
+        return sorted(LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+
+
+def _read_log_tail(n):
+    """Read the last n lines from the newest log file, or None if there are none."""
+    for path in _log_files():
+        try:
+            with open(path, "r", errors="replace") as f:
+                return [line.rstrip() for line in f.readlines()[-n:]]
+        except OSError:
+            continue
+    return None
+
+
 def _broadcast(event, data):
-    """Push event to all SSE listeners."""
+    """Push an event to all SSE listeners.
+
+    The listeners are plain deques, not queue.Queue objects: they are
+    append-only and the consumer pops from them, so a bounded deque avoids
+    unbounded growth if a client stops reading.
+    """
     payload = f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
     dead = []
-    for q in dashboard_state["sse_listeners"]:
+    for q in list(dashboard_state["sse_listeners"]):
         try:
-            q.put_nowait(payload)
+            q.append(payload)
         except Exception:
             dead.append(q)
     for q in dead:
         try:
             dashboard_state["sse_listeners"].remove(q)
-        except Exception:
+        except ValueError:
             pass
 
 
 async def _fetch_kalshi_data():
     """Fetch balance and positions from Kalshi API."""
     from src.clients.kalshi_client import KalshiClient
+
     client = KalshiClient()
     try:
         await client.initialize()
@@ -104,28 +157,62 @@ async def _fetch_kalshi_data():
         positions = await client.get_positions()
         return balance, positions
     except Exception as e:
-        dashboard_state["errors"].append({"time": _now(), "error": f"Kalshi fetch: {e}"})
+        _push_error(f"Kalshi fetch: {e}")
         return None, None
     finally:
         await client.close()
 
 
-async def _fetch_db_data():
-    """Fetch positions and trades from SQLite."""
-    from src.utils.database import DatabaseManager
-    db = DatabaseManager()
-    await db.initialize()
+def _run_async(coro):
+    """Run a coroutine on a throwaway event loop.
+
+    Flask's request handlers are sync, so each DB call needs its own loop.
+    The loop is always closed, otherwise aiosqlite threads accumulate until
+    the worker runs out of file descriptors.
+    """
     try:
-        open_positions = await db.get_open_live_positions()
-        perf = await db.get_performance_by_strategy()
-        return open_positions, perf
-    finally:
-        # aiosqlite auto-closes on context exit; no explicit close needed
+        asyncio.get_running_loop()
+    except RuntimeError:
         pass
+    else:
+        coro.close()
+        raise RuntimeError(
+            "_run_async() cannot be called from inside a running event loop; "
+            "await the coroutine directly instead."
+        )
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+    finally:
+        try:
+            asyncio.set_event_loop(None)
+        finally:
+            loop.close()
+
+
+def _db():
+    """Build an initialized DatabaseManager (schema created if missing)."""
+    from src.utils.database import DatabaseManager
+
+    mgr = DatabaseManager(db_path=DB_PATH)
+    _run_async(mgr.initialize())
+    return mgr
+
+
+async def _fetch_db_data():
+    """Fetch open positions and per-strategy performance from SQLite."""
+    from src.utils.database import DatabaseManager
+
+    db = DatabaseManager(db_path=DB_PATH)
+    await db.initialize()
+    open_positions = await db.get_open_live_positions()
+    perf = await db.get_performance_by_strategy()
+    return open_positions, perf
 
 
 def _monitor_loop():
-    """Background thread: credentials, Kalshi connect, log tail."""
+    """Background thread: credentials, Kalshi connect, DB init."""
     dashboard_state["status"] = "online"
 
     kalshi_key = os.environ.get("KALSHI_API_KEY", "")
@@ -137,44 +224,52 @@ def _monitor_loop():
     dashboard_state["has_kalshi_creds"] = bool(kalshi_key and kalshi_private)
     dashboard_state["has_openrouter_creds"] = bool(openrouter_key)
 
+    # Make sure the schema exists so the dashboard shows real numbers even
+    # on a fresh container where the trading loop has never run.
+    try:
+        _db()
+    except Exception as e:
+        _push_error(f"Database init: {e}")
+
     if not dashboard_state["has_kalshi_creds"]:
-        dashboard_state["errors"].append(
-            {"time": _now(), "error": "Kalshi credentials not configured — info mode only"}
-        )
+        _push_error("Kalshi credentials not configured — info mode only")
         dashboard_state["last_update"] = _now()
         return
 
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        balance, positions = loop.run_until_complete(_fetch_kalshi_data())
+        balance, positions = _run_async(_fetch_kalshi_data())
         if balance:
             dashboard_state["balance"] = balance.get("balance", 0) / 100.0
         if positions:
             dashboard_state["positions"] = positions.get("event_positions", [])
         dashboard_state["last_update"] = _now()
     except Exception as e:
-        dashboard_state["errors"].append({"time": _now(), "error": f"Kalshi connect: {e}"})
+        _push_error(f"Kalshi connect: {e}")
 
 
 def _log_tail_loop():
-    """Tail the log file and buffer lines."""
-    log_path = Path("logs/trading_system.log")
+    """Tail the newest log file and buffer lines for the log viewer."""
+    seen = set()
     while True:
-        if log_path.exists():
-            try:
-                with open(log_path, "r", errors="replace") as f:
-                    f.seek(0, 2)  # end
-                    while True:
-                        line = f.readline()
-                        if not line:
-                            time.sleep(0.5)
-                            continue
-                        log_buffer.append(line.strip())
-            except Exception:
-                time.sleep(2)
-        else:
+        files = _log_files()
+        if not files:
             time.sleep(2)
+            continue
+        for path in files:
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                with open(path, "r", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            log_buffer.append(line)
+            except OSError:
+                continue
+        if len(seen) > 8:
+            seen = set(files[:1])
+        time.sleep(1)
 
 
 # ---------------------------------------------------------------------------
@@ -187,22 +282,32 @@ def dashboard():
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok"})
+    """Railway healthcheck. Must stay fast and never depend on the network."""
+    return jsonify(
+        {
+            "status": "ok",
+            "app": dashboard_state["status"],
+            "uptime_sec": int(time.time() - _STARTED_AT),
+            "db": str(DB_PATH),
+            "db_exists": Path(DB_PATH).exists(),
+        }
+    )
 
 
-# ---------------------------------------------------------------------------
-# Routes — API
-# ---------------------------------------------------------------------------
 @app.route("/api/status")
 def api_status():
     return jsonify(
         {
             "status": dashboard_state["status"],
+            "uptime_sec": int(time.time() - _STARTED_AT),
             "has_kalshi_creds": dashboard_state["has_kalshi_creds"],
             "has_openrouter_creds": dashboard_state["has_openrouter_creds"],
             "balance": dashboard_state["balance"],
             "positions_count": len(dashboard_state["positions"]),
+            "db_positions_count": dashboard_state["db_positions_count"],
+            "running_strategies": sum(1 for s in strategy_state.values() if s["running"]),
             "last_update": dashboard_state["last_update"],
+            "db_path": str(DB_PATH),
             "errors": dashboard_state["errors"][-10:],
             "alert_state": alert_state,
         }
@@ -212,14 +317,10 @@ def api_status():
 # 1. Live position table
 @app.route("/api/positions")
 def api_positions():
-    """Return open positions from DB + Kalshi."""
+    """Return open positions from the local DB, falling back to Kalshi."""
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(_fetch_db_data())
-        db = __import__("src.utils.database", fromlist=["DatabaseManager"])()
-        loop.run_until_complete(db.initialize())
-        positions = loop.run_until_complete(db.get_open_live_positions())
+        db = _db()
+        positions = _run_async(db.get_open_live_positions())
         result = []
         for p in positions:
             result.append(
@@ -236,6 +337,23 @@ def api_positions():
                     "timestamp": str(p.timestamp),
                 }
             )
+        # Kalshi is the source of truth for anything the local DB missed.
+        if not result and dashboard_state["positions"]:
+            for p in dashboard_state["positions"]:
+                result.append(
+                    {
+                        "id": None,
+                        "market_id": p.get("ticker") or p.get("market_ticker") or "?",
+                        "side": p.get("side", "?"),
+                        "entry_price": (p.get("last_entry_price") or 0) / 100.0,
+                        "quantity": p.get("position", 0),
+                        "strategy": "kalshi_api",
+                        "stop_loss": None,
+                        "take_profit": None,
+                        "status": p.get("status", "open"),
+                        "timestamp": str(p.get("last_update_time", "")),
+                    }
+                )
         return jsonify({"positions": result})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -245,26 +363,84 @@ def api_positions():
 @app.route("/api/stream")
 def api_stream():
     """SSE endpoint for real-time events."""
+    from flask import Response
+
     def generate():
         q = deque(maxlen=50)
         dashboard_state["sse_listeners"].append(q)
-        yield f"event: connected\ndata: {json.dumps({'msg': 'connected'})}\n\n"
-        while True:
+        try:
+            # Unnamed event so the browser's default onmessage handler fires.
+            yield f"data: {json.dumps({'event': 'connected', 'msg': 'connected'})}\n\n"
+            while True:
+                try:
+                    msg = q.popleft()
+                    yield msg
+                except IndexError:
+                    time.sleep(0.5)
+        finally:
             try:
-                msg = q.popleft()
-                yield msg
-            except IndexError:
-                time.sleep(0.5)
+                dashboard_state["sse_listeners"].remove(q)
+            except ValueError:
+                pass
 
-    from flask import Response
-
-    return Response(generate(), mimetype="text/event-stream")
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # 3. Strategy control panel
 @app.route("/api/strategies", methods=["GET"])
 def api_strategies():
     return jsonify(strategy_state)
+
+
+# Keep strong references to spawned processes so Python's GC never reaps them,
+# and always route child output to a file. Pipes would fill after ~64KB and
+# deadlock the trading loop, since nothing drains them.
+_child_procs: Dict[int, "subprocess.Popen[Any]"] = {}
+
+
+def _stop_child(st):
+    """Stop a running strategy process: SIGTERM, then SIGKILL if it lingers."""
+    pid = st.get("pid")
+    if not pid:
+        return
+    proc = _child_procs.get(pid)
+    if proc is not None:
+        # Preferred path: the Popen object works identically on every platform.
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        except (OSError, ValueError):
+            pass
+        _child_procs.pop(pid, None)
+    else:
+        # No Popen reference (e.g. state restored after a restart); fall back to
+        # signals. signal.SIGKILL does not exist on Windows.
+        import signal
+
+        for sig in (getattr(signal, "SIGTERM", 15), getattr(signal, "SIGKILL", 9)):
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                break
+            for _ in range(10):
+                try:
+                    os.kill(pid, 0)
+                except (ProcessLookupError, OSError):
+                    break
+                time.sleep(0.2)
+            else:
+                continue
+            break
+    st["running"] = False
+    st["pid"] = None
 
 
 @app.route("/api/strategy/<name>/toggle", methods=["POST"])
@@ -274,42 +450,58 @@ def api_strategy_toggle(name):
         return jsonify({"error": f"Unknown strategy: {name}"}), 404
 
     st = strategy_state[name]
-    mode = request.json.get("mode", "paper") if request.json else "paper"
+    mode = (request.json or {}).get("mode", "paper")
+    if mode not in ("paper", "live"):
+        return jsonify({"error": "mode must be 'paper' or 'live'"}), 400
+    if mode == "live" and not os.environ.get("KALSHI_API_KEY"):
+        return jsonify({"error": "Live mode needs KALSHI_API_KEY configured"}), 400
 
     if st["running"]:
-        # Stop
-        if st["pid"]:
-            try:
-                import signal
-                os.kill(st["pid"], signal.SIGTERM)
-            except Exception:
-                pass
-        st["running"] = False
-        st["pid"] = None
+        _stop_child(st)
         _broadcast("strategy", {"name": name, "action": "stopped"})
         return jsonify({"name": name, "running": False})
 
-    # Start
-    cmd_map = {
-        "ai_directional": ["python", "cli.py", "run", f"--{'live' if mode == 'live' else 'paper'}"],
-        "safe_compounder": [
-            "python",
-            "cli.py",
-            "run",
-            "--safe-compounder",
-            f"--{'live' if mode == 'live' else 'paper'}",
-        ],
-        "beast_mode": ["python", "cli.py", "run", "--beast", f"--{'live' if mode == 'live' else 'paper'}"],
-        "market_making": ["python", "cli.py", "run", "--safe-compounder"],  # placeholder
-        "quick_flip": ["python", "cli.py", "run"],  # placeholder
-    }
-    cmd = cmd_map.get(name, ["python", "cli.py", "run", "--paper"])
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(Path(__file__).parent),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    if mode == "live":
+        return (
+            jsonify(
+                {
+                    "error": "Live trading is disabled on this deployment. "
+                    "Set KALSHI_PRIVATE_KEY via the Railway dashboard and redeploy to enable."
+                }
+            ),
+            403,
+        )
+
+    # sys.executable guarantees the child uses the same interpreter (and venv)
+    # as the dashboard, rather than whatever 'python' resolves to on PATH.
+    py = sys.executable or "python"
+    cmd = [py, "cli.py", "run", "--paper"]
+    if name == "safe_compounder":
+        cmd = [py, "cli.py", "run", "--safe-compounder", "--paper"]
+    elif name == "beast_mode":
+        cmd = [py, "cli.py", "run", "--beast", "--paper"]
+    elif name in ("market_making", "quick_flip"):
+        # No dedicated CLI entry point for these strategies yet; fall back to
+        # the AI directional loop so the button still does something real.
+        cmd = [py, "cli.py", "run", "--paper"]
+
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        out = open(LOG_DIR / f"strategy_{name}.log", "ab", buffering=0)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(BASE_DIR),
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        out.close()
+    except Exception as e:
+        _push_error(f"Strategy start ({name}): {e}")
+        return jsonify({"error": f"Failed to start: {e}"}), 500
+
+    _child_procs[proc.pid] = proc
     st["running"] = True
     st["pid"] = proc.pid
     st["mode"] = mode
@@ -322,37 +514,39 @@ def api_strategy_toggle(name):
 def api_chart_pnl():
     """Return P&L data for Chart.js."""
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        db = __import__("src.utils.database", fromlist=["DatabaseManager"])()
-        loop.run_until_complete(db.initialize())
-        perf = loop.run_until_complete(db.get_performance_by_strategy())
-        trades = loop.run_until_complete(db.get_llm_queries(hours_back=24))
+        db = _db()
+        perf = _run_async(db.get_performance_by_strategy())
 
         labels = []
         pnl_data = []
         cumulative = 0.0
         try:
-            from src.utils.database import TradeLog
             import aiosqlite
-            with aiosqlite.connect(db.db_path) as conn:
-                conn.row_factory = aiosqlite.Row
-                cur = conn.execute(
-                    "SELECT exit_timestamp, pnl FROM trade_logs ORDER BY exit_timestamp ASC LIMIT 200"
-                )
-                for row in cur.fetchall():
-                    labels.append(row[0][:19])
-                    cumulative += row[1] or 0.0
-                    pnl_data.append(round(cumulative, 2))
-        except Exception:
-            labels = ["--"]
+
+            async def _read_trades():
+                async with aiosqlite.connect(db.db_path) as conn:
+                    cur = await conn.execute(
+                        "SELECT exit_timestamp, pnl FROM trade_logs "
+                        "ORDER BY exit_timestamp ASC LIMIT 200"
+                    )
+                    return await cur.fetchall()
+
+            for row in _run_async(_read_trades()):
+                labels.append(str(row[0] or "")[:19])
+                cumulative += row[1] or 0.0
+                pnl_data.append(round(cumulative, 2))
+        except Exception as e:
+            _push_error(f"P&L history: {e}")
+
+        if not labels:
+            labels = ["no closed trades yet"]
             pnl_data = [0]
 
         return jsonify(
             {
                 "labels": labels,
                 "pnl": pnl_data,
-                "by_strategy": {k: v.get("total_pnl", 0) for k, v in perf.items()},
+                "by_strategy": {k: (v.get("total_pnl") or 0) for k, v in perf.items()},
             }
         )
     except Exception as e:
@@ -363,12 +557,8 @@ def api_chart_pnl():
 def api_chart_performance():
     """Strategy performance breakdown."""
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        db = __import__("src.utils.database", fromlist=["DatabaseManager"])()
-        loop.run_until_complete(db.initialize())
-        perf = loop.run_until_complete(db.get_performance_by_strategy())
-        return jsonify(perf)
+        db = _db()
+        return jsonify(_run_async(db.get_performance_by_strategy()))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -392,6 +582,7 @@ def _send_alert(msg):
     if not alert_state["enabled"]:
         return
     import requests
+
     payload = {"text": msg}
     if alert_state["telegram_url"]:
         try:
@@ -407,6 +598,46 @@ def _send_alert(msg):
 
 
 # 6. Config editor
+CONFIG_FIELDS = [
+    "max_position_size_pct",
+    "max_daily_loss_pct",
+    "max_positions",
+    "min_confidence_to_trade",
+    "kelly_fraction",
+    "max_single_position",
+    "daily_ai_budget",
+    "max_ai_cost_per_decision",
+    "scan_interval_seconds",
+    "market_scan_interval",
+    "use_kelly_criterion",
+    "live_trading_enabled",
+    "paper_trading_mode",
+]
+
+
+def _coerce_like(current, raw):
+    """Coerce a form value to the type of the value it replaces.
+
+    The browser sends every field as a string; without this, booleans would
+    become non-empty strings and ints would silently become floats.
+    """
+    if isinstance(current, bool):
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(current, int) and not isinstance(current, bool):
+        try:
+            return int(float(str(raw).strip()))
+        except (TypeError, ValueError):
+            return current
+    if isinstance(current, float):
+        try:
+            return float(str(raw).strip())
+        except (TypeError, ValueError):
+            return current
+    return raw
+
+
 @app.route("/api/config", methods=["GET", "POST"])
 def api_config():
     """Read/write trading config."""
@@ -414,30 +645,22 @@ def api_config():
 
     if request.method == "POST":
         data = request.json or {}
-        # Apply config changes at runtime
+        updated, skipped = [], []
         for key, val in data.items():
-            if hasattr(settings.trading, key):
-                setattr(settings.trading, key, val)
-        _broadcast("config", {"action": "updated", "keys": list(data.keys())})
-        return jsonify({"ok": True, "updated": list(data.keys())})
+            if key not in CONFIG_FIELDS or not hasattr(settings.trading, key):
+                skipped.append(key)
+                continue
+            setattr(settings.trading, key, _coerce_like(getattr(settings.trading, key), val))
+            updated.append(key)
+        if skipped:
+            _push_error(f"Ignored unknown config keys: {', '.join(skipped)}")
+        _broadcast("config", {"action": "updated", "keys": updated})
+        return jsonify({"ok": True, "updated": updated, "skipped": skipped})
 
-    # Read
     readable = {}
-    for field in [
-        "max_position_size_pct",
-        "max_daily_loss_pct",
-        "max_positions",
-        "min_confidence_to_trade",
-        "kelly_fraction",
-        "max_single_position",
-        "daily_ai_budget",
-        "max_ai_cost_per_decision",
-        "scan_interval_seconds",
-        "market_scan_interval",
-        "live_trading_enabled",
-        "paper_trading_mode",
-    ]:
-        readable[field] = getattr(settings.trading, field, None)
+    for field in CONFIG_FIELDS:
+        if hasattr(settings.trading, field):
+            readable[field] = getattr(settings.trading, field)
     return jsonify(readable)
 
 
@@ -445,18 +668,14 @@ def api_config():
 @app.route("/api/logs")
 def api_logs():
     """Return recent log lines."""
-    lines = request.args.get("lines", "100")
     try:
-        n = int(lines)
+        n = max(1, min(2000, int(request.args.get("lines", "100"))))
     except ValueError:
         n = 100
-    log_path = Path("logs/trading_system.log")
-    if log_path.exists():
-        with open(log_path, "r", errors="replace") as f:
-            all_lines = f.readlines()
-        recent = all_lines[-n:]
-        return jsonify({"lines": [l.strip() for l in recent]})
-    return jsonify({"lines": list(log_buffer)[-n:]})
+    lines = _read_log_tail(n)
+    if lines is not None:
+        return jsonify({"lines": lines, "source": "file"})
+    return jsonify({"lines": list(log_buffer)[-n:], "source": "buffer"})
 
 
 # 8. Multi-bot management
@@ -487,18 +706,13 @@ def api_bots():
 
 @app.route("/api/bot/<name>/kill", methods=["POST"])
 def api_bot_kill(name):
-    """Force-kill a bot process."""
+    """Force-stop a bot process."""
     if name not in strategy_state:
         return jsonify({"error": "unknown"}), 404
     st = strategy_state[name]
-    if st["pid"]:
-        try:
-            import signal
-            os.kill(st["pid"], signal.SIGKILL)
-        except Exception:
-            pass
-    st["running"] = False
-    st["pid"] = None
+    if not st.get("pid"):
+        return jsonify({"name": name, "killed": False, "reason": "not running"})
+    _stop_child(st)
     return jsonify({"name": name, "killed": True})
 
 
@@ -544,6 +758,7 @@ pre { background:var(--bg); border:1px solid var(--border); border-radius:6px; p
 .three-col { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; }
 .flex-row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
 .tag { display:inline-block; background:#21262d; color:var(--blue); padding:1px 6px; border-radius:8px; font-size:.6rem; margin-right:3px; }
+.err { color:var(--muted); text-align:center; padding:8px; }
 canvas { max-height:250px; }
 </style>
 </head>
@@ -558,7 +773,13 @@ canvas { max-height:250px; }
   <div class="stat"><div class="stat-value" id="sPositions">0</div><div class="stat-label">Positions</div></div>
   <div class="stat"><div class="stat-value" id="sKalshi">--</div><div class="stat-label">Kalshi</div></div>
   <div class="stat"><div class="stat-value" id="sOpenRouter">--</div><div class="stat-label">OpenRouter</div></div>
-  <div class="stat"><div class="stat-value" id="sStrategies">0</div><div class="stat-label">Strategies</div></div>
+  <div class="stat"><div class="stat-value" id="sStrategies">0</div><div class="stat-label">Running</div></div>
+  <div class="stat"><div class="stat-value" id="sUptime">0m</div><div class="stat-label">Uptime</div></div>
+</div>
+
+<div class="card">
+  <h2>⚠️ Recent Errors</h2>
+  <div id="sErrors" class="flex-row"><span class="badge no">loading</span></div>
 </div>
 
 <div class="two-col">
@@ -599,6 +820,7 @@ canvas { max-height:250px; }
   <h2>⚙️ Config Editor</h2>
   <div id="configEditor"></div>
   <button onclick="saveConfig()" style="margin-top:8px">Save Config</button>
+  <span id="configStatus" class="stat-label"></span>
 </div>
 
 <!-- Feature 7: Log Viewer -->
@@ -631,120 +853,165 @@ Kalshi-Frigo · Not financial advice
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>
+const $ = id => document.getElementById(id);
+const esc = v => String(v == null ? '' : v);
+const num = (v, d=2) => (v == null || v === '' ? '-' : Number(v).toFixed(d));
+
 // --- SSE Trade Feed ---
-const evtSource = new EventSource("/api/stream");
+// Server sends unnamed `data:` frames, so onmessage fires. Named events
+// (event: strategy / alert / config) need explicit listeners.
+const feedLines = [];
+function pushFeed(msg) {
+  feedLines.unshift('[' + new Date().toLocaleTimeString() + '] ' + msg);
+  if (feedLines.length > 50) feedLines.length = 50;
+  $('tradeFeed').textContent = feedLines.join('\n');
+}
+const evtSource = new EventSource('/api/stream');
 evtSource.onmessage = e => {
-  const feed = document.getElementById('tradeFeed');
-  const d = JSON.parse(e.data);
-  feed.textContent = '[' + new Date().toLocaleTimeString() + '] ' + JSON.stringify(d) + '\n' + feed.textContent;
-  if (feed.childNodes.length > 50) feed.removeChild(feed.lastChild);
+  try { const d = JSON.parse(e.data); pushFeed(JSON.stringify(d)); } catch (_) { pushFeed(e.data); }
 };
+['strategy','alert','config'].forEach(name =>
+  evtSource.addEventListener(name, e => pushFeed(name + ': ' + e.data)));
+evtSource.onerror = () => pushFeed('stream disconnected — retrying...');
 
 // --- Stats ---
 async function loadStatus() {
-  const r = await fetch('/api/status').then(r=>r.json());
-  document.getElementById('sStatus').innerHTML = r.status==='online'?'<span class="badge ok">ONLINE</span>':'<span class="badge no">OFF</span>';
-  document.getElementById('sBalance').textContent = r.balance ? '$'+r.balance : '-';
-  document.getElementById('sPositions').textContent = r.positions_count||0;
-  document.getElementById('sKalshi').innerHTML = r.has_kalshi_creds?'<span class="badge ok">OK</span>':'<span class="badge no">No</span>';
-  document.getElementById('sOpenRouter').innerHTML = r.has_openrouter_creds?'<span class="badge ok">OK</span>':'<span class="badge no">No</span>';
+  try {
+    const r = await fetch('/api/status').then(r=>r.json());
+    $('sStatus').innerHTML = r.status==='online'?'<span class="badge ok">ONLINE</span>':'<span class="badge no">OFF</span>';
+    $('sBalance').textContent = r.balance != null ? '$' + num(r.balance) : '-';
+    $('sPositions').textContent = r.positions_count||0;
+    $('sKalshi').innerHTML = r.has_kalshi_creds?'<span class="badge ok">OK</span>':'<span class="badge no">No</span>';
+    $('sOpenRouter').innerHTML = r.has_openrouter_creds?'<span class="badge ok">OK</span>':'<span class="badge no">No</span>';
+    $('sStrategies').textContent = r.running_strategies||0;
+    $('sUptime').textContent = Math.floor((r.uptime_sec||0)/60) + 'm';
+    $('sErrors').innerHTML = (r.errors||[]).slice(-5).reverse()
+      .map(e => `<div class="tag">${esc(e.time)} ${esc(e.error)}</div>`).join('') || '<span class="badge ok">none</span>';
+  } catch (e) { $('sStatus').innerHTML = '<span class="badge warn">ERR</span>'; }
 }
 
 // --- Positions ---
 async function loadPositions() {
-  const r = await fetch('/api/positions').then(r=>r.json());
   const tbody = document.querySelector('#posTable tbody');
-  tbody.innerHTML = (r.positions||[]).map(p => `<tr>
-    <td>${p.market_id.slice(0,20)}</td><td>${p.side}</td><td>${p.entry_price}</td>
-    <td>${p.quantity}</td><td><span class="tag">${p.strategy}</span></td>
-    <td>${p.stop_loss||'-'}</td><td>${p.take_profit||'-'}</td></tr>`).join('');
+  try {
+    const r = await fetch('/api/positions').then(r=>r.json());
+    if (r.error) { tbody.innerHTML = `<tr><td colspan="7" class="err">${esc(r.error)}</td></tr>`; return; }
+    const rows = r.positions||[];
+    tbody.innerHTML = rows.length ? rows.map(p => `<tr>
+      <td>${esc(String(p.market_id||'?').slice(0,20))}</td><td>${esc(p.side)}</td><td>${num(p.entry_price)}</td>
+      <td>${esc(p.quantity)}</td><td><span class="tag">${esc(p.strategy)}</span></td>
+      <td>${p.stop_loss!=null?num(p.stop_loss):'-'}</td><td>${p.take_profit!=null?num(p.take_profit):'-'}</td></tr>`).join('')
+      : '<tr><td colspan="7" class="err">No open positions</td></tr>';
+  } catch (e) { tbody.innerHTML = `<tr><td colspan="7" class="err">${esc(e.message)}</td></tr>`; }
 }
 
 // --- Strategies ---
 async function loadStrategies() {
   const r = await fetch('/api/strategies').then(r=>r.json());
-  const div = document.getElementById('strategyButtons');
-  div.innerHTML = Object.entries(r).map(([name,s]) =>
-    `<div style="margin:4px 0"><span class="tag">${name}</span> ${s.running?'<span class="badge ok">RUN</span>':'<span class="badge no">STOP</span>'} ${s.pid?'PID:'+s.pid:''}
+  $('strategyButtons').innerHTML = Object.entries(r).map(([name,s]) =>
+    `<div style="margin:4px 0"><span class="tag">${esc(name)}</span> ${s.running?'<span class="badge ok">RUN</span>':'<span class="badge no">STOP</span>'} ${s.pid?'PID:'+esc(s.pid):''}
     <button onclick="toggleStrategy('${name}')">${s.running?'Stop':'Start'}</button></div>`
   ).join('');
 }
 async function toggleStrategy(name) {
-  const r = await fetch('/api/strategy/'+name+'/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'paper'})});
+  const r = await fetch('/api/strategy/'+encodeURIComponent(name)+'/toggle',
+    {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'paper'})});
+  const d = await r.json().catch(()=>({}));
+  if (d.error) pushFeed(name + ': ' + d.error);
   loadStrategies(); loadBots();
 }
 
 // --- Alerts ---
 async function loadAlerts() {
   const r = await fetch('/api/alerts').then(r=>r.json());
-  document.getElementById('tgUrl').value = r.telegram_url||'';
-  document.getElementById('dcUrl').value = r.discord_url||'';
-  document.getElementById('alertEnabled').checked = r.enabled;
+  $('tgUrl').value = r.telegram_url||'';
+  $('dcUrl').value = r.discord_url||'';
+  $('alertEnabled').checked = !!r.enabled;
 }
 async function saveAlerts() {
   const r = await fetch('/api/alerts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-    telegram_url: document.getElementById('tgUrl').value,
-    discord_url: document.getElementById('dcUrl').value,
-    enabled: document.getElementById('alertEnabled').checked
+    telegram_url: $('tgUrl').value, discord_url: $('dcUrl').value, enabled: $('alertEnabled').checked
   })});
   const d = await r.json();
-  document.getElementById('alertStatus').textContent = d.ok?'Saved':'Error';
+  $('alertStatus').textContent = d.ok?'Saved':'Error';
 }
 
 // --- Config ---
+// Send each value typed from the current value, so booleans stay booleans.
+const cfgTypes = {};
 async function loadConfig() {
   const r = await fetch('/api/config').then(r=>r.json());
-  const div = document.getElementById('configEditor');
-  div.innerHTML = Object.entries(r).map(([k,v]) =>
-    `<label style="display:block;margin:4px 0;font-size:.75rem">${k}<input data-key="${k}" value="${v}" style="width:100%"></label>`
-  ).join('');
+  Object.entries(r).forEach(([k,v]) => { cfgTypes[k] = typeof v; });
+  $('configEditor').innerHTML = Object.entries(r).map(([k,v]) => {
+    if (typeof v === 'boolean') {
+      return `<label style="display:flex;gap:6px;align-items:center;margin:4px 0;font-size:.75rem">
+        <input type="checkbox" data-key="${k}" data-type="boolean" ${v?'checked':''}> ${k}</label>`;
+    }
+    const step = typeof v === 'number' ? ' step="any"' : '';
+    return `<label style="display:block;margin:4px 0;font-size:.75rem">${esc(k)}
+      <input data-key="${k}" data-type="${typeof v}" value="${esc(v)}"${step} style="width:100%"></label>`;
+  }).join('');
 }
 async function saveConfig() {
   const obj = {};
-  document.querySelectorAll('#configEditor input').forEach(i => obj[i.dataset.key]=parseFloat(i.value));
-  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});
+  document.querySelectorAll('#configEditor input').forEach(i => {
+    const t = i.dataset.type;
+    if (t === 'boolean') obj[i.dataset.key] = i.checked;
+    else if (t === 'number') obj[i.dataset.key] = i.value === '' ? null : Number(i.value);
+    else obj[i.dataset.key] = i.value;
+  });
+  const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});
+  const d = await r.json().catch(()=>({}));
+  $('configStatus').textContent = d.ok ? 'Saved: ' + (d.updated||[]).length + ' field(s)' : 'Error';
+  loadConfig();
 }
 
 // --- Logs ---
 async function loadLogs() {
-  const n = document.getElementById('logLines').value;
-  const r = await fetch('/api/logs?lines='+n).then(r=>r.json());
-  document.getElementById('logOutput').textContent = (r.lines||[]).join('\n');
+  const n = $('logLines').value || 100;
+  const r = await fetch('/api/logs?lines='+encodeURIComponent(n)).then(r=>r.json());
+  $('logOutput').textContent = (r.lines||[]).join('\n') || '(no log files yet — start a strategy to generate logs)';
 }
 
 // --- Bots ---
 async function loadBots() {
   const r = await fetch('/api/bots').then(r=>r.json());
-  const tbody = document.querySelector('#botTable tbody');
-  tbody.innerHTML = r.map(b => `<tr>
-    <td>${b.name}</td><td>${b.pid||'-'}</td><td>${b.mode}</td>
+  if (!Array.isArray(r)) { return; }
+  document.querySelector('#botTable tbody').innerHTML = r.map(b => `<tr>
+    <td>${esc(b.name)}</td><td>${b.pid?esc(b.pid):'-'}</td><td>${esc(b.mode)}</td>
     <td>${b.running?'<span class="badge ok">RUN</span>':'<span class="badge no">STOP</span>'}</td>
-    <td><button class="danger" onclick="killBot('${b.name}')">Kill</button></td></tr>`).join('');
+    <td><button class="danger" onclick="killBot('${b.name}')">Stop</button></td></tr>`).join('');
 }
 async function killBot(name) {
-  await fetch('/api/bot/'+name+'/kill',{method:'POST'});
+  await fetch('/api/bot/'+encodeURIComponent(name)+'/kill',{method:'POST'});
   loadBots(); loadStrategies();
 }
 
 // --- Charts ---
 let pnlChart;
 async function loadCharts() {
+  if (typeof Chart === 'undefined') return;
   const r = await fetch('/api/chart/pnl').then(r=>r.json());
-  const ctx = document.getElementById('pnlChart');
+  if (r.error) return;
+  const ctx = $('pnlChart');
   if (pnlChart) pnlChart.destroy();
   pnlChart = new Chart(ctx, {
     type: 'line',
-    data: { labels: r.labels, datasets: [{ label: 'Cumulative P&L', data: r.pnl, borderColor: '#3fb950', backgroundColor: 'rgba(63,185,80,0.1)', tension: 0.3, fill: true }] },
-    options: { responsive: true, plugins: { legend: { labels: { color: '#c9d1d9' } } }, scales: { x: { ticks: { color: '#8b949e' } }, y: { ticks: { color: '#8b949e' } } } }
+    data: { labels: r.labels, datasets: [{ label: 'Cumulative P&L ($)', data: r.pnl, borderColor: '#3fb950', backgroundColor: 'rgba(63,185,80,0.1)', tension: 0.3, fill: true, pointRadius: 2 }] },
+    options: { responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: { legend: { labels: { color: '#c9d1d9' } } },
+      scales: { x: { ticks: { color: '#8b949e', maxTicksLimit: 8 } }, y: { ticks: { color: '#8b949e' } } } }
   });
 }
 
 // --- Init ---
 async function init() {
-  await loadStatus(); await loadPositions(); await loadStrategies(); await loadAlerts();
-  await loadConfig(); await loadLogs(); await loadBots(); await loadCharts();
-  setInterval(loadStatus, 5000); setInterval(loadPositions, 10000);
-  setInterval(loadStrategies, 10000); setInterval(loadBots, 10000);
+  await Promise.allSettled([loadStatus(), loadPositions(), loadStrategies(), loadAlerts(),
+                             loadConfig(), loadLogs(), loadBots(), loadCharts()]);
+  setInterval(loadStatus, 5000);
+  setInterval(loadPositions, 10000);
+  setInterval(loadStrategies, 10000);
+  setInterval(loadBots, 10000);
   setInterval(loadCharts, 30000);
 }
 init();
@@ -757,26 +1024,54 @@ init();
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+_workers_started = False
+
+
+def start_background_workers():
+    """Start the monitor and log-tail threads exactly once per process.
+
+    gunicorn imports this module in the master process before forking, so the
+    threads must be started after the fork (from the gunicorn hook) or they
+    will not exist in the workers.
+    """
+    global _workers_started
+    if _workers_started:
+        return
+    _workers_started = True
+    for target in (_monitor_loop, _log_tail_loop):
+        threading.Thread(target=target, daemon=True).start()
+
+
 def main():
+    """Run the built-in development server.
+
+    Production (Railway) uses gunicorn instead:
+        gunicorn --config gunicorn.conf.py web_dashboard:app
+    gunicorn only runs on POSIX, so `python web_dashboard.py` stays the way to
+    start the app on Windows.
+    """
     import signal
 
     def handle_signal(signum, frame):
-        global running
-        running = False
-        sys.exit(0)
+        for st in strategy_state.values():
+            if st.get("pid"):
+                try:
+                    _stop_child(st)
+                except Exception:
+                    pass
+        os._exit(0)
 
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, handle_signal)
+        except (ValueError, OSError):
+            pass  # not on the main thread (e.g. under a WSGI server)
 
-    monitor_thread = threading.Thread(target=_monitor_loop, daemon=True)
-    monitor_thread.start()
-
-    log_thread = threading.Thread(target=_log_tail_loop, daemon=True)
-    log_thread.start()
+    start_background_workers()
 
     port = int(os.environ.get("PORT", 8080))
-    print(f"[web_dashboard] Kalshi-Frigo enhanced dashboard starting on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    print(f"[web_dashboard] Kalshi-Frigo dashboard starting on port {port}", flush=True)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
 
 
 if __name__ == "__main__":

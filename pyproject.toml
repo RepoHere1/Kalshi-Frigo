@@ -59,6 +59,8 @@ dependencies = [
     "xai_sdk>=1.0.0",
     "uvicorn",
     "json-repair",
+    "flask",
+    "gunicorn",
 ]
 
 [project.optional-dependencies]
