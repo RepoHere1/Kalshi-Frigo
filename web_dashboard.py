@@ -305,7 +305,7 @@ def api_status():
             "balance": dashboard_state["balance"],
             "positions_count": len(dashboard_state["positions"]),
             "db_positions_count": dashboard_state["db_positions_count"],
-            "running_strategies": sum(1 for s in strategy_state.values() if s["running"]),
+            "running_strategies": len(_running_strategies()),
             "last_update": dashboard_state["last_update"],
             "db_path": str(DB_PATH),
             "errors": dashboard_state["errors"][-10:],
@@ -443,6 +443,51 @@ def _stop_child(st):
     st["pid"] = None
 
 
+def _pid_alive(pid):
+    """True if a strategy process is still running.
+
+    Popen.poll() is authoritative and portable when we own the handle, so it is
+    checked first. os.kill(pid, 0) is only a safe existence probe on POSIX: on
+    Windows os.kill() maps to TerminateProcess for any signal other than the
+    CTRL_* events, so probing with 0 would kill the very process being checked.
+    """
+    if not pid:
+        return False
+    proc = _child_procs.get(pid)
+    if proc is not None:
+        return proc.poll() is None
+    if os.name == "nt":
+        return False  # no safe probe without the handle
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True  # exists, owned by another user
+    except (ProcessLookupError, OSError):
+        return False
+    return True
+
+
+def _running_strategies():
+    """Strategies whose process is actually alive.
+
+    Reconciles the recorded flag against the OS, so a subprocess that crashed
+    stops being reported as running instead of lingering in the UI forever.
+    """
+    names = []
+    for name, st in strategy_state.items():
+        if not st.get("pid"):
+            st["running"] = False
+            continue
+        if _pid_alive(st["pid"]):
+            names.append(name)
+        else:
+            _push_error(f"Strategy '{name}' exited unexpectedly (pid {st['pid']})")
+            st["running"] = False
+            st["pid"] = None
+            _child_procs.pop(st.get("pid", 0), None)
+    return names
+
+
 @app.route("/api/strategy/<name>/toggle", methods=["POST"])
 def api_strategy_toggle(name):
     """Start/stop a strategy subprocess."""
@@ -470,6 +515,23 @@ def api_strategy_toggle(name):
                 }
             ),
             403,
+        )
+
+    # Even paper mode boots a KalshiClient, which dies immediately without
+    # credentials ("Private key file not found"). Refuse up front so the button
+    # does not report success for a process that is about to exit.
+    if not os.environ.get("KALSHI_API_KEY") or not (
+        os.environ.get("KALSHI_PRIVATE_KEY") or os.environ.get("KALSHI_PRIVATE_KEY_PATH")
+    ):
+        return (
+            jsonify(
+                {
+                    "error": "Kalshi credentials are not configured. Set KALSHI_API_KEY "
+                    "and KALSHI_PRIVATE_KEY as Railway service variables, then "
+                    "restart the service. The trading loop cannot start without them."
+                }
+            ),
+            400,
         )
 
     # sys.executable guarantees the child uses the same interpreter (and venv)
@@ -681,27 +743,21 @@ def api_logs():
 # 8. Multi-bot management
 @app.route("/api/bots", methods=["GET"])
 def api_bots():
-    """List tracked bot processes."""
-    bots = []
-    for name, st in strategy_state.items():
-        alive = False
-        if st["pid"]:
-            try:
-                os.kill(st["pid"], 0)
-                alive = True
-            except (ProcessLookupError, PermissionError):
-                alive = False
-                st["running"] = False
-                st["pid"] = None
-        bots.append(
+    """List tracked bot processes, reconciling stale state against the OS."""
+    # Mutates strategy_state as a side effect, so /api/status and /api/bots
+    # can never disagree about whether a strategy is running.
+    _running_strategies()
+    return jsonify(
+        [
             {
                 "name": name,
-                "running": st["running"] and alive,
+                "running": st["running"],
                 "pid": st["pid"],
                 "mode": st.get("mode", "paper"),
             }
-        )
-    return jsonify(bots)
+            for name, st in strategy_state.items()
+        ]
+    )
 
 
 @app.route("/api/bot/<name>/kill", methods=["POST"])
@@ -820,7 +876,7 @@ canvas { max-height:250px; }
   <h2>⚙️ Config Editor</h2>
   <div id="configEditor"></div>
   <button onclick="saveConfig()" style="margin-top:8px">Save Config</button>
-  <span id="configStatus" class="stat-label"></span>
+  <span id="configStatus" style="font-size:.7rem;color:var(--muted);margin-left:6px"></span>
 </div>
 
 <!-- Feature 7: Log Viewer -->

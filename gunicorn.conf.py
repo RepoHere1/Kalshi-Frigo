@@ -11,8 +11,14 @@ import os
 
 bind = f"0.0.0.0:{os.environ.get('PORT', '8080')}"
 worker_class = "gthread"
-workers = int(os.environ.get("WEB_CONCURRENCY", "2"))
-threads = int(os.environ.get("WEB_THREADS", "16"))
+
+# MUST stay at 1. All dashboard state - sse_listeners, strategy_state,
+# _child_procs - is held in module-level dicts, so a second worker gets its own
+# copy: a /api/stream connection held by worker 1 never sees events broadcast
+# by worker 2, and /api/bots disagrees with /api/strategies. Scale with
+# threads instead. Remove this constraint before raising `workers`.
+workers = 1
+threads = int(os.environ.get("WEB_THREADS", "32"))
 
 # SSE connections are long-lived, so the worker timeout must be generous or
 # gunicorn will reap workers that are behaving correctly.

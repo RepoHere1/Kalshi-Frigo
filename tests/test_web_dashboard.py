@@ -6,6 +6,7 @@ listener, and config saves corrupting typed settings.
 """
 import asyncio
 import json
+import sys
 import time
 
 import pytest
@@ -215,6 +216,133 @@ def test_toggle_rejects_live_without_credentials(client, monkeypatch):
 def test_toggle_rejects_invalid_mode(client):
     r = client.post("/api/strategy/ai_directional/toggle", json={"mode": "yolo"})
     assert r.status_code == 400
+
+
+def test_toggle_refuses_without_kalshi_credentials(client, monkeypatch):
+    """Paper mode still boots a KalshiClient and dies without credentials.
+
+    The button must not report success for a process that is about to exit.
+    """
+    monkeypatch.delenv("KALSHI_API_KEY", raising=False)
+    monkeypatch.delenv("KALSHI_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("KALSHI_PRIVATE_KEY_PATH", raising=False)
+    r = client.post("/api/strategy/safe_compounder/toggle", json={"mode": "paper"})
+    assert r.status_code == 400
+    assert "credentials" in r.get_json()["error"].lower()
+    assert not any(s["pid"] for s in client.get("/api/bots").get_json())
+
+
+def test_toggle_refuses_when_only_api_key_present(client, monkeypatch):
+    monkeypatch.setenv("KALSHI_API_KEY", "kid")
+    monkeypatch.delenv("KALSHI_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("KALSHI_PRIVATE_KEY_PATH", raising=False)
+    r = client.post("/api/strategy/safe_compounder/toggle", json={"mode": "paper"})
+    assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Liveness reconciliation
+# ---------------------------------------------------------------------------
+def test_dead_child_is_not_reported_running(client):
+    """A crashed subprocess must stop being reported as running."""
+    st = wd.strategy_state["safe_compounder"]
+    st["running"] = True
+    st["pid"] = 424_242  # not a live process
+    try:
+        bots = {b["name"]: b for b in client.get("/api/bots").get_json()}
+        assert bots["safe_compounder"]["running"] is False
+        assert bots["safe_compounder"]["pid"] is None
+        # /api/status must agree with /api/bots.
+        assert client.get("/api/status").get_json()["running_strategies"] == 0
+    finally:
+        st["running"] = False
+        st["pid"] = None
+
+
+def test_exited_popen_detected_via_poll(client):
+    """A Popen whose child already exited is dead even if the pid is reused."""
+    import subprocess as sp
+    import time as _t
+
+    proc = sp.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=30)
+    wd._child_procs[proc.pid] = proc
+    st = wd.strategy_state["beast_mode"]
+    st["running"] = True
+    st["pid"] = proc.pid
+    try:
+        assert wd._pid_alive(proc.pid) is False
+        assert "beast_mode" not in wd._running_strategies()
+    finally:
+        wd._child_procs.pop(proc.pid, None)
+        st["running"] = False
+        st["pid"] = None
+    del _t
+
+
+def test_status_and_bots_agree(client):
+    """The Running tile and the bot table must never disagree."""
+    for st in wd.strategy_state.values():
+        st["running"] = False
+        st["pid"] = None
+    bots = {b["name"]: b["running"] for b in client.get("/api/bots").get_json()}
+    status = client.get("/api/status").get_json()
+    assert status["running_strategies"] == sum(1 for v in bots.values() if v)
+
+
+def test_toggle_starts_process_when_credentials_present(client, monkeypatch, tmp_path):
+    """The new credential gate must not block a legitimate start."""
+    monkeypatch.setenv("KALSHI_API_KEY", "kid")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----")
+    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
+    spawned = {}
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            spawned["cmd"] = cmd
+            spawned.update(kw)
+            self.pid = 31337
+            self._rc = None
+
+        def poll(self):
+            return self._rc
+
+        def terminate(self):
+            self._rc = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            self._rc = -9
+
+    monkeypatch.setattr(wd.subprocess, "Popen", FakePopen)
+    st = wd.strategy_state["safe_compounder"]
+    try:
+        r = client.post("/api/strategy/safe_compounder/toggle", json={"mode": "paper"})
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["running"] is True
+        assert body["pid"] == 31337
+        # Must use this interpreter, not whatever `python` resolves to on PATH.
+        assert spawned["cmd"][0] == sys.executable
+        assert "--safe-compounder" in spawned["cmd"]
+        assert "--paper" in spawned["cmd"]
+        # Output must not go to an undrained PIPE (that deadlocks the child
+        # once the ~64KB buffer fills); stderr folds into the same log file.
+        assert spawned["stderr"] == wd.subprocess.STDOUT
+        assert spawned["stdin"] == wd.subprocess.DEVNULL
+        assert spawned["stdout"] is not wd.subprocess.PIPE
+
+        bots = {b["name"]: b for b in client.get("/api/bots").get_json()}
+        assert bots["safe_compounder"]["running"] is True
+
+        r2 = client.post("/api/strategy/safe_compounder/toggle", json={"mode": "paper"})
+        assert r2.get_json()["running"] is False
+    finally:
+        st["running"] = False
+        st["pid"] = None
+        wd._child_procs.pop(31337, None)
 
 
 def test_kill_when_not_running_is_noop(client):
