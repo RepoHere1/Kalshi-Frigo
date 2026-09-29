@@ -809,6 +809,7 @@ button:hover { opacity:.85; }
 button.danger { background:var(--red); }
 button.success { background:var(--green); color:#000; }
 input, textarea { background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:4px 8px; font-size:.8rem; width:100%; }
+input[type=checkbox] { width:auto; margin:0 6px 0 0; padding:0; vertical-align:middle; accent-color:var(--blue); }
 pre { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:8px; font-size:.7rem; max-height:300px; overflow:auto; white-space:pre-wrap; }
 .two-col { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
 .three-col { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; }
