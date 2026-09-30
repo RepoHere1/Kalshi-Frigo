@@ -63,6 +63,7 @@ dashboard_state = {
     "errors": [],
     "sse_listeners": [],
     "db_positions_count": 0,
+    "kalshi_position_count": 0,
 }
 
 # Strategy control state
@@ -359,39 +360,58 @@ STRATEGY_DOCS = {
 }
 
 
+def _refresh_kalshi():
+    """One balance/positions sync from the Kalshi API into dashboard_state."""
+    balance, positions = _run_async(_fetch_kalshi_data())
+    if balance:
+        # Kalshi reports cents; the dashboard shows dollars.
+        dashboard_state["balance"] = balance.get("balance", 0) / 100.0
+    if positions:
+        # Kalshi uses different keys for event markets vs market tickers.
+        merged = list(positions.get("market_positions") or [])
+        merged += list(positions.get("event_positions") or [])
+        dashboard_state["positions"] = merged
+    dashboard_state["last_update"] = _now()
+    dashboard_state["kalshi_position_count"] = len(dashboard_state["positions"])
+
+
 def _monitor_loop():
-    """Background thread: credentials, Kalshi connect, DB init."""
-    dashboard_state["status"] = "online"
+    """Background thread: keep credentials, DB schema and Kalshi state fresh.
 
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+    This used to run once and return, which left `last_update` and
+    `positions` frozen at whatever the first fetch returned (or permanently
+    empty when credentials were absent at boot). It now loops for the life of
+    the process, so enabling credentials via a redeploy is picked up without a
+    restart and live positions stay current.
+    """
+    interval = max(15, int(os.environ.get("KALSHI_REFRESH_SECONDS", "60")))
+    warned_missing = False
+    while True:
+        dashboard_state["status"] = "online"
+        dashboard_state["has_openrouter_creds"] = bool(
+            os.environ.get("OPENROUTER_API_KEY", "").strip()
+        )
+        dashboard_state["has_kalshi_creds"] = kalshi_configured()
 
-    dashboard_state["has_kalshi_creds"] = kalshi_configured()
-    dashboard_state["has_openrouter_creds"] = bool(openrouter_key)
+        # Make sure the schema exists so the dashboard shows real numbers even
+        # on a fresh container where the trading loop has never run.
+        try:
+            _db()
+        except Exception as e:
+            _push_error(f"Database init: {e}")
 
-    # Make sure the schema exists so the dashboard shows real numbers even
-    # on a fresh container where the trading loop has never run.
-    try:
-        _db()
-    except Exception as e:
-        _push_error(f"Database init: {e}")
+        if not dashboard_state["has_kalshi_creds"]:
+            if not warned_missing:
+                _push_error("Kalshi credentials not configured — info mode only")
+                warned_missing = True
+            dashboard_state["last_update"] = _now()
+        else:
+            try:
+                _refresh_kalshi()
+            except Exception as e:
+                _push_error(f"Kalshi connect: {e}")
 
-    if not dashboard_state["has_kalshi_creds"]:
-        _push_error("Kalshi credentials not configured — info mode only")
-        dashboard_state["last_update"] = _now()
-        return
-
-    try:
-        balance, positions = _run_async(_fetch_kalshi_data())
-        if balance:
-            dashboard_state["balance"] = balance.get("balance", 0) / 100.0
-        if positions:
-            # Kalshi uses different keys for event markets vs market tickers.
-            merged = list(positions.get("market_positions") or [])
-            merged += list(positions.get("event_positions") or [])
-            dashboard_state["positions"] = merged
-        dashboard_state["last_update"] = _now()
-    except Exception as e:
-        _push_error(f"Kalshi connect: {e}")
+        time.sleep(interval)
 
 
 def _log_tail_loop():
@@ -580,25 +600,71 @@ def _row_positions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def _kalshi_positions() -> List[Dict[str, Any]]:
+def _as_float(value: Any, default: float = 0.0) -> float:
+    """Kalshi returns money as decimal *strings* (e.g. "-0.012000")."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _kalshi_account() -> Dict[str, Any]:
+    """Normalise the raw Kalshi portfolio payload into something displayable.
+
+    The portfolio endpoint returns two different shapes and neither matches what
+    the old fallback assumed:
+      market_positions -> ticker, position_fp, market_exposure_dollars,
+                          total_traded_dollars, realized_pnl_dollars, fees_paid_dollars
+      event_positions  -> event_ticker, total_cost_dollars, total_cost_shares_fp,
+                          event_exposure_dollars, realized_pnl_dollars, fees_paid_dollars
+    There is no `side`, `position`, `last_entry_price` or `status` field on
+    either, so those lookups previously rendered "?" and 0 for every row.
+    All money fields are decimal strings, not numbers.
+    """
     raw: List[Dict[str, Any]] = cast(List[Dict[str, Any]], dashboard_state["positions"])
-    out = []
+    markets: List[Dict[str, Any]] = []
+    events: List[Dict[str, Any]] = []
+
     for p in raw:
-        out.append(
-            {
-                "market_id": p.get("ticker") or p.get("market_ticker") or "?",
-                "side": p.get("side", "?"),
-                "entry_price": (p.get("last_entry_price") or 0) / 100.0,
-                "quantity": p.get("position", 0),
-                "strategy": "kalshi_api",
-                "stop_loss": None,
-                "take_profit": None,
-                "status": p.get("status", "open"),
-                "timestamp": str(p.get("last_update_time", "")),
-                "source": "kalshi",
-            }
-        )
-    return out
+        if p.get("ticker"):
+            markets.append(
+                {
+                    "ticker": p.get("ticker"),
+                    "shares": _as_float(p.get("position_fp")),
+                    "exposure": round(_as_float(p.get("market_exposure_dollars")), 2),
+                    "traded": round(_as_float(p.get("total_traded_dollars")), 2),
+                    "realized": round(_as_float(p.get("realized_pnl_dollars")), 2),
+                    "fees": round(_as_float(p.get("fees_paid_dollars")), 2),
+                    "updated": str(p.get("last_updated_ts") or ""),
+                }
+            )
+        elif p.get("event_ticker"):
+            events.append(
+                {
+                    "ticker": p.get("event_ticker"),
+                    "shares": _as_float(p.get("total_cost_shares_fp")),
+                    "cost": round(_as_float(p.get("total_cost_dollars")), 2),
+                    "exposure": round(_as_float(p.get("event_exposure_dollars")), 2),
+                    "realized": round(_as_float(p.get("realized_pnl_dollars")), 2),
+                    "fees": round(_as_float(p.get("fees_paid_dollars")), 2),
+                }
+            )
+
+    def total(rows: List[Dict[str, Any]], key: str) -> float:
+        return round(sum(float(r.get(key) or 0.0) for r in rows), 2)
+
+    return {
+        "connected": bool(markets or events),
+        "market_count": len(markets),
+        "event_count": len(events),
+        "markets": sorted(markets, key=lambda r: -abs(r["exposure"]))[:25],
+        "events": sorted(events, key=lambda r: -abs(r["cost"]))[:25],
+        "exposure": round(total(markets, "exposure") + total(events, "exposure"), 2),
+        "cost_basis": total(events, "cost"),
+        "realized": round(total(markets, "realized") + total(events, "realized"), 2),
+        "fees": round(total(markets, "fees") + total(events, "fees"), 2),
+        "traded": total(markets, "traded"),
+    }
 
 
 def build_snapshot() -> Dict[str, Any]:
@@ -642,9 +708,24 @@ def build_snapshot() -> Dict[str, Any]:
         recent.append(r)
 
     positions = _row_positions(pos_r)
-    if not positions:
+    account = _kalshi_account()
+    if not positions and account["connected"]:
         # Kalshi is the source of truth for anything the local DB missed.
-        positions = _kalshi_positions()
+        positions = [
+            {
+                "market_id": r["ticker"],
+                "side": "event" if not r["shares"] else ("long" if r["shares"] > 0 else "short"),
+                "entry_price": None,
+                "quantity": r["shares"],
+                "strategy": "kalshi_api",
+                "stop_loss": None,
+                "take_profit": None,
+                "status": "open",
+                "timestamp": r.get("updated", ""),
+                "source": "kalshi",
+            }
+            for r in (account["markets"] + account["events"])
+        ]
     dashboard_state["db_positions_count"] = len(positions)
 
     running = _running_strategies()
@@ -658,6 +739,7 @@ def build_snapshot() -> Dict[str, Any]:
         "has_kalshi_creds": kalshi_configured(),
         "has_openrouter_creds": bool(os.environ.get("OPENROUTER_API_KEY", "").strip()),
         "balance": dashboard_state["balance"],
+        "kalshi": account,
         "db_path": str(DB_PATH),
         "db_exists": Path(DB_PATH).exists(),
         "db_persistent": not _is_ephemeral_db(),
@@ -1229,436 +1311,697 @@ _TEMPLATE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kalshi-Frigo — AI Trading Dashboard</title>
+<title>Kalshi-Frigo — Live Trading Dashboard</title>
 <style>
-:root { --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#c9d1d9;
-  --muted:#8b949e; --green:#3fb950; --red:#f85149; --blue:#58a6ff;
-  --yellow:#d29922; --purple:#bc8cff; }
-* { box-sizing:border-box; margin:0; padding:0; }
-body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-  background:var(--bg); color:var(--text); min-height:100vh; padding:16px; }
-.container { max-width:1300px; margin:0 auto; }
-h1 { font-size:1.5rem; margin-bottom:.25rem; }
-.subtitle { color:var(--muted); margin-bottom:1rem; font-size:.85rem; }
-.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:8px; margin-bottom:12px; }
-.card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px; margin-bottom:10px; }
-.card h2 { font-size:.95rem; margin-bottom:8px; color:#fff; border-bottom:1px solid var(--border); padding-bottom:6px; }
-.stat { text-align:center; background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:8px; }
-.stat-value { font-size:1.3rem; font-weight:700; }
-.stat-label { font-size:.65rem; color:var(--muted); text-transform:uppercase; }
-.badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:.65rem; font-weight:600; }
-.badge.ok { background:#033a16; color:var(--green); }
-.badge.no { background:#1c2128; color:var(--muted); }
-.badge.warn { background:#3d2e00; color:var(--yellow); }
-table { width:100%; border-collapse:collapse; font-size:.8rem; }
-th { text-align:left; padding:4px 6px; color:var(--muted); font-size:.65rem; text-transform:uppercase; border-bottom:2px solid var(--border); }
-td { padding:4px 6px; border-bottom:1px solid var(--border); }
-button { background:var(--blue); color:#fff; border:none; padding:4px 10px; border-radius:6px; cursor:pointer; font-size:.75rem; }
-button:hover { opacity:.85; }
-button.danger { background:var(--red); }
-input, textarea { background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:4px 8px; font-size:.8rem; width:100%; }
-input[type=checkbox] { width:auto; margin:0 6px 0 0; padding:0; vertical-align:middle; accent-color:var(--blue); }
-pre { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:8px; font-size:.7rem; max-height:300px; overflow:auto; white-space:pre-wrap; }
-.two-col { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-.flex-row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-.tag { display:inline-block; background:#21262d; color:var(--blue); padding:1px 6px; border-radius:8px; font-size:.6rem; margin-right:3px; }
-.err { color:var(--muted); text-align:center; padding:8px; }
-.pos { color:var(--green); }
-.neg { color:var(--red); }
-canvas { max-height:250px; }
-.kv { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; font-size:.78rem; }
-.kv dt { color:var(--muted); }
-.kv dd { text-align:right; }
-.desc { font-size:.72rem; color:var(--muted); }
-.steps { font-size:.78rem; line-height:1.7; }
-.steps li { margin-bottom:2px; }
-code { background:var(--bg); border:1px solid var(--border); border-radius:4px; padding:0 4px; font-size:.72rem; }
+:root{
+  --bg:#080b12; --panel:#0f1420; --panel2:#141b2a; --line:#1f2937; --line2:#2b3648;
+  --fg:#e6edf6; --dim:#8494ab; --faint:#5b6a80;
+  --up:#2ee6a8; --down:#ff5c7a; --blue:#4d9fff; --amber:#ffb454; --violet:#a78bfa;
+  --r:14px; --shadow:0 1px 0 rgba(255,255,255,.03) inset, 0 8px 30px rgba(0,0,0,.45);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scrollbar-color:#2b3648 transparent}
+body{
+  font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;
+  background:
+    radial-gradient(1100px 520px at 12% -10%, #16233c 0%, transparent 60%),
+    radial-gradient(900px 480px at 92% 0%, #1a1533 0%, transparent 55%),
+    var(--bg);
+  color:var(--fg); min-height:100vh; padding:22px 18px 48px;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1400px;margin:0 auto}
+
+/* ---------- header ---------- */
+header{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;justify-content:space-between;margin-bottom:22px}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{
+  width:42px;height:42px;border-radius:12px;display:grid;place-items:center;font-size:20px;
+  background:linear-gradient(145deg,#2b6cff,#8b5cf6);box-shadow:0 6px 20px rgba(43,108,255,.35);
+}
+h1{font-size:20px;font-weight:650;letter-spacing:-.2px}
+h1 span{color:var(--dim);font-weight:400}
+.sub{color:var(--faint);font-size:12px;margin-top:2px}
+.headright{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+.url{
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:var(--blue);
+  background:rgba(77,159,255,.09);border:1px solid rgba(77,159,255,.25);
+  padding:3px 9px;border-radius:7px;cursor:pointer;transition:.15s;
+}
+.url:hover{background:rgba(77,159,255,.18)}
+.stamp{font-size:11px;color:var(--faint)}
+
+/* ---------- tiles ---------- */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:10px;margin-bottom:18px}
+.tile{
+  background:linear-gradient(180deg,var(--panel) 0%,var(--panel2) 100%);
+  border:1px solid var(--line);border-radius:var(--r);padding:14px 15px;box-shadow:var(--shadow);
+  position:relative;overflow:hidden;
+}
+.tile::after{content:"";position:absolute;inset:0 0 auto 0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,.09),transparent)}
+.tile .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);margin-bottom:7px}
+.tile .v{font-size:25px;font-weight:660;letter-spacing:-.6px;font-variant-numeric:tabular-nums;line-height:1.05}
+.tile .s{font-size:11px;color:var(--dim);margin-top:4px}
+.up{color:var(--up)} .down{color:var(--down)} .flat{color:var(--fg)}
+
+/* ---------- layout ---------- */
+.row{display:grid;gap:12px;margin-bottom:12px}
+.row.two{grid-template-columns:1.15fr .85fr}
+.row.half{grid-template-columns:1fr 1fr}
+@media(max-width:1000px){.row.two,.row.half{grid-template-columns:1fr}}
+.panel{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--r);
+  box-shadow:var(--shadow);overflow:hidden;display:flex;flex-direction:column;
+}
+.ph{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:13px 16px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.012);
+}
+.ph h2{font-size:12.5px;font-weight:620;letter-spacing:.04em;text-transform:uppercase;color:var(--fg)}
+.ph .note{font-size:11px;color:var(--faint);font-weight:400;text-transform:none;letter-spacing:0}
+.pb{padding:14px 16px;flex:1}
+
+/* ---------- bits ---------- */
+.pill{display:inline-flex;align-items:center;gap:5px;padding:2.5px 9px;border-radius:999px;font-size:10.5px;font-weight:620;letter-spacing:.02em}
+.pill.ok{background:rgba(46,230,168,.13);color:var(--up)}
+.pill.no{background:rgba(255,92,122,.13);color:var(--down)}
+.pill.warn{background:rgba(255,180,84,.14);color:var(--amber)}
+.pill.info{background:rgba(77,159,255,.13);color:var(--blue)}
+.dot{width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 0 3px rgba(255,255,255,.05)}
+.pulse{animation:pl 2s ease-in-out infinite}
+@keyframes pl{0%,100%{opacity:1}50%{opacity:.35}}
+
+.kv{display:grid;grid-template-columns:1fr auto;gap:7px 14px;font-size:12.5px;align-items:center}
+.kv dt{color:var(--dim)}
+.kv dd{text-align:right;font-variant-numeric:tabular-nums}
+
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{
+  text-align:left;padding:8px 10px;color:var(--faint);font-size:10px;font-weight:640;
+  text-transform:uppercase;letter-spacing:.07em;border-bottom:1px solid var(--line);white-space:nowrap;
+}
+td{padding:8px 10px;border-bottom:1px solid rgba(31,41,55,.55);vertical-align:middle}
+tr:last-child td{border-bottom:0}
+tbody tr:hover{background:rgba(255,255,255,.022)}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px}
+.tag{
+  display:inline-block;background:rgba(77,159,255,.12);color:var(--blue);
+  padding:1.5px 7px;border-radius:6px;font-size:10px;font-weight:600;white-space:nowrap;
+}
+.empty{padding:26px 14px;text-align:center;color:var(--faint);font-size:12.5px}
+
+.scroll{max-height:290px;overflow:auto}
+.scroll::-webkit-scrollbar{width:8px;height:8px}
+.scroll::-webkit-scrollbar-thumb{background:var(--line2);border-radius:8px}
+
+canvas{max-height:250px}
+
+/* ---------- controls ---------- */
+button{
+  background:rgba(77,159,255,.14);color:var(--blue);border:1px solid rgba(77,159,255,.28);
+  padding:5px 12px;border-radius:8px;cursor:pointer;font-size:11.5px;font-weight:600;
+  font-family:inherit;transition:.14s;white-space:nowrap;
+}
+button:hover{background:rgba(77,159,255,.26)}
+button.danger{background:rgba(255,92,122,.12);color:var(--down);border-color:rgba(255,92,122,.28)}
+button.danger:hover{background:rgba(255,92,122,.24)}
+button:disabled{opacity:.45;cursor:not-allowed}
+input[type=text],input[type=number]{
+  background:var(--bg);color:var(--fg);border:1px solid var(--line2);border-radius:8px;
+  padding:6px 10px;font-size:12px;width:100%;font-family:inherit;
+}
+input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(77,159,255,.13)}
+input[type=checkbox]{width:auto;margin:0;accent-color:var(--blue);vertical-align:middle;cursor:pointer}
+.field{margin-bottom:7px}
+.field label{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--dim);margin-bottom:4px}
+.bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+
+pre{
+  background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:11px;
+  font-size:11px;line-height:1.55;max-height:240px;overflow:auto;white-space:pre-wrap;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dim);margin:0;
+}
+.steps{margin:0;padding-left:18px;font-size:12.5px;line-height:1.85;color:var(--dim)}
+.steps li{margin-bottom:3px}
+.steps b{color:var(--fg);font-weight:620}
+.note-box{
+  background:rgba(255,180,84,.07);border:1px solid rgba(255,180,84,.22);
+  border-radius:10px;padding:10px 12px;font-size:11.5px;color:var(--dim);line-height:1.6;
+}
+.note-box b{color:var(--amber)}
+code{background:var(--bg);border:1px solid var(--line2);border-radius:5px;padding:1px 5px;font-size:11px;font-family:ui-monospace,monospace}
+footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 </style>
 </head>
 <body>
-<div class="container">
-<h1>&#129504; Kalshi-Frigo Dashboard</h1>
-<p class="subtitle">
-  AI trading bot for Kalshi prediction markets &middot; rendered {{ s.generated_at }}
-  {%- if s.public_domain %} &middot; <code>{{ s.public_domain }}</code>{% endif %}
-</p>
+<div class="wrap">
 
-<div class="grid">
-  <div class="stat"><div class="stat-value">{% if s.status == 'online' %}<span class="badge ok">ONLINE</span>{% else %}<span class="badge no">OFF</span>{% endif %}</div><div class="stat-label">Status</div></div>
-  <div class="stat"><div class="stat-value">{{ s.balance if s.balance is not none else '-' }}</div><div class="stat-label">Balance $</div></div>
-  <div class="stat"><div class="stat-value" id="sPositions">{{ s.open.positions if s.open else 0 }}</div><div class="stat-label">Open positions</div></div>
-  <div class="stat"><div class="stat-value" id="sCapital">{{ s.open.capital if s.open else 0 }}</div><div class="stat-label">Capital at risk</div></div>
-  <div class="stat"><div class="stat-value {{ 'pos' if s.trades and s.trades.realized_pnl > 0 else ('neg' if s.trades and s.trades.realized_pnl < 0 else '') }}">{{ s.trades.realized_pnl if s.trades else 0 }}</div><div class="stat-label">Realized P&amp;L</div></div>
-  <div class="stat"><div class="stat-value">{{ s.trades.win_rate if s.trades else 0 }}%</div><div class="stat-label">Win rate</div></div>
-  <div class="stat"><div class="stat-value">{{ s.trades.trades if s.trades else 0 }}</div><div class="stat-label">Closed trades</div></div>
-  <div class="stat"><div class="stat-value">{{ s.data.ai_cost_today if s.data else 0 }}<span style="font-size:.7rem;color:var(--muted)">/{{ s.data.ai_budget if s.data else 0 }}</span></div><div class="stat-label">AI spend today $</div></div>
-  <div class="stat"><div class="stat-value">{{ s.running_count if s.running_count is defined else 0 }}</div><div class="stat-label">Strategies running</div></div>
-  <div class="stat"><div class="stat-value" id="sUptime">{{ (s.uptime_sec // 60) if s.uptime_sec is defined else 0 }}m</div><div class="stat-label">Uptime</div></div>
+<header>
+  <div class="brand">
+    <div class="logo">&#129504;</div>
+    <div>
+      <h1>Kalshi-Frigo <span>&middot; live trading dashboard</span></h1>
+      <div class="sub">LLM-driven Kalshi automation &middot; paper &amp; live &middot; multi-strategy</div>
+    </div>
+  </div>
+  <div class="headright">
+    <div class="url" onclick="navigator.clipboard.writeText(location.href)" title="Click to copy this URL">{{ s.public_domain or 'localhost' }}</div>
+    <div class="stamp">Rendered {{ s.generated_at }}</div>
+  </div>
+</header>
+
+{% if not s.public_domain %}
+<div class="note-box" style="margin-bottom:14px">
+  <b>Heads up:</b> you are viewing this over a hostname other than the Railway public domain.
+  The canonical address is <code>kalshi-frigo-production.up.railway.app</code> &mdash;
+  <code>kalshi-frigo.up.railway.app</code> does not exist, because Railway always names
+  service domains <code>&lt;service&gt;-&lt;environment&gt;.up.railway.app</code>.
+</div>
+{% endif %}
+
+<!-- ============ headline tiles ============ -->
+<div class="tiles">
+  <div class="tile">
+    <div class="k">Engine</div>
+    <div class="v">{% if s.status == 'online' %}<span class="pill ok"><span class="dot pulse"></span>ONLINE</span>{% else %}<span class="pill no">OFF</span>{% endif %}</div>
+    <div class="s" id="tUptime">up {{ (s.uptime_sec // 60) if s.uptime_sec is defined else 0 }}m</div>
+  </div>
+  <div class="tile">
+    <div class="k">Kalshi balance</div>
+    <div class="v" id="tBalance">{{ '$%.2f'|format(s.balance) if s.balance is not none else '-' }}</div>
+    <div class="s">{% if s.has_kalshi_creds %}API connected{% else %}no credentials{% endif %}</div>
+  </div>
+  <div class="tile">
+    <div class="k">Live positions</div>
+    <div class="v" id="tLivePos">{{ (s.kalshi.market_count + s.kalshi.event_count) if s.kalshi else 0 }}</div>
+    <div class="s">{{ s.kalshi.market_count if s.kalshi else 0 }} market &middot; {{ s.kalshi.event_count if s.kalshi else 0 }} event</div>
+  </div>
+  <div class="tile">
+    <div class="k">Exposure</div>
+    <div class="v" id="tExposure">{{ '$%.2f'|format(s.kalshi.exposure) if s.kalshi else '$0.00' }}</div>
+    <div class="s">cost basis {{ '$%.2f'|format(s.kalshi.cost_basis) if s.kalshi else '$0.00' }}</div>
+  </div>
+  <div class="tile">
+    <div class="k">Kalshi realized P&amp;L</div>
+    <div class="v {{ 'up' if s.kalshi and s.kalshi.realized > 0 else ('down' if s.kalshi and s.kalshi.realized < 0 else 'flat') }}" id="tKalshiPnl">{{ '$%.2f'|format(s.kalshi.realized) if s.kalshi else '$0.00' }}</div>
+    <div class="s">fees {{ '$%.2f'|format(s.kalshi.fees) if s.kalshi else '$0.00' }}</div>
+  </div>
+  <div class="tile">
+    <div class="k">Bot realized P&amp;L</div>
+    <div class="v {{ 'up' if s.trades and s.trades.realized_pnl > 0 else ('down' if s.trades and s.trades.realized_pnl < 0 else 'flat') }}" id="tBotPnl">{{ '$%.2f'|format(s.trades.realized_pnl) if s.trades else '$0.00' }}</div>
+    <div class="s">{{ s.trades.trades if s.trades else 0 }} closed trades</div>
+  </div>
+  <div class="tile">
+    <div class="k">Win rate</div>
+    <div class="v" id="tWinRate">{{ s.trades.win_rate if s.trades else 0 }}%</div>
+    <div class="s">{{ s.trades.wins if s.trades else 0 }}W / {{ s.trades.losses if s.trades else 0 }}L</div>
+  </div>
+  <div class="tile">
+    <div class="k">AI spend today</div>
+    <div class="v" id="tAiSpend">{{ '$%.2f'|format(s.data.ai_cost_today) if s.data else '$0.00' }}</div>
+    <div class="s">of {{ '$%.2f'|format(s.data.ai_budget) if s.data else '$0.00' }} budget</div>
+  </div>
+  <div class="tile">
+    <div class="k">Strategies live</div>
+    <div class="v" id="tRunning">{{ s.running_count if s.running_count is defined else 0 }}</div>
+    <div class="s">of {{ s.bots|length }} available</div>
+  </div>
 </div>
 
-<div class="two-col">
-  <div class="card">
-    <h2>&#9881; System readiness</h2>
-    <dl class="kv">
-      <dt>Kalshi API credentials</dt>
-      <dd>{% if s.has_kalshi_creds %}<span class="badge ok">CONFIGURED</span>{% else %}<span class="badge no">MISSING</span>{% endif %}</dd>
-      <dt>OpenRouter API key</dt>
-      <dd>{% if s.has_openrouter_creds %}<span class="badge ok">CONFIGURED</span>{% else %}<span class="badge no">MISSING</span>{% endif %}</dd>
-      <dt>Database</dt>
-      <dd>{% if s.db_exists %}<span class="badge ok">PRESENT</span>{% else %}<span class="badge warn">MISSING</span>{% endif %}</dd>
-      <dt>Database persistence</dt>
-      <dd>{% if s.db_persistent %}<span class="badge ok">VOLUME</span>{% else %}<span class="badge warn">EPHEMERAL</span>{% endif %}</dd>
-      <dt>Database path</dt>
-      <dd><code>{{ s.db_path }}</code></dd>
-      <dt>Last Kalshi sync</dt>
-      <dd>{{ s.last_update or 'never' }}</dd>
-    </dl>
-    {% if not s.db_persistent %}
-    <p class="desc" style="margin-top:8px">
-      <span class="badge warn">Why the tables are empty</span>
-      The database lives in the container filesystem, so every redeploy recreates it
-      from empty. Mount a Railway volume and set <code>DB_PATH</code> inside it to
-      keep trade history between deployments.
-    </p>
+<!-- ============ readiness + inventory ============ -->
+<div class="row two">
+  <div class="panel">
+    <div class="ph"><h2>System readiness</h2><span class="note">what is and isn't wired up</span></div>
+    <div class="pb">
+      <dl class="kv">
+        <dt>Kalshi API credentials</dt>
+        <dd>{% if s.has_kalshi_creds %}<span class="pill ok">configured</span>{% else %}<span class="pill no">missing</span>{% endif %}</dd>
+        <dt>OpenRouter API key</dt>
+        <dd>{% if s.has_openrouter_creds %}<span class="pill ok">configured</span>{% else %}<span class="pill no">missing</span>{% endif %}</dd>
+        <dt>Database</dt>
+        <dd>{% if s.db_exists %}<span class="pill ok">present</span>{% else %}<span class="pill warn">missing</span>{% endif %}</dd>
+        <dt>Database persistence</dt>
+        <dd>{% if s.db_persistent %}<span class="pill ok">volume</span>{% else %}<span class="pill warn">ephemeral</span>{% endif %}</dd>
+        <dt>Last Kalshi sync</dt><dd>{{ s.last_update or 'never' }}</dd>
+        <dt>Database path</dt><dd class="mono" style="color:var(--faint)">{{ s.db_path }}</dd>
+      </dl>
+      {% if not s.db_persistent %}
+      <div class="note-box" style="margin-top:12px">
+        <b>Bot trade history is wiped on every deploy.</b>
+        <code>trading_system.db</code> lives in the container filesystem rather than a mounted
+        volume, so each redeploy recreates it empty. Mount a Railway volume and point
+        <code>DB_PATH</code> inside it to make bot positions and trade logs persist.
+        The Kalshi figures above are unaffected &mdash; they come straight from the API.
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="ph"><h2>Data inventory</h2><span class="note">row counts per table</span></div>
+    <div class="pb">
+      <dl class="kv">
+        {%- for name, count in (s.data.tables if s.data else {}).items() %}
+        <dt class="mono">{{ name }}</dt><dd>{{ count }}</dd>
+        {%- endfor %}
+        <dt>LLM queries logged</dt><dd>{{ s.data.llm_queries if s.data else 0 }}</dd>
+        <dt>LLM tokens used</dt><dd>{{ s.data.llm_tokens if s.data else 0 }}</dd>
+        <dt>LLM spend (all time)</dt><dd>${{ s.data.llm_cost if s.data else 0 }}</dd>
+      </dl>
+    </div>
+  </div>
+</div>
+
+{% if s.errors %}
+<div class="panel" style="margin-bottom:12px">
+  <div class="ph"><h2>Recent errors</h2><span class="note">{{ s.errors|length }} most recent</span></div>
+  <div class="pb"><div class="bar">
+    {%- for e in s.errors[-6:]|reverse %}<span class="pill warn"><span class="mono">{{ e.time }}</span> {{ e.error }}</span>{% endfor %}
+  </div></div>
+</div>
+{% endif %}
+
+<!-- ============ Kalshi account ============ -->
+<div class="panel" style="margin-bottom:12px">
+  <div class="ph">
+    <h2>Kalshi account &mdash; live from the API</h2>
+    <span class="note">{% if s.last_update %}synced {{ s.last_update }}{% else %}not synced yet{% endif %}</span>
+  </div>
+  {%- if s.kalshi and s.kalshi.connected %}
+  <div class="row two" style="padding:14px 16px 0;margin:0">
+    <div class="pb" style="padding:0">
+      <table><thead><tr><th>Market</th><th class="num">Shares</th><th class="num">Exposure</th><th class="num">Traded</th><th class="num">Realized</th><th class="num">Fees</th></tr></thead><tbody>
+      <tbody id="kalshiMarkets">
+      {%- for r in s.kalshi.markets %}
+        <tr>
+          <td class="mono">{{ r.ticker }}</td>
+          <td class="num">{{ r.shares }}</td>
+          <td class="num">{{ r.exposure }}</td>
+          <td class="num">{{ r.traded }}</td>
+          <td class="num {{ 'up' if r.realized > 0 else ('down' if r.realized < 0 else 'flat') }}">{{ r.realized }}</td>
+          <td class="num" style="color:var(--faint)">{{ r.fees }}</td>
+        </tr>
+      {%- endfor %}
+      </tbody></table>
+    </div>
+    <div class="pb" style="padding:0">
+      <table><thead><tr><th>Event</th><th class="num">Shares</th><th class="num">Cost</th><th class="num">Exposure</th><th class="num">Realized</th><th class="num">Fees</th></tr></thead><tbody>
+      <tbody id="kalshiEvents">
+      {%- for r in s.kalshi.events %}
+        <tr>
+          <td class="mono">{{ r.ticker }}</td>
+          <td class="num">{{ r.shares }}</td>
+          <td class="num">{{ r.cost }}</td>
+          <td class="num">{{ r.exposure }}</td>
+          <td class="num {{ 'up' if r.realized > 0 else ('down' if r.realized < 0 else 'flat') }}">{{ r.realized }}</td>
+          <td class="num" style="color:var(--faint)">{{ r.fees }}</td>
+        </tr>
+      {%- endfor %}
+      </tbody></table>
+    </div>
+  </div>
+  {%- else %}
+  <div class="empty">
+    {% if s.has_kalshi_creds %}
+      Waiting for the first Kalshi sync &mdash; the poller runs every 60s.
+    {% else %}
+      No Kalshi credentials configured, so there is nothing to poll.
+      Set <code>KALSHI_API_KEY</code> and <code>KALSHI_PRIVATE_KEY</code> as Railway service variables.
     {% endif %}
   </div>
+  {%- endif %}
+</div>
 
-  <div class="card">
-    <h2>&#128202; Data inventory</h2>
-    <dl class="kv">
-      {%- for name, count in (s.data.tables if s.data else {}).items() %}
-      <dt><code>{{ name }}</code></dt><dd>{{ count }} row{{ '' if count == 1 else 's' }}</dd>
+<!-- ============ positions + equity ============ -->
+<div class="row two">
+  <div class="panel">
+    <div class="ph"><h2>Open positions</h2><span class="note">{{ s.positions|length }} row{{ '' if s.positions|length == 1 else 's' }}</span></div>
+    <div class="scroll">
+      {%- if s.positions %}
+      <table><thead><tr><th>Market</th><th>Side</th><th class="num">Entry</th><th class="num">Qty</th><th>Strategy</th><th class="num">SL</th><th class="num">TP</th></tr></thead><tbody id="posBody">
+      {%- for p in s.positions %}
+        <tr>
+          <td class="mono" title="{{ p.market_id }}">{{ p.market_id[:26] }}</td>
+          <td><span class="tag">{{ p.side }}</span></td>
+          <td class="num">{{ '%.3f'|format(p.entry_price) if p.entry_price is not none else '-' }}</td>
+          <td class="num">{{ p.quantity }}</td>
+          <td><span class="tag">{{ p.strategy }}</span></td>
+          <td class="num">{{ p.stop_loss if p.stop_loss is not none else '-' }}</td>
+          <td class="num">{{ p.take_profit if p.take_profit is not none else '-' }}</td>
+        </tr>
       {%- endfor %}
-      <dt>LLM queries logged</dt><dd>{{ s.data.llm_queries if s.data else 0 }}</dd>
-      <dt>LLM tokens used</dt><dd>{{ s.data.llm_tokens if s.data else 0 }}</dd>
-      <dt>LLM spend (all time)</dt><dd>${{ s.data.llm_cost if s.data else 0 }}</dd>
-      <dt>Analyses today</dt><dd>{{ s.data.ai_analyses_today if s.data else 0 }}</dd>
-    </dl>
-  </div>
-</div>
-
-<div class="card">
-  <h2>&#9888; Recent errors</h2>
-  <div id="sErrors" class="flex-row">
-    {%- if s.errors %}
-    {%- for e in s.errors[-5:]|reverse %}
-    <span class="tag">{{ e.time }} {{ e.error }}</span>
-    {%- endfor %}
-    {%- else %}
-    <span class="badge ok">none</span>
-    {%- endif %}
-  </div>
-</div>
-
-<div class="two-col">
-  <div class="card">
-    <h2>&#128205; Open positions</h2>
-    <table id="posTable"><thead><tr><th>Market</th><th>Side</th><th>Entry</th><th>Qty</th><th>Strategy</th><th>SL</th><th>TP</th></tr></thead><tbody>
-    {%- if s.positions %}
-    {%- for p in s.positions %}
-      <tr>
-        <td title="{{ p.market_id }}">{{ p.market_id[:20] }}</td>
-        <td>{{ p.side }}</td><td>{{ '%.3f'|format(p.entry_price) }}</td>
-        <td>{{ p.quantity }}</td><td><span class="tag">{{ p.strategy }}</span></td>
-        <td>{{ p.stop_loss if p.stop_loss is not none else '-' }}</td>
-        <td>{{ p.take_profit if p.take_profit is not none else '-' }}</td>
-      </tr>
-    {%- endfor %}
-    {%- else %}
-      <tr><td colspan="7" class="err">No open positions</td></tr>
-    {%- endif %}
-    </tbody></table>
-  </div>
-
-  <div class="card">
-    <h2>&#128200; Cumulative realized P&amp;L</h2>
-    <canvas id="pnlChart"></canvas>
-    <p class="desc" id="pnlSummary">
-      {%- if s.equity and s.equity.pn %}
-      {{ s.equity.pn|length }} closed trade{{ '' if s.equity.pn|length == 1 else 's' }},
-      ending at ${{ s.equity.pn[-1] }}.
+      </tbody></table>
       {%- else %}
-      No closed trades yet, so the equity curve is flat at $0.
+      <div class="empty">No open positions. The bot opens one after an LLM decision clears the confidence threshold.</div>
       {%- endif %}
-    </p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="ph"><h2>Cumulative realized P&amp;L</h2><span class="note" id="pnlSummary"></span></div>
+    <div class="pb"><canvas id="pnlChart"></canvas></div>
   </div>
 </div>
 
-<div class="two-col">
-  <div class="card">
-    <h2>&#128200; Strategy performance</h2>
-    <table id="perfTable"><thead><tr><th>Strategy</th><th>Trades</th><th>Wins</th><th>Win&nbsp;rate</th><th>P&amp;L</th><th>Best</th><th>Worst</th></tr></thead><tbody>
+<!-- ============ performance + recent trades ============ -->
+<div class="row half">
+  <div class="panel">
+    <div class="ph"><h2>Strategy performance</h2><span class="note">closed trades by strategy</span></div>
     {%- if s.by_strategy %}
+    <table><thead><tr><th>Strategy</th><th class="num">Trades</th><th class="num">Win rate</th><th class="num">P&amp;L</th><th class="num">Best</th><th class="num">Worst</th></tr></thead><tbody>
     {%- for r in s.by_strategy %}
       <tr>
         <td><span class="tag">{{ r.strategy }}</span></td>
-        <td>{{ r.trades }}</td><td>{{ r.wins }}</td><td>{{ r.win_rate }}%</td>
-        <td class="{{ 'pos' if r.pnl > 0 else ('neg' if r.pnl < 0 else '') }}">{{ r.pnl }}</td>
-        <td class="pos">{{ r.best }}</td><td class="neg">{{ r.worst }}</td>
+        <td class="num">{{ r.trades }}</td>
+        <td class="num">{{ r.win_rate }}%</td>
+        <td class="num {{ 'up' if r.pnl > 0 else ('down' if r.pnl < 0 else 'flat') }}">{{ r.pnl }}</td>
+        <td class="num up">{{ r.best }}</td>
+        <td class="num down">{{ r.worst }}</td>
       </tr>
     {%- endfor %}
-    {%- else %}
-      <tr><td colspan="7" class="err">No closed trades to break down yet</td></tr>
-    {%- endif %}
     </tbody></table>
+    {%- else %}
+    <div class="empty">No closed trades to break down yet.</div>
+    {%- endif %}
   </div>
 
-  <div class="card">
-    <h2>&#128197; Recent closed trades</h2>
-    <table id="tradeTable"><thead><tr><th>Market</th><th>Side</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&amp;L</th><th>Exited</th></tr></thead><tbody>
+  <div class="panel">
+    <div class="ph"><h2>Recent closed trades</h2><span class="note">{{ s.recent_trades|length }} most recent</span></div>
     {%- if s.recent_trades %}
+    <div class="scroll">
+    <table><thead><tr><th>Market</th><th>Side</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Qty</th><th class="num">P&amp;L</th><th>Exited</th></tr></thead><tbody>
     {%- for t in s.recent_trades %}
       <tr>
-        <td title="{{ t.market_id }}">{{ t.market_id[:20] }}</td>
+        <td class="mono" title="{{ t.market_id }}">{{ t.market_id[:24] }}</td>
         <td>{{ t.side }}</td>
-        <td>{{ '%.3f'|format(t.entry_price) }}</td>
-        <td>{{ '%.3f'|format(t.exit_price) }}</td>
-        <td>{{ t.quantity }}</td>
-        <td class="{{ 'pos' if t.pnl > 0 else ('neg' if t.pnl < 0 else '') }}">{{ t.pnl }}</td>
-        <td>{{ t.exit_timestamp[:16] if t.exit_timestamp else '-' }}</td>
+        <td class="num">{{ '%.3f'|format(t.entry_price) }}</td>
+        <td class="num">{{ '%.3f'|format(t.exit_price) }}</td>
+        <td class="num">{{ t.quantity }}</td>
+        <td class="num {{ 'up' if t.pnl > 0 else ('down' if t.pnl < 0 else 'flat') }}">{{ t.pnl }}</td>
+        <td class="mono" style="color:var(--faint)">{{ (t.exit_timestamp or '')[:16] }}</td>
       </tr>
     {%- endfor %}
+    </tbody></table>
+    </div>
     {%- else %}
-      <tr><td colspan="7" class="err">No closed trades recorded</td></tr>
+    <div class="empty">No closed trades recorded yet.</div>
     {%- endif %}
+  </div>
+</div>
+
+<!-- ============ strategies ============ -->
+<div class="panel" style="margin-bottom:12px">
+  <div class="ph"><h2>Strategies</h2><span class="note">what each one actually does</span></div>
+  <div class="pb" style="padding:0">
+    <table><thead><tr><th style="width:170px">Strategy</th><th>Approach</th><th style="width:80px">Mode</th><th style="width:100px">State</th><th style="width:150px">Actions</th></tr></thead><tbody>
+    {%- for b in s.bots %}
+      <tr>
+        <td><strong>{{ b.label }}</strong><div class="mono" style="color:var(--faint)">{{ b.name }}</div></td>
+        <td style="color:var(--dim)">{{ b.description }}</td>
+        <td>{{ b.mode }}</td>
+        <td>{% if b.running %}<span class="pill ok"><span class="dot pulse"></span>running</span>{% else %}<span class="pill no">stopped</span>{% endif %}</td>
+        <td>
+          <div class="bar">
+            <button onclick="toggleStrategy('{{ b.name }}')">{% if b.running %}Stop{% else %}Start{% endif %}</button>
+            <button class="danger" onclick="killBot('{{ b.name }}')">Kill</button>
+          </div>
+        </td>
+      </tr>
+    {%- endfor %}
     </tbody></table>
   </div>
 </div>
 
-<div class="card">
-  <h2>&#129302; Strategies and what they do</h2>
-  <table id="botTable"><thead><tr><th>Strategy</th><th>Mode</th><th>PID</th><th>State</th><th>Actions</th></tr></thead><tbody>
-  {%- for b in s.bots %}
-    <tr>
-      <td><strong>{{ b.name }}</strong><div class="desc">{{ b.label }}</div></td>
-      <td>{{ b.mode }}</td>
-      <td>{{ b.pid if b.pid else '-' }}</td>
-      <td>{% if b.running %}<span class="badge ok">RUNNING</span>{% else %}<span class="badge no">STOPPED</span>{% endif %}</td>
-      <td>
-        <button onclick="toggleStrategy('{{ b.name }}')">{% if b.running %}Stop{% else %}Start{% endif %}</button>
-        <button class="danger" onclick="killBot('{{ b.name }}')">Kill</button>
-      </td>
-    </tr>
-  {%- endfor %}
-  </tbody></table>
-</div>
-
-<div class="card">
-  <h2>&#129518; What this system does</h2>
-  <p class="desc" style="margin-bottom:8px">
-    Kalshi-Frigo scans prediction markets, asks an LLM whether each contract is
-    mispriced, sizes a position with fractional Kelly sizing, and manages exits
-    with stop-loss, take-profit and time-based rules. Each scan is recorded in
-    SQLite, which is what every number on this page is read from.
-  </p>
-  <ol class="steps">
-    <li><strong>Ingest</strong> &mdash; pulls open markets from the Kalshi API and upserts prices into <code>markets</code>.</li>
-    <li><strong>Decide</strong> &mdash; scores each eligible market with an LLM decision pass (OpenRouter), subject to a daily cost budget.</li>
-    <li><strong>Execute</strong> &mdash; sizes with quarter-Kelly and places paper or live orders, with price-sanity and fail-closed balance checks.</li>
-    <li><strong>Track</strong> &mdash; monitors open positions and closes them on stop-loss, take-profit, time or resolution, writing each close to <code>trade_logs</code>.</li>
-    <li><strong>Evaluate</strong> &mdash; aggregates realized P&amp;L, win rate and per-strategy attribution.</li>
-  </ol>
-  <table style="margin-top:8px"><thead><tr><th>Strategy</th><th>Approach</th></tr></thead><tbody>
-  {%- for d in s.strategy_docs %}
-    <tr><td><span class="tag">{{ d.name }}</span></td><td class="desc">{{ d.description }}</td></tr>
-  {%- endfor %}
-  </tbody></table>
-  <p class="desc" style="margin-top:8px">
-    Run modes: <code>python cli.py run --paper</code> (AI directional),
-    <code>--safe-compounder</code> (no LLM), <code>--beast</code> (aggressive),
-    <code>--live</code> (real money). Live trading additionally requires
-    <code>LIVE_TRADING_ENABLED=true</code> and valid Kalshi credentials.
-  </p>
-</div>
-
-<div class="two-col">
-  <div class="card">
-    <h2>&#9881; Config editor</h2>
-    <div id="configEditor">
-    {%- for key, value in s.config.items() %}
-      {%- if value is sameas true or value is sameas false %}
-      <label style="display:flex;gap:6px;align-items:center;margin:4px 0;font-size:.75rem">
-        <input type="checkbox" data-key="{{ key }}" data-type="boolean" {{ 'checked' if value else '' }}> {{ key }}
-      </label>
-      {%- else %}
-      <label style="display:block;margin:4px 0;font-size:.75rem">{{ key }}
-        <input data-key="{{ key }}" data-type="{{ 'number' if value is number else 'string' }}" value="{{ value }}" step="any" style="width:100%">
-      </label>
-      {%- endif %}
-    {%- endfor %}
+<!-- ============ what it does ============ -->
+<div class="panel" style="margin-bottom:12px">
+  <div class="ph"><h2>What this system does</h2><span class="note">the trading pipeline</span></div>
+  <div class="pb">
+    <p style="color:var(--dim);font-size:12.5px;margin-bottom:10px">
+      Kalshi-Frigo scans prediction markets, asks an LLM whether each contract is mispriced,
+      sizes a position with fractional Kelly sizing, then manages exits with stop-loss,
+      take-profit and time-based rules. Every scan is recorded in SQLite &mdash; that is what
+      the numbers on this page are read from.
+    </p>
+    <ol class="steps">
+      <li><b>Ingest</b> &mdash; pulls open markets from the Kalshi API and upserts prices into <code>markets</code>.</li>
+      <li><b>Decide</b> &mdash; scores each eligible market with an LLM pass via OpenRouter, under a daily cost budget.</li>
+      <li><b>Execute</b> &mdash; sizes with quarter-Kelly and places orders, with price-sanity and fail-closed balance checks.</li>
+      <li><b>Track</b> &mdash; monitors open positions and closes them on stop-loss, take-profit, time or resolution, writing each close to <code>trade_logs</code>.</li>
+      <li><b>Evaluate</b> &mdash; aggregates realized P&amp;L, win rate and per-strategy attribution.</li>
+    </ol>
+    <div class="bar" style="margin-top:12px">
+      <span class="tag">python cli.py run --paper</span>
+      <span class="tag">--safe-compounder</span>
+      <span class="tag">--beast</span>
+      <span class="tag">--live</span>
+      <span style="font-size:11.5px;color:var(--faint)">Live trading additionally needs <code>LIVE_TRADING_ENABLED=true</code>.</span>
     </div>
-    <button onclick="saveConfig()" style="margin-top:8px">Save Config</button>
-    <span id="configStatus" style="font-size:.7rem;color:var(--muted);margin-left:6px"></span>
-  </div>
-
-  <div class="card">
-    <h2>&#128276; Alerts</h2>
-    <label>Telegram webhook <input id="tgUrl" value="{{ s.alerts.telegram_url if s.alerts else '' }}" style="width:80%"></label><br><br>
-    <label>Discord webhook <input id="dcUrl" value="{{ s.alerts.discord_url if s.alerts else '' }}" style="width:80%"></label><br><br>
-    <label><input type="checkbox" id="alertEnabled" {{ 'checked' if s.alerts and s.alerts.enabled else '' }}> Enable alerts</label><br><br>
-    <button onclick="saveAlerts()">Save</button>
-    <span id="alertStatus"></span>
   </div>
 </div>
 
-<div class="two-col">
-  <div class="card">
-    <h2>&#128203; Log viewer</h2>
-    <div class="flex-row" style="margin-bottom:6px">
-      <input id="logLines" value="100" style="width:80px">
-      <button onclick="loadLogs()">Load</button>
+<!-- ============ config + alerts ============ -->
+<div class="row half">
+  <div class="panel">
+    <div class="ph"><h2>Config editor</h2><span class="note" id="configStatus">in-memory only</span></div>
+    <div class="pb">
+      {%- for key, value in s.config.items() %}
+        {%- if value is sameas true or value is sameas false %}
+        <div class="field"><label><input type="checkbox" data-key="{{ key }}" data-type="boolean" {{ 'checked' if value else '' }}> {{ key }}</label></div>
+        {%- else %}
+        <div class="field"><label>{{ key }}</label>
+          <input type="text" data-key="{{ key }}" data-type="{{ 'number' if value is number else 'string' }}" value="{{ value }}">
+        </div>
+        {%- endif %}
+      {%- endfor %}
+      <div class="bar" style="margin-top:10px"><button onclick="saveConfig()">Save config</button></div>
     </div>
-    <pre id="logOutput" style="max-height:250px">{% if s.logs %}{{ s.logs|join('\n')|e }}{% else %}(no log files yet — start a strategy to generate logs){% endif %}</pre>
   </div>
 
-  <div class="card">
-    <h2>&#128225; Real-time event feed</h2>
-    <pre id="tradeFeed" style="max-height:250px">Listening for events&hellip;</pre>
+  <div class="panel">
+    <div class="ph"><h2>Alerts</h2><span class="note" id="alertStatus"></span></div>
+    <div class="pb">
+      <div class="field"><label>Telegram webhook</label><input type="text" id="tgUrl" value="{{ s.alerts.telegram_url if s.alerts else '' }}" placeholder="https://api.telegram.org/..."></div>
+      <div class="field"><label>Discord webhook</label><input type="text" id="dcUrl" value="{{ s.alerts.discord_url if s.alerts else '' }}" placeholder="https://discord.com/api/webhooks/..."></div>
+      <div class="field"><label><input type="checkbox" id="alertEnabled" {{ 'checked' if s.alerts and s.alerts.enabled else '' }}> Enable alerts</label></div>
+      <div class="bar" style="margin-top:10px"><button onclick="saveAlerts()">Save alerts</button></div>
+    </div>
   </div>
 </div>
 
-<footer style="margin-top:16px;text-align:center;color:var(--muted);font-size:.7rem">
-  Kalshi-Frigo &middot; Prediction-market automation &middot; Not financial advice
-</footer>
+<!-- ============ logs + feed ============ -->
+<div class="row half">
+  <div class="panel">
+    <div class="ph"><h2>Log tail</h2><span class="bar"><input type="text" id="logLines" value="100" style="width:64px"><button onclick="loadLogs()">Load</button></span></div>
+    <div class="pb"><pre id="logOutput">{% if s.logs %}{{ s.logs|join('\n')|e }}{% else %}No log files yet. Start a strategy to generate logs.{% endif %}</pre></div>
+  </div>
+
+  <div class="panel">
+    <div class="ph"><h2>Live event feed</h2><span class="note">server-sent events</span></div>
+    <div class="pb"><pre id="tradeFeed">Connected. Waiting for events&hellip;</pre></div>
+  </div>
+</div>
+
+<footer>Kalshi-Frigo &middot; prediction-market automation &middot; not financial advice</footer>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>
-// Server-rendered snapshot, so the page is already correct before any fetch.
+// Server-rendered snapshot: the page is already correct before any fetch runs,
+// and the poller below refreshes the exact same payload in place.
 const SNAPSHOT = {{ s | tojson }};
-const EQUITY_LABELS = SNAPSHOT.equity ? SNAPSHOT.equity.labels : [];
-const EQUITY_VALUES = SNAPSHOT.equity ? SNAPSHOT.equity.pnl : [];
+const EQUITY = { labels: [], pnl: [] };
+Object.assign(EQUITY, SNAPSHOT.equity || {});
 const $ = id => document.getElementById(id);
 const esc = v => String(v == null ? '' : v);
-const num = (v, d=2) => (v == null || v === '' ? '-' : Number(v).toFixed(d));
 
-// --- SSE event feed ---
-// Server sends unnamed `data:` frames, so onmessage fires. Named events
-// (event: strategy / alert / config) need explicit listeners.
-const feedLines = [];
-function pushFeed(msg) {
-  feedLines.unshift('[' + new Date().toLocaleTimeString() + '] ' + msg);
-  if (feedLines.length > 50) feedLines.length = 50;
-  $('tradeFeed').textContent = feedLines.join('\n');
+// --- live event feed ---
+const feed = [];
+function note(msg) {
+  feed.unshift('[' + new Date().toLocaleTimeString() + '] ' + msg);
+  if (feed.length > 60) feed.length = 60;
+  $('tradeFeed').textContent = feed.join('\n');
 }
-const evtSource = new EventSource('/api/stream');
-evtSource.onmessage = e => {
-  try { const d = JSON.parse(e.data); pushFeed(JSON.stringify(d)); } catch (_) { pushFeed(e.data); }
+const es = new EventSource('/api/stream');
+es.onmessage = e => {
+  try { note(JSON.stringify(JSON.parse(e.data))); } catch (_) { note(e.data); }
 };
-['strategy','alert','config'].forEach(name =>
-  evtSource.addEventListener(name, e => pushFeed(name + ': ' + e.data)));
-evtSource.onerror = () => pushFeed('stream disconnected — retrying...');
+['strategy', 'alert', 'config'].forEach(n =>
+  es.addEventListener(n, e => note(n + ': ' + e.data)));
+es.onerror = () => note('stream disconnected - retrying...');
 
-// --- Snapshot refresh ---
-// Polls the same endpoint the page was server-rendered from, so the live view
-// and the server-rendered HTML always agree.
-function renderSnapshot(s) {
+// --- snapshot refresh ---
+// Re-paints the live panels in place from the same payload the server rendered,
+// so an open tab tracks Kalshi without a reload.
+function rows(cells, emptyMsg, colspan) {
+  if (!cells.length) return '<tr><td colspan="' + colspan + '" class="empty">' + emptyMsg + '</td></tr>';
+  return cells.map(c => '<tr>' + c + '</tr>').join('');
+}
+function num(v) { return v == null ? '-' : v; }
+function sgn(v) { return v > 0 ? 'up' : (v < 0 ? 'down' : 'flat'); }
+
+function paint(s) {
   if (!s) return;
-  if (s.positions) {
-    const tb = document.querySelector('#posTable tbody');
-    tb.innerHTML = s.positions.length ? s.positions.map(p => `<tr>
-      <td title="${esc(p.market_id)}">${esc(String(p.market_id||'?').slice(0,20))}</td>
-      <td>${esc(p.side)}</td><td>${num(p.entry_price,3)}</td><td>${esc(p.quantity)}</td>
-      <td><span class="tag">${esc(p.strategy)}</span></td>
-      <td>${p.stop_loss!=null?num(p.stop_loss,3):'-'}</td>
-      <td>${p.take_profit!=null?num(p.take_profit,3):'-'}</td></tr>`).join('')
-      : '<tr><td colspan="7" class="err">No open positions</td></tr>';
+  const k = s.kalshi || {};
+
+  const mk = k.markets || [], ev = k.events || [];
+  const mkBody = document.getElementById('kalshiMarkets');
+  const evBody = document.getElementById('kalshiEvents');
+  if (mkBody) {
+    mkBody.innerHTML = rows(mk.map(r =>
+      '<td class="mono">' + esc(r.ticker) + '</td>' +
+      '<td class="num">' + num(r.shares) + '</td>' +
+      '<td class="num">' + num(r.exposure) + '</td>' +
+      '<td class="num">' + num(r.traded) + '</td>' +
+      '<td class="num ' + sgn(r.realized) + '">' + num(r.realized) + '</td>' +
+      '<td class="num" style="color:var(--faint)">' + num(r.fees) + '</td>'
+    ), 'No market positions.', 6);
   }
-  if (s.trades) {
-    $('sCapital') && ($('sCapital').textContent = (s.open ? s.open.capital : 0));
+  if (evBody) {
+    evBody.innerHTML = rows(ev.map(r =>
+      '<td class="mono">' + esc(r.event || r.ticker) + '</td>' +
+      '<td class="num">' + num(r.shares) + '</td>' +
+      '<td class="num">' + num(r.cost) + '</td>' +
+      '<td class="num">' + num(r.exposure) + '</td>' +
+      '<td class="num ' + sgn(r.realized) + '">' + num(r.realized) + '</td>' +
+      '<td class="num" style="color:var(--faint)">' + num(r.fees) + '</td>'
+    ), 'No event positions.', 6);
   }
-  const errs = (s.errors || []).slice(-5).reverse();
-  $('sErrors').innerHTML = errs.length
-    ? errs.map(e => `<span class="tag">${esc(e.time)} ${esc(e.error)}</span>`).join('')
-    : '<span class="badge ok">none</span>';
-  drawChart();
+
+  const posBody = document.getElementById('posBody');
+  if (posBody) {
+    posBody.innerHTML = rows((s.positions || []).map(p =>
+      '<td class="mono">' + esc(String(p.market_id || '?').slice(0, 26)) + '</td>' +
+      '<td><span class="tag">' + esc(p.side) + '</span></td>' +
+      '<td class="num">' + (p.entry_price == null ? '-' : Number(p.entry_price).toFixed(3)) + '</td>' +
+      '<td class="num">' + num(p.quantity) + '</td>' +
+      '<td><span class="tag">' + esc(p.strategy) + '</span></td>' +
+      '<td class="num">' + num(p.stop_loss) + '</td>' +
+      '<td class="num">' + num(p.take_profit) + '</td>'
+    ), 'No open positions.', 7);
+  }
+
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  set('tBalance', s.balance == null ? '-' : '$' + Number(s.balance).toFixed(2));
+  set('tLivePos', (k.market_count || 0) + (k.event_count || 0));
+  const money = v => '$' + Number(v || 0).toFixed(2);
+  set('tExposure', money(k.exposure));
+  set('tKalshiPnl', money(k.realized));
+  const kr = document.getElementById('tKalshiPnl');
+  if (kr) kr.className = 'v ' + sgn(k.realized || 0);
+
+  const t = s.trades || {}, d = s.data || {};
+  set('tBotPnl', money(t.realized_pnl));
+  const br = document.getElementById('tBotPnl');
+  if (br) br.className = 'v ' + sgn(t.realized_pnl || 0);
+  set('tWinRate', (t.win_rate || 0) + '%');
+  set('tAiSpend', money(d.ai_cost_today));
+  set('tRunning', s.running_count || 0);
+  set('tUptime', Math.floor((s.uptime_sec || 0) / 60) + 'm');
+
+  SNAPSHOT.equity = s.equity || SNAPSHOT.equity;
+  set('pnlSummary', SNAPSHOT.equity.pn.length
+    ? SNAPSHOT.equity.pn.length + ' closed trades'
+    : 'no closed trades yet');
 }
 
-async function loadSnapshot() {
-  try { renderSnapshot(await fetch('/api/snapshot').then(r => r.json())); }
-  catch (e) { pushFeed('snapshot refresh failed: ' + e.message); }
-}
-
-async function loadStatus() {
+async function refresh() {
   try {
-    const r = await fetch('/api/status').then(r => r.json());
-    $('sPositions').textContent = (r.positions_count || 0) + (r.db_positions_count || 0);
-    $('sUptime').textContent = Math.floor((r.uptime_sec || 0) / 60) + 'm';
-  } catch (e) { pushFeed('status refresh failed: ' + e.message); }
+    paint(await fetch('/api/snapshot').then(r => r.json()));
+    drawChart();
+  } catch (e) {
+    note('snapshot refresh failed: ' + e.message);
+  }
 }
 
-// --- Strategies ---
+// --- controls ---
 async function toggleStrategy(name) {
-  const r = await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle',
-    { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mode:'paper'}) });
+  const r = await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: 'paper' }),
+  });
   const d = await r.json().catch(() => ({}));
-  if (d.error) pushFeed(name + ': ' + d.error);
-  loadSnapshot();
+  note(d.error ? name + ': ' + d.error : name + ': ' + (d.running ? 'started' : 'stopped'));
+  refresh();
 }
 async function killBot(name) {
   await fetch('/api/bot/' + encodeURIComponent(name) + '/kill', { method: 'POST' });
-  loadSnapshot();
+  note(name + ': kill requested');
+  refresh();
 }
-
-// --- Alerts ---
 async function saveAlerts() {
-  const r = await fetch('/api/alerts', { method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ telegram_url: $('tgUrl').value, discord_url: $('dcUrl').value, enabled: $('alertEnabled').checked }) });
+  const r = await fetch('/api/alerts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      telegram_url: $('tgUrl').value,
+      discord_url: $('dcUrl').value,
+      enabled: $('alertEnabled').checked,
+    }),
+  });
   const d = await r.json().catch(() => ({}));
-  $('alertStatus').textContent = d.ok ? 'Saved' : 'Error';
+  $('alertStatus').textContent = d.ok ? 'saved' : 'error';
 }
-
-// --- Config ---
 async function saveConfig() {
   const obj = {};
-  document.querySelectorAll('#configEditor input').forEach(i => {
+  document.querySelectorAll('.pb input[data-key]').forEach(i => {
     const t = i.dataset.type;
     if (t === 'boolean') obj[i.dataset.key] = i.checked;
     else if (t === 'number') obj[i.dataset.key] = i.value === '' ? null : Number(i.value);
     else obj[i.dataset.key] = i.value;
   });
-  const r = await fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(obj) });
+  const r = await fetch('/api/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(obj),
+  });
   const d = await r.json().catch(() => ({}));
-  $('configStatus').textContent = d.ok ? 'Saved: ' + (d.updated || []).length + ' field(s)' : 'Error';
+  $('configStatus').textContent = d.ok ? 'saved ' + (d.updated || []).length + ' field(s)' : 'error';
 }
-
-// --- Logs ---
 async function loadLogs() {
   const n = $('logLines').value || 100;
   const r = await fetch('/api/logs?lines=' + encodeURIComponent(n)).then(r => r.json());
-  $('logOutput').textContent = (r.lines || []).join('\n') || '(no log files yet — start a strategy to generate logs)';
+  $('logOutput').textContent = (r.lines || []).join('\n') || 'No log files yet.';
 }
-// --- Equity chart (server-rendered data, no fetch needed) ---
-let pnlChart;
+
+// --- equity chart, drawn from server-rendered data ---
+let chart;
 function drawChart() {
   if (typeof Chart === 'undefined') return;
   const ctx = $('pnlChart');
   if (!ctx) return;
-  if (pnlChart) pnlChart.destroy();
-  const flat = EQUITY_VALUES.length === 0;
-  pnlChart = new Chart(ctx, {
+  if (chart) chart.destroy();
+  const flat = !EQUITY.pn.length;
+  chart = new Chart(ctx, {
     type: 'line',
     data: {
-      labels: flat ? ['no closed trades yet'] : EQUITY_LABELS,
-      datasets: [{ label: 'Cumulative P&L ($)', data: flat ? [0] : EQUITY_VALUES,
-        borderColor: '#3fb950', backgroundColor: 'rgba(63,185,80,0.1)', tension: 0.3, fill: true, pointRadius: 2 }]
+      labels: flat ? ['no closed trades yet'] : EQUITY.labels,
+      datasets: [{
+        label: 'Cumulative P&L ($)',
+        data: flat ? [0] : EQUITY.pnl,
+        borderColor: '#2ee6a8',
+        backgroundColor: 'rgba(46,230,168,.10)',
+        tension: 0.3, fill: true, pointRadius: 2,
+      }],
     },
-    options: { responsive: true, maintainAspectRatio: false, animation: false,
-      plugins: { legend: { labels: { color: '#c9d1d9' } } },
-      scales: { x: { ticks: { color: '#8b949e', maxTicksLimit: 8 } }, y: { ticks: { color: '#8b949e' } } } }
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: { legend: { labels: { color: '#e6edf6', boxWidth: 10 } } },
+      scales: {
+        x: { ticks: { color: '#5b6a80', maxTicksLimit: 7 }, grid: { color: 'rgba(255,255,255,.04)' } },
+        y: { ticks: { color: '#5b6a80' }, grid: { color: 'rgba(255,255,255,.04)' } },
+      },
+    },
   });
 }
 
-// --- Init ---
-async function init() {
-  drawChart();
-  loadLogs();
-  loadSnapshot();
-  setInterval(loadSnapshot, 5000);
-  setInterval(loadStatus, 10000);
-  setInterval(loadLogs, 30000);
-}
-init();
+// --- init ---
+drawChart();
+loadLogs();
+refresh();
+setInterval(refresh, 10000);
+setInterval(loadLogs, 30000);
 </script>
 </body>
 </html>

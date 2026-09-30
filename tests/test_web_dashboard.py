@@ -139,6 +139,98 @@ def test_equity_curve_is_oldest_first(client):
     assert labels == sorted(labels)
 
 
+# ---------------------------------------------------------------------------
+# Kalshi portfolio payload.
+# The endpoint returns two shapes and neither has `side`/`position`/
+# `last_entry_price`; every money field is a decimal *string*. The old fallback
+# looked up those missing keys, so every row rendered "?" and 0.
+# ---------------------------------------------------------------------------
+KALSHI_MARKET_POSITION = {
+    "exchange_index": 1,
+    "fees_paid_dollars": "0.005000",
+    "last_updated_ts": "2026-08-27T12:38:10.888325Z",
+    "market_exposure_dollars": "1.850000",
+    "position_fp": "4.00",
+    "realized_pnl_dollars": "0.330000",
+    "ticker": "KXPRES-26-BIDEN",
+    "total_traded_dollars": "9.400000",
+}
+KALSHI_EVENT_POSITION = {
+    "event_exposure_dollars": "0.000000",
+    "event_ticker": "KXMLB-26",
+    "fees_paid_dollars": "0.050600",
+    "realized_pnl_dollars": "-0.026000",
+    "total_cost_dollars": "7.026000",
+    "total_cost_shares_fp": "14.00",
+}
+
+
+def _load_kalshi(client):
+    """Install a realistic Kalshi payload for the duration of a request."""
+    wd.dashboard_state["positions"] = [
+        dict(KALSHI_MARKET_POSITION),
+        dict(KALSHI_EVENT_POSITION),
+    ]
+    try:
+        yield
+    finally:
+        wd.dashboard_state["positions"] = []
+
+
+def test_kalshi_account_normalises_both_shapes(client):
+    gen = _load_kalshi(client)
+    next(gen)
+    try:
+        snap = client.get("/api/snapshot").get_json()
+    finally:
+        gen.close()
+    k = snap["kalshi"]
+    assert k["connected"] is True
+    assert k["market_count"] == 1
+    assert k["event_count"] == 1
+    # Decimal strings must become floats, not stay as text.
+    assert k["exposure"] == 1.85
+    assert k["cost_basis"] == 7.03
+    assert k["realized"] == 0.30  # 0.33 - 0.026
+    assert k["fees"] == 0.06  # 0.005 + 0.0506
+    assert k["traded"] == 9.4
+
+
+def test_kalshi_rows_carry_real_values(client):
+    gen = _load_kalshi(client)
+    next(gen)
+    try:
+        html = client.get("/").get_data(as_text=True)
+    finally:
+        gen.close()
+    assert "KXPRES-26-BIDEN" in html
+    assert "KXMLB-26" in html
+    assert "$1.85" in html, "exposure not rendered"
+    assert "$0.30" in html, "Kalshi realized P&L not rendered"
+    # The old code emitted a literal "?" for the missing `side` field.
+    assert ">?<" not in html
+
+
+def test_kalshi_positions_stand_in_for_empty_db(client):
+    """With an empty DB the Kalshi account is the only source of positions."""
+    gen = _load_kalshi(client)
+    next(gen)
+    try:
+        snap = client.get("/api/snapshot").get_json()
+    finally:
+        gen.close()
+    assert snap["open"]["positions"] == 0  # nothing in SQLite
+    assert len(snap["positions"]) == 2  # but two live from Kalshi
+    assert all(p["strategy"] == "kalshi_api" for p in snap["positions"])
+
+
+def test_as_float_handles_none_and_garbage():
+    assert wd._as_float(None) == 0.0
+    assert wd._as_float("") == 0.0
+    assert wd._as_float("not-a-number") == 0.0
+    assert wd._as_float("-0.012000") == -0.012
+
+
 def test_kalshi_configured_false_without_credentials(client, monkeypatch):
     for var in (
         "KALSHI_API_KEY",
