@@ -1,0 +1,330 @@
+"""Persisted DRY / LIVE trading mode, plus the simulated DRY account.
+
+DRY  - real market data, simulated fills. Orders are never sent to Kalshi; a
+       local cash ledger is debited/credited at the real quoted price and every
+       simulated trade is written to `trade_logs` so the charts fill in.
+LIVE - real orders against the Kalshi production account. Guarded by
+       `arm_live()`, which refuses unless the caller has already authenticated
+       and explicitly confirmed.
+
+The mode survives restarts: it lives in the `runtime_config` table rather than
+in process memory, so a redeploy cannot silently revert LIVE trading to DRY or
+the other way around.
+"""
+import asyncio
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Any, AsyncIterator, Dict, List, Optional
+
+MODE_DRY = "dry"
+MODE_LIVE = "live"
+VALID_MODES = (MODE_DRY, MODE_LIVE)
+
+DEFAULT_DRY_STARTING_BALANCE = 300.0
+
+# Every DB call is bounded. A hung read must surface as an error the dashboard
+# can render, not as a request that never returns.
+DB_TIMEOUT_SEC = 10
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS runtime_config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dry_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    side TEXT NOT NULL,
+    action TEXT NOT NULL,
+    quantity REAL NOT NULL,
+    price REAL NOT NULL,
+    amount REAL NOT NULL,
+    cash_after REAL NOT NULL,
+    note TEXT
+);
+"""
+
+_MODE_KEY = "trading_mode"
+_START_KEY = "dry_starting_balance"
+_CASH_KEY = "dry_cash"
+
+
+class ModeError(Exception):
+    """Raised when a mode transition is not allowed."""
+
+
+def _now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+class TradingMode:
+    """Reads and writes the persisted mode and DRY cash ledger."""
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+
+    @asynccontextmanager
+    async def _conn(self) -> AsyncIterator[Any]:
+        """Open a connection with the schema guaranteed.
+
+        `async with aiosqlite.connect(...)` must not be preceded by `await`:
+        aiosqlite's awaitable starts its worker thread, and __aenter__ awaits
+        the same object again, which raises "threads can only be started once".
+        """
+        import aiosqlite
+
+        async with aiosqlite.connect(self.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.executescript(_SCHEMA)
+            yield conn
+
+    async def _get(self, conn, key: str) -> Optional[str]:
+        cur = await conn.execute("SELECT value FROM runtime_config WHERE key = ?", (key,))
+        row = await cur.fetchone()
+        return row["value"] if row else None
+
+    async def _set(self, conn, key: str, value: str) -> None:
+        await conn.execute(
+            "INSERT INTO runtime_config (key, value, updated_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value,"
+            " updated_at = excluded.updated_at",
+            (key, str(value), _now()),
+        )
+
+    # ------------------------------------------------------------------
+    # Mode
+    # ------------------------------------------------------------------
+    async def current(self) -> str:
+        async with self._conn() as conn:
+            value = await self._get(conn, _MODE_KEY)
+        # Default to DRY. A fresh database must never come up LIVE.
+        return value if value in VALID_MODES else MODE_DRY
+
+    async def set(self, mode: str, *, confirmed: bool = False) -> str:
+        mode = (mode or "").strip().lower()
+        if mode not in VALID_MODES:
+            raise ModeError(f"mode must be one of {VALID_MODES}")
+
+        async with self._conn() as conn:
+            previous = await self._get(conn, _MODE_KEY) or MODE_DRY
+            if mode == previous:
+                return mode
+
+            # Going LIVE places real orders with real money. It cannot happen by
+            # a single unconfirmed call, and it cannot happen from a stale session.
+            if mode == MODE_LIVE and not confirmed:
+                raise ModeError(
+                    "Switching to LIVE places real orders with real money and "
+                    "requires an explicit confirmation."
+                )
+
+            await self._set(conn, _MODE_KEY, mode)
+            await conn.commit()
+            return mode
+
+    # ------------------------------------------------------------------
+    # DRY account
+    # ------------------------------------------------------------------
+    @staticmethod
+    async def _scalar(conn: Any, sql: str) -> Any:
+        """First column of the first row, or None if the table does not exist.
+
+        `positions` and `trade_logs` are created by DatabaseManager, not here,
+        so on a brand-new database this module can legitimately run first.
+        """
+        try:
+            cur = await conn.execute(sql)
+            row = await cur.fetchone()
+            return row[0] if row else None
+        except Exception:  # noqa: BLE001 - missing table is an expected state
+            return None
+
+    async def dry_account(self) -> Dict[str, Any]:
+        """Cash, equity and realized/unrealized split for the simulated book."""
+        async with self._conn() as conn:
+            starting = await self._get(conn, _START_KEY)
+            cash = await self._get(conn, _CASH_KEY)
+            starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
+            cash_f = float(cash) if cash is not None else starting_f
+
+            # Cost basis of still-open simulated positions.
+            deployed = float(
+                await self._scalar(
+                    conn,
+                    "SELECT COALESCE(SUM(quantity * entry_price), 0.0) FROM positions"
+                    " WHERE status = 'open'",
+                )
+                or 0.0
+            )
+
+            realized = float(
+                await self._scalar(conn, "SELECT COALESCE(SUM(pnl), 0.0) FROM trade_logs") or 0.0
+            )
+            closed = int(await self._scalar(conn, "SELECT COUNT(*) FROM trade_logs") or 0)
+            ledger_rows = int(await self._scalar(conn, "SELECT COUNT(*) FROM dry_ledger") or 0)
+
+        return {
+            "starting_balance": round(starting_f, 2),
+            "cash": round(cash_f, 2),
+            "deployed": round(deployed, 2),
+            "equity": round(cash_f + deployed, 2),
+            "realized": round(realized, 2),
+            "total_pnl": round(cash_f - starting_f + realized, 2),
+            "closed_trades": closed,
+            "ledger_entries": ledger_rows,
+            "return_pct": round((cash_f - starting_f + realized) / starting_f * 100, 2)
+            if starting_f
+            else 0.0,
+        }
+
+    async def set_dry_cash(self, amount: float) -> None:
+        """Reset the simulated cash balance (top-up / reset to $300)."""
+        async with self._conn() as conn:
+            await self._set(conn, _CASH_KEY, str(round(float(amount), 2)))
+            await conn.commit()
+
+    async def reset_dry_account(self) -> Dict[str, Any]:
+        """Restore the DRY account to its starting balance and clear the ledger."""
+        async with self._conn() as conn:
+            starting = await self._get(conn, _START_KEY)
+            starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
+            await self._set(conn, _CASH_KEY, str(round(starting_f, 2)))
+            await conn.execute("DELETE FROM dry_ledger")
+            await conn.commit()
+        return await self.dry_account()
+
+    async def record_fill(
+        self,
+        *,
+        market_id: str,
+        side: str,
+        action: str,
+        quantity: float,
+        price: float,
+        note: str = "",
+    ) -> Dict[str, Any]:
+        """Debit/credit simulated cash for a simulated fill and log it.
+
+        `action` is 'buy' or 'sell'. Buying spends cash, selling returns it.
+        """
+        quantity = float(quantity)
+        price = float(price)
+        amount = round(quantity * price, 2)
+
+        async with self._conn() as conn:
+            starting = await self._get(conn, _START_KEY)
+            cash = await self._get(conn, _CASH_KEY)
+            starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
+            cash_f = float(cash) if cash is not None else starting_f
+
+            if action == "buy":
+                if amount > cash_f:
+                    raise ModeError(
+                        f"Insufficient simulated funds: ${amount:.2f} needed, "
+                        f"${cash_f:.2f} available."
+                    )
+                cash_f -= amount
+            elif action == "sell":
+                cash_f += amount
+            else:
+                raise ModeError("action must be 'buy' or 'sell'")
+
+            await self._set(conn, _CASH_KEY, str(round(cash_f, 2)))
+            await conn.execute(
+                "INSERT INTO dry_ledger (ts, market_id, side, action, quantity,"
+                " price, amount, cash_after, note) VALUES (?,?,?,?,?,?,?,?,?)",
+                (_now(), market_id, side, action, quantity, price, amount, round(cash_f, 2), note),
+            )
+            await conn.commit()
+            return {"cash": round(cash_f, 2), "amount": amount}
+
+    async def ledger(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Most recent simulated fills, newest first."""
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                "SELECT ts, market_id, side, action, quantity, price, amount,"
+                " cash_after, note FROM dry_ledger ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+    # ------------------------------------------------------------------
+    # LIVE funding
+    # ------------------------------------------------------------------
+    async def funding(self, private_key_path: Optional[str] = None) -> Dict[str, Any]:
+        """Real Kalshi balance, and whether it can actually fund an order.
+
+        The caller supplies the resolved key path so this module never imports
+        the dashboard (which would be a cycle). Everything happens inside this
+        one coroutine: crossing event loops per request would be both slow and
+        a source of hangs.
+        """
+        import os
+
+        from src.clients.kalshi_client import KalshiClient
+
+        if not private_key_path:
+            return {
+                "connected": False,
+                "balance": 0.0,
+                "balance_cents": 0,
+                "can_fund": False,
+                "reason": "no Kalshi credentials configured",
+            }
+
+        client = None
+        try:
+            client = KalshiClient(
+                api_key=os.environ.get("KALSHI_API_KEY", ""),
+                private_key_path=private_key_path,
+            )
+            payload = await client.get_balance()
+            cents = int(payload.get("balance", 0))
+        except Exception as exc:  # noqa: BLE001 - surfaced to the dashboard
+            return {
+                "connected": False,
+                "balance": 0.0,
+                "balance_cents": 0,
+                "can_fund": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+        finally:
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        balance = cents / 100.0
+        # Kalshi's minimum order is $1, so anything below that cannot be traded.
+        return {
+            "connected": True,
+            "balance": round(balance, 2),
+            "balance_cents": cents,
+            "can_fund": balance >= 1.0,
+            "reason": ""
+            if balance >= 1.0
+            else (
+                f"balance ${balance:.2f} is below Kalshi's $1.00 minimum order size - "
+                "fund the account before going LIVE"
+            ),
+        }
+
+
+def run(coro: Any, timeout: float = DB_TIMEOUT_SEC) -> Any:
+    """Run a coroutine on a fresh loop with a hard timeout.
+
+    Flask handlers are synchronous, so each needs its own loop. The timeout
+    keeps a wedged DB or socket from holding a worker thread forever.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(asyncio.wait_for(coro, timeout=timeout))
+    finally:
+        try:
+            asyncio.set_event_loop(None)
+        finally:
+            loop.close()

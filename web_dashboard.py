@@ -17,6 +17,7 @@ Railway-ready: listens on $PORT, healthcheck on /health.
 import asyncio
 import json
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -45,6 +46,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = os.environ.get("DB_PATH", str(BASE_DIR / "trading_system.db"))
 LOG_DIR = Path(os.environ.get("LOG_DIR", str(BASE_DIR / "logs")))
 MAX_ERRORS = 50
+MAX_EVENTS = 100
 
 # ---------------------------------------------------------------------------
 # State
@@ -62,6 +64,7 @@ dashboard_state = {
     "last_update": None,
     "errors": [],
     "sse_listeners": [],
+    "events": [],
     "db_positions_count": 0,
     "kalshi_position_count": 0,
 }
@@ -114,6 +117,20 @@ def _log_files():
         return sorted(LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
     except OSError:
         return []
+
+
+def _audit(message):
+    """Record a privileged action in a bounded audit trail and push it to clients.
+
+    Kept separate from _push_error: switching to LIVE is not a fault, but it is
+    the single most consequential thing this process can do, so it needs a
+    timestamped record that survives long enough to be noticed.
+    """
+    entry = {"time": _now(), "action": message}
+    dashboard_state.setdefault("events", []).append(entry)
+    if len(dashboard_state["events"]) > MAX_EVENTS:
+        del dashboard_state["events"][: len(dashboard_state["events"]) - MAX_EVENTS]
+    _broadcast("audit", entry)
 
 
 def _read_log_tail(n):
@@ -730,6 +747,7 @@ def build_snapshot() -> Dict[str, Any]:
 
     running = _running_strategies()
     errors: List[Dict[str, Any]] = cast(List[Dict[str, Any]], dashboard_state["errors"])
+    events: List[Dict[str, Any]] = cast(List[Dict[str, Any]], dashboard_state["events"])
 
     return {
         "generated_at": _now(),
@@ -763,9 +781,39 @@ def build_snapshot() -> Dict[str, Any]:
             for n in strategy_state
         ],
         "alerts": dict(alert_state),
+        "mode": _safe_mode_payload(),
         "logs": _read_log_tail(100) or list(log_buffer)[-100:],
         "errors": errors[-10:],
+        "events": events[-8:],
     }
+
+
+def _safe_mode_payload() -> Dict[str, Any]:
+    """Mode payload for rendering, degraded rather than fatal.
+
+    A failure here must not take the whole page down: the dashboard is still
+    useful for read-only Kalshi data even if the mode store is unavailable.
+    """
+    try:
+        return _mode_payload()
+    except Exception as e:
+        _push_error(f"Mode payload: {e}")
+        return {
+            "mode": "dry",
+            "token_set": token_required(),
+            "dry": {
+                "starting_balance": 300.0,
+                "cash": 300.0,
+                "deployed": 0.0,
+                "equity": 300.0,
+                "realized": 0.0,
+                "total_pnl": 0.0,
+                "closed_trades": 0,
+                "ledger_entries": 0,
+                "return_pct": 0.0,
+            },
+            "funding": {"connected": False, "balance": 0.0, "can_fund": False, "reason": str(e)},
+        }
 
 
 def _is_ephemeral_db() -> bool:
@@ -779,6 +827,199 @@ def _is_ephemeral_db() -> bool:
     if override and Path(override).exists():
         return False
     return not bool(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH"))
+
+
+# ---------------------------------------------------------------------------
+# Token gate
+#
+# The dashboard is public. Reading it is harmless, but every state-changing
+# route used to be an open POST on the open internet: /api/strategy/<name>/
+# toggle would spawn a real trading process for anyone who found the URL, and
+# once the Kalshi credentials are present that burns real money and real LLM
+# budget. Mutating routes now require a shared token.
+# ---------------------------------------------------------------------------
+def _configured_token() -> str:
+    return os.environ.get("DASHBOARD_TOKEN", "").strip()
+
+
+def token_required() -> bool:
+    """If no token is configured the gate fails closed and locks writes.
+
+    Failing open would defeat the point; failing closed means an operator who
+    forgot to set DASHBOARD_TOKEN gets a locked dashboard and a clear error,
+    not an unprotected one.
+    """
+    return bool(_configured_token())
+
+
+def _presented_token() -> str:
+    header = request.headers.get("X-Auth-Token", "")
+    if header:
+        return header.strip()
+    data = request.get_json(silent=True) or {}
+    if isinstance(data, dict):
+        return str(data.get("token", "")).strip()
+    return request.args.get("token", "").strip()
+
+
+def require_token():
+    """Flask guard for mutating routes. Returns None when allowed, else a response."""
+    if not token_required():
+        return (
+            jsonify(
+                {
+                    "error": "Dashboard is locked: DASHBOARD_TOKEN is not set. "
+                    "Set it as a Railway service variable to enable write actions."
+                }
+            ),
+            503,
+        )
+    if not secrets.compare_digest(_presented_token(), _configured_token()):
+        _audit(f"rejected unauthorized {request.method} {request.path} from {request.remote_addr}")
+        return jsonify({"error": "Unauthorized: bad or missing X-Auth-Token"}), 401
+    return None
+
+
+# ---------------------------------------------------------------------------
+# DRY / LIVE trading mode
+# ---------------------------------------------------------------------------
+def _mode_manager():
+    from src.utils.mode import TradingMode
+
+    return TradingMode(db_path=DB_PATH)
+
+
+def _mode_payload() -> Dict[str, Any]:
+    from src.utils.mode import MODE_DRY, MODE_LIVE, run
+
+    mgr = _mode_manager()
+    payload: Dict[str, Any] = {
+        "mode": run(mgr.current()),
+        "token_set": token_required(),
+        "dry": run(mgr.dry_account()),
+        "funding": {},
+    }
+    # Only the live path needs the network, so only probe it in LIVE mode.
+    if payload["mode"] == MODE_LIVE:
+        payload["funding"] = run(mgr.funding(materialize_private_key()))
+    else:
+        assert MODE_DRY
+        payload["funding"] = {
+            "connected": dashboard_state["has_kalshi_creds"],
+            "balance": dashboard_state["balance"],
+            "can_fund": bool(dashboard_state["balance"]),
+            "reason": "",
+        }
+    assert MODE_LIVE  # keeps the import meaningful for readers
+    return payload
+
+
+@app.route("/api/mode", methods=["GET"])
+def api_mode():
+    """Current DRY/LIVE mode, the DRY account, and real funding status."""
+    try:
+        return jsonify(_mode_payload())
+    except Exception as e:
+        _push_error(f"Mode read: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/mode", methods=["POST"])
+def api_mode_set():
+    """Switch DRY <-> LIVE.
+
+    Going LIVE places real orders, so it needs the token *and* an explicit
+    confirmation *and* a balance that can actually fund an order.
+    """
+    denied = require_token()
+    if denied is not None:
+        return denied
+
+    from src.utils.mode import MODE_DRY, MODE_LIVE, ModeError, run
+
+    data = request.get_json(silent=True) or {}
+    target = str(data.get("mode", "")).strip().lower()
+    confirmed = bool(data.get("confirm"))
+
+    mgr = _mode_manager()
+    try:
+        if target == MODE_LIVE and not confirmed:
+            return (
+                jsonify(
+                    {
+                        "error": "LIVE places real orders with real money. "
+                        "Resend with confirm=true to proceed."
+                    }
+                ),
+                400,
+            )
+        if target == MODE_LIVE:
+            funding = run(mgr.funding(materialize_private_key()))
+            if not funding.get("connected"):
+                return (
+                    jsonify(
+                        {
+                            "error": "Cannot go LIVE: Kalshi API unreachable - "
+                            + str(funding.get("reason", ""))
+                        }
+                    ),
+                    400,
+                )
+            if not funding.get("can_fund"):
+                return (
+                    jsonify(
+                        {
+                            "error": "Cannot go LIVE: "
+                            + str(funding.get("reason", "insufficient funds"))
+                        }
+                    ),
+                    400,
+                )
+
+        mode = run(mgr.set(target, confirmed=confirmed))
+    except ModeError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        _push_error(f"Mode switch: {e}")
+        return jsonify({"error": str(e)}), 500
+
+    _broadcast("mode", {"mode": mode})
+    if mode == MODE_DRY:
+        # Back to simulated: make sure a DRY book exists and is funded. This must
+        # be awaited - calling the coroutine bare leaves the DRY account at $0
+        # and emits a RuntimeWarning.
+        run(mgr.reset_dry_account())
+    _audit(f"trading mode set to {mode.upper()}")
+    return jsonify({"ok": True, **_mode_payload()})
+
+
+@app.route("/api/dry/reset", methods=["POST"])
+def api_dry_reset():
+    """Top the DRY account back up to its starting balance and clear the ledger."""
+    denied = require_token()
+    if denied is not None:
+        return denied
+    from src.utils.mode import run
+
+    mgr = _mode_manager()
+    try:
+        account = run(mgr.reset_dry_account())
+    except Exception as e:
+        _push_error(f"DRY reset: {e}")
+        return jsonify({"error": str(e)}), 500
+    _broadcast("mode", {"mode": run(mgr.current()), "action": "dry_reset"})
+    return jsonify({"ok": True, "dry": account})
+
+
+@app.route("/api/dry/ledger")
+def api_dry_ledger():
+    """Recent simulated fills."""
+    try:
+        from src.utils.mode import run
+
+        return jsonify({"ledger": run(_mode_manager().ledger(100))})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------------------------------------------------------------------------
@@ -1022,6 +1263,9 @@ def _running_strategies():
 @app.route("/api/strategy/<name>/toggle", methods=["POST"])
 def api_strategy_toggle(name):
     """Start/stop a strategy subprocess."""
+    denied = require_token()
+    if denied is not None:
+        return denied
     if name not in strategy_state:
         return jsonify({"error": f"Unknown strategy: {name}"}), 404
 
@@ -1161,6 +1405,9 @@ def api_chart_performance():
 def api_alerts():
     """Configure alert webhooks."""
     if request.method == "POST":
+        denied = require_token()
+        if denied is not None:
+            return denied
         data = request.json or {}
         alert_state["telegram_url"] = data.get("telegram_url", alert_state["telegram_url"])
         alert_state["discord_url"] = data.get("discord_url", alert_state["discord_url"])
@@ -1237,6 +1484,9 @@ def api_config():
     from src.config.settings import settings
 
     if request.method == "POST":
+        denied = require_token()
+        if denied is not None:
+            return denied
         data = request.json or {}
         updated, skipped = [], []
         for key, val in data.items():
@@ -1294,6 +1544,9 @@ def api_bots():
 @app.route("/api/bot/<name>/kill", methods=["POST"])
 def api_bot_kill(name):
     """Force-stop a bot process."""
+    denied = require_token()
+    if denied is not None:
+        return denied
     if name not in strategy_state:
         return jsonify({"error": "unknown"}), 404
     st = strategy_state[name]
@@ -1343,6 +1596,20 @@ h1{font-size:20px;font-weight:650;letter-spacing:-.2px}
 h1 span{color:var(--dim);font-weight:400}
 .sub{color:var(--faint);font-size:12px;margin-top:2px}
 .headright{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+
+/* DRY / LIVE switch - the highest-stakes control on the page, so it is the
+   most prominent thing in the header and colour-coded rather than subtle. */
+.modeswitch{display:flex;gap:0;border-radius:10px;overflow:hidden;border:1px solid var(--line2)}
+.modebtn{
+  background:var(--panel);color:var(--faint);border:0;border-radius:0;
+  padding:7px 18px;font-size:12px;font-weight:700;letter-spacing:.09em;cursor:pointer;
+}
+.modebtn:hover{background:rgba(255,255,255,.07)}
+.modebtn.on{background:rgba(46,230,168,.16);color:var(--up);box-shadow:inset 0 -2px 0 var(--up)}
+.modebtn.live.on{background:rgba(255,92,122,.18);color:var(--down);box-shadow:inset 0 -2px 0 var(--down)}
+.modebtn:disabled{opacity:.5;cursor:not-allowed}
+.note-box.live{background:rgba(255,92,122,.08);border-color:rgba(255,92,122,.28)}
+.note-box.live b{color:var(--down)}
 .url{
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:var(--blue);
   background:rgba(77,159,255,.09);border:1px solid rgba(77,159,255,.25);
@@ -1466,10 +1733,89 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
     </div>
   </div>
   <div class="headright">
+    <!-- DRY / LIVE switch: the one control that decides whether orders are real -->
+    <div class="modeswitch">
+      <button id="modeDry"  class="modebtn {{ 'on' if s.mode.mode != 'live' else '' }}" onclick="setMode('dry')">DRY</button>
+      <button id="modeLive" class="modebtn live {{ 'on' if s.mode.mode == 'live' else '' }}" onclick="setMode('live')">LIVE</button>
+    </div>
     <div class="url" onclick="navigator.clipboard.writeText(location.href)" title="Click to copy this URL">{{ s.public_domain or 'localhost' }}</div>
     <div class="stamp">Rendered {{ s.generated_at }}</div>
   </div>
 </header>
+
+{% if s.mode.mode == 'live' %}
+<div class="note-box live" style="margin-bottom:14px">
+  <b>LIVE MODE &mdash; real orders, real money.</b>
+  Every fill below is a real Kalshi trade against the production account
+  (funding source: <b>{{ '$%.2f'|format(s.mode.funding.get('balance', 0)) if s.mode.funding.get('balance') is not none else 'unavailable' }}</b>).
+  Realized P&amp;L of <b>{{ '$%.2f'|format(s.mode.funding.get('balance', 0) or 0) }}</b> is the account balance, not a simulation.
+</div>
+{% endif %}
+
+{% if not s.mode.token_set %}
+<div class="note-box" style="margin-bottom:14px">
+  <b>Write actions are locked.</b>
+  <code>DASHBOARD_TOKEN</code> is not set, so every mutating endpoint (mode switch,
+  strategy start/stop, config, alerts) returns <code>503</code>. This is deliberate:
+  the dashboard is public, and with Kalshi credentials present an open
+  <code>/api/strategy/&lt;name&gt;/toggle</code> would let anyone spawn a trading process.
+</div>
+{% endif %}
+
+<!-- DRY account: the only simulated thing in the system -->
+<div class="row two">
+  <div class="panel">
+    <div class="ph">
+      <h2>{{ 'DRY account' if s.mode.mode != 'live' else 'DRY account (paused while LIVE)' }}</h2>
+      <span class="note">
+        <span id="tDryCash">{{ '$%.2f'|format(s.mode.dry.cash) }}</span> cash
+      </span>
+    </div>
+    <div class="pb">
+      <dl class="kv">
+        <dt>Starting balance</dt><dd>{{ '$%.2f'|format(s.mode.dry.starting_balance) }}</dd>
+        <dt>Cash</dt><dd id="dCash">{{ '$%.2f'|format(s.mode.dry.cash) }}</dd>
+        <dt>Deployed in open positions</dt><dd id="dDeployed">{{ '$%.2f'|format(s.mode.dry.deployed) }}</dd>
+        <dt>Equity</dt><dd id="dEquity">{{ '$%.2f'|format(s.mode.dry.equity) }}</dd>
+        <dt>Realized</dt><dd id="dRealized">{{ '$%.2f'|format(s.mode.dry.realized) }}</dd>
+        <dt>Total P&amp;L vs start</dt>
+        <dd id="dPnl" class="{{ 'up' if s.mode.dry.total_pnl > 0 else ('down' if s.mode.dry.total_pnl < 0 else 'flat') }}">{{ '$%.2f'|format(s.mode.dry.total_pnl) }}</dd>
+        <dt>Return</dt><dd id="dRet">{{ s.mode.dry.return_pct }}%</dd>
+        <dt>Simulated fills</dt><dd id="dLedger">{{ s.mode.dry.ledger_entries }}</dd>
+      </dl>
+      <div class="bar" style="margin-top:12px">
+        <button onclick="resetDry()">Reset DRY account to {{ '$%.0f'|format(s.mode.dry.starting_balance) }}</button>
+        <span id="dryStatus" style="font-size:11px;color:var(--faint)"></span>
+      </div>
+      <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
+        Prices, markets and P&amp;L inputs are the real production API. Only the
+        order fill and the cash ledger are simulated, so the DRY book exercises
+        the same code path as LIVE without spending money.
+      </p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="ph"><h2>Funding source</h2><span class="note">live Kalshi account</span></div>
+    <div class="pb">
+      <dl class="kv">
+        <dt>API connection</dt>
+        <dd>{% if s.mode.funding.get('connected') %}<span class="pill ok">connected</span>{% else %}<span class="pill no">offline</span>{% endif %}</dd>
+        <dt>Available balance</dt><dd id="fBalance">{{ '$%.2f'|format(s.mode.funding.get('balance', 0) or 0) }}</dd>
+        <dt>Can fund an order</dt>
+        <dd>{% if s.mode.funding.get('can_fund') %}<span class="pill ok">yes</span>{% else %}<span class="pill no">no</span>{% endif %}</dd>
+      </dl>
+      {% if s.mode.funding.get('reason') %}
+      <div class="note-box" style="margin-top:12px"><b>Cannot go LIVE:</b> {{ s.mode.funding.get('reason') }}</div>
+      {% endif %}
+      <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
+        Kalshi rejects orders below $1.00. Until the production account is funded,
+        the LIVE switch stays locked by design &mdash; this is the guard that stops a
+        mis-click from becoming a failed or partial order.
+      </p>
+    </div>
+  </div>
+</div>
 
 {% if not s.public_domain %}
 <div class="note-box" style="margin-bottom:14px">
@@ -1909,16 +2255,102 @@ async function refresh() {
   try {
     paint(await fetch('/api/snapshot').then(r => r.json()));
     drawChart();
+    try { paintMode(await fetch('/api/mode').then(r => r.json())); } catch (_) {}
   } catch (e) {
     note('snapshot refresh failed: ' + e.message);
   }
 }
 
+// --- DRY / LIVE mode -----------------------------------------------------
+// The token is held in sessionStorage, never in the URL, so it does not leak
+// into shared links or Referer headers.
+function authHeaders(extra) {
+  return Object.assign({ 'Content-Type': 'application/json' },
+    { 'X-Auth-Token': sessionStorage.getItem('frigoToken') || '' }, extra || {});
+}
+
+function setMode(mode) {
+  if (mode === 'live') {
+    const ok = confirm(
+      'GO LIVE?\n\n' +
+      'Every order from now on is a REAL order on the Kalshi PRODUCTION account ' +
+      'with REAL money. Simulated fills stop.\n\n' +
+      'Type LIVE to confirm:');
+    if (ok === null) return;
+    if (String(ok).trim().toUpperCase() !== 'LIVE') {
+      note('LIVE cancelled - confirmation did not match');
+      return;
+    }
+  }
+  postMode(mode, mode === 'live');
+}
+
+async function postMode(mode, confirmLive) {
+  const r = await fetch('/api/mode', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ mode: mode, confirm: !!confirmLive }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (d.error) {
+    note('mode switch blocked: ' + d.error);
+    alert(d.error);
+    return;
+  }
+  note('trading mode is now ' + String(d.mode).toUpperCase());
+  paintMode(d);
+}
+
+async function resetDry() {
+  const r = await fetch('/api/dry/reset', { method: 'POST', headers: authHeaders() });
+  const d = await r.json().catch(() => ({}));
+  if (d.error) { $('dryStatus').textContent = d.error; return; }
+  $('dryStatus').textContent = 'reset to ' + money(d.dry.starting_balance);
+  paintMode(d);
+}
+
+function money(v) { return '$' + Number(v || 0).toFixed(2); }
+
+function paintMode(d) {
+  if (!d) return;
+  const live = d.mode === 'live';
+  $('modeDry').classList.toggle('on', !live);
+  $('modeLive').classList.toggle('on', live);
+  const dry = d.dry || {};
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  set('dCash', money(dry.cash));
+  set('dDeployed', money(dry.deployed));
+  set('dEquity', money(dry.equity));
+  set('dRealized', money(dry.realized));
+  set('tDryCash', money(dry.cash));
+  set('dLedger', dry.ledger_entries);
+  set('dRet', (dry.return_pct || 0) + '%');
+  const pnl = dry.total_pnl || 0;
+  set('dPnl', money(pnl));
+  const p = $('dPnl');
+  if (p) p.className = pnl > 0 ? 'up' : (pnl < 0 ? 'down' : 'flat');
+  const f = d.funding || {};
+  set('fBalance', money(f.balance));
+}
+
+// Token prompt: the write controls need it, reads do not.
+function ensureToken() {
+  if (sessionStorage.getItem('frigoToken')) return true;
+  const t = prompt('Dashboard write actions need DASHBOARD_TOKEN:');
+  if (t) { sessionStorage.setItem('frigoToken', t.trim()); return true; }
+  return false;
+}
+const _oldNote = note;
+note = function (msg) {
+  if (/blocked|unauthorized|locked|needs DASHBOARD_TOKEN/i.test(msg)) ensureToken();
+  _oldNote(msg);
+};
+
 // --- controls ---
 async function toggleStrategy(name) {
   const r = await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders(),
     body: JSON.stringify({ mode: 'paper' }),
   });
   const d = await r.json().catch(() => ({}));
@@ -1926,14 +2358,15 @@ async function toggleStrategy(name) {
   refresh();
 }
 async function killBot(name) {
-  await fetch('/api/bot/' + encodeURIComponent(name) + '/kill', { method: 'POST' });
+  await fetch('/api/bot/' + encodeURIComponent(name) + '/kill',
+    { method: 'POST', headers: authHeaders() });
   note(name + ': kill requested');
   refresh();
 }
 async function saveAlerts() {
   const r = await fetch('/api/alerts', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders(),
     body: JSON.stringify({
       telegram_url: $('tgUrl').value,
       discord_url: $('dcUrl').value,
@@ -1953,7 +2386,7 @@ async function saveConfig() {
   });
   const r = await fetch('/api/config', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders(),
     body: JSON.stringify(obj),
   });
   const d = await r.json().catch(() => ({}));

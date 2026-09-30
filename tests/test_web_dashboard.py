@@ -13,6 +13,8 @@ import pytest
 
 import web_dashboard as wd
 
+TEST_TOKEN = "test-dashboard-token"
+
 
 @pytest.fixture
 def client(monkeypatch, tmp_path):
@@ -21,6 +23,23 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setitem(wd.dashboard_state, "errors", [])
     monkeypatch.setitem(wd.dashboard_state, "positions", [])
+    monkeypatch.setenv("DASHBOARD_TOKEN", TEST_TOKEN)
+    with wd.app.test_client() as c:
+        yield c
+
+
+@pytest.fixture
+def auth():
+    """Headers that satisfy the write token gate."""
+    return {"X-Auth-Token": TEST_TOKEN}
+
+
+@pytest.fixture
+def unlocked(monkeypatch, tmp_path):
+    """A client whose token gate is locked because DASHBOARD_TOKEN is unset."""
+    monkeypatch.delenv("DASHBOARD_TOKEN", raising=False)
+    monkeypatch.setattr(wd, "DB_PATH", str(tmp_path / "locked.db"))
+    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
     with wd.app.test_client() as c:
         yield c
 
@@ -397,7 +416,7 @@ def test_coerce_like_keeps_current_on_bad_input():
     assert wd._coerce_like(1.5, "xyz") == 1.5
 
 
-def test_config_post_preserves_types(client):
+def test_config_post_preserves_types(client, auth):
     from src.config.settings import settings
 
     before_max = settings.trading.max_positions
@@ -406,6 +425,7 @@ def test_config_post_preserves_types(client):
         r = client.post(
             "/api/config",
             json={"max_positions": "7", "live_trading_enabled": "true", "bogus": "x"},
+            headers=auth,
         )
         body = r.get_json()
         assert r.status_code == 200
@@ -419,34 +439,34 @@ def test_config_post_preserves_types(client):
         settings.trading.live_trading_enabled = before_bool
 
 
-def test_config_rejects_unknown_fields(client):
+def test_config_rejects_unknown_fields(client, auth):
     from src.config.settings import settings
 
     assert not hasattr(settings.trading, "definitely_not_a_field")
-    r = client.post("/api/config", json={"definitely_not_a_field": 1})
+    r = client.post("/api/config", json={"definitely_not_a_field": 1}, headers=auth)
     assert r.get_json()["skipped"] == ["definitely_not_a_field"]
 
 
 # ---------------------------------------------------------------------------
 # Strategy control
 # ---------------------------------------------------------------------------
-def test_toggle_unknown_strategy_404(client):
-    r = client.post("/api/strategy/nope/toggle", json={"mode": "paper"})
+def test_toggle_unknown_strategy_404(client, auth):
+    r = client.post("/api/strategy/nope/toggle", json={"mode": "paper"}, headers=auth)
     assert r.status_code == 404
 
 
-def test_toggle_rejects_live_without_credentials(client, monkeypatch):
+def test_toggle_rejects_live_without_credentials(client, auth, monkeypatch):
     monkeypatch.delenv("KALSHI_API_KEY", raising=False)
-    r = client.post("/api/strategy/ai_directional/toggle", json={"mode": "live"})
+    r = client.post("/api/strategy/ai_directional/toggle", json={"mode": "live"}, headers=auth)
     assert r.status_code == 400
 
 
-def test_toggle_rejects_invalid_mode(client):
-    r = client.post("/api/strategy/ai_directional/toggle", json={"mode": "yolo"})
+def test_toggle_rejects_invalid_mode(client, auth):
+    r = client.post("/api/strategy/ai_directional/toggle", json={"mode": "yolo"}, headers=auth)
     assert r.status_code == 400
 
 
-def test_toggle_refuses_without_kalshi_credentials(client, monkeypatch):
+def test_toggle_refuses_without_kalshi_credentials(client, auth, monkeypatch):
     """Paper mode still boots a KalshiClient and dies without credentials.
 
     The button must not report success for a process that is about to exit.
@@ -454,17 +474,17 @@ def test_toggle_refuses_without_kalshi_credentials(client, monkeypatch):
     monkeypatch.delenv("KALSHI_API_KEY", raising=False)
     monkeypatch.delenv("KALSHI_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("KALSHI_PRIVATE_KEY_PATH", raising=False)
-    r = client.post("/api/strategy/safe_compounder/toggle", json={"mode": "paper"})
+    r = client.post("/api/strategy/safe_compounder/toggle", json={"mode": "paper"}, headers=auth)
     assert r.status_code == 400
     assert "credentials" in r.get_json()["error"].lower()
     assert not any(s["pid"] for s in client.get("/api/bots").get_json())
 
 
-def test_toggle_refuses_when_only_api_key_present(client, monkeypatch):
+def test_toggle_refuses_when_only_api_key_present(client, auth, monkeypatch):
     monkeypatch.setenv("KALSHI_API_KEY", "kid")
     monkeypatch.delenv("KALSHI_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("KALSHI_PRIVATE_KEY_PATH", raising=False)
-    r = client.post("/api/strategy/safe_compounder/toggle", json={"mode": "paper"})
+    r = client.post("/api/strategy/safe_compounder/toggle", json={"mode": "paper"}, headers=auth)
     assert r.status_code == 400
 
 
@@ -518,7 +538,7 @@ def test_status_and_bots_agree(client):
     assert status["running_strategies"] == sum(1 for v in bots.values() if v)
 
 
-def test_toggle_starts_process_when_credentials_present(client, monkeypatch, tmp_path):
+def test_toggle_starts_process_when_credentials_present(client, auth, monkeypatch, tmp_path):
     """The new credential gate must not block a legitimate start."""
     monkeypatch.setenv("KALSHI_API_KEY", "kid")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----")
@@ -547,7 +567,9 @@ def test_toggle_starts_process_when_credentials_present(client, monkeypatch, tmp
     monkeypatch.setattr(wd.subprocess, "Popen", FakePopen)
     st = wd.strategy_state["safe_compounder"]
     try:
-        r = client.post("/api/strategy/safe_compounder/toggle", json={"mode": "paper"})
+        r = client.post(
+            "/api/strategy/safe_compounder/toggle", json={"mode": "paper"}, headers=auth
+        )
         assert r.status_code == 200
         body = r.get_json()
         assert body["running"] is True
@@ -565,7 +587,9 @@ def test_toggle_starts_process_when_credentials_present(client, monkeypatch, tmp
         bots = {b["name"]: b for b in client.get("/api/bots").get_json()}
         assert bots["safe_compounder"]["running"] is True
 
-        r2 = client.post("/api/strategy/safe_compounder/toggle", json={"mode": "paper"})
+        r2 = client.post(
+            "/api/strategy/safe_compounder/toggle", json={"mode": "paper"}, headers=auth
+        )
         assert r2.get_json()["running"] is False
     finally:
         st["running"] = False
@@ -573,8 +597,8 @@ def test_toggle_starts_process_when_credentials_present(client, monkeypatch, tmp
         wd._child_procs.pop(31337, None)
 
 
-def test_kill_when_not_running_is_noop(client):
-    r = client.post("/api/bot/ai_directional/kill")
+def test_kill_when_not_running_is_noop(client, auth):
+    r = client.post("/api/bot/ai_directional/kill", headers=auth)
     assert r.status_code == 200
     assert r.get_json()["killed"] is False
 
@@ -656,3 +680,218 @@ def test_healthcheck_is_fast_and_offline(client, monkeypatch):
     start = time.time()
     assert client.get("/health").status_code == 200
     assert time.time() - start < 2.0
+
+
+# ---------------------------------------------------------------------------
+# Token gate.
+# The dashboard is public. Every mutating route used to be an open POST, which
+# with credentials present meant anyone could spawn a trading process.
+# ---------------------------------------------------------------------------
+MUTATING_ROUTES = [
+    ("/api/mode", {"mode": "dry"}),
+    ("/api/dry/reset", {}),
+    ("/api/strategy/ai_directional/toggle", {"mode": "paper"}),
+    ("/api/bot/ai_directional/kill", {}),
+    ("/api/config", {"max_positions": 5}),
+    ("/api/alerts", {"enabled": True}),
+]
+
+
+@pytest.mark.parametrize("path,body", MUTATING_ROUTES)
+def test_mutating_routes_reject_missing_token(client, path, body):
+    assert client.post(path, json=body).status_code == 401
+
+
+@pytest.mark.parametrize("path,body", MUTATING_ROUTES)
+def test_mutating_routes_reject_wrong_token(client, path, body):
+    r = client.post(path, json=body, headers={"X-Auth-Token": "nope"})
+    assert r.status_code == 401
+    assert "Unauthorized" in r.get_json()["error"]
+
+
+@pytest.mark.parametrize("path,body", MUTATING_ROUTES)
+def test_mutating_routes_fail_closed_without_configured_token(unlocked, path, body):
+    """No DASHBOARD_TOKEN must lock writes, not open them."""
+    r = unlocked.post(path, json=body)
+    assert r.status_code == 503, "writes must fail closed"
+    assert "DASHBOARD_TOKEN" in r.get_json()["error"]
+
+
+def test_reads_stay_public(client):
+    """The token gates writes only - the dashboard must remain viewable."""
+    for path in ("/", "/health", "/api/status", "/api/snapshot", "/api/mode"):
+        assert client.get(path).status_code == 200
+
+
+def test_token_accepted_from_header(client, auth):
+    r = client.post("/api/dry/reset", headers=auth)
+    assert r.status_code == 200
+
+
+def test_token_accepted_from_json_body(client):
+    r = client.post("/api/dry/reset", json={"token": TEST_TOKEN})
+    assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# DRY / LIVE mode
+# ---------------------------------------------------------------------------
+def test_mode_defaults_to_dry(client):
+    assert client.get("/api/mode").get_json()["mode"] == "dry"
+
+
+def test_dry_account_starts_at_300(client):
+    dry = client.get("/api/mode").get_json()["dry"]
+    assert dry["starting_balance"] == 300.0
+    assert dry["cash"] == 300.0
+    assert dry["equity"] == 300.0
+    assert dry["total_pnl"] == 0.0
+
+
+def test_mode_rejects_unknown_value(client, auth):
+    r = client.post("/api/mode", json={"mode": "yolo"}, headers=auth)
+    assert r.status_code == 400
+
+
+def test_going_live_requires_explicit_confirmation(client, auth):
+    r = client.post("/api/mode", json={"mode": "live"}, headers=auth)
+    assert r.status_code == 400
+    assert "real money" in r.get_json()["error"]
+    assert client.get("/api/mode").get_json()["mode"] == "dry"
+
+
+def test_going_live_blocked_when_unfunded(client, auth, monkeypatch):
+    """A $0 balance must not be switchable to LIVE."""
+    from src.utils.mode import TradingMode
+
+    async def unfunded(_self, private_key_path=None):
+        return {
+            "connected": True,
+            "balance": 0.0,
+            "balance_cents": 0,
+            "can_fund": False,
+            "reason": "balance $0.00 is below Kalshi's $1.00 minimum",
+        }
+
+    monkeypatch.setattr(TradingMode, "funding", unfunded)
+    r = client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
+    assert r.status_code == 400
+    assert "Cannot go LIVE" in r.get_json()["error"]
+
+
+def test_dry_to_live_and_back(client, auth, monkeypatch):
+    from src.utils.mode import TradingMode
+
+    async def funded(_self, private_key_path=None):
+        return {
+            "connected": True,
+            "balance": 5000.0,
+            "balance_cents": 500000,
+            "can_fund": True,
+            "reason": "",
+        }
+
+    monkeypatch.setattr(TradingMode, "funding", funded)
+    r = client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
+    assert r.status_code == 200
+    assert r.get_json()["mode"] == "live"
+
+    r2 = client.post("/api/mode", json={"mode": "dry", "confirm": True}, headers=auth)
+    assert r2.status_code == 200
+    assert r2.get_json()["mode"] == "dry"
+
+
+def test_mode_is_persisted_across_manager_instances(client, auth, monkeypatch):
+    """Mode lives in the DB, not process memory, so a redeploy cannot revert it."""
+    from src.utils.mode import TradingMode, run
+
+    async def funded(_self, private_key_path=None):
+        return {
+            "connected": True,
+            "balance": 5000.0,
+            "balance_cents": 500000,
+            "can_fund": True,
+            "reason": "",
+        }
+
+    monkeypatch.setattr(TradingMode, "funding", funded)
+    client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
+    # A brand-new manager against the same file must agree.
+    fresh = TradingMode(db_path=wd.DB_PATH)
+    assert run(fresh.current()) == "live"
+
+
+def test_dry_reset_restores_starting_balance(client, auth):
+    from src.utils.mode import TradingMode, run
+
+    mgr = TradingMode(db_path=wd.DB_PATH)
+    run(mgr.set_dry_cash(12.5))
+    assert client.get("/api/mode").get_json()["dry"]["cash"] == 12.5
+    r = client.post("/api/dry/reset", headers=auth)
+    assert r.status_code == 200
+    assert r.get_json()["dry"]["cash"] == 300.0
+
+
+# ---------------------------------------------------------------------------
+# DRY cash ledger
+# ---------------------------------------------------------------------------
+def test_ledger_debits_and_credits(client):
+    from src.utils.mode import TradingMode, run
+
+    mgr = TradingMode(db_path=wd.DB_PATH)
+    run(mgr.record_fill(market_id="KXTEST", side="YES", action="buy", quantity=10, price=0.5))
+    assert mgr and run(mgr.dry_account())["cash"] == 295.0
+    run(mgr.record_fill(market_id="KXTEST", side="YES", action="sell", quantity=10, price=0.65))
+    assert run(mgr.dry_account())["cash"] == 301.5
+    assert run(mgr.ledger(10))[0]["action"] == "sell"
+
+
+def test_ledger_refuses_overspend(client):
+    from src.utils.mode import ModeError, TradingMode, run
+
+    mgr = TradingMode(db_path=wd.DB_PATH)
+    try:
+        # 1000 x $0.90 = $900, comfortably past the $300 DRY balance.
+        run(mgr.record_fill(market_id="KXTEST", side="YES", action="buy", quantity=1000, price=0.9))
+        raise AssertionError("overspend must be rejected")
+    except ModeError as exc:
+        assert "Insufficient simulated funds" in str(exc)
+    assert run(mgr.dry_account())["cash"] == 300.0
+
+
+def test_ledger_rejects_bad_action(client):
+    from src.utils.mode import ModeError, TradingMode, run
+
+    mgr = TradingMode(db_path=wd.DB_PATH)
+    try:
+        run(mgr.record_fill(market_id="KXTEST", side="YES", action="short", quantity=1, price=0.5))
+        raise AssertionError("bad action must be rejected")
+    except ModeError:
+        pass
+
+
+def test_dry_account_tolerates_missing_tables(tmp_path):
+    """The mode store can be the first thing to touch a brand-new database."""
+    from src.utils.mode import TradingMode, run
+
+    mgr = TradingMode(db_path=str(tmp_path / "brand_new.db"))
+    acct = run(mgr.dry_account())
+    assert acct["cash"] == 300.0
+    assert acct["closed_trades"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+def test_page_renders_mode_switch_and_dry_account(client):
+    html = client.get("/").get_data(as_text=True)
+    assert 'id="modeDry"' in html
+    assert 'id="modeLive"' in html
+    assert "DRY account" in html
+    assert "$300.00" in html, "DRY starting balance not rendered"
+    assert "Funding source" in html
+
+
+def test_page_shows_write_lock_notice_when_token_unset(unlocked):
+    html = unlocked.get("/").get_data(as_text=True)
+    assert "Write actions are locked" in html
