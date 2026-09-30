@@ -44,6 +44,142 @@ def test_index_renders(client):
     assert b"Kalshi-Frigo" in r.data
 
 
+# ---------------------------------------------------------------------------
+# Regression: / used to return a static shell whose values were all "--" or
+# "loading" until client-side JS ran. The page must now ship the real numbers
+# in the HTML itself, so view-source and non-JS clients see actual data.
+# ---------------------------------------------------------------------------
+def _seed_activity(client):
+    """Write a position and some closed trades, then return the rendered page."""
+    import aiosqlite
+
+    _db()  # create the schema outside the event loop used by the routes
+
+    async def seed():
+        async with aiosqlite.connect(wd.DB_PATH) as conn:
+            await conn.execute(
+                "INSERT INTO positions (market_id, side, entry_price, quantity,"
+                " timestamp, live, status, strategy, stop_loss_price, take_profit_price)"
+                " VALUES ('KXTESTMKT', 'YES', 0.42, 10, '2026-01-01T00:00:00', 1,"
+                " 'open', 'ai_directional', 0.35, 0.58)"
+            )
+            # Third trade has no strategy tag: track.py never sets one, so the
+            # totals must not silently drop it.
+            for pnl, strategy in (
+                (1.5, "ai_directional"),
+                (-0.75, "safe_compounder"),
+                (2.25, None),
+            ):
+                await conn.execute(
+                    "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
+                    " quantity, pnl, entry_timestamp, exit_timestamp, rationale, strategy)"
+                    " VALUES (?, 'yes', 0.40, 0.45, 5, ?, '2026-01-01T00:00:00',"
+                    " '2026-01-01T01:00:00', 'test', ?)",
+                    (f"KXTRADE{int(pnl * 100)}", pnl, strategy),
+                )
+            await conn.commit()
+
+    asyncio.run(seed())
+    return client.get("/").get_data(as_text=True)
+
+
+def test_index_is_server_rendered_with_positions(client):
+    html = _seed_activity(client)
+    assert "KXTESTMKT" in html, "open position missing from server-rendered HTML"
+    assert "0.35" in html and "0.58" in html, "stop-loss/take-profit not rendered"
+
+
+def test_index_is_server_rendered_with_trade_totals(client):
+    html = _seed_activity(client)
+    # 1.5 - 0.75 + 2.25 = 3.0 realized, 2 wins of 3.
+    assert "3.0" in html, "realized P&L not rendered"
+    assert "66.7%" in html, "win rate not rendered"
+
+
+def test_index_shows_unattributed_trades(client):
+    """A NULL strategy must still be counted, not dropped by the aggregate."""
+    html = _seed_activity(client)
+    assert "unattributed" in html
+
+
+def test_index_documents_the_system(client):
+    """The page explains what the bot does, not just that it is up."""
+    html = client.get("/").get_data(as_text=True)
+    for needle in ("What this system does", "Ingest", "Decide", "Execute", "LLM directional"):
+        assert needle in html, f"missing {needle!r}"
+
+
+def test_index_renders_config_values(client):
+    html = client.get("/").get_data(as_text=True)
+    assert "max_position_size_pct" in html
+    assert "0.45" in html, "min_confidence_to_trade value not rendered"
+
+
+def test_snapshot_endpoint_matches_page(client):
+    """The poller and the server-rendered page read the same payload."""
+    _seed_activity(client)
+    snap = client.get("/api/snapshot").get_json()
+    assert snap["trades"]["trades"] == 3
+    assert snap["trades"]["realized_pnl"] == 3.0
+    assert snap["trades"]["win_rate"] == 66.7
+    assert snap["open"]["positions"] == 1
+    assert snap["open"]["capital"] == 4.2
+    assert len(snap["positions"]) == 1
+    assert len(snap["equity"]["pnl"]) == 3
+    assert {r["strategy"] for r in snap["by_strategy"]} == {
+        "ai_directional",
+        "safe_compounder",
+        "unattributed",
+    }
+
+
+def test_equity_curve_is_oldest_first(client):
+    _seed_activity(client)
+    labels = client.get("/api/snapshot").get_json()["equity"]["labels"]
+    assert labels == sorted(labels)
+
+
+def test_kalshi_configured_false_without_credentials(client, monkeypatch):
+    for var in (
+        "KALSHI_API_KEY",
+        "KALSHI_PRIVATE_KEY",
+        "KALSHI_PRIVATE_KEY_PATH",
+        "DB_PATH",
+        "RAILWAY_VOLUME_MOUNT_PATH",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    assert wd.kalshi_configured() is False
+
+
+def test_kalshi_configured_true_with_api_key_and_pem(client, monkeypatch):
+    monkeypatch.setenv("KALSHI_API_KEY", "kid")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nabc\n")
+    assert wd.kalshi_configured() is True
+
+
+def test_private_key_env_var_is_written_to_a_readable_file(client, monkeypatch):
+    """KalshiClient reads a path, but Railway can only inject env vars."""
+    pem = "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY", pem)
+    path = wd.materialize_private_key()
+    assert path and wd.Path(path).exists()
+    assert wd.Path(path).read_text().strip() == pem.strip()
+
+
+def test_fetch_kalshi_data_skips_network_without_credentials(client, monkeypatch):
+    """Must not build a KalshiClient (it raises without a key) or hit the API."""
+    for var in ("KALSHI_API_KEY", "KALSHI_PRIVATE_KEY", "KALSHI_PRIVATE_KEY_PATH"):
+        monkeypatch.delenv(var, raising=False)
+
+    def explode(*a, **kw):
+        raise AssertionError("must not construct KalshiClient without credentials")
+
+    import src.clients.kalshi_client as kc
+
+    monkeypatch.setattr(kc, "KalshiClient", explode)
+    assert wd._run_async(wd._fetch_kalshi_data()) == (None, None)
+
+
 def test_status_reports_uptime_and_db(client):
     body = client.get("/api/status").get_json()
     assert "uptime_sec" in body
