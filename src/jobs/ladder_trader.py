@@ -233,14 +233,19 @@ class LadderTrader:
         from src.jobs.broker import should_trade_live
         from src.utils.database import DatabaseManager
         from src.utils.mode import TradingMode
-        from src.utils.mode import run as mode_run
 
         if self.db_manager is None:
             self.db_manager = DatabaseManager()
+            # The dashboard creates the schema, but a strategy started on its own
+            # may be the first process to touch this database.
+            await self.db_manager.initialize()
 
         live = should_trade_live()
         self.book.dry = not live
-        mode = mode_run(TradingMode(db_path=str(self._db_path())).current())
+        # Awaited directly. `mode.run()` builds a fresh event loop, which raises
+        # "Cannot run the event loop while another loop is running" from inside
+        # this coroutine - that killed the strategy on its very first cycle.
+        mode = await TradingMode(db_path=str(self._db_path())).current()
 
         try:
             await self.ladder.fetch()

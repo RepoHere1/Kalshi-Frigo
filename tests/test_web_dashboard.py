@@ -1676,3 +1676,69 @@ def test_pid_alive_never_signals_the_process():
     assert pid_alive(999_999_999) is False
     # Still alive after being probed - the regression that matters.
     assert pid_alive(os.getpid()) is True
+
+
+# ---------------------------------------------------------------------------
+# Regression: every spawned strategy died instantly on
+# "Private key file not found: kalshi_private_key.pem". Railway injects
+# KALSHI_PRIVATE_KEY as PEM text; KalshiClient loads a *path*, and only the
+# dashboard was bridging the two. A child inherited the text and died, which is
+# why every Start button read "stopped" no matter what it did.
+# ---------------------------------------------------------------------------
+class _RecordingPopen:
+    """Captures the kwargs the dashboard spawns a strategy with."""
+
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.pid = 424242
+        _RecordingPopen.instances.append(self)
+
+    def poll(self):
+        return None  # alive
+
+
+def _toggle_env(monkeypatch, tmp_path, pem="-----BEGIN PRIVATE KEY-----\nxyz\n"):
+    monkeypatch.setattr(wd.subprocess, "Popen", _RecordingPopen)
+    monkeypatch.setattr(wd, "_child_procs", {})
+    monkeypatch.setenv("KALSHI_API_KEY", "kid")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY", pem)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "child.db"))
+    # strategy_state is module-level, so a start from a previous test would make
+    # the next one take the stop path and never spawn anything.
+    for st in wd.strategy_state.values():
+        st.update({"running": False, "pid": None, "stop_reason": ""})
+    _RecordingPopen.instances = []
+    return pem
+
+
+def test_child_process_receives_a_readable_private_key_path(client, auth, monkeypatch, tmp_path):
+    _toggle_env(monkeypatch, tmp_path)
+    r = client.post("/api/strategy/ai_directional/toggle", json={"mode": "paper"}, headers=auth)
+    assert r.status_code == 200
+    env = _RecordingPopen.instances[-1].kwargs["env"]
+    key_path = env.get("KALSHI_PRIVATE_KEY_PATH")
+    assert key_path, "child got no KALSHI_PRIVATE_KEY_PATH"
+    # The path must actually resolve to the PEM, or the child dies the same way.
+    assert "BEGIN" in open(key_path, encoding="utf-8").read()
+
+
+def test_child_process_shares_the_deployed_database(client, auth, monkeypatch, tmp_path):
+    """Otherwise every strategy writes to a throwaway container database."""
+    _toggle_env(monkeypatch, tmp_path)
+    client.post("/api/strategy/ai_directional/toggle", json={"mode": "paper"}, headers=auth)
+    env = _RecordingPopen.instances[-1].kwargs["env"]
+    assert env["DB_PATH"] == str(wd.DB_PATH)
+
+
+def test_every_strategy_command_is_paper(client, auth, monkeypatch, tmp_path):
+    """A spawned strategy must never carry --live."""
+    _toggle_env(monkeypatch, tmp_path)
+    for name in wd.strategy_state:
+        _RecordingPopen.instances = []
+        client.post(f"/api/strategy/{name}/toggle", json={"mode": "paper"}, headers=auth)
+        args = list(_RecordingPopen.instances[-1].args[0])
+        assert "--live" not in args, f"{name} was spawned with --live"
+        assert "--paper" in args, f"{name} was spawned without --paper"

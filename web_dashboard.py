@@ -1810,6 +1810,17 @@ def api_strategy_toggle(name):
     py = sys.executable or "python"
     cmd = [py, *STRATEGY_COMMANDS.get(name, STRATEGY_COMMANDS["ai_directional"])]
 
+    # The child needs a private key it can actually open. Railway injects
+    # KALSHI_PRIVATE_KEY as PEM *text*, but KalshiClient loads a *path*, so
+    # without this every spawned strategy died on "Private key file not found"
+    # the moment it started - which is why the buttons always read "stopped".
+    child_env = os.environ.copy()
+    key_path = materialize_private_key()
+    if key_path:
+        child_env["KALSHI_PRIVATE_KEY_PATH"] = key_path
+    # Children must share the volume-mounted database, not a fresh container one.
+    child_env["DB_PATH"] = str(DB_PATH)
+
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         out = open(LOG_DIR / f"strategy_{name}.log", "ab", buffering=0)
@@ -1819,6 +1830,7 @@ def api_strategy_toggle(name):
             stdout=out,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
+            env=child_env,
             start_new_session=True,
         )
         out.close()
