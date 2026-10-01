@@ -141,6 +141,79 @@ class TradingMode:
         except Exception:  # noqa: BLE001 - missing table is an expected state
             return None
 
+    async def reconcile_dry(self) -> Dict[str, Any]:
+        """Rebuild DRY cash from the persisted book and report the drift.
+
+        The DRY cash figure used to be a running counter debited on every
+        simulated fill. Anything that filled without leaving a matching row - a
+        rejected insert, a duplicate market, a position written without going
+        through the broker - debited the counter and never credited it back. The
+        DRY book then read $38.47 of an original $300 with zero closed trades,
+        which is arithmetically impossible and exactly the kind of number that
+        makes the whole panel untrustworthy.
+
+        So cash is *derived* from the same rows everything else reads:
+
+            cash = starting + realized - cost basis of open DRY positions
+
+        which makes equity == starting + realized by construction. The ledger is
+        still appended to for the fill-by-fill history; it is just no longer
+        trusted as the source of truth. The drift is returned so the discrepancy
+        stays visible instead of being quietly overwritten.
+
+        An empty book is left alone: with no positions and no closes there is
+        nothing to derive from, and a manually set balance must survive.
+        """
+        async with self._conn() as conn:
+            starting = await self._get(conn, _START_KEY)
+            starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
+            ledger_cash = await self._get(conn, _CASH_KEY)
+            ledger_f = float(ledger_cash) if ledger_cash is not None else starting_f
+
+            book_rows = int(
+                await self._scalar(
+                    conn,
+                    "SELECT (SELECT COUNT(*) FROM positions"
+                    " WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry') +"
+                    " (SELECT COUNT(*) FROM trade_logs"
+                    " WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry')",
+                )
+                or 0
+            )
+            if book_rows == 0:
+                return {
+                    "ledger_cash": round(ledger_f, 2),
+                    "derived_cash": round(ledger_f, 2),
+                    "drift": 0.0,
+                    "note": "no DRY positions or closes yet; the stored balance stands",
+                }
+
+            deployed = float(
+                await self._scalar(
+                    conn,
+                    "SELECT COALESCE(SUM(quantity * entry_price), 0.0) FROM positions"
+                    " WHERE status = 'open' AND COALESCE(NULLIF(mode, ''), 'dry') = 'dry'",
+                )
+                or 0.0
+            )
+            realized = float(
+                await self._scalar(
+                    conn,
+                    "SELECT COALESCE(SUM(pnl), 0.0) FROM trade_logs"
+                    " WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'",
+                )
+                or 0.0
+            )
+            derived = round(starting_f + realized - deployed, 2)
+            await self._set(conn, _CASH_KEY, str(derived))
+            await conn.commit()
+
+        return {
+            "ledger_cash": round(ledger_f, 2),
+            "derived_cash": derived,
+            "drift": round(derived - ledger_f, 2),
+        }
+
     async def book_account(self, mode: str) -> Dict[str, Any]:
         """Cash, equity and the realized/unrealized split for one book.
 

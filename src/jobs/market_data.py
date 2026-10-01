@@ -35,7 +35,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Deque, Dict, List, Optional, Tuple, cast
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -63,9 +63,15 @@ def _f(v: Any) -> Optional[float]:
         return None
 
 
-def _ws_messages(ws: Any) -> Any:
-    """aiohttp's message iterator, typed past the stub's missing attribute."""
-    return cast(Any, ws).messages
+def _ws_messages(ws: Any):
+    """Yield websocket frames from an aiohttp response.
+
+    `ws.messages` does not exist in aiohttp 3.9 - it was added later - so the
+    obvious spelling raises AttributeError inside the connection handler and the
+    socket silently falls back to the REST poller. Iterating `ws` directly is the
+    supported form and works on every version.
+    """
+    return ws
 
 
 def _parse_bucket(event_ticker: str) -> Optional[str]:

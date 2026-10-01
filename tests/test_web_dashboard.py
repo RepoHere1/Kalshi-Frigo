@@ -1742,3 +1742,139 @@ def test_every_strategy_command_is_paper(client, auth, monkeypatch, tmp_path):
         args = list(_RecordingPopen.instances[-1].args[0])
         assert "--live" not in args, f"{name} was spawned with --live"
         assert "--paper" in args, f"{name} was spawned without --paper"
+
+
+# ---------------------------------------------------------------------------
+# Regression: the DRY cash figure used to be a running counter debited on every
+# simulated fill, so a fill that left no matching row drained it permanently.
+# The deployment read $38.47 of an original $300 with zero closed trades -
+# arithmetically impossible, and the reason the whole panel became untrustworthy.
+# Cash is now derived from the persisted book.
+# ---------------------------------------------------------------------------
+def _seed_dry_book(cash_key="dry_cash", value="38.47"):
+    """An open DRY position plus a stale ledger counter that disagrees with it."""
+    from src.utils.mode import TradingMode
+
+    _db()
+    # dry_ledger and runtime_config belong to TradingMode, not DatabaseManager.
+    asyncio.run(TradingMode(db_path=wd.DB_PATH).current())
+
+    async def seed():
+        async with aiosqlite.connect(wd.DB_PATH) as conn:
+            await conn.execute(
+                "INSERT INTO positions (market_id, side, entry_price, quantity,"
+                " timestamp, live, status, strategy, mode)"
+                " VALUES ('KXOPEN1', 'YES', 0.50, 14, '2026-10-01T00:00:00', 0,"
+                " 'open', 'ai_directional', 'dry')"
+            )
+            await conn.execute(
+                "INSERT INTO positions (market_id, side, entry_price, quantity,"
+                " timestamp, live, status, strategy, mode)"
+                " VALUES ('KXLIVE1', 'YES', 0.50, 100, '2026-10-01T00:00:00', 1,"
+                " 'open', 'ai_directional', 'live')"
+            )
+            await conn.execute(
+                "INSERT INTO dry_ledger (ts, market_id, side, action, quantity,"
+                " price, amount, cash_after, note)"
+                " VALUES ('2026-10-01T00:00:00', 'KXOPEN1', 'YES', 'buy', 14,"
+                " 0.5, 7.0, ?, 'seed')",
+                (value,),
+            )
+            await conn.execute(
+                "INSERT INTO runtime_config (key, value, updated_at)"
+                " VALUES ('dry_cash', ?, '2026-10-01T00:00:00')"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (value,),
+            )
+            await conn.commit()
+
+    asyncio.run(seed())
+
+
+def test_reconcile_derives_cash_from_the_book(client):
+    _seed_dry_book()
+    from src.utils.mode import TradingMode
+
+    mgr = TradingMode(db_path=wd.DB_PATH)
+    drift = asyncio.run(mgr.reconcile_dry())
+    # 300 start, no closes, $7.00 deployed in DRY only -> $293.00
+    assert drift["derived_cash"] == 293.0
+    assert drift["ledger_cash"] == 38.47
+    assert drift["drift"] == pytest.approx(254.53, abs=0.01)
+
+
+def test_dry_account_is_self_consistent_after_reconciling(client):
+    _seed_dry_book()
+    book = client.get("/api/mode").get_json()["dry"]
+    # equity == starting + realized, always
+    assert book["equity"] == pytest.approx(book["starting_balance"] + book["realized"], abs=0.01)
+    assert book["cash"] == pytest.approx(book["equity"] - book["deployed"], abs=0.01)
+    assert book["cash"] == pytest.approx(293.0, abs=0.01)
+    # The live position's $50 cost basis is not in the DRY book.
+    assert book["deployed"] == pytest.approx(7.0, abs=0.01)
+
+
+def test_drift_is_reported_not_hidden(client):
+    _seed_dry_book()
+    mode = client.get("/api/mode").get_json()
+    assert mode["drift"]["drift"] != 0
+    assert "drift" in mode
+
+
+def test_reconcile_is_idempotent(client):
+    _seed_dry_book()
+    client.get("/api/mode")
+    first = client.get("/api/mode").get_json()["dry"]["cash"]
+    second = client.get("/api/mode").get_json()["dry"]["cash"]
+    assert first == second
+
+
+def test_reconcile_includes_realized_proceeds(client):
+    _db()
+
+    async def seed():
+        async with aiosqlite.connect(wd.DB_PATH) as conn:
+            await conn.execute(
+                "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
+                " quantity, pnl, entry_timestamp, exit_timestamp, rationale,"
+                " strategy, mode) VALUES ('KXWON','yes',0.4,0.5,10,1.0,"
+                "'2026-10-01T00:00:00','2026-10-01T01:00:00','t','ai_directional','dry')"
+            )
+            await conn.execute(
+                "INSERT INTO positions (market_id, side, entry_price, quantity,"
+                " timestamp, live, status, strategy, mode)"
+                " VALUES ('KXOPEN2','YES',0.25,8,'2026-10-01T00:00:00',0,'open',"
+                "'ai_directional','dry')"
+            )
+            await conn.commit()
+
+    asyncio.run(seed())
+    book = client.get("/api/mode").get_json()["dry"]
+    # 300 + 1.00 realized - 2.00 deployed = 299.00
+    assert book["cash"] == pytest.approx(299.0, abs=0.01)
+    assert book["realized"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# The Coinbase websocket never connected: `ws.messages` does not exist in
+# aiohttp 3.9, so the handler raised AttributeError and the feed silently fell
+# back to a 2-second REST poll - which then looked like a stale "leading" price.
+# ---------------------------------------------------------------------------
+def test_websocket_iterator_does_not_use_the_missing_messages_attribute():
+    from src.jobs.market_data import _ws_messages
+
+    class FakeWs:
+        """An aiohttp response from 3.9: iterable, but with no .messages."""
+
+        def __init__(self):
+            self.frames = iter([1, 2, 3])
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return next(self.frames)
+
+    ws = FakeWs()
+    assert not hasattr(ws, "messages")
+    assert _ws_messages(ws) is ws

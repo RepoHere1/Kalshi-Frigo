@@ -1259,9 +1259,13 @@ def _mode_payload() -> Dict[str, Any]:
 
     mgr = _mode_manager()
     mode = run(mgr.current())
+    # Reconcile before reporting, so the DRY headline is derived from the
+    # persisted book rather than from a counter that can drift from it.
+    drift = run(mgr.reconcile_dry())
     payload: Dict[str, Any] = {
         "mode": mode,
         "token_set": token_required(),
+        "drift": drift,
         # Both books are reported, always scoped to themselves. The page renders
         # the one it is in, but a DRY view that merely *hid* the real account
         # would still be one refactor away from showing it again.
