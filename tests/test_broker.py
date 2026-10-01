@@ -15,6 +15,7 @@ import pytest
 from src.jobs.broker import (
     MAX_PRICE_CENTS,
     MIN_ORDER_CENTS,
+    minimum_viable_quantity,
     DryBroker,
     LiveBroker,
     OrderRequest,
@@ -148,18 +149,54 @@ def test_build_rejects_unaffordable_order():
     assert "only 100c available" in reason
 
 
-def test_build_rejects_below_kalshi_minimum_order():
-    """Kalshi's floor is $1.00; a 50c order is rejected by the exchange."""
+def test_size_floor_raises_a_sub_minimum_buy():
+    """Kalshi's floor is $1.00, so a too-small buy is rounded up, not dropped.
+
+    Rejecting it outright meant a percentage sizer could silently produce zero
+    trades - 3% of a $28 balance is $0.85, and that order never stood a chance.
+    """
     req, reason = build_order_request(
-        market_id="KXTEST-26",
-        side="YES",
-        action="buy",
-        quantity=1,
-        market=NORMAL_MARKET,
-        available_cents=300_00,
+        market_id="KXTEST-26", side="YES", action="buy", quantity=1,
+        market=NORMAL_MARKET, available_cents=300_00,
+    )
+    assert req is not None and reason == ""
+    assert req.count == 3, "1 @ 42c must become 3 to clear $1.00"
+    assert req.notional == pytest.approx(1.26)
+
+
+def test_size_floor_never_reduces_an_adequate_order():
+    req, _ = build_order_request(
+        market_id="KXTEST-26", side="YES", action="buy", quantity=50,
+        market=NORMAL_MARKET, available_cents=300_00,
+    )
+    assert req.count == 50
+
+
+def test_size_floor_still_respects_the_funding_source():
+    """The bump must not talk us into an order we cannot pay for."""
+    req, reason = build_order_request(
+        market_id="KXTEST-26", side="YES", action="buy", quantity=1,
+        market=NORMAL_MARKET, available_cents=100,  # only $1.00
     )
     assert req is None
-    assert str(MIN_ORDER_CENTS) in reason
+    assert "minimum" in reason
+
+
+def test_size_floor_does_not_apply_to_sells():
+    """A small remainder must still be sellable so it can be closed out."""
+    req, _ = build_order_request(
+        market_id="KXTEST-26", side="YES", action="sell", quantity=1,
+        market=NORMAL_MARKET, available_cents=300_00, limit_price_dollars=0.42,
+    )
+    assert req is not None and req.count == 1
+
+
+def test_minimum_viable_quantity_math():
+    assert minimum_viable_quantity(0.42) == 3   # ceil(1.00 / 0.42)
+    assert minimum_viable_quantity(0.99) == 2   # 1 x 0.99 is under $1.00
+    assert minimum_viable_quantity(0.50) == 2
+    assert minimum_viable_quantity(0.05) == 20
+    assert minimum_viable_quantity(0) == 0
 
 
 def test_build_rejects_bad_side_and_quantity():

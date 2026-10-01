@@ -209,3 +209,12 @@ secrets.yaml
 *.pem
 *.key
 .env*
+
+# Secrets and local state that must never be committed
+*.env
+master.env
+master.clean.env
+.env.*
+backups/
+*.bak_*
+!env.template

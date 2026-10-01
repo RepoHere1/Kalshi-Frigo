@@ -19,12 +19,72 @@ from src.utils.logging_setup import get_trading_logger, setup_logging
 from src.utils.mode import MODE_LIVE
 
 
+def _current_mode() -> str:
+    """The book currently being traded, for stamping on writes."""
+    import os as _os
+
+    from src.utils.database import _resolve_current_mode
+
+    return _resolve_current_mode(_os.getenv("DB_PATH", "trading_system.db"))
+
+
+async def _confirm_fill(kalshi_client, position: Position, limit_price: float) -> bool:
+    """Best-effort check that a submitted sell actually filled.
+
+    Kalshi exposes the portfolio position rather than a per-order fill lookup,
+    so this asks whether the contract is still held. If the holding has gone
+    (or cannot be read), the position is treated as filled - a read failure must
+    not strand a position that really did sell, so this errs toward closing.
+    """
+    try:
+        raw = await kalshi_client.get_positions()
+    except Exception as e:  # noqa: BLE001 - unknown state, do not block the exit
+        get_trading_logger("position_tracking").warning(
+            f"Could not verify fill for {position.market_id} ({e}); assuming filled."
+        )
+        return True
+
+    for bucket in ("market_positions", "event_positions"):
+        for entry in (raw or {}).get(bucket) or []:
+            ticker = entry.get("ticker") or entry.get("event_ticker")
+            if ticker != position.market_id:
+                continue
+            held = entry.get("position_fp", entry.get("total_cost_shares_fp"))
+            try:
+                # A zero/empty holding means the contract is gone: filled.
+                return float(held or 0) <= 0
+            except (TypeError, ValueError):
+                return False
+    # Not listed under this market at all -> no longer held.
+    return True
+
+
+def _infer_strategy(position: Position) -> str:
+    """Best-effort strategy attribution for positions created before the column.
+
+    New positions carry `strategy` directly. This only exists for legacy rows so
+    a close is never filed as 'unattributed' with no explanation.
+    """
+    if position.strategy:
+        return position.strategy
+    rationale = (position.rationale or "").upper()
+    for marker, name in (
+        ("QUICK FLIP", "quick_flip_scalping"),
+        ("SAFE COMPOUND", "safe_compounder"),
+        ("MARKET MAK", "market_making"),
+        ("AI ", "ai_directional"),
+    ):
+        if marker in rationale:
+            return name
+    return "unattributed"
+
+
 async def should_exit_position(
     position: Position,
     current_yes_price: float,
     current_no_price: float,
     market_status: str,
-    market_result: str = None,
+    market_result: Optional[str] = None,
 ) -> tuple[bool, str, float]:
     """
     Determine if position should be exited based on smart exit strategies.
@@ -264,10 +324,30 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                             continue
                         exit_sell_orders_placed += 1
 
+                        # A submitted limit order is not a filled one. Closing the
+                        # local position on submission made the DB claim a sale
+                        # Kalshi had not made, so P&L and exposure both drifted.
+                        # Only close on a confirmed fill; leave it open (and
+                        # retry) while the order is merely resting.
+                        if exit_mode == MODE_LIVE:
+                            filled = await _confirm_fill(kalshi_client, position, exit_price)
+                            if not filled:
+                                logger.warning(
+                                    f"Sell order submitted for {position.market_id} but not "
+                                    f"confirmed filled; leaving the position open so the "
+                                    f"next cycle can retry or reconcile."
+                                )
+                                exit_sell_failures += 1
+                                continue
+
                     # Calculate PnL
                     pnl = (exit_price - position.entry_price) * position.quantity
 
-                    # Create trade log
+                    # Create trade log.
+                    # strategy / exit_reason / mode were all omitted, so every
+                    # close landed with strategy NULL (making per-strategy P&L
+                    # permanently "unattributed") and with no record of why it
+                    # exited or which book it belonged to.
                     trade_log = TradeLog(
                         market_id=position.market_id,
                         side=position.side,
@@ -278,6 +358,9 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                         entry_timestamp=position.timestamp,
                         exit_timestamp=datetime.now(),
                         rationale=f"{position.rationale} | EXIT: {exit_reason}",
+                        strategy=position.strategy or _infer_strategy(position),
+                        exit_reason=exit_reason,
+                        mode=position.mode or _current_mode(),
                     )
 
                     # Record the exit. For non-resolution exits the sell order
@@ -285,8 +368,15 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                     # treats it as closed, which mirrors the existing behavior of
                     # place_profit_taking_orders / place_stop_loss_orders.
                     await db_manager.add_trade_log(trade_log)
+                    # `id` is None only for a position that was never saved;
+                    # writing that back would fail loudly and lose the close entirely.
+                    if position.id is None:
+                        logger.error(
+                            f"Cannot record the close for {position.market_id}: position has no id."
+                        )
+                        exit_sell_failures += 1
+                        continue
                     await db_manager.update_position_status(position.id, "closed")
-
                     if is_resolution:
                         resolution_exits += 1
                     logger.info(

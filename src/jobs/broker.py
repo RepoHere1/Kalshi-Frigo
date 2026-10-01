@@ -17,6 +17,7 @@ A DRY order therefore fails for every reason a live order would fail, minus the
 side effect. That is the whole point: a DRY run that succeeds proves the real
 path is wired up, not merely that the arithmetic works out locally.
 """
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -67,6 +68,30 @@ class OrderRequest:
         if self.expiration_ts is not None:
             out["expiration_ts"] = self.expiration_ts
         return out
+
+
+def minimum_viable_quantity(price_dollars: float) -> int:
+    """Smallest contract count Kalshi will accept at this price.
+
+    Kalshi rejects any order with a notional under $1.00. A percentage-based
+    sizer can easily produce less than that - 3% of a $28 balance is $0.85 -
+    which means the order is rejected by the exchange and the trade silently
+    never happens. This rounds up to the smallest count that clears the floor,
+    so sizing targets are achievable rather than nominal.
+    """
+    price = float(price_dollars)
+    if price <= 0:
+        return 0
+    raw = MIN_ORDER_CENTS / 100.0 / price
+    return max(1, int(math.ceil(raw - 1e-9)))
+
+
+def apply_size_floor(quantity: int, price_dollars: float) -> int:
+    """Raise `quantity` to the exchange minimum if it falls short.
+
+    Never lowers it - a larger intended size is always respected.
+    """
+    return max(int(quantity), minimum_viable_quantity(price_dollars))
 
 
 def build_order_request(
@@ -121,19 +146,35 @@ def build_order_request(
             f"is outside Kalshi's valid range {MIN_PRICE_CENTS}-{MAX_PRICE_CENTS}c"
         )
 
+    # Guard 3: never send an order the funding source cannot cover. This is
+    # checked BEFORE the size floor so a bump past the minimum can still fail
+    # here rather than being submitted and rejected by the exchange.
     notional_cents = price_cents * int(quantity)
-
-    # Guard 3: never send an order the funding source cannot cover.
-    if notional_cents < MIN_ORDER_CENTS:
-        return None, (
-            f"{market_id}: order notional {notional_cents}c is below Kalshi's "
-            f"{MIN_ORDER_CENTS}c minimum order size"
-        )
     if notional_cents > int(available_cents):
         return None, (
             f"{market_id}: needs {notional_cents}c "
             f"({quantity} @ {price_cents}c) but only {int(available_cents)}c available"
         )
+
+    # Size floor: raise to the exchange minimum, but only if we can afford it.
+    # Applies to buys; a sell of a small remainder should be left alone so the
+    # position can actually be closed out.
+    if action == "buy":
+        floored = apply_size_floor(int(quantity), price_dollars)
+        if floored != int(quantity):
+            if floored * price_cents > int(available_cents):
+                return None, (
+                    f"{market_id}: reaching Kalshi's $1.00 minimum needs "
+                    f"{floored} @ {price_cents}c = {floored * price_cents}c, "
+                    f"but only {int(available_cents)}c available"
+                )
+            logger.info(
+                f"Rounding {quantity} -> {floored} contracts: {quantity} @ "
+                f"{price_cents}c is ${notional_cents / 100:.2f}, under Kalshi's "
+                f"$1.00 minimum order size"
+            )
+            quantity = floored
+            notional_cents = price_cents * quantity
 
     req = OrderRequest(
         ticker=market_id,

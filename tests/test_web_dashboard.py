@@ -8,7 +8,9 @@ import asyncio
 import json
 import sys
 import time
+from pathlib import Path
 
+import aiosqlite
 import pytest
 
 import web_dashboard as wd
@@ -259,7 +261,8 @@ def test_dry_page_labels_the_real_account_as_not_being_traded(client):
     finally:
         gen.close()
     assert "Real Kalshi account — NOT what DRY is trading" in html
-    assert "none of these figures are its performance" in html
+    assert "managed outside this bot" in html
+    assert "none of these figures describe the bot's results" in html
 
 
 def test_live_headline_shows_the_real_account(client, auth, monkeypatch):
@@ -1048,3 +1051,322 @@ def test_refused_live_switch_leaves_the_page_in_dry(client, auth):
     # Check the rendered flag element, not the JS source, which mentions both.
     assert '<span id="modeFlagText">DRY MODE</span>' in html
     assert '<span id="modeFlagText">LIVE MODE</span>' not in html
+
+
+# ---------------------------------------------------------------------------
+# Regression: the column map.
+#
+# get_open_positions() built Position from positional indexes against
+# `SELECT *`. The positions table has 15 columns, so every index from 10 on was
+# shifted by one and `stop_loss_price` came back holding the `strategy` column -
+# a TEXT string. Every exit that used those levels would have fired at a
+# strategy name. Positional access is now banned; named access is used.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_position_columns_map_by_name(tmp_path):
+    from datetime import datetime
+
+    from src.utils.database import DatabaseManager, Position
+
+    db_path = str(tmp_path / "colmap.db")
+    db = DatabaseManager(db_path=db_path)
+    await db.initialize()
+    pos = Position(
+        market_id="KXCOLMAP-26",
+        side="YES",
+        entry_price=0.40,
+        quantity=7,
+        timestamp=datetime(2026, 1, 1),
+        rationale="r",
+        strategy="safe_compounder",
+        live=True,
+        stop_loss_price=0.30,
+        take_profit_price=0.55,
+        max_hold_hours=48,
+        target_confidence_change=0.25,
+    )
+    await db.add_position(pos)
+
+    rows = await db.get_open_positions()
+    assert len(rows) == 1
+    got = rows[0]
+    # Every field that was previously shifted.
+    assert got.stop_loss_price == 0.30
+    assert got.take_profit_price == 0.55
+    assert got.max_hold_hours == 48
+    assert got.target_confidence_change == 0.25
+    assert got.strategy == "safe_compounder"
+    assert got.market_id == "KXCOLMAP-26"
+    assert got.quantity == 7
+    assert got.entry_price == 0.40
+
+
+@pytest.mark.asyncio
+async def test_stop_loss_is_never_a_strategy_string(tmp_path):
+    """The exact failure: stop_loss_price holding 'ai_directional'."""
+    from datetime import datetime
+
+    from src.utils.database import DatabaseManager, Position
+
+    db_path = str(tmp_path / "sltest.db")
+    db = DatabaseManager(db_path=db_path)
+    await db.initialize()
+    await db.add_position(
+        Position(
+            market_id="KXBAD-26",
+            side="NO",
+            entry_price=0.60,
+            quantity=3,
+            timestamp=datetime(2026, 1, 1),
+            rationale="r",
+            strategy="ai_directional",
+            live=True,
+            stop_loss_price=0.45,
+            take_profit_price=0.80,
+        )
+    )
+    got = (await db.get_open_positions())[0]
+    assert isinstance(got.stop_loss_price, float)
+    assert got.stop_loss_price == 0.45
+    assert got.stop_loss_price != "ai_directional"
+
+
+@pytest.mark.asyncio
+async def test_migrations_add_mode_and_blocked_trades(tmp_path):
+    """cli.py queries blocked_trades unguarded; it must exist after initialize()."""
+    import sqlite3
+
+    from src.utils.database import DatabaseManager
+
+    db_path = str(tmp_path / "mig.db")
+    db = DatabaseManager(db_path=db_path)
+    await db.initialize()
+
+    conn = sqlite3.connect(db_path)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    pos_cols = {r[1] for r in conn.execute("PRAGMA table_info(positions)")}
+    log_cols = {r[1] for r in conn.execute("PRAGMA table_info(trade_logs)")}
+    conn.close()
+
+    assert "blocked_trades" in tables
+    assert {"mode", "strategy", "stop_loss_price", "take_profit_price"} <= pos_cols
+    assert {"strategy", "exit_reason", "mode"} <= log_cols
+
+
+@pytest.mark.asyncio
+async def test_position_is_stamped_with_a_mode(tmp_path):
+    from datetime import datetime
+
+    from src.utils.database import DatabaseManager, Position
+
+    db_path = str(tmp_path / "stamp.db")
+    db = DatabaseManager(db_path=db_path)
+    await db.initialize()
+    await db.add_position(
+        Position(
+            market_id="KXSTAMP-26",
+            side="YES",
+            entry_price=0.5,
+            quantity=1,
+            timestamp=datetime(2026, 1, 1),
+            rationale="r",
+            live=False,
+        )
+    )
+    got = (await db.get_open_positions())[0]
+    assert got.mode == "dry", "a fresh database resolves to DRY"
+
+
+@pytest.mark.asyncio
+async def test_trackers_see_dry_positions(tmp_path):
+    """DRY positions must be visible to exit management.
+
+    They used to be filtered out by `live = 1`, which meant DRY opened trades
+    that were never exited.
+    """
+    from datetime import datetime
+
+    from src.utils.database import DatabaseManager, Position
+
+    db_path = str(tmp_path / "vis.db")
+    db = DatabaseManager(db_path=db_path)
+    await db.initialize()
+    await db.add_position(
+        Position(
+            market_id="KXVIS-26",
+            side="YES",
+            entry_price=0.5,
+            quantity=2,
+            timestamp=datetime(2026, 1, 1),
+            rationale="r",
+            live=False,
+            mode="dry",
+        )
+    )
+    visible = await db.get_open_live_positions()
+    assert len(visible) == 1
+    assert visible[0].market_id == "KXVIS-26"
+    assert await db.get_open_non_live_positions() != []
+
+
+@pytest.mark.asyncio
+async def test_tradelog_records_strategy_exit_reason_and_mode(tmp_path):
+    """track.py omitted all three, so P&L was unattributable."""
+    from datetime import datetime
+
+    from src.utils.database import DatabaseManager, TradeLog
+
+    db_path = str(tmp_path / "tl.db")
+    db = DatabaseManager(db_path=db_path)
+    await db.initialize()
+    await db.add_trade_log(
+        TradeLog(
+            market_id="KXLOG-26",
+            side="YES",
+            entry_price=0.4,
+            exit_price=0.55,
+            quantity=10,
+            pnl=1.5,
+            entry_timestamp=datetime(2026, 1, 1),
+            exit_timestamp=datetime(2026, 1, 2),
+            rationale="r",
+            strategy="ai_directional",
+            exit_reason="take_profit",
+            mode="dry",
+        )
+    )
+    got = (await db.get_all_trade_logs())[0]
+    assert got.strategy == "ai_directional"
+    assert got.exit_reason == "take_profit"
+    assert got.mode == "dry"
+
+
+@pytest.mark.asyncio
+async def test_migration_column_added_to_old_database(tmp_path):
+    """An existing database gains the new columns, it is not recreated."""
+    import sqlite3
+
+    from src.utils.database import DatabaseManager
+
+    db_path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(db_path)
+    # The pre-mode schema, 14 columns and no mode.
+    conn.execute(
+        """CREATE TABLE positions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, market_id TEXT NOT NULL, side TEXT NOT NULL,
+        entry_price REAL NOT NULL, quantity INTEGER NOT NULL, timestamp TEXT NOT NULL,
+        rationale TEXT, confidence REAL, live BOOLEAN NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'open', strategy TEXT, stop_loss_price REAL,
+        take_profit_price REAL)"""
+    )
+    conn.execute(
+        "INSERT INTO positions (market_id, side, entry_price, quantity, timestamp, live)"
+        " VALUES ('KXBARE-26','YES',0.5,4,'2026-01-01T00:00:00',0)"
+    )
+    conn.commit()
+    conn.close()
+
+    db = DatabaseManager(db_path=db_path)
+    await db.initialize()
+
+    rows = await db.get_open_positions()
+    assert len(rows) == 1, "the existing row must survive the migration"
+    assert rows[0].mode == "dry"
+
+
+# ---------------------------------------------------------------------------
+# #9 authentication
+# ---------------------------------------------------------------------------
+def test_write_accepts_basic_auth(client, monkeypatch):
+    import base64
+
+    monkeypatch.setenv("DASHBOARD_USER", "operator")
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
+    creds = base64.b64encode(b"operator:hunter2").decode()
+    r = client.post("/api/dry/reset", headers={"Authorization": f"Basic {creds}"})
+    assert r.status_code == 200
+
+
+def test_write_rejects_wrong_basic_auth(client, monkeypatch):
+    import base64
+
+    monkeypatch.setenv("DASHBOARD_USER", "operator")
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
+    creds = base64.b64encode(b"operator:wrong").decode()
+    r = client.post("/api/dry/reset", headers={"Authorization": f"Basic {creds}"})
+    assert r.status_code == 401
+
+
+def test_basic_auth_ignored_when_unconfigured(client):
+    import base64
+
+    monkeypatch_user = None
+    creds = base64.b64encode(b"anyone:anything").decode()
+    r = client.post("/api/dry/reset", headers={"Authorization": f"Basic {creds}"})
+    assert r.status_code == 401, monkeypatch_user
+
+
+# ---------------------------------------------------------------------------
+# #10 backups
+# ---------------------------------------------------------------------------
+def test_backup_creates_a_snapshot(client):
+    _db()  # create the database file; there is nothing to copy before this
+    dest = wd.backup_database()
+    assert dest and Path(dest).exists()
+    assert Path(dest).parent.name == wd.BACKUP_DIR_NAME
+
+
+def test_backup_prunes_old_snapshots(client):
+    _db()
+    out_dir = Path(wd.DB_PATH).parent / wd.BACKUP_DIR_NAME
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Deliberately old names, so they sort behind the ones just written.
+    stale = [out_dir / f"trading_system_2000010{i}000000.db" for i in range(5)]
+    for f in stale:
+        f.write_bytes(b"old")
+    wd.backup_database()  # one recent snapshot
+    wd.BACKUP_KEEP = 2
+    wd._prune_backups(out_dir)
+    remaining = sorted(p.name for p in out_dir.glob("trading_system_*.db"))
+    # Exactly the 2 newest survive: the fresh snapshot plus one old one.
+    assert len(remaining) == 2, f"expected 2 kept, got {remaining}"
+    survivors = [f.name for f in stale if f.exists()]
+    assert len(survivors) == 1, f"only the newest stale file should remain: {survivors}"
+    assert survivors == ["trading_system_20000104000000.db"]
+
+
+def test_backup_status_counts_snapshots(client):
+    _db()
+    wd.backup_database()
+    assert wd._backup_status()["count"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# #3 never-run banner
+# ---------------------------------------------------------------------------
+def test_page_warns_when_the_pipeline_has_never_run(client):
+    html = client.get("/").get_data(as_text=True)
+    assert "The pipeline has never run" in html
+
+
+def test_never_run_clears_once_markets_are_ingested(client):
+    import asyncio
+
+    _db()  # ensure schema
+    asyncio.run(
+        _db_many_insert(
+            "INSERT INTO markets (market_id, title, yes_price, no_price, volume,"
+            " expiration_ts, category, status, last_updated, has_position)"
+            " VALUES ('KX1','t',0.5,0.5,10,'2026-12-31','Politics','open',"
+            "'2026-01-01T00:00:00',0)"
+        )
+    )
+    snap = client.get("/api/snapshot").get_json()
+    assert snap["never_run"] is False
+    assert "The pipeline has never run" not in client.get("/").get_data(as_text=True)
+
+
+async def _db_many_insert(sql: str) -> None:
+    async with aiosqlite.connect(wd.DB_PATH) as conn:
+        await conn.execute(sql)
+        await conn.commit()

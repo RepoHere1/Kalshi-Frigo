@@ -15,6 +15,7 @@ Features:
 Railway-ready: listens on $PORT, healthcheck on /health.
 """
 import asyncio
+import base64
 import json
 import os
 import secrets
@@ -117,6 +118,65 @@ def _log_files():
         return sorted(LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
     except OSError:
         return []
+
+
+BACKUP_DIR_NAME = "backups"
+BACKUP_INTERVAL_SEC = 6 * 60 * 60  # every 6h
+BACKUP_KEEP = 48  # ~2 weeks
+
+
+def backup_database() -> Optional[str]:
+    """Snapshot the SQLite file with the online backup API.
+
+    The Railway volume is a single copy in one region with no history, so a
+    lost volume is a lost trade record. Uses sqlite3's backup() rather than a
+    file copy because the database is written by several threads and a raw copy
+    can capture a torn page.
+    """
+    import sqlite3
+
+    src = DB_PATH
+    if not Path(src).exists():
+        return None
+    out_dir = Path(src).parent / BACKUP_DIR_NAME
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = _now().replace(":", "").replace("-", "").replace(" ", "_")
+        dest = out_dir / f"trading_system_{stamp}.db"
+        with sqlite3.connect(src) as source, sqlite3.connect(dest) as target:
+            source.backup(target)
+    except Exception as e:
+        _push_error(f"Database backup failed: {e}")
+        return None
+    _prune_backups(out_dir)
+    _audit(f"database backed up to {dest.name}")
+    return str(dest)
+
+
+def _prune_backups(out_dir: Path) -> None:
+    try:
+        files = sorted(out_dir.glob("trading_system_*.db"), reverse=True)
+        for stale in files[BACKUP_KEEP:]:
+            stale.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _backup_loop():
+    """Back up on a timer, and once at startup."""
+    while True:
+        backup_database()
+        time.sleep(BACKUP_INTERVAL_SEC)
+
+
+def _backup_status() -> Dict[str, Any]:
+    """How many snapshots exist on disk, for the readiness panel."""
+    out_dir = Path(DB_PATH).parent / BACKUP_DIR_NAME
+    try:
+        count = len(list(out_dir.glob("trading_system_*.db")))
+    except OSError:
+        count = 0
+    return {"count": count, "keep": BACKUP_KEEP, "every_hours": BACKUP_INTERVAL_SEC // 3600}
 
 
 def _audit(message):
@@ -766,6 +826,17 @@ def build_snapshot() -> Dict[str, Any]:
     errors: List[Dict[str, Any]] = cast(List[Dict[str, Any]], dashboard_state["errors"])
     events: List[Dict[str, Any]] = cast(List[Dict[str, Any]], dashboard_state["events"])
 
+    def _count(index: int) -> int:
+        """Rows in a count result, tolerating a table that does not exist yet.
+
+        _db_many yields an empty list for a failed query, so a brand-new
+        database (no schema at all) must not index blindly.
+        """
+        rows = counts[index] if index < len(counts) else []
+        return int(rows[0].get("n", 0) or 0) if rows else 0
+
+    never_run = _count(0) == 0 and _count(5) == 0 and _count(2) == 0
+
     return {
         "generated_at": _now(),
         "uptime_sec": int(time.time() - _STARTED_AT),
@@ -779,6 +850,9 @@ def build_snapshot() -> Dict[str, Any]:
         "db_exists": Path(DB_PATH).exists(),
         "db_persistent": not _is_ephemeral_db(),
         "public_domain": os.environ.get("RAILWAY_PUBLIC_DOMAIN", ""),
+        # Nothing has run if we have never ingested a market or recorded a
+        # decision. Shown as an explicit banner instead of a page of zeros.
+        "never_run": never_run,
         "trades": _row_trades(trades_r),
         "open": _row_open(open_r),
         "open_dry": _row_open_dry(dry_open_r),
@@ -800,6 +874,7 @@ def build_snapshot() -> Dict[str, Any]:
         ],
         "alerts": dict(alert_state),
         "mode": _safe_mode_payload(),
+        "backups": _backup_status(),
         "logs": _read_log_tail(100) or list(log_buffer)[-100:],
         "errors": errors[-10:],
         "events": events[-8:],
@@ -880,8 +955,30 @@ def _presented_token() -> str:
     return request.args.get("token", "").strip()
 
 
+def _basic_auth_ok() -> bool:
+    """HTTP Basic check against DASHBOARD_USER / DASHBOARD_PASSWORD."""
+    user = os.environ.get("DASHBOARD_USER", "").strip()
+    password = os.environ.get("DASHBOARD_PASSWORD", "")
+    if not user or not password:
+        return False
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(header[6:]).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return False
+    got_user, _, got_pass = decoded.partition(":")
+    return secrets.compare_digest(got_user, user) and secrets.compare_digest(got_pass, password)
+
+
 def require_token():
-    """Flask guard for mutating routes. Returns None when allowed, else a response."""
+    """Flask guard for mutating routes. Returns None when allowed, else a response.
+
+    Accepts either the write token (for fetch/XHR from the page) or HTTP Basic
+    credentials. Basic auth is what protects the deployment, because the write
+    token is embedded in the page and therefore readable by any visitor.
+    """
     if not token_required():
         return (
             jsonify(
@@ -892,10 +989,12 @@ def require_token():
             ),
             503,
         )
-    if not secrets.compare_digest(_presented_token(), _configured_token()):
-        _audit(f"rejected unauthorized {request.method} {request.path} from {request.remote_addr}")
-        return jsonify({"error": "Unauthorized: bad or missing X-Auth-Token"}), 401
-    return None
+    if secrets.compare_digest(_presented_token(), _configured_token()):
+        return None
+    if _basic_auth_ok():
+        return None
+    _audit(f"rejected unauthorized {request.method} {request.path} from {request.remote_addr}")
+    return jsonify({"error": "Unauthorized: bad or missing X-Auth-Token"}), 401
 
 
 # ---------------------------------------------------------------------------
@@ -1818,6 +1917,16 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 </div>
 {% endif %}
 
+{% if s.never_run %}
+<div class="note-box" style="margin-bottom:14px">
+  <b>The pipeline has never run.</b>
+  {{ s.data.tables.markets }} markets ingested, {{ s.data.llm_queries }} LLM calls,
+  {{ s.trades.trades }} closed trades &mdash; every figure on this page is a default,
+  not a measurement. Start a strategy below to exercise ingest &rarr; decide &rarr;
+  execute &rarr; track. In DRY it will rehearse against real prices without spending money.
+</div>
+{% endif %}
+
 {% if not s.mode.token_set %}
 <div class="note-box" style="margin-bottom:14px">
   <b>Write actions are locked.</b>
@@ -1993,6 +2102,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
         <dd>{% if s.db_persistent %}<span class="pill ok">volume</span>{% else %}<span class="pill warn">ephemeral</span>{% endif %}</dd>
         <dt>Last Kalshi sync</dt><dd>{{ s.last_update or 'never' }}</dd>
         <dt>Database path</dt><dd class="mono" style="color:var(--faint)">{{ s.db_path }}</dd>
+        <dt>Database backups</dt><dd id="dBackups">{{ s.backups.count }} (every 6h, keeps {{ s.backups.keep }})</dd>
       </dl>
       {% if not s.db_persistent %}
       <div class="note-box" style="margin-top:12px">
@@ -2036,15 +2146,16 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
       <h2>{{ 'Kalshi account — real, and being traded' if s.mode.mode == 'live' else 'Real Kalshi account — NOT what DRY is trading' }}</h2>
       <span class="note">{% if s.last_update %}synced {{ s.last_update }}{% else %}not synced yet{% endif %}</span>
     </div>
-    {% if s.mode.mode != 'live' %}
+    {%- if s.mode.mode != 'live' %}
     <div class="pb" style="padding-bottom:0">
       <p class="note" style="font-size:11.5px;color:var(--faint)">
-        Read-only reference. The bot is in <b>DRY</b>, so it is not trading this
-        account and none of these figures are its performance. The simulated
-        $300 book above is what DRY is trading.
+        Read-only reference, and <b>managed outside this bot</b>. This deployment
+        does not trade it: the strategy loop has never placed an order here, and
+        the book is driven by a separate system. The simulated $300 book above is
+        what DRY is trading, so none of these figures describe the bot's results.
       </p>
     </div>
-    {% endif %}
+    {%- endif %}
   {%- if s.kalshi and s.kalshi.connected %}
   <div class="row two" style="padding:14px 16px 0;margin:0">
     <div class="pb" style="padding:0">
@@ -2628,7 +2739,7 @@ def start_background_workers():
     if _workers_started:
         return
     _workers_started = True
-    for target in (_monitor_loop, _log_tail_loop):
+    for target in (_monitor_loop, _log_tail_loop, _backup_loop):
         threading.Thread(target=target, daemon=True).start()
 
 
