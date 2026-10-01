@@ -17,10 +17,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-
 # ---------------------------------------------------------------------------
 # Subcommand implementations
 # ---------------------------------------------------------------------------
+
 
 def cmd_run(args: argparse.Namespace) -> None:
     """Start the trading bot (disciplined mode by default)."""
@@ -59,11 +59,48 @@ def cmd_run(args: argparse.Namespace) -> None:
         print("⚠️  BEAST MODE: Aggressive settings enabled.")
         print("   WARNING: Aggressive settings with no guardrails. Use at your own risk.")
         from beast_mode_bot import BeastModeBot
+
         bot = BeastModeBot(live_mode=live_mode)
         try:
             asyncio.run(bot.run())
         except KeyboardInterrupt:
             print("\nTrading bot stopped by user.")
+        return
+
+    # --market-making mode: quote both sides of the book
+    if getattr(args, "market_making", False):
+        _run_market_making(
+            live_mode=live_mode,
+            loop=getattr(args, "loop", False),
+            interval=getattr(args, "interval", 300),
+        )
+        return
+
+    # --btc-ladder mode: fast spot feed vs Kalshi's own BTC ladder quotes
+    if getattr(args, "btc_ladder", False):
+        from src.jobs.ladder_trader import LadderConfig, run_ladder_trader
+
+        print("📈 BTC LADDER MODE")
+        print("   Live spot feed vs Kalshi BTC ladder | $5 per clip | 1 position at a time")
+        try:
+            asyncio.run(
+                run_ladder_trader(
+                    LadderConfig(),
+                    loop=getattr(args, "loop", True),
+                    interval=float(getattr(args, "interval", 0) or 4),
+                )
+            )
+        except KeyboardInterrupt:
+            print("\nBTC ladder trader stopped by user.")
+        return
+
+    # --quick-flip mode: short-horizon momentum scalping
+    if getattr(args, "quick_flip", False):
+        _run_quick_flip(
+            live_mode=live_mode,
+            loop=getattr(args, "loop", True),
+            interval=getattr(args, "interval", 120),
+        )
         return
 
     # DEFAULT: AI directional strategy with disciplined settings active.
@@ -76,11 +113,12 @@ def cmd_run(args: argparse.Namespace) -> None:
     print("   Use --beast to run without guardrails (not recommended).")
 
     from beast_mode_bot import BeastModeBot
-    from src.strategies.category_scorer import CategoryScorer
-    from src.strategies.portfolio_enforcer import PortfolioEnforcer
 
     # Apply disciplined settings overrides
     from src.config import settings as cfg
+    from src.strategies.category_scorer import CategoryScorer
+    from src.strategies.portfolio_enforcer import PortfolioEnforcer
+
     cfg.settings.trading.min_confidence_to_trade = 0.45  # LOOSENED from 0.65 (approved 2026-03-29)
     cfg.settings.trading.max_position_size_pct = 3.0
     cfg.settings.trading.kelly_fraction = 0.25
@@ -147,6 +185,90 @@ def _run_safe_compounder(
         print("\nSafe Compounder stopped by user.")
 
 
+def _run_single_pass_strategy(
+    label: str,
+    runner,
+    live_mode: bool = False,
+    loop: bool = False,
+    interval: int = 300,
+    capital: float = 500.0,
+) -> None:
+    """Run a one-shot strategy pass on a loop, with real clients.
+
+    `market_making` and `quick_flip` expose a `run_*_strategy()` coroutine but
+    had no CLI entry point, so the dashboard's toggle for them silently spawned
+    the AI directional loop instead - two buttons running the same bot. This
+    gives each one its own process and its own log.
+
+    Both strategies gate their order placement on `should_trade_live()`, which
+    requires the LIVE_TRADING_ENABLED env var *and* a persisted dashboard mode
+    of "live". `--live` alone therefore cannot put real orders on the wire.
+    """
+    from src.clients.kalshi_client import KalshiClient
+    from src.clients.xai_client import XAIClient
+    from src.jobs.broker import should_trade_live
+    from src.utils.database import DatabaseManager
+
+    print(f"🎯 {label.upper()} MODE")
+    if not should_trade_live():
+        print("   DRY RUN — no real orders will be placed")
+    else:
+        print("   LIVE — real orders will be sent")
+    if loop:
+        print(f"   Continuous mode — re-running every {interval}s. Ctrl-C to stop.")
+
+    async def _run_once():
+        db = DatabaseManager()
+        client = KalshiClient()
+        try:
+            return await runner(db, client, XAIClient(db_manager=db), capital)
+        finally:
+            await client.close()
+
+    async def _run_forever():
+        cycle = 0
+        while True:
+            cycle += 1
+            print(f"\n──── Cycle {cycle} — " f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ────")
+            try:
+                print(await _run_once())
+            except Exception as exc:
+                # One bad cycle must not kill the loop.
+                print(f"Cycle {cycle} failed: {exc}. Continuing after {interval}s.")
+            print(f"\n⏳ Sleeping {interval}s before next cycle...")
+            await asyncio.sleep(interval)
+
+    try:
+        if loop:
+            asyncio.run(_run_forever())
+        else:
+            asyncio.run(_run_once())
+    except KeyboardInterrupt:
+        print(f"\n{label} stopped by user.")
+
+
+def _run_market_making(live_mode: bool = False, loop: bool = False, interval: int = 300) -> None:
+    from src.strategies.market_making import run_market_making_strategy
+
+    async def _runner(db, client, xai, _capital):
+        return await run_market_making_strategy(db, client, xai)
+
+    _run_single_pass_strategy(
+        "market making", _runner, live_mode=live_mode, loop=loop, interval=interval
+    )
+
+
+def _run_quick_flip(live_mode: bool = False, loop: bool = False, interval: int = 120) -> None:
+    from src.strategies.quick_flip_scalping import run_quick_flip_strategy
+
+    async def _runner(db, client, xai, capital):
+        return await run_quick_flip_strategy(db, client, xai, capital)
+
+    _run_single_pass_strategy(
+        "quick flip scalping", _runner, live_mode=live_mode, loop=loop, interval=interval
+    )
+
+
 def cmd_dashboard(args: argparse.Namespace) -> None:
     """Launch the Streamlit monitoring dashboard."""
     import subprocess
@@ -159,8 +281,8 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
         subprocess.run([sys.executable, str(dashboard_script)], check=False)
     elif beast_dashboard.exists():
         # Fall back to running the dashboard module directly.
-        from src.utils.logging_setup import setup_logging
         from beast_mode_bot import BeastModeBot
+        from src.utils.logging_setup import setup_logging
 
         setup_logging(log_level="INFO")
         bot = BeastModeBot(live_mode=False, dashboard_mode=True)
@@ -193,8 +315,7 @@ def cmd_status(args: argparse.Namespace) -> None:
             positions_resp = await client.get_positions()
             event_positions = positions_resp.get("event_positions", [])
             active_positions = [
-                p for p in event_positions
-                if float(p.get("event_exposure_dollars", "0")) > 0
+                p for p in event_positions if float(p.get("event_exposure_dollars", "0")) > 0
             ]
 
             # Display
@@ -250,6 +371,7 @@ def cmd_scores(args: argparse.Namespace) -> None:
 
     async def _scores():
         from src.strategies.category_scorer import CategoryScorer
+
         scorer = CategoryScorer()
         await scorer.initialize()
         scores = await scorer.get_all_scores()
@@ -281,14 +403,16 @@ def cmd_history(args: argparse.Namespace) -> None:
             db.row_factory = aiosqlite.Row
 
             # Overall stats
-            cursor = await db.execute("""
+            cursor = await db.execute(
+                """
                 SELECT
                     COUNT(*) as total,
                     SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
                     SUM(pnl) as total_pnl,
                     AVG(pnl) as avg_pnl
                 FROM trade_logs
-            """)
+            """
+            )
             overview = await cursor.fetchone()
 
             print("=" * 70)
@@ -305,7 +429,8 @@ def cmd_history(args: argparse.Namespace) -> None:
             print()
 
             # Category breakdown
-            cursor = await db.execute("""
+            cursor = await db.execute(
+                """
                 SELECT
                     strategy as category,
                     COUNT(*) as trades,
@@ -314,7 +439,8 @@ def cmd_history(args: argparse.Namespace) -> None:
                 FROM trade_logs
                 GROUP BY strategy
                 ORDER BY total_pnl DESC
-            """)
+            """
+            )
             cats = await cursor.fetchall()
 
             if cats:
@@ -330,18 +456,22 @@ def cmd_history(args: argparse.Namespace) -> None:
                 print()
 
             # Recent trades
-            cursor = await db.execute(f"""
+            cursor = await db.execute(
+                f"""
                 SELECT market_id, side, entry_price, exit_price, quantity, pnl,
                        entry_timestamp, strategy
                 FROM trade_logs
                 ORDER BY entry_timestamp DESC
                 LIMIT {limit}
-            """)
+            """
+            )
             trades = await cursor.fetchall()
 
             if trades:
                 print(f"  Recent {limit} trades:")
-                print(f"  {'Market':<28} {'Side':>4} {'Entry':>6} {'Exit':>6} {'Qty':>4} {'P&L':>8} {'Category'}")
+                print(
+                    f"  {'Market':<28} {'Side':>4} {'Entry':>6} {'Exit':>6} {'Qty':>4} {'P&L':>8} {'Category'}"
+                )
                 print(f"  {'-'*28} {'-'*4} {'-'*6} {'-'*6} {'-'*4} {'-'*8} {'-'*12}")
                 for t in trades:
                     ts = (t["entry_timestamp"] or "")[:10]
@@ -353,12 +483,16 @@ def cmd_history(args: argparse.Namespace) -> None:
                     )
 
             # Blocked trades summary
-            cursor2 = await db.execute("""
+            cursor2 = await db.execute(
+                """
                 SELECT COUNT(*) FROM blocked_trades
-            """)
+            """
+            )
             r2 = await cursor2.fetchone()
             if r2 and r2[0]:
-                print(f"\n  ⛔ {r2[0]} trades blocked by portfolio enforcer (use 'python cli.py health' for details)")
+                print(
+                    f"\n  ⛔ {r2[0]} trades blocked by portfolio enforcer (use 'python cli.py health' for details)"
+                )
 
             print("=" * 70)
 
@@ -401,12 +535,12 @@ def cmd_close_all(args: argparse.Namespace) -> None:
 
     async def _close() -> None:
         from src.clients.kalshi_client import KalshiClient
+
         client = KalshiClient()
         try:
             positions_resp = await client.get_positions()
             market_positions = [
-                p for p in positions_resp.get("market_positions", [])
-                if p.get("position", 0) != 0
+                p for p in positions_resp.get("market_positions", []) if p.get("position", 0) != 0
             ]
 
             if not market_positions:
@@ -420,7 +554,7 @@ def cmd_close_all(args: argparse.Namespace) -> None:
             failed = 0
             for pos in market_positions:
                 ticker = pos["ticker"]
-                contracts = pos["position"]            # signed: + YES, - NO
+                contracts = pos["position"]  # signed: + YES, - NO
                 side = "yes" if contracts > 0 else "no"
                 quantity = abs(contracts)
 
@@ -540,6 +674,7 @@ def cmd_health(args: argparse.Namespace) -> None:
 
     # 2. Required environment variables
     from dotenv import load_dotenv
+
     load_dotenv()
 
     for var, placeholder in (
@@ -555,6 +690,7 @@ def cmd_health(args: argparse.Namespace) -> None:
     # 3. Kalshi API connection
     async def _check_api() -> None:
         from src.clients.kalshi_client import KalshiClient
+
         client = KalshiClient()
         try:
             balance_resp = await client.get_balance()
@@ -589,6 +725,7 @@ def cmd_health(args: argparse.Namespace) -> None:
 
         async def _check_db() -> None:
             from src.utils.database import DatabaseManager
+
             db_manager = DatabaseManager()
             await db_manager.initialize()
             ok("Database initialization", str(db_path))
@@ -599,7 +736,10 @@ def cmd_health(args: argparse.Namespace) -> None:
 
     # 5. Python version
     if sys.version_info >= (3, 12):
-        ok("Python version", f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+        ok(
+            "Python version",
+            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        )
     else:
         fail("Python version", f"requires >=3.12, found {sys.version}")
 
@@ -620,6 +760,7 @@ def cmd_health(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -684,10 +825,28 @@ def build_parser() -> argparse.ArgumentParser:
         dest="safe_compounder",
         help="Safe Compounder: NO-side only, edge-based, near-certain outcomes",
     )
+    strategy_group.add_argument(
+        "--market-making",
+        action="store_true",
+        dest="market_making",
+        help="Market making: quote both sides of the book and earn the spread",
+    )
+    strategy_group.add_argument(
+        "--quick-flip",
+        action="store_true",
+        dest="quick_flip",
+        help="Quick flip scalping: short-horizon momentum entries and exits",
+    )
+    strategy_group.add_argument(
+        "--btc-ladder",
+        action="store_true",
+        dest="btc_ladder",
+        help="BTC ladder: trade only when live spot and Kalshi's BTC ladder disagree",
+    )
     p_run.add_argument(
         "--loop",
         action="store_true",
-        help="Re-run the strategy continuously (only honored by --safe-compounder today)",
+        help="Re-run the strategy continuously",
     )
     p_run.add_argument(
         "--interval",
@@ -786,6 +945,7 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     parser = build_parser()

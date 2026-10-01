@@ -293,6 +293,31 @@ class LiveBroker:
         return cancelled
 
 
+def should_trade_live() -> bool:
+    """True only when live trading is permitted by BOTH switches.
+
+    Three strategies gated their order placement on
+    `settings.trading.live_trading_enabled`, which reads the LIVE_TRADING_ENABLED
+    environment variable and knows nothing about the dashboard's persisted mode.
+    That meant the DRY/LIVE switch on the page did not actually govern them: the
+    safety came from an unrelated env var, and flipping the dashboard to LIVE
+    would have left them in DRY while the page claimed otherwise.
+
+    Requiring both is fail-safe in the direction that matters - the dashboard
+    saying DRY always wins, so no env var mistake can start trading behind the
+    operator's back.
+    """
+    import os
+
+    from src.utils.database import _resolve_current_mode
+
+    env_allows = os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
+    if not env_allows:
+        return False
+    db_path = os.environ.get("DB_PATH", "trading_system.db")
+    return _resolve_current_mode(db_path) == "live"
+
+
 def broker_for_mode(mode: str, *, kalshi_client: Any = None, mode_manager: Any = None) -> Any:
     """Pick the broker. The single decision point for DRY vs LIVE.
 

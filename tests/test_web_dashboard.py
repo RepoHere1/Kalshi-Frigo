@@ -6,6 +6,7 @@ listener, and config saves corrupting typed settings.
 """
 import asyncio
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -1370,3 +1371,308 @@ async def _db_many_insert(sql: str) -> None:
     async with aiosqlite.connect(wd.DB_PATH) as conn:
         await conn.execute(sql)
         await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Strategy cards
+#
+# Every strategy must have a card, its own persistent curve, and a detail view.
+# The alias map matters because strategies write their own names into
+# trade_logs.strategy (quick_flip_scalping, directional_trading), which are not
+# the names of the buttons - without it every card reads "unattributed".
+# ---------------------------------------------------------------------------
+def _seed_cards(client):
+    """Closes and open positions spread across several strategy names."""
+    _db()
+
+    async def seed():
+        async with aiosqlite.connect(wd.DB_PATH) as conn:
+            rows = [
+                # (strategy, pnl, mode)
+                ("directional_trading", 1.00, "dry"),
+                ("directional_trading", 2.00, "dry"),
+                ("directional_trading", -0.50, "dry"),
+                ("quick_flip_scalping", 0.75, "dry"),
+                ("safe_compounder", -1.25, "dry"),
+                ("market_making", 0.25, "dry"),
+                # A LIVE close must not leak into the DRY cards.
+                ("ai_directional", 99.00, "live"),
+            ]
+            for i, (strategy, pnl, mode) in enumerate(rows):
+                await conn.execute(
+                    "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
+                    " quantity, pnl, entry_timestamp, exit_timestamp, rationale,"
+                    " strategy, mode) VALUES (?, 'yes', 0.40, 0.45, 5, ?,"
+                    " '2026-01-01T00:00:00', ?, 'card test', ?, ?)",
+                    (f"KXCARD{i}", pnl, f"2026-01-0{i + 1}T0{i}:00:00", strategy, mode),
+                )
+            await conn.execute(
+                "INSERT INTO positions (market_id, side, entry_price, quantity,"
+                " timestamp, live, status, strategy, mode)"
+                " VALUES ('KXOPEN', 'YES', 0.30, 12, '2026-01-01T00:00:00', 0,"
+                " 'open', 'market_making', 'dry')"
+            )
+            await conn.execute(
+                "INSERT INTO positions (market_id, side, entry_price, quantity,"
+                " timestamp, live, status, strategy, mode)"
+                " VALUES ('KXLIVEOPEN', 'YES', 0.30, 12, '2026-01-01T00:00:00', 1,"
+                " 'open', 'ai_directional', 'live')"
+            )
+            await conn.commit()
+
+    asyncio.run(seed())
+
+
+def _cards(client):
+    return {c["name"]: c for c in client.get("/api/snapshot").get_json()["strategy_cards"]}
+
+
+def test_every_strategy_has_a_card(client):
+    _seed_cards(client)
+    cards = _cards(client)
+    assert set(cards) == set(wd.strategy_state), "a strategy has no card"
+
+
+def test_every_strategy_runs_its_own_command(client):
+    """No two buttons may run the same process - that was how two fake
+    'strategies' ended up being one bot."""
+    _seed_cards(client)
+    cards = _cards(client)
+    assert set(cards) == set(wd.STRATEGY_COMMANDS), "a strategy has no command"
+    commands = {c["name"]: c["command"] for c in cards.values()}
+    assert len(set(commands.values())) == len(commands), "two strategies share a command"
+
+
+def test_cards_alias_strategy_names(client):
+    _seed_cards(client)
+    cards = _cards(client)
+    # "directional_trading" is what decide.py writes; the button is ai_directional.
+    assert cards["ai_directional"]["trades"] == 3
+    assert cards["ai_directional"]["realized"] == 2.5
+    assert cards["quick_flip"]["trades"] == 1
+    assert cards["quick_flip"]["realized"] == 0.75
+    assert cards["safe_compounder"]["trades"] == 1
+    assert cards["beast_mode"]["trades"] == 0
+
+
+def test_card_curve_is_cumulative_and_persistent(client):
+    _seed_cards(client)
+    curve = _cards(client)["ai_directional"]["equity"]
+    # Three closes: +1.00, +2.00, -0.50 -> 1.00, 3.00, 2.50
+    assert curve["pnl"] == [1.0, 3.0, 2.5]
+    assert len(curve["labels"]) == 3
+
+
+def test_card_shows_only_the_current_book(client):
+    _seed_cards(client)
+    snap = client.get("/api/snapshot").get_json()
+    assert snap["book"] == "dry"
+    # The +99.00 LIVE close and the LIVE open position must not appear.
+    assert _cards(client)["ai_directional"]["realized"] == 2.5
+    assert _cards(client)["ai_directional"]["open_positions"] == 0
+
+
+def test_card_counts_open_positions_per_strategy(client):
+    _seed_cards(client)
+    card = _cards(client)["market_making"]
+    assert card["open_positions"] == 1
+    assert card["deployed"] == 3.6  # 12 contracts at $0.30
+
+
+def test_card_reports_its_own_command(client):
+    _seed_cards(client)
+    cards = _cards(client)
+    # Each strategy must run a distinct process, not fall back to one loop.
+    commands = {c["name"]: c["command"] for c in cards.values()}
+    assert len(set(commands.values())) == len(commands), "two strategies share a command"
+    assert "--market-making" in commands["market_making"]
+    assert "--quick-flip" in commands["quick_flip"]
+    # A strategy that runs once and exits must not report itself as running.
+    for cmd in commands.values():
+        assert "--loop" in cmd or "--beast" in cmd
+
+
+def test_index_renders_one_card_per_strategy(client):
+    _seed_cards(client)
+    html = client.get("/").get_data(as_text=True)
+    for name in wd.strategy_state:
+        assert f'id="card-{name}"' in html
+        assert f'id="spark-{name}"' in html
+    assert "Start all in DRY" in html
+
+
+def test_strategy_detail_returns_that_strategy_only(client):
+    _seed_cards(client)
+    d = client.get("/api/strategy/ai_directional").get_json()
+    assert d["book"] == "dry"
+    assert d["strategy"]["trades"] == 3
+    assert len(d["trades"]) == 3
+    assert {t["market_id"] for t in d["trades"]} == {"KXCARD0", "KXCARD1", "KXCARD2"}
+    assert d["strategy"]["equity"]["pnl"] == [1.0, 3.0, 2.5]
+
+
+def test_strategy_detail_excludes_other_books_and_strategies(client):
+    _seed_cards(client)
+    d = client.get("/api/strategy/quick_flip").get_json()
+    assert d["strategy"]["trades"] == 1
+    assert all(t["market_id"] != "KXCARD0" for t in d["trades"])
+    assert d["positions"] == []
+
+
+def test_strategy_detail_404s_for_unknown(client):
+    _seed_cards(client)
+    assert client.get("/api/strategy/not_a_strategy").status_code == 404
+
+
+def test_strategy_detail_lists_open_positions_and_logs(client):
+    _seed_cards(client)
+    wd.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    (wd.LOG_DIR / "strategy_market_making.log").write_text("cycle 1\ncycle 2\n", encoding="utf-8")
+    d = client.get("/api/strategy/market_making").get_json()
+    assert [p["market_id"] for p in d["positions"]] == ["KXOPEN"]
+    assert d["logs"] == ["cycle 1", "cycle 2"]
+
+
+def test_cards_exist_on_an_empty_database(client):
+    """No closes yet must still yield a card per strategy with an explicit empty state."""
+    cards = _cards(client)
+    assert len(cards) == len(wd.strategy_state)
+    for card in cards.values():
+        assert card["trades"] == 0
+        assert (
+            card["equity"]["pnl"] == []
+        )  # ---------------------------------------------------------------------------
+
+
+# Truthfulness: DRY must never report the real account, and a strategy's state
+# pill must reflect the OS rather than the flag the request that started it
+# happened to set.
+# ---------------------------------------------------------------------------
+def _seed_two_books():
+    """One DRY position/trade and one LIVE position/trade for the same strategy."""
+    _db()
+
+    async def seed():
+        async with aiosqlite.connect(wd.DB_PATH) as conn:
+            await conn.execute(
+                "INSERT INTO positions (market_id, side, entry_price, quantity,"
+                " timestamp, live, status, strategy, mode)"
+                " VALUES ('KXDRYPOS', 'YES', 0.40, 10, '2026-01-01T00:00:00', 0,"
+                " 'open', 'ai_directional', 'dry')"
+            )
+            await conn.execute(
+                "INSERT INTO positions (market_id, side, entry_price, quantity,"
+                " timestamp, live, status, strategy, mode)"
+                " VALUES ('KXLIVEPOS', 'YES', 0.60, 20, '2026-01-01T00:00:00', 1,"
+                " 'open', 'ai_directional', 'live')"
+            )
+            for mid, pnl, mode in (("KXDRYTRD", 1.0, "dry"), ("KXLIVETRD", 50.0, "live")):
+                await conn.execute(
+                    "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
+                    " quantity, pnl, entry_timestamp, exit_timestamp, rationale,"
+                    " strategy, mode) VALUES (?, 'yes', 0.40, 0.45, 5, ?,"
+                    " '2026-01-01T00:00:00', '2026-01-02T00:00:00', 'book',"
+                    " 'ai_directional', ?)",
+                    (mid, pnl, mode),
+                )
+            await conn.commit()
+
+    asyncio.run(seed())
+
+
+def test_dry_book_excludes_live_rows(client):
+    """The DRY panel once summed every row regardless of book, so it reported the
+    real Kalshi account's exposure and realized P&L under a DRY heading."""
+    from src.utils.mode import TradingMode
+
+    _seed_two_books()
+    dry = asyncio.run(TradingMode(db_path=wd.DB_PATH).dry_account())
+    assert dry["deployed"] == 4.0, "DRY deployed must be the DRY position only"
+    assert dry["open_positions"] == 1
+    assert dry["realized"] == 1.0, "DRY realized must exclude the LIVE close"
+    assert dry["closed_trades"] == 1
+    assert dry["equity"] == dry["cash"] + 4.0
+
+
+def test_live_book_excludes_dry_rows(client):
+    from src.utils.mode import TradingMode
+
+    _seed_two_books()
+    live = asyncio.run(TradingMode(db_path=wd.DB_PATH).live_account())
+    assert live["deployed"] == 12.0  # 20 contracts at $0.60
+    assert live["open_positions"] == 1
+    assert live["realized"] == 50.0
+    assert live["closed_trades"] == 1
+
+
+def test_mode_payload_reports_both_books_separately(client):
+    _seed_two_books()
+    d = client.get("/api/mode").get_json()
+    assert d["mode"] == "dry"
+    assert d["dry"]["realized"] == 1.0
+    assert d["live"]["realized"] == 50.0
+
+
+def test_strategy_state_reads_the_database_not_the_request_flag(client, monkeypatch):
+    """A pid recorded by another request - or another worker - must be honoured."""
+    _db()
+    from src.utils.strategy_runtime import StrategyRuntime
+
+    store = StrategyRuntime(db_path=wd.DB_PATH)
+    # A pid that is certainly alive: this very test process.
+    asyncio.run(store.record_start("quick_flip", os.getpid(), "paper", "cli.py run --quick-flip"))
+
+    # Wipe the in-memory flag, as a fresh worker or a redeploy would.
+    wd.strategy_state["quick_flip"].update({"running": False, "pid": None})
+
+    recorded = wd._recorded_state()
+    assert recorded["quick_flip"]["pid"] == os.getpid()
+    assert wd.strategy_state["quick_flip"]["running"] is True
+    assert "quick_flip" in wd._running_strategies()
+    snap = client.get("/api/snapshot").get_json()
+    cards = {c["name"]: c for c in snap["strategy_cards"]}
+    assert cards["quick_flip"]["running"] is True
+    assert cards["quick_flip"]["pid"] == os.getpid()
+
+
+def test_strategy_state_records_why_a_dead_strategy_stopped(client):
+    """A dead pid must read 'stopped' with a reason, not sit silently at zero."""
+    _db()
+    from src.utils.strategy_runtime import StrategyRuntime
+
+    store = StrategyRuntime(db_path=wd.DB_PATH)
+    # A pid that cannot exist, so the liveness probe must fail.
+    asyncio.run(store.record_start("market_making", 999_999_999, "paper", "cli.py run"))
+    wd.strategy_state["market_making"].update({"running": True, "pid": 999_999_999})
+
+    wd._recorded_state()
+    st = wd.strategy_state["market_making"]
+    assert st["running"] is False
+    assert st["pid"] is None
+    assert "exited" in (st["stop_reason"] or "")
+
+    # The reason must reach the page so the pill is never ambiguous.
+    cards = {c["name"]: c for c in client.get("/api/snapshot").get_json()["strategy_cards"]}
+    assert "exited" in cards["market_making"]["stop_reason"]
+
+
+def test_strategy_state_is_empty_before_anything_runs(client):
+    """Never started must be distinguishable from started-and-stopped."""
+    _db()
+    wd._recorded_state()
+    cards = {c["name"]: c for c in client.get("/api/snapshot").get_json()["strategy_cards"]}
+    for card in cards.values():
+        assert card["running"] is False
+        assert card["stop_reason"] == ""
+
+
+def test_pid_alive_never_signals_the_process():
+    """The Windows-safe probe must not terminate what it is asked about."""
+    from src.utils.strategy_runtime import pid_alive
+
+    assert pid_alive(os.getpid()) is True
+    assert pid_alive(None) is False
+    assert pid_alive(0) is False
+    assert pid_alive(999_999_999) is False
+    # Still alive after being probed - the regression that matters.
+    assert pid_alive(os.getpid()) is True

@@ -128,47 +128,89 @@ class TradingMode:
     # DRY account
     # ------------------------------------------------------------------
     @staticmethod
-    async def _scalar(conn: Any, sql: str) -> Any:
+    async def _scalar(conn: Any, sql: str, params: Optional[List[Any]] = None) -> Any:
         """First column of the first row, or None if the table does not exist.
 
         `positions` and `trade_logs` are created by DatabaseManager, not here,
         so on a brand-new database this module can legitimately run first.
         """
         try:
-            cur = await conn.execute(sql)
+            cur = await conn.execute(sql, tuple(params or ()))
             row = await cur.fetchone()
             return row[0] if row else None
         except Exception:  # noqa: BLE001 - missing table is an expected state
             return None
 
-    async def dry_account(self) -> Dict[str, Any]:
-        """Cash, equity and realized/unrealized split for the simulated book."""
+    async def book_account(self, mode: str) -> Dict[str, Any]:
+        """Cash, equity and the realized/unrealized split for one book.
+
+        Every query is scoped to the book's own rows. This used to sum *every*
+        open position and *every* closed trade regardless of which book they
+        belonged to, so the DRY panel reported the real Kalshi account's
+        exposure and realized P&L under a DRY heading - the exact confusion the
+        mode switch exists to prevent. `live = 0` is the historical marker for a
+        simulated row, so both the new `mode` column and the old flag are
+        honoured for rows written before the migration.
+        """
+        mode = MODE_LIVE if str(mode).strip().lower() == MODE_LIVE else MODE_DRY
+        book_filter = (
+            "COALESCE(NULLIF(mode, ''), 'dry') = ?"
+            if mode == MODE_DRY
+            else "COALESCE(NULLIF(mode, ''), 'dry') = 'live'"
+        )
+        params: List[Any] = [MODE_DRY] if mode == MODE_DRY else []
+
         async with self._conn() as conn:
             starting = await self._get(conn, _START_KEY)
             cash = await self._get(conn, _CASH_KEY)
             starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
             cash_f = float(cash) if cash is not None else starting_f
 
-            # Cost basis of still-open simulated positions.
             deployed = float(
                 await self._scalar(
                     conn,
                     "SELECT COALESCE(SUM(quantity * entry_price), 0.0) FROM positions"
-                    " WHERE status = 'open'",
+                    f" WHERE status = 'open' AND {book_filter}",
+                    params,
                 )
                 or 0.0
             )
-
-            realized = float(
-                await self._scalar(conn, "SELECT COALESCE(SUM(pnl), 0.0) FROM trade_logs") or 0.0
+            open_count = int(
+                await self._scalar(
+                    conn,
+                    f"SELECT COUNT(*) FROM positions WHERE status = 'open' AND {book_filter}",
+                    params,
+                )
+                or 0
             )
-            closed = int(await self._scalar(conn, "SELECT COUNT(*) FROM trade_logs") or 0)
-            ledger_rows = int(await self._scalar(conn, "SELECT COUNT(*) FROM dry_ledger") or 0)
+            realized = float(
+                await self._scalar(
+                    conn,
+                    f"SELECT COALESCE(SUM(pnl), 0.0) FROM trade_logs WHERE {book_filter}",
+                    params,
+                )
+                or 0.0
+            )
+            closed = int(
+                await self._scalar(
+                    conn, f"SELECT COUNT(*) FROM trade_logs WHERE {book_filter}", params
+                )
+                or 0
+            )
+            ledger_rows = (
+                int(await self._scalar(conn, "SELECT COUNT(*) FROM dry_ledger") or 0)
+                if mode == MODE_DRY
+                else 0
+            )
 
+        # The live book has no simulated cash ledger: its cash is the real
+        # Kalshi balance, which the caller supplies from the API.
         return {
+            "book": mode,
             "starting_balance": round(starting_f, 2),
             "cash": round(cash_f, 2),
             "deployed": round(deployed, 2),
+            "open_positions": open_count,
             "equity": round(cash_f + deployed, 2),
             "realized": round(realized, 2),
             "total_pnl": round(cash_f - starting_f + realized, 2),
@@ -178,6 +220,14 @@ class TradingMode:
             if starting_f
             else 0.0,
         }
+
+    async def dry_account(self) -> Dict[str, Any]:
+        """Cash, equity and realized/unrealized split for the simulated book."""
+        return await self.book_account(MODE_DRY)
+
+    async def live_account(self) -> Dict[str, Any]:
+        """The real book, from local rows only - no Kalshi balance here."""
+        return await self.book_account(MODE_LIVE)
 
     async def set_dry_cash(self, amount: float) -> None:
         """Reset the simulated cash balance (top-up / reset to $300)."""

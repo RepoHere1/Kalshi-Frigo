@@ -68,6 +68,7 @@ dashboard_state = {
     "events": [],
     "db_positions_count": 0,
     "kalshi_position_count": 0,
+    "market": {},
 }
 
 # Strategy control state
@@ -77,6 +78,66 @@ strategy_state = {
     "beast_mode": {"running": False, "pid": None, "mode": "paper"},
     "market_making": {"running": False, "pid": None, "mode": "paper"},
     "quick_flip": {"running": False, "pid": None, "mode": "paper"},
+    "btc_ladder": {"running": False, "pid": None, "mode": "paper"},
+}
+
+# The command each strategy is actually run with. Every one is a distinct
+# process and writes its own log.
+#
+# Two of these used to be fiction. `market_making` and `quick_flip` had no CLI
+# entry point, so their buttons spawned the AI directional loop: two "strategies"
+# on the page were the same bot twice, with one shared log. And `safe_compounder`
+# ran a single pass and exited, so its button reported "started" for a process
+# that was already gone. `--loop` is what makes a strategy continuous, so it is
+# now part of the command rather than an afterthought.
+STRATEGY_COMMANDS: Dict[str, List[str]] = {
+    "ai_directional": ["cli.py", "run", "--paper", "--loop", "--interval", "300"],
+    "safe_compounder": [
+        "cli.py",
+        "run",
+        "--safe-compounder",
+        "--paper",
+        "--loop",
+        "--interval",
+        "300",
+    ],
+    "beast_mode": ["cli.py", "run", "--beast", "--paper"],
+    "market_making": [
+        "cli.py",
+        "run",
+        "--market-making",
+        "--paper",
+        "--loop",
+        "--interval",
+        "180",
+    ],
+    "quick_flip": ["cli.py", "run", "--quick-flip", "--paper", "--loop", "--interval", "120"],
+    "btc_ladder": ["cli.py", "run", "--btc-ladder", "--paper", "--loop", "--interval", "0"],
+}
+
+# `trade_logs.strategy` and `positions.strategy` are written by the strategies
+# themselves and are not consistent with the dashboard's button names. Without
+# this map every card would read "unattributed" except ai_directional.
+STRATEGY_ALIASES = {
+    "ai_directional": "ai_directional",
+    "ai directional": "ai_directional",
+    "directional_trading": "ai_directional",
+    "directional": "ai_directional",
+    "safe_compounder": "safe_compounder",
+    "safe compounding": "safe_compounder",
+    "safe_compounding": "safe_compounder",
+    "beast_mode": "beast_mode",
+    "beast": "beast_mode",
+    "market_making": "market_making",
+    "market making": "market_making",
+    "market_maker": "market_making",
+    "quick_flip": "quick_flip",
+    "quick_flip_scalping": "quick_flip",
+    "quick flip": "quick_flip",
+    "quick_flip_scalping_strategy": "quick_flip",
+    "btc_ladder": "btc_ladder",
+    "btc ladder": "btc_ladder",
+    "ladder": "btc_ladder",
 }
 
 # Alert webhooks
@@ -434,6 +495,14 @@ STRATEGY_DOCS = {
         "Quick flip scalping",
         "Short-horizon strategy that enters on momentum and exits on a small " "favourable move.",
     ),
+    "btc_ladder": (
+        "BTC ladder",
+        "Compares the live Coinbase BTC spot feed against Kalshi's own BTC "
+        "price-ladder quotes and trades only when they disagree by more than the "
+        "configured edge. $5 per clip, one position at a time. Kalshi's BTC series "
+        "settles hourly - there is no 15-minute up/down contract - so the ladder is "
+        "the real shape of this trade.",
+    ),
 }
 
 
@@ -491,6 +560,46 @@ def _monitor_loop():
         time.sleep(interval)
 
 
+def _market_data_loop():
+    """Own the live BTC feeds for the life of the process.
+
+    The feeds are websocket-driven and therefore async, while the dashboard's
+    handlers are synchronous Flask routes. Rather than opening a loop per
+    request - which would tear down the socket on every poll - one thread holds a
+    single event loop and one long-lived connection, and the routes read the
+    cached payload it produces.
+    """
+    import asyncio
+
+    from src.jobs.market_data import MarketDataHub
+
+    hub = MarketDataHub()
+
+    async def _run() -> None:
+        await hub.start()
+        while True:
+            try:
+                dashboard_state["market"] = hub.chart_payload()
+            except Exception as e:  # noqa: BLE001 - a bad payload must not kill the feed
+                _push_error(f"Market data: {e}")
+            await asyncio.sleep(2)
+
+    def _thread_main() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_run())
+        except Exception as e:  # noqa: BLE001
+            _push_error(f"Market data thread: {e}")
+        finally:
+            try:
+                loop.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    threading.Thread(target=_thread_main, daemon=True, name="market-data").start()
+
+
 def _log_tail_loop():
     """Tail the newest log file and buffer lines for the log viewer."""
     seen = set()
@@ -523,14 +632,120 @@ def _bots_payload() -> List[Dict[str, Any]]:
     return [
         {
             "name": name,
-            "running": st["running"],
-            "pid": st["pid"],
+            "running": bool(st.get("running")),
+            "pid": st.get("pid"),
             "mode": st.get("mode", "paper"),
             "label": STRATEGY_DOCS.get(name, ("", ""))[0],
             "description": STRATEGY_DOCS.get(name, ("", ""))[1],
+            "started_at": st.get("started_at"),
+            "stop_reason": st.get("stop_reason") or "",
         }
         for name, st in strategy_state.items()
     ]
+
+
+def _strategy_bucket(name: Optional[str]) -> str:
+    """Map whatever a trade log recorded onto one of the five buttons."""
+    key = (name or "").strip().lower()
+    return STRATEGY_ALIASES.get(key, key or "unattributed")
+
+
+def _current_book_mode() -> str:
+    """Which book's numbers the page is showing: 'dry' or 'live'."""
+    try:
+        from src.utils.mode import run
+
+        return str(run(_mode_manager().current()))
+    except Exception:
+        return "dry"
+
+
+def _strategy_cards(
+    curve_rows: List[Dict[str, Any]],
+    position_rows: List[Dict[str, Any]],
+    book: str,
+) -> List[Dict[str, Any]]:
+    """One card per strategy: headline stats plus its own cumulative P&L curve.
+
+    Everything is derived from persisted rows (`trade_logs`, `positions`), never
+    from in-process counters, so a strategy's chart still has its history after a
+    redeploy. A card with no closes yet renders an explicit empty state instead
+    of a flat zero line that reads like a real result.
+    """
+    cards: Dict[str, Dict[str, Any]] = {}
+    for name, st in strategy_state.items():
+        label, description = STRATEGY_DOCS.get(name, (name, ""))
+        cards[name] = {
+            "name": name,
+            "label": label,
+            "description": description,
+            "running": bool(st.get("running")),
+            "pid": st.get("pid"),
+            "mode": st.get("mode", "paper"),
+            "command": " ".join(STRATEGY_COMMANDS.get(name, [])),
+            "started_at": st.get("started_at"),
+            # Shown on the card so "stopped" is never ambiguous about whether the
+            # strategy ever ran, or how it ended.
+            "stop_reason": st.get("stop_reason") or "",
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "realized": 0.0,
+            "best": 0.0,
+            "worst": 0.0,
+            "open_positions": 0,
+            "deployed": 0.0,
+            "first_trade": None,
+            "last_trade": None,
+            "equity": {"labels": [], "pnl": []},
+        }
+
+    # Cumulative P&L per strategy over the book's own closes.
+    running: Dict[str, float] = {}
+    for row in curve_rows:
+        if _resolve_book(row.get("mode")) != book:
+            continue
+        name = _strategy_bucket(row.get("strategy"))
+        card = cards.get(name)
+        if card is None:
+            continue  # a close from a strategy this build no longer exposes
+        pnl = float(row.get("pnl") or 0.0)
+        running[name] = running.get(name, 0.0) + pnl
+        card["trades"] += 1
+        card["wins"] += 1 if pnl > 0 else 0
+        card["losses"] += 0 if pnl > 0 else 1
+        card["realized"] = round(running[name], 2)
+        card["best"] = max(card["best"], round(pnl, 2))
+        card["worst"] = min(card["worst"], round(pnl, 2))
+        stamp = str(row.get("exit_timestamp") or "")[:19]
+        if stamp:
+            card["first_trade"] = card["first_trade"] or stamp
+            card["last_trade"] = stamp
+            card["equity"]["labels"].append(stamp)
+            card["equity"]["pnl"].append(card["realized"])
+
+    for row in position_rows:
+        if _resolve_book(row.get("mode")) != book:
+            continue
+        card = cards.get(_strategy_bucket(row.get("strategy")))
+        if card is None:
+            continue
+        card["open_positions"] += 1
+        card["deployed"] = round(
+            card["deployed"] + float(row.get("quantity") or 0) * float(row.get("entry_price") or 0),
+            2,
+        )
+
+    for card in cards.values():
+        card["win_rate"] = (
+            round(100.0 * card["wins"] / card["trades"], 1) if card["trades"] else 0.0
+        )
+    return list(cards.values())
+
+
+def _resolve_book(value: Optional[str]) -> str:
+    """Normalize a stored book name. Anything unrecorded is a simulated row."""
+    return (value or "dry").strip().lower()
 
 
 def _config_payload() -> Dict[str, Any]:
@@ -593,9 +808,19 @@ _SQL_RECENT = (
     " ORDER BY exit_timestamp DESC LIMIT 25"
 )
 _SQL_EQUITY = "SELECT exit_timestamp, pnl FROM trade_logs ORDER BY exit_timestamp DESC LIMIT 200"
+# Every close, oldest first, so each strategy's own curve can be reconstructed.
+# This is the persistent backing for the per-strategy charts: the series is
+# rebuilt from the trade log rather than accumulated in memory, so it survives a
+# redeploy and grows without a background writer.
+_SQL_STRATEGY_CURVE = (
+    "SELECT COALESCE(NULLIF(strategy, ''), 'unattributed') AS strategy,"
+    " COALESCE(NULLIF(mode, ''), 'dry') AS mode,"
+    " exit_timestamp, pnl, market_id FROM trade_logs"
+    " ORDER BY COALESCE(exit_timestamp, entry_timestamp) ASC LIMIT 2000"
+)
 _SQL_POSITIONS = (
     "SELECT market_id, side, entry_price, quantity, strategy, stop_loss_price,"
-    " take_profit_price, status, timestamp FROM positions"
+    " take_profit_price, status, timestamp, mode FROM positions"
     " WHERE status = 'open' ORDER BY timestamp DESC"
 )
 
@@ -687,6 +912,7 @@ def _row_positions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "take_profit": r.get("take_profit_price"),
                 "status": r.get("status"),
                 "timestamp": str(r.get("timestamp") or ""),
+                "mode": r.get("mode") or "dry",
                 "source": "db",
             }
         )
@@ -779,11 +1005,14 @@ def build_snapshot() -> Dict[str, Any]:
             (_SQL_RECENT, ()),
             (_SQL_EQUITY, ()),
             (_SQL_POSITIONS, ()),
+            (_SQL_STRATEGY_CURVE, ()),
         ]
         + [(f"SELECT COUNT(*) AS n FROM {t}", ()) for t in DATA_TABLES]
     )
-    trades_r, open_r, dry_open_r, ai_r, llm_r, strat_r, recent_r, equity_r, pos_r = batch[:9]
-    counts = batch[9:]
+    trades_r, open_r, dry_open_r, ai_r, llm_r, strat_r, recent_r, equity_r, pos_r, curve_r = batch[
+        :10
+    ]
+    counts = batch[10:]
 
     # Equity curve is fetched newest-first; flip it so the chart reads left to right.
     equity_rows = list(reversed(equity_r))
@@ -825,6 +1054,8 @@ def build_snapshot() -> Dict[str, Any]:
     running = _running_strategies()
     errors: List[Dict[str, Any]] = cast(List[Dict[str, Any]], dashboard_state["errors"])
     events: List[Dict[str, Any]] = cast(List[Dict[str, Any]], dashboard_state["events"])
+    book = _current_book_mode()
+    cards = _strategy_cards(curve_r, pos_r, book)
 
     def _count(index: int) -> int:
         """Rows in a count result, tolerating a table that does not exist yet.
@@ -863,6 +1094,8 @@ def build_snapshot() -> Dict[str, Any]:
         "equity": {"labels": labels, "pnl": values},
         "bots": _bots_payload(),
         "running_count": len(running),
+        "book": book,
+        "strategy_cards": cards,
         "config": _config_payload(),
         "strategy_docs": [
             {
@@ -875,6 +1108,10 @@ def build_snapshot() -> Dict[str, Any]:
         "alerts": dict(alert_state),
         "mode": _safe_mode_payload(),
         "backups": _backup_status(),
+        "market": _market_context(),
+        "accounts": {
+            _current_book_mode(): _account_payload(_current_book_mode()),
+        },
         "logs": _read_log_tail(100) or list(log_buffer)[-100:],
         "errors": errors[-10:],
         "events": events[-8:],
@@ -899,6 +1136,18 @@ def _safe_mode_payload() -> Dict[str, Any]:
                 "cash": 300.0,
                 "deployed": 0.0,
                 "equity": 300.0,
+                "realized": 0.0,
+                "total_pnl": 0.0,
+                "closed_trades": 0,
+                "ledger_entries": 0,
+                "return_pct": 0.0,
+            },
+            "live": {
+                "starting_balance": 0.0,
+                "cash": 0.0,
+                "deployed": 0.0,
+                "open_positions": 0,
+                "equity": 0.0,
                 "realized": 0.0,
                 "total_pnl": 0.0,
                 "closed_trades": 0,
@@ -1010,24 +1259,28 @@ def _mode_payload() -> Dict[str, Any]:
     from src.utils.mode import MODE_DRY, MODE_LIVE, run
 
     mgr = _mode_manager()
+    mode = run(mgr.current())
     payload: Dict[str, Any] = {
-        "mode": run(mgr.current()),
+        "mode": mode,
         "token_set": token_required(),
+        # Both books are reported, always scoped to themselves. The page renders
+        # the one it is in, but a DRY view that merely *hid* the real account
+        # would still be one refactor away from showing it again.
         "dry": run(mgr.dry_account()),
+        "live": run(mgr.live_account()),
         "funding": {},
     }
     # Only the live path needs the network, so only probe it in LIVE mode.
-    if payload["mode"] == MODE_LIVE:
+    if mode == MODE_LIVE:
         payload["funding"] = run(mgr.funding(materialize_private_key()))
     else:
-        assert MODE_DRY
         payload["funding"] = {
             "connected": dashboard_state["has_kalshi_creds"],
             "balance": dashboard_state["balance"],
             "can_fund": bool(dashboard_state["balance"]),
             "reason": "",
         }
-    assert MODE_LIVE  # keeps the import meaningful for readers
+    assert MODE_DRY  # keeps the import meaningful for readers
     return payload
 
 
@@ -1166,7 +1419,17 @@ def dashboard():
     # write. That is an accepted trade for a single-operator dashboard; drop this
     # line and the controls fall back to prompting.
     snap["token"] = _configured_token()
-    return render_template_string(_TEMPLATE, s=snap)
+    # Context for the live-feed row. Best-effort by design: a feed that has not
+    # connected yet must still render a page, with its own honest empty state.
+    context = _market_context()
+    acct = _account_payload(_current_book_mode())
+    return render_template_string(
+        _TEMPLATE,
+        s=snap,
+        m={"spot": context["spot"], "kalshi": context["kalshi"]},
+        lead=context["lead"],
+        acct=acct,
+    )
 
 
 @app.route("/api/snapshot")
@@ -1288,6 +1551,7 @@ def api_stream():
 # 3. Strategy control panel
 @app.route("/api/strategies", methods=["GET"])
 def api_strategies():
+    _recorded_state()
     return jsonify(strategy_state)
 
 
@@ -1298,11 +1562,16 @@ _child_procs: Dict[int, "subprocess.Popen[Any]"] = {}
 
 
 def _stop_child(st):
-    """Stop a running strategy process: SIGTERM, then SIGKILL if it lingers."""
+    """Stop a running strategy process: SIGTERM, then SIGKILL if it lingers.
+
+    Returns the child's exit code when the OS will report it, so the page can
+    say what happened rather than just that it stopped.
+    """
     pid = st.get("pid")
     if not pid:
-        return
+        return None
     proc = _child_procs.get(pid)
+    code: Optional[int] = None
     if proc is not None:
         # Preferred path: the Popen object works identically on every platform.
         try:
@@ -1312,12 +1581,15 @@ def _stop_child(st):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
+            code = getattr(proc, "returncode", None)
         except (OSError, ValueError):
             pass
         _child_procs.pop(pid, None)
     else:
-        # No Popen reference (e.g. state restored after a restart); fall back to
-        # signals. signal.SIGKILL does not exist on Windows.
+        # No Popen reference (the process was started by another worker, or the
+        # dashboard restarted). Fall back to signals. SIGKILL does not exist on
+        # Windows, and on Windows signalling anything but CTRL_* terminates the
+        # target outright - which is what we want here anyway.
         import signal
 
         for sig in (getattr(signal, "SIGTERM", 15), getattr(signal, "SIGKILL", 9)):
@@ -1325,10 +1597,10 @@ def _stop_child(st):
                 os.kill(pid, sig)
             except (ProcessLookupError, PermissionError, OSError):
                 break
+            from src.utils.strategy_runtime import pid_alive as safe_pid_alive
+
             for _ in range(10):
-                try:
-                    os.kill(pid, 0)
-                except (ProcessLookupError, OSError):
+                if not safe_pid_alive(pid):
                     break
                 time.sleep(0.2)
             else:
@@ -1336,51 +1608,148 @@ def _stop_child(st):
             break
     st["running"] = False
     st["pid"] = None
+    return code
+
+
+def _runtime_store():
+    from src.utils.strategy_runtime import StrategyRuntime
+
+    return StrategyRuntime(db_path=str(DB_PATH))
+
+
+def _recorded_state() -> Dict[str, Dict[str, Any]]:
+    """Persisted strategy state, reconciled against the OS.
+
+    This is the source of truth for the Start/Stop pills. In-memory
+    `strategy_state` alone produced a page that said "stopped" for strategies
+    that were running, because the flag was written by whichever request started
+    the process and never learned what happened afterwards.
+    """
+    recorded = _run_async(_runtime_store().snapshot())
+    for name, st in strategy_state.items():
+        row = recorded.get(name) or {}
+        pid = row.get("pid")
+        if pid and not _pid_alive(pid):
+            # Died without us being told. Say so instead of implying it never ran.
+            _run_async(_runtime_store().record_stop(name, "exited on its own"))
+            st["pid"] = None
+            st["running"] = False
+            st["stop_reason"] = "exited on its own"
+            continue
+        st["pid"] = pid if pid else None
+        st["running"] = bool(pid)
+        st["started_at"] = row.get("started_at")
+        st["command"] = row.get("command")
+        st["stop_reason"] = row.get("stop_reason") or ""
+    return cast(Dict[str, Dict[str, Any]], recorded)
 
 
 def _pid_alive(pid):
     """True if a strategy process is still running.
 
-    Popen.poll() is authoritative and portable when we own the handle, so it is
-    checked first. os.kill(pid, 0) is only a safe existence probe on POSIX: on
-    Windows os.kill() maps to TerminateProcess for any signal other than the
-    CTRL_* events, so probing with 0 would kill the very process being checked.
+    Delegates to the runtime store so the check is platform-safe: on Windows
+    os.kill(pid, 0) would terminate the process being probed, and the Popen
+    handle only exists in the process that spawned it.
     """
+    from src.utils.strategy_runtime import pid_alive as safe_pid_alive
+
     if not pid:
         return False
     proc = _child_procs.get(pid)
     if proc is not None:
+        # Authoritative when we own the handle.
         return proc.poll() is None
-    if os.name == "nt":
-        return False  # no safe probe without the handle
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True  # exists, owned by another user
-    except (ProcessLookupError, OSError):
-        return False
-    return True
+    return safe_pid_alive(pid)
 
 
 def _running_strategies():
-    """Strategies whose process is actually alive.
+    """Names of strategies whose process is actually alive."""
+    _recorded_state()
+    return [name for name, st in strategy_state.items() if st.get("running")]
 
-    Reconciles the recorded flag against the OS, so a subprocess that crashed
-    stops being reported as running instead of lingering in the UI forever.
+
+@app.route("/api/strategy/<name>", methods=["GET"])
+def api_strategy_detail(name):
+    """Everything known about one strategy: its card, its book, its own closes.
+
+    Read-only and unauthenticated, like the rest of the read surface. The card
+    grid on the page is rendered from the same builder, so a card and its detail
+    view can never disagree about a number.
     """
-    names = []
-    for name, st in strategy_state.items():
-        if not st.get("pid"):
-            st["running"] = False
-            continue
-        if _pid_alive(st["pid"]):
-            names.append(name)
-        else:
-            _push_error(f"Strategy '{name}' exited unexpectedly (pid {st['pid']})")
-            st["running"] = False
-            st["pid"] = None
-            _child_procs.pop(st.get("pid", 0), None)
-    return names
+    if name not in strategy_state:
+        return jsonify({"error": f"Unknown strategy: {name}"}), 404
+
+    batch = _db_many(
+        [
+            (_SQL_STRATEGY_CURVE, ()),
+            (_SQL_POSITIONS, ()),
+            (_SQL_RECENT, ()),
+            # Not filtered in SQL: `strategy` is written by each strategy under
+            # its own name (quick_flip_scalping, directional_trading, ...), so an
+            # equality filter against the button name would match nothing. The
+            # alias map is applied in Python instead.
+            (
+                "SELECT market_id, side, entry_price, exit_price, quantity, pnl,"
+                " exit_timestamp, rationale, strategy, mode FROM trade_logs"
+                " ORDER BY COALESCE(exit_timestamp, entry_timestamp) DESC LIMIT 400",
+                (),
+            ),
+        ]
+    )
+    curve_r, pos_r, _recent_r, trades_r = batch
+
+    book = _current_book_mode()
+    cards = _strategy_cards(curve_r, pos_r, book)
+    card = next((c for c in cards if c["name"] == name), None)
+    if card is None:
+        return jsonify({"error": f"Unknown strategy: {name}"}), 404
+
+    def _mine(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [r for r in rows if _strategy_bucket(r.get("strategy")) == name]
+
+    def _in_book(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [r for r in rows if _resolve_book(r.get("mode")) == book]
+
+    closed = _in_book(_mine(trades_r))[:50]
+    for r in closed:
+        r["pnl"] = round(float(r.get("pnl") or 0.0), 2)
+        r["exit_timestamp"] = str(r.get("exit_timestamp") or "")[:19]
+
+    return jsonify(
+        {
+            "strategy": card,
+            "book": book,
+            "positions": [
+                {
+                    "market_id": r.get("market_id"),
+                    "side": r.get("side"),
+                    "entry_price": r.get("entry_price"),
+                    "quantity": r.get("quantity"),
+                    "stop_loss": r.get("stop_loss_price"),
+                    "take_profit": r.get("take_profit_price"),
+                    "opened": str(r.get("timestamp") or "")[:19],
+                }
+                for r in _in_book(_mine(pos_r))
+            ],
+            "trades": closed,
+            "logs": _strategy_log_tail(name),
+        }
+    )
+
+
+def _strategy_log_tail(name: str, lines: int = 60) -> List[str]:
+    """Tail the log this strategy's own process writes."""
+    path = LOG_DIR / f"strategy_{name}.log"
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 16384))
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    tail = [ln for ln in text.splitlines() if ln.strip()]
+    return tail[-lines:]
 
 
 @app.route("/api/strategy/<name>/toggle", methods=["POST"])
@@ -1399,10 +1768,13 @@ def api_strategy_toggle(name):
     if mode == "live" and not os.environ.get("KALSHI_API_KEY"):
         return jsonify({"error": "Live mode needs KALSHI_API_KEY configured"}), 400
 
-    if st["running"]:
-        _stop_child(st)
+    store = _runtime_store()
+    if st.get("running"):
+        code = _stop_child(st)
+        _run_async(store.record_stop(name, "stopped by operator"))
+        _recorded_state()
         _broadcast("strategy", {"name": name, "action": "stopped"})
-        return jsonify({"name": name, "running": False})
+        return jsonify({"name": name, "running": False, "exit_code": code})
 
     if mode == "live":
         return (
@@ -1434,16 +1806,9 @@ def api_strategy_toggle(name):
 
     # sys.executable guarantees the child uses the same interpreter (and venv)
     # as the dashboard, rather than whatever 'python' resolves to on PATH.
+    # Only paper commands are reachable: the live branch above returns 403.
     py = sys.executable or "python"
-    cmd = [py, "cli.py", "run", "--paper"]
-    if name == "safe_compounder":
-        cmd = [py, "cli.py", "run", "--safe-compounder", "--paper"]
-    elif name == "beast_mode":
-        cmd = [py, "cli.py", "run", "--beast", "--paper"]
-    elif name in ("market_making", "quick_flip"):
-        # No dedicated CLI entry point for these strategies yet; fall back to
-        # the AI directional loop so the button still does something real.
-        cmd = [py, "cli.py", "run", "--paper"]
+    cmd = [py, *STRATEGY_COMMANDS.get(name, STRATEGY_COMMANDS["ai_directional"])]
 
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1465,11 +1830,150 @@ def api_strategy_toggle(name):
     st["running"] = True
     st["pid"] = proc.pid
     st["mode"] = mode
+    # Persist before answering: the next request may be served by a different
+    # process, and a button that reports "started" for a process nobody can see
+    # is exactly the lie this store exists to remove.
+    _run_async(store.record_start(name, proc.pid, mode, " ".join(cmd[1:])))
     _broadcast("strategy", {"name": name, "action": "started", "pid": proc.pid})
     return jsonify({"name": name, "running": True, "pid": proc.pid})
 
 
 # 4. Charting data (P&L)
+_SQL_ACCOUNT_CURVE = (
+    "SELECT date(COALESCE(exit_timestamp, entry_timestamp)) AS day,"
+    " COALESCE(SUM(pnl), 0.0) AS pnl, COUNT(*) AS trades"
+    " FROM trade_logs WHERE {book} GROUP BY day ORDER BY day ASC LIMIT 90"
+)
+
+
+def _account_payload(mode: str) -> Dict[str, Any]:
+    """One account card's worth of data: today's curve plus trader-standard stats.
+
+    The curve is aggregated from `trade_logs` by day and rebuilt from the
+    database on every call, so it is persistent across restarts rather than an
+    in-memory buffer that a redeploy would erase. In DRY the book filter selects
+    simulated rows only, which is what keeps the DRY card honest.
+    """
+    from src.utils.mode import MODE_DRY
+
+    dry_book = mode == MODE_DRY
+    where = (
+        "COALESCE(NULLIF(mode, ''), 'dry') = 'dry'"
+        if dry_book
+        else ("COALESCE(NULLIF(mode, ''), 'dry') = 'live'")
+    )
+    curve_sql = _SQL_ACCOUNT_CURVE.format(book=where)
+    today_sql = (
+        "SELECT COALESCE(SUM(pnl), 0.0) AS pnl, COUNT(*) AS trades,"
+        " COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins"
+        f" FROM trade_logs WHERE {where} AND date(COALESCE(exit_timestamp,"
+        " entry_timestamp)) = date('now')"
+    )
+    curve_r, today_r = _db_many([(curve_sql, ()), (today_sql, ())])
+    today = today_r[0] if today_r else {}
+
+    running_pnl = 0.0
+    labels: List[str] = []
+    values: List[float] = []
+    for row in curve_r:
+        running_pnl += float(row.get("pnl") or 0.0)
+        labels.append(str(row.get("day") or ""))
+        values.append(round(running_pnl, 2))
+
+    today_pnl = round(float(today.get("pnl") or 0.0), 2)
+    trades_today = int(today.get("trades") or 0)
+    wins_today = int(today.get("wins") or 0)
+
+    if dry_book:
+        from src.utils.mode import run as mode_run
+
+        book = mode_run(_mode_manager().dry_account())
+        cash, equity = book["cash"], book["equity"]
+        starting = book["starting_balance"]
+        realized = book["realized"]
+        exposure = book["deployed"]
+        open_positions = book["open_positions"]
+        closed = book["closed_trades"]
+        wins = max(wins_today, 0)
+    else:
+        account = _kalshi_account()
+        cash = float(dashboard_state.get("balance") or 0.0)  # type: ignore[arg-type]
+        exposure = account["exposure"]
+        equity = round(cash + exposure, 2)
+        starting = 0.0
+        realized = round(float(today.get("pnl") or 0.0), 2)
+        open_positions = account["market_count"] + account["event_count"]
+        closed = int(today.get("trades") or 0)
+        wins = wins_today
+
+    return {
+        "book": "dry" if dry_book else "live",
+        "label": "DRY account (simulated)" if dry_book else "LIVE Kalshi account",
+        "cash": round(cash, 2),
+        "equity": round(equity, 2),
+        "starting_balance": round(starting, 2),
+        "return_pct": round(100.0 * (equity - starting) / starting, 2) if starting else 0.0,
+        "exposure": round(exposure, 2),
+        "open_positions": open_positions,
+        "realized_all_time": round(realized, 2),
+        "today": {
+            "pnl": today_pnl,
+            "trades": trades_today,
+            "wins": wins_today,
+            "losses": max(trades_today - wins_today, 0),
+            "win_rate": round(100.0 * wins_today / trades_today, 1) if trades_today else 0.0,
+            "avg": round(today_pnl / trades_today, 2) if trades_today else 0.0,
+        },
+        "closed_trades": closed,
+        "curve": {"labels": labels, "pnl": values},
+    }
+
+
+@app.route("/api/accounts", methods=["GET"])
+def api_accounts():
+    """Both account cards. Always both books, each scoped to itself."""
+    mode = _current_book_mode()
+    other = "live" if mode == "dry" else "dry"
+    return jsonify(
+        {
+            "current": mode,
+            "accounts": {mode: _account_payload(mode), other: _account_payload(other)},
+        }
+    )
+
+
+def _market_context() -> Dict[str, Any]:
+    """Live-feed context for the page, complete even before the socket connects.
+
+    Every key the template reads is always present. A partial dict made Jinja
+    raise on `lead.delta` during the first seconds after boot, which turned the
+    whole page into a 500 instead of a page with a waiting feed.
+    """
+    market = cast(Dict[str, Any], dashboard_state.get("market") or {})
+    lead = market.get("lead") or {}
+    return {
+        "spot": market.get("spot", {}),
+        "kalshi": market.get("kalshi", {"nearest": None}),
+        "lead": {
+            "spot": lead.get("spot"),
+            "implied_spot": lead.get("implied_spot"),
+            "delta": lead.get("delta"),
+            "usable": bool(lead.get("usable")),
+            "measured_at": lead.get("measured_at"),
+            "note": lead.get("note") or "Measuring the lead from the live feeds.",
+        },
+    }
+
+
+@app.route("/api/marketdata", methods=["GET"])
+def api_marketdata():
+    """Live BTC spot, the Kalshi ladder quote, and the measured lead between them."""
+    data = dashboard_state.get("market") or {}
+    if not data:
+        return jsonify({"error": "market data feed is still starting"}), 503
+    return jsonify(data)
+
+
 @app.route("/api/chart/pnl")
 def api_chart_pnl():
     """Return P&L data for Chart.js."""
@@ -1877,6 +2381,24 @@ pre{
   border-radius:10px;padding:10px 12px;font-size:11.5px;color:var(--dim);line-height:1.6;
 }
 .note-box b{color:var(--amber)}
+/* strategy cards: one per strategy, each with its own persistent curve */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(258px,1fr));gap:10px}
+.row.three{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}
+.card{
+  background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:11px 12px;
+  cursor:pointer;transition:border-color .15s,transform .15s;
+}
+.card:hover{border-color:var(--blue);transform:translateY(-1px)}
+.card.hot{border-color:rgba(46,230,168,.45)}
+.ctop{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+.clabel{font-size:13px;font-weight:650}
+.cname{font-size:10.5px;color:var(--faint);margin-top:1px}
+.cchart{height:54px;margin:8px 0 6px}
+.cstats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;text-align:center}
+.cstats b{display:block;font-size:13px;font-weight:640}
+.cstats span{font-size:9.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.04em}
+.cfoot{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:9px;padding-top:8px;border-top:1px solid var(--line)}
+.cfoot button{padding:3px 9px;font-size:11px}
 code{background:var(--bg);border:1px solid var(--line2);border-radius:5px;padding:1px 5px;font-size:11px;font-family:ui-monospace,monospace}
 footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 </style>
@@ -2278,27 +2800,109 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   </div>
 </div>
 
-<!-- ============ strategies ============ -->
+<!-- ============ live feeds + account ============ -->
 <div class="panel" style="margin-bottom:12px">
-  <div class="ph"><h2>Strategies</h2><span class="note">what each one actually does</span></div>
-  <div class="pb" style="padding:0">
-    <table><thead><tr><th style="width:170px">Strategy</th><th>Approach</th><th style="width:80px">Mode</th><th style="width:100px">State</th><th style="width:150px">Actions</th></tr></thead><tbody>
-    {%- for b in s.bots %}
-      <tr>
-        <td><strong>{{ b.label }}</strong><div class="mono" style="color:var(--faint)">{{ b.name }}</div></td>
-        <td style="color:var(--dim)">{{ b.description }}</td>
-        <td>{{ b.mode }}</td>
-        <td>{% if b.running %}<span class="pill ok"><span class="dot pulse"></span>running</span>{% else %}<span class="pill no">stopped</span>{% endif %}</td>
-        <td>
-          <div class="bar">
-            <button onclick="toggleStrategy('{{ b.name }}')">{% if b.running %}Stop{% else %}Start{% endif %}</button>
-            <button class="danger" onclick="killBot('{{ b.name }}')">Kill</button>
-          </div>
-        </td>
-      </tr>
-    {%- endfor %}
-    </tbody></table>
+  <div class="ph">
+    <h2>Live feeds &amp; account</h2>
+    <span class="note" id="feedNote">streaming</span>
   </div>
+  <div class="pb">
+    <div class="row three">
+      <div class="card" style="cursor:default">
+        <div class="ctop">
+          <div><div class="clabel">BTC spot</div><div class="mono cname" id="spotSource">connecting...</div></div>
+          <span class="pill" id="spotPill">--</span>
+        </div>
+        <div class="cchart" style="height:130px"><canvas id="spotChart"></canvas></div>
+        <div class="cfoot"><span class="mono" style="color:var(--faint)" id="spotAge">no tick yet</span></div>
+      </div>
+
+      <div class="card" style="cursor:default">
+        <div class="ctop">
+          <div><div class="clabel">Kalshi BTC ladder</div><div class="mono cname" id="ladderTicker">{{ (m.kalshi.nearest.ticker if m.kalshi.nearest else 'KXBTC') }}</div></div>
+          <span class="pill" id="ladderPill">--</span>
+        </div>
+        <div class="cchart" style="height:130px"><canvas id="ladderChart"></canvas></div>
+        <div class="cfoot"><span class="mono" style="color:var(--faint)" id="ladderDetail">waiting for a two-sided quote</span></div>
+      </div>
+
+      <div class="card" style="cursor:default" id="accountCard">
+        <div class="ctop">
+          <div><div class="clabel" id="acctLabel">{{ acct.label }}</div><div class="mono cname">{{ acct.book }} book</div></div>
+          <span class="pill {{ 'ok' if acct.book == 'dry' else 'warn' }}" id="acctPill">{{ acct.book|upper }}</span>
+        </div>
+        <div class="cchart" style="height:130px"><canvas id="accountChart"></canvas></div>
+        <div class="cstats">
+          <div><b id="acctEquity">{{ '$%.2f'|format(acct.equity) }}</b><span>equity</span></div>
+          <div><b id="acctToday" class="{{ 'up' if acct.today.pnl > 0 else ('down' if acct.today.pnl < 0 else 'flat') }}">{{ '$%.2f'|format(acct.today.pnl) }}</b><span>today</span></div>
+          <div><b id="acctWin">{{ acct.today.win_rate }}%</b><span>today WR</span></div>
+          <div><b id="acctOpen">{{ acct.open_positions }}</b><span>open</span></div>
+        </div>
+        <div class="cfoot">
+          <span class="mono" style="color:var(--faint)" id="acctFoot">cash {{ '$%.2f'|format(acct.cash) }} &middot; {{ acct.today.trades }} trades today</span>
+        </div>
+      </div>
+    </div>
+    <p style="color:var(--faint);font-size:11.5px;margin-top:10px">
+      {{ lead.note }}
+      Kalshi's BTC series settles on an <b>hourly</b> snapshot and quotes a ladder of strikes
+      &mdash; there is no 15-minute up/down BTC contract to trade.
+      Measured lead: <b class="mono">{{ ('$%.2f'|format(lead.delta)) if lead.delta is not none else '--' }}</b>
+      between live spot and the price Kalshi's own quote implies.
+    </p>
+  </div>
+</div>
+
+<!-- ============ strategy cards ============ -->
+<div class="panel" style="margin-bottom:12px">
+  <div class="ph">
+    <h2>Strategies</h2>
+    <span class="note">click a card for everything about that strategy</span>
+    <span class="bar"><button onclick="startAll()">Start all in DRY</button><button onclick="stopAll()">Stop all</button></span>
+  </div>
+  <div class="pb">
+    <div class="cards">
+      {%- for c in s.strategy_cards %}
+      <div class="card{{ ' hot' if c.running else '' }}" id="card-{{ c.name }}" onclick="openStrategy('{{ c.name }}')">
+        <div class="ctop">
+          <div>
+            <div class="clabel">{{ c.label }}</div>
+            <div class="mono cname">{{ c.name }}</div>
+          </div>
+          <span class="pill {{ 'ok' if c.running else 'no' }}" id="pill-{{ c.name }}">{% if c.running %}<span class="dot pulse"></span>running{% elif c.stop_reason %}stopped{% else %}not started{% endif %}</span>
+        </div>
+        <div class="cchart"><canvas id="spark-{{ c.name }}" height="54"></canvas></div>
+        <div class="cstats">
+          <div><b id="c-{{ c.name }}-trades">{{ c.trades }}</b><span>trades</span></div>
+          <div><b id="c-{{ c.name }}-pnl" class="{{ 'up' if c.realized > 0 else ('down' if c.realized < 0 else 'flat') }}">${{ '%.2f'|format(c.realized) }}</b><span>realized</span></div>
+          <div><b id="c-{{ c.name }}-win">{{ c.win_rate }}%</b><span>win rate</span></div>
+          <div><b id="c-{{ c.name }}-open">{{ c.open_positions }}</b><span>open</span></div>
+        </div>
+        <div class="cfoot">
+          <span class="mono" style="color:var(--faint)">$<span id="c-{{ c.name }}-dep">{{ '%.2f'|format(c.deployed) }}</span> deployed{% if not c.running and c.stop_reason %} &middot; {{ c.stop_reason }}{% endif %}</span>
+          <span class="bar" onclick="event.stopPropagation()">
+            <button id="btn-{{ c.name }}" onclick="toggleStrategy('{{ c.name }}')">{% if c.running %}Stop{% else %}Start{% endif %}</button>
+            <button class="danger" onclick="killBot('{{ c.name }}')">Kill</button>
+          </span>
+        </div>
+      </div>
+      {%- endfor %}
+    </div>
+    <p style="color:var(--faint);font-size:11.5px;margin-top:10px">
+      Curves are rebuilt from <code>trade_logs</code>, so a strategy keeps its history across restarts and deploys.
+      Cards show the <b>{{ s.book|upper }}</b> book only.
+    </p>
+  </div>
+</div>
+
+<!-- ============ strategy detail ============ -->
+<div class="panel" id="detailPanel" style="margin-bottom:12px;display:none">
+  <div class="ph">
+    <h2 id="detailTitle">Strategy</h2>
+    <span class="note" id="detailState"></span>
+    <span class="bar"><button onclick="closeStrategy()">Close</button></span>
+  </div>
+  <div class="pb" id="detailBody"></div>
 </div>
 
 <!-- ============ what it does ============ -->
@@ -2469,15 +3073,50 @@ function paint(s) {
   set('tUptime', Math.floor((s.uptime_sec || 0) / 60) + 'm');
 
   SNAPSHOT.equity = s.equity || SNAPSHOT.equity;
+  paintCards(s.strategy_cards);
   set('pnlSummary', SNAPSHOT.equity.pn.length
     ? SNAPSHOT.equity.pn.length + ' closed trades'
     : 'no closed trades yet');
+}
+
+// Patch the volatile parts of each card in place. The cards themselves are
+// server-rendered, so this only has to keep numbers and state current - it must
+// not rebuild the DOM, or the sparkline canvases would be destroyed.
+function paintCards(cards) {
+  if (!cards) return;
+  SNAPSHOT.strategy_cards = cards;
+  cards.forEach(c => {
+    const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+    set('c-' + c.name + '-trades', c.trades);
+    set('c-' + c.name + '-win', c.win_rate + '%');
+    set('c-' + c.name + '-open', c.open_positions);
+    set('c-' + c.name + '-dep', Number(c.deployed || 0).toFixed(2));
+    const pnl = $('c-' + c.name + '-pnl');
+    if (pnl) {
+      pnl.textContent = money(c.realized);
+      pnl.className = c.realized > 0 ? 'up' : (c.realized < 0 ? 'down' : 'flat');
+    }
+    const card = $('card-' + c.name);
+    if (card) card.classList.toggle('hot', !!c.running);
+    const pill = $('pill-' + c.name);
+    if (pill) {
+      pill.className = 'pill ' + (c.running ? 'ok' : 'no');
+      pill.innerHTML = c.running
+        ? '<span class="dot pulse"></span>running'
+        : (c.stop_reason ? 'stopped' : 'not started');
+    }
+    const btn = $('btn-' + c.name);
+    if (btn) btn.textContent = c.running ? 'Stop' : 'Start';
+  });
+  drawSparks(cards);
 }
 
 async function refresh() {
   try {
     paint(await fetch('/api/snapshot').then(r => r.json()));
     drawChart();
+    // Keep an open detail view current without yanking the page around.
+    if (openName) openStrategy(openName, true);
     try { paintMode(await fetch('/api/mode').then(r => r.json())); } catch (_) {}
   } catch (e) {
     note('snapshot refresh failed: ' + e.message);
@@ -2627,14 +3266,22 @@ function paintMode(d) {
 }
 
 // --- controls ---
-async function toggleStrategy(name) {
-  const r = await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
-    method: 'POST',
-    headers: authHeaders(),
-    body: JSON.stringify({ mode: 'paper' }),
-  });
-  const d = await r.json().catch(() => ({}));
-  note(d.error ? name + ': ' + d.error : name + ': ' + (d.running ? 'started' : 'stopped'));
+async function toggleStrategy(name, quiet) {
+  // Start or stop based on the card's actual state, so a bulk "start all" can
+  // never be turned into a bulk "stop all" by a stale button label.
+  const card = (SNAPSHOT.strategy_cards || []).find(c => c.name === name);
+  if (card && card.running) {
+    await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
+      method: 'POST', headers: authHeaders(), body: JSON.stringify({ mode: 'paper' }),
+    });
+    if (!quiet) note(name + ': stopped');
+  } else {
+    const r = await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
+      method: 'POST', headers: authHeaders(), body: JSON.stringify({ mode: 'paper' }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!quiet) note(d.error ? name + ': ' + d.error : name + ': ' + (d.running ? 'started' : 'stopped'));
+  }
   refresh();
 }
 async function killBot(name) {
@@ -2709,13 +3356,282 @@ function drawChart() {
   });
 }
 
+// --- live feeds: BTC spot, Kalshi ladder, account curve ---
+// Drawn from whatever the server has cached, then polled. Nothing here invents
+// a number: an empty series renders "waiting" rather than a flat line that reads
+// like a real result.
+const feedCharts = {};
+function drawFeed(id, labels, datasets, opts) {
+  if (typeof Chart === 'undefined') return;
+  const ctx = $(id);
+  if (!ctx) return;
+  const cfg = {
+    type: 'line',
+    data: { labels: labels, datasets: datasets },
+    options: Object.assign({
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: { legend: { labels: { color: '#e6edf6', boxWidth: 10, font: { size: 10 } } } },
+      scales: {
+        x: { ticks: { color: '#5b6a80', maxTicksLimit: 5, font: { size: 9 } }, grid: { color: 'rgba(255,255,255,.04)' } },
+        y: { ticks: { color: '#5b6a80', font: { size: 9 } }, grid: { color: 'rgba(255,255,255,.04)' } },
+      },
+    }, opts || {}),
+  };
+  if (feedCharts[id]) { feedCharts[id].destroy(); }
+  feedCharts[id] = new Chart(ctx, cfg);
+}
+function hhmmss(t) { return new Date(t * 1000).toLocaleTimeString(); }
+
+function paintMarket(md) {
+  if (!md || !md.spot) return;
+  const spot = md.spot || {};
+  const pts = spot.points || [];
+  $('spotSource').textContent = spot.source || 'connecting...';
+  $('spotAge').textContent = spot.price
+    ? '$' + Number(spot.price).toLocaleString() + '  ·  ' + (spot.age_sec != null ? spot.age_sec.toFixed(1) + 's old' : '')
+    : 'no tick yet';
+  const pill = $('spotPill');
+  if (pill) {
+    pill.className = 'pill ' + (spot.fresh ? 'ok' : 'warn');
+    pill.textContent = spot.fresh ? 'live' : (spot.price ? 'stale' : 'waiting');
+  }
+  drawFeed('spotChart', pts.map(p => hhmmss(p.t)), [{
+    label: 'BTC-USD spot', borderColor: '#f7a600', backgroundColor: 'rgba(247,166,0,.10)',
+    data: pts.map(p => p.p), tension: 0.2, fill: true, pointRadius: 0, borderWidth: 1.5,
+  }]);
+
+  const k = md.kalshi || {};
+  const kpts = k.points || [];
+  if (k.nearest) $('ladderTicker').textContent = k.nearest.ticker;
+  const lp = $('ladderPill');
+  if (lp) {
+    lp.className = 'pill ' + (k.nearest ? 'ok' : 'warn');
+    lp.textContent = k.nearest ? 'quoted' : 'no quote';
+  }
+  $('ladderDetail').textContent = k.nearest
+    ? k.nearest.label + '  ·  YES ' + (k.nearest.yes != null ? k.nearest.yes : '--')
+      + '  ·  ' + k.levels + ' strikes'
+    : 'waiting for a two-sided quote';
+  drawFeed('ladderChart', kpts.map(p => hhmmss(p.t)), [
+    {
+      label: 'spot', borderColor: '#f7a600', backgroundColor: 'rgba(247,166,0,.08)',
+      data: kpts.map(p => p.spot), tension: 0.2, pointRadius: 0, borderWidth: 1.5,
+    },
+    {
+      label: 'Kalshi implied', borderColor: '#4d9fff', backgroundColor: 'rgba(77,159,255,.10)',
+      data: kpts.map(p => p.implied), tension: 0.2, pointRadius: 0, borderWidth: 1.5, borderDash: [4, 3],
+    },
+  ], { scales: { x: { ticks: { color: '#5b6a80', maxTicksLimit: 4, font: { size: 9 } } },
+                  y: { ticks: { color: '#5b6a80', font: { size: 9 } } } } });
+
+  const lead = md.lead || {};
+  $('feedNote').textContent = lead.usable
+    ? 'streaming · lead measured live'
+    : (k.error ? 'streaming · Kalshi: ' + k.error : 'streaming');
+}
+
+function paintAccount(a) {
+  if (!a) return;
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  set('acctLabel', a.label);
+  set('acctEquity', money(a.equity));
+  set('acctWin', (a.today ? a.today.win_rate : 0) + '%');
+  set('acctOpen', a.open_positions);
+  set('acctFoot', 'cash ' + money(a.cash) + ' · ' + (a.today ? a.today.trades : 0) + ' trades today');
+  const pnl = $('acctToday');
+  const v = a.today ? a.today.pnl : 0;
+  if (pnl) {
+    pnl.textContent = money(v);
+    pnl.className = v > 0 ? 'up' : (v < 0 ? 'down' : 'flat');
+  }
+  const pill = $('acctPill');
+  if (pill) {
+    pill.className = 'pill ' + (a.book === 'dry' ? 'ok' : 'warn');
+    pill.textContent = String(a.book || '').toUpperCase();
+  }
+  const curve = a.curve || { labels: [], pnl: [] };
+  drawFeed('accountChart', curve.labels, [{
+    label: "Today's P&L ($)", data: curve.pnl,
+    borderColor: (a.today && a.today.pnl > 0) ? '#2ee6a8' : ((a.today && a.today.pnl < 0) ? '#ff5c7a' : '#4d9fff'),
+    backgroundColor: 'rgba(46,230,168,.10)', tension: 0.3, fill: true, pointRadius: 2,
+  }]);
+}
+
+async function refreshFeeds() {
+  try {
+    paintMarket(await fetch('/api/marketdata').then(r => r.json()));
+  } catch (_) { /* feed still starting */ }
+  try {
+    const d = await fetch('/api/accounts').then(r => r.json());
+    if (d.accounts) paintAccount(d.accounts[d.current]);
+  } catch (_) { /* ignore */ }
+}
+
+// --- strategy cards ---
+// Each card's curve is read from the server-rendered snapshot, so the grid is
+// populated on the first byte and does not depend on Chart.js loading.
+const sparks = {};
+function drawSparks(cards) {
+  if (typeof Chart === 'undefined') return;
+  (cards || SNAPSHOT.strategy_cards || []).forEach(c => {
+    const ctx = $('spark-' + c.name);
+    if (!ctx) return;
+    if (sparks[c.name]) sparks[c.name].destroy();
+    const flat = !(c.equity && c.equity.pnl.length);
+    sparks[c.name] = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: flat ? ['no closed trades yet'] : c.equity.labels,
+        datasets: [{
+          label: 'Cumulative P&L ($)',
+          data: flat ? [0] : c.equity.pnl,
+          borderColor: c.realized > 0 ? '#2ee6a8' : (c.realized < 0 ? '#ff5c7a' : '#4d9fff'),
+          backgroundColor: 'rgba(46,230,168,.08)',
+          tension: 0.3, fill: true, pointRadius: 0, borderWidth: 1.5,
+        }],
+      },
+      options: sparkOptions(),
+    });
+  });
+}
+function sparkOptions() {
+  return {
+    responsive: true, maintainAspectRatio: false, animation: false,
+    plugins: {
+      legend: { display: false },
+      tooltip: { callbacks: { title: it => it[0].label, label: it => '$' + it.parsed.y } },
+    },
+    scales: {
+      x: { display: false },
+      y: { ticks: { color: '#5b6a80', maxTicksLimit: 3, font: { size: 9 } }, grid: { color: 'rgba(255,255,255,.04)' } },
+    },
+  };
+}
+
+// --- strategy detail ---
+let detailChart = null;
+let openName = null;
+function cell(t, v, cls) { return '<td' + (cls ? ' class="' + cls + '"' : '') + '>' + esc(v) + '</td>'; }
+
+async function openStrategy(name, keepScroll) {
+  openName = name;
+  const panel = $('detailPanel');
+  panel.style.display = '';
+  $('detailTitle').textContent = name;
+  $('detailState').textContent = 'loading...';
+  const r = await fetch('/api/strategy/' + encodeURIComponent(name));
+  const d = await r.json().catch(() => ({}));
+  if (d.error) {
+    $('detailState').textContent = '';
+    $('detailBody').innerHTML = '<div class="empty">' + esc(d.error) + '</div>';
+    return;
+  }
+  const s = d.strategy;
+  $('detailTitle').textContent = s.label;
+  $('detailState').textContent = s.running
+    ? 'running (pid ' + s.pid + ')'
+    : 'stopped';
+
+  const stat = (label, value, cls) =>
+    '<div class="cstats" style="grid-template-columns:repeat(auto-fit,minmax(88px,1fr));margin:0 0 12px">'
+    + '<div><b class="' + (cls || '') + '">' + value + '</b><span>' + label + '</span></div></div>';
+
+  let html = '<p style="color:var(--dim);font-size:12.5px;margin-bottom:10px">' + esc(s.description) + '</p>';
+  html += '<div class="bar" style="margin-bottom:12px"><span class="tag">python ' + esc(s.command) + '</span>'
+    + '<span class="tag">' + esc(d.book) + ' book</span>'
+    + '<span class="mono" style="color:var(--faint)">pid ' + (s.pid == null ? '-' : s.pid) + '</span></div>';
+  html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:8px;margin-bottom:14px">'
+    + stat('trades', s.trades)
+    + stat('realized', money(s.realized), s.realized > 0 ? 'up' : (s.realized < 0 ? 'down' : 'flat'))
+    + stat('win rate', s.win_rate + '%')
+    + stat('best', money(s.best), 'up')
+    + stat('worst', money(s.worst), 'down')
+    + stat('open', s.open_positions)
+    + stat('deployed', money(s.deployed))
+    + '</div>';
+  html += '<div style="height:190px;margin-bottom:14px"><canvas id="detailChart"></canvas></div>';
+
+  html += '<h3 style="font-size:12px;margin:0 0 6px">Open positions</h3>';
+  html += d.positions.length
+    ? '<table><thead><tr><th>Market</th><th>Side</th><th>Entry</th><th>Qty</th><th>Stop</th><th>Target</th><th>Opened</th></tr></thead><tbody>'
+      + d.positions.map(p => '<tr>' + cell('', p.market_id, 'mono') + cell('', p.side) + cell('', money(p.entry_price))
+        + cell('', p.quantity) + cell('', p.stop_loss == null ? '-' : money(p.stop_loss))
+        + cell('', p.take_profit == null ? '-' : money(p.take_profit)) + cell('', p.opened, 'mono') + '</tr>').join('')
+      + '</tbody></table>'
+    : '<div class="empty">No open positions in this book.</div>';
+
+  html += '<h3 style="font-size:12px;margin:14px 0 6px">Closed trades</h3>';
+  html += d.trades.length
+    ? '<table><thead><tr><th>Market</th><th>Side</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&amp;L</th><th>Closed</th></tr></thead><tbody>'
+      + d.trades.map(t => '<tr>' + cell('', t.market_id, 'mono') + cell('', t.side) + cell('', money(t.entry_price))
+        + cell('', money(t.exit_price)) + cell('', t.quantity)
+        + cell('', money(t.pnl), t.pnl > 0 ? 'up' : (t.pnl < 0 ? 'down' : 'flat'))
+        + cell('', t.exit_timestamp, 'mono') + '</tr>').join('')
+      + '</tbody></table>'
+    : '<div class="empty">No closed trades yet for this strategy.</div>';
+
+  html += '<h3 style="font-size:12px;margin:14px 0 6px">Process log</h3>';
+  html += '<pre>' + esc((d.logs || []).join('\n') || 'No log yet. Start the strategy to generate one.') + '</pre>';
+  $('detailBody').innerHTML = html;
+
+  if (detailChart) detailChart.destroy();
+  const ctx = $('detailChart');
+  if (ctx && typeof Chart !== 'undefined') {
+    const eq = s.equity || { labels: [], pnl: [] };
+    const empty = !eq.pnl.length;
+    detailChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: empty ? ['no closed trades yet'] : eq.labels,
+        datasets: [{
+          label: 'Cumulative P&L ($)',
+          data: empty ? [0] : eq.pnl,
+          borderColor: s.realized > 0 ? '#2ee6a8' : (s.realized < 0 ? '#ff5c7a' : '#4d9fff'),
+          backgroundColor: 'rgba(46,230,168,.10)',
+          tension: 0.3, fill: true, pointRadius: 2, borderWidth: 2,
+        }],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { labels: { color: '#e6edf6', boxWidth: 10 } } },
+        scales: {
+          x: { ticks: { color: '#5b6a80', maxTicksLimit: 8 }, grid: { color: 'rgba(255,255,255,.04)' } },
+          y: { ticks: { color: '#5b6a80' }, grid: { color: 'rgba(255,255,255,.04)' } },
+        },
+      },
+    });
+  }
+  if (!keepScroll) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function closeStrategy() {
+  openName = null;
+  $('detailPanel').style.display = 'none';
+  if (detailChart) { detailChart.destroy(); detailChart = null; }
+}
+
+async function startAll() {
+  const names = (SNAPSHOT.strategy_cards || []).map(c => c.name);
+  for (const n of names) await toggleStrategy(n, true);
+  note('started: ' + names.join(', '));
+}
+async function stopAll() {
+  const names = (SNAPSHOT.strategy_cards || []).filter(c => c.running).map(c => c.name);
+  for (const n of names) await toggleStrategy(n, true);
+  note('stopped: ' + (names.join(', ') || 'nothing was running'));
+}
+
 // --- init ---
 drawChart();
+drawSparks();
+paintMarket({{ (m | tojson) }});
+paintAccount({{ (acct | tojson) }});
 loadLogs();
 paintMode({ mode: SNAPSHOT.mode.mode });
 refresh();
+refreshFeeds();
 setInterval(refresh, 10000);
 setInterval(loadLogs, 30000);
+setInterval(refreshFeeds, 5000);
 </script>
 </body>
 </html>
@@ -2739,7 +3655,7 @@ def start_background_workers():
     if _workers_started:
         return
     _workers_started = True
-    for target in (_monitor_loop, _log_tail_loop, _backup_loop):
+    for target in (_monitor_loop, _log_tail_loop, _backup_loop, _market_data_loop):
         threading.Thread(target=target, daemon=True).start()
 
 

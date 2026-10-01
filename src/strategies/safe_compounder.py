@@ -26,7 +26,7 @@ import logging
 import math
 import time
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import aiosqlite
@@ -41,29 +41,78 @@ logger = logging.getLogger(__name__)
 
 # Skip sports/entertainment — too unpredictable for "near-certain" plays
 SKIP_PREFIXES = [
-    "KXNBA", "KXNFL", "KXNHL", "KXMLB", "KXUFC", "KXPGA", "KXATP",
-    "KXEPL", "KXUCL", "KXLIGA", "KXSERIE", "KXBUNDES", "KXLIGUE",
-    "KXWC", "KXMARMAD", "KXMAKEMARMAD", "KXWMARMAD", "KXRT-",
-    "KXPERFORM", "KXACTOR", "KXBOND-", "KXOSCAR", "KXBAFTA", "KXSAG",
-    "KXSNL", "KXSURVIVOR", "KXTRAITORS", "KXDAILY",
-    "KXALBUM", "KXSONG", "KX1SONG", "KX20SONG", "KXTOUR-",
-    "KXFEATURE", "KXGTA", "KXBIG10", "KXBIG12", "KXACC", "KXSEC",
-    "KXAAC", "KXBIGEAST", "KXNCAAM", "KXCOACH", "KXMV",
-    "KXCHESS", "KXBELGIAN", "KXEFL", "KXSUPER", "KXLAMIN",
-    "KXWHATSON", "KXWOWHOCKEY",
-    "KXMENTION", "KXTMENTION", "KXTRUMPMENTION", "KXTRUMPSAY",
-    "KXSPEECH", "KXTSPEECH", "KXADDRESS",
+    "KXNBA",
+    "KXNFL",
+    "KXNHL",
+    "KXMLB",
+    "KXUFC",
+    "KXPGA",
+    "KXATP",
+    "KXEPL",
+    "KXUCL",
+    "KXLIGA",
+    "KXSERIE",
+    "KXBUNDES",
+    "KXLIGUE",
+    "KXWC",
+    "KXMARMAD",
+    "KXMAKEMARMAD",
+    "KXWMARMAD",
+    "KXRT-",
+    "KXPERFORM",
+    "KXACTOR",
+    "KXBOND-",
+    "KXOSCAR",
+    "KXBAFTA",
+    "KXSAG",
+    "KXSNL",
+    "KXSURVIVOR",
+    "KXTRAITORS",
+    "KXDAILY",
+    "KXALBUM",
+    "KXSONG",
+    "KX1SONG",
+    "KX20SONG",
+    "KXTOUR-",
+    "KXFEATURE",
+    "KXGTA",
+    "KXBIG10",
+    "KXBIG12",
+    "KXACC",
+    "KXSEC",
+    "KXAAC",
+    "KXBIGEAST",
+    "KXNCAAM",
+    "KXCOACH",
+    "KXMV",
+    "KXCHESS",
+    "KXBELGIAN",
+    "KXEFL",
+    "KXSUPER",
+    "KXLAMIN",
+    "KXWHATSON",
+    "KXWOWHOCKEY",
+    "KXMENTION",
+    "KXTMENTION",
+    "KXTRUMPMENTION",
+    "KXTRUMPSAY",
+    "KXSPEECH",
+    "KXTSPEECH",
+    "KXADDRESS",
 ]
 
 SKIP_TITLE_PHRASES = [
-    "mention", "say in", "speech mention", "address mention",
+    "mention",
+    "say in",
+    "speech mention",
+    "address mention",
 ]
 
 # Thresholds (all in dollar format 0.00-1.00)
 MIN_VOLUME = 10
-MIN_NO_ASK = 0.80      # Lowest NO ask must be > $0.80
-MIN_EDGE = 0.03        # Edge (EV - price) must be > $0.03 (loosened from $0.05, approved 2026-03-29)
-MAX_POSITION_PCT = 0.10    # Max 10% of portfolio per position
+MIN_NO_ASK = 0.80  # Lowest NO ask must be > $0.80
+MIN_EDGE = 0.03  # Edge (EV - price) must be > $0.03 (loosened from $0.05, approved 2026-03-29)
+MAX_POSITION_PCT = 0.10  # Max 10% of portfolio per position
 USE_KELLY = True
 MIN_CONFIDENCE = 0.4
 
@@ -71,6 +120,7 @@ MIN_CONFIDENCE = 0.4
 # -----------------------------------------------------------------------
 # Core math
 # -----------------------------------------------------------------------
+
 
 def should_skip(ticker: str) -> bool:
     upper = ticker.upper()
@@ -136,7 +186,7 @@ def market_confidence_score(ticker: str, orderbook: dict, market: dict) -> Tuple
             all_levels.append((1.0 - price, qty))  # Convert YES to NO price in dollars
         except (ValueError, TypeError):
             continue
-    
+
     for price_data, qty_data in no_side:
         try:
             price = float(price_data)
@@ -167,7 +217,7 @@ def market_confidence_score(ticker: str, orderbook: dict, market: dict) -> Tuple
             best_no_ask = 1.0 - highest_yes_bid
         except (ValueError, TypeError):
             pass
-    
+
     best_no_bid = 0
     if no_side:
         try:
@@ -201,7 +251,7 @@ def market_confidence_score(ticker: str, orderbook: dict, market: dict) -> Tuple
     # Convert old cent format to dollar format if needed
     if yes_last > 1.0:
         yes_last = yes_last / 100.0
-    
+
     if best_no_ask:
         price_gap = abs(best_no_ask - (1.0 - yes_last))
         stability_score = max(0, 1.0 - (price_gap / 0.15))  # 15¢ = $0.15
@@ -210,12 +260,7 @@ def market_confidence_score(ticker: str, orderbook: dict, market: dict) -> Tuple
     else:
         stability_score = 0.3
 
-    score = (
-        depth_ratio * 0.30
-        + spread_score * 0.30
-        + volume_score * 0.25
-        + stability_score * 0.15
-    )
+    score = depth_ratio * 0.30 + spread_score * 0.30 + volume_score * 0.25 + stability_score * 0.15
 
     reason_str = ", ".join(reasons) if reasons else "ok"
     return round(score, 3), reason_str
@@ -224,6 +269,7 @@ def market_confidence_score(ticker: str, orderbook: dict, market: dict) -> Tuple
 # -----------------------------------------------------------------------
 # SafeCompounder class
 # -----------------------------------------------------------------------
+
 
 class SafeCompounder:
     """
@@ -262,6 +308,21 @@ class SafeCompounder:
         if dry_run is not None:
             self.dry_run = dry_run
 
+        # The dashboard's DRY setting is authoritative downward only: it can
+        # force DRY, but it can never force LIVE. Going live additionally
+        # requires should_trade_live() (env var AND persisted mode), so neither
+        # a caller passing dry_run=False nor a stale env var can trade behind
+        # the operator's back.
+        from src.jobs.broker import should_trade_live
+
+        if not should_trade_live():
+            if not self.dry_run:
+                logger.warning(
+                    "LIVE requested but live trading is not enabled "
+                    "(LIVE_TRADING_ENABLED and dashboard mode). Forcing DRY RUN."
+                )
+            self.dry_run = True
+
         start = time.time()
 
         logger.info("=" * 70)
@@ -269,7 +330,9 @@ class SafeCompounder:
         logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         logger.info(
             "Rules: NO only | ask > $%.2f | edge > $%.2f | max %.0f%%/position | maker orders",
-            self.min_no_ask, self.min_edge, self.max_position_pct * 100,
+            self.min_no_ask,
+            self.min_edge,
+            self.max_position_pct * 100,
         )
         logger.info("=" * 70)
 
@@ -278,8 +341,11 @@ class SafeCompounder:
         portfolio = bal.get("portfolio_value", 0)
         cash = bal.get("balance", 0)
 
-        print(f"\n💰 Cash: ${cash/100:.2f} | Portfolio: ${portfolio/100:.2f} | "
-              f"Total: ${(cash+portfolio)/100:.2f}\n", flush=True)
+        print(
+            f"\n💰 Cash: ${cash/100:.2f} | Portfolio: ${portfolio/100:.2f} | "
+            f"Total: ${(cash+portfolio)/100:.2f}\n",
+            flush=True,
+        )
 
         # Step 0: Cancel legacy YES orders
         print("🧹 Step 0: Cancel legacy YES orders...", flush=True)
@@ -299,9 +365,7 @@ class SafeCompounder:
         opportunities = await self._check_orderbook_and_price(candidates)
 
         # Display top opportunities
-        sorted_opps = sorted(
-            opportunities, key=lambda x: (-x["edge"], -x["annualized_roi"])
-        )
+        sorted_opps = sorted(opportunities, key=lambda x: (-x["edge"], -x["annualized_roi"]))
         print(f"\n📋 Top Opportunities:", flush=True)
         for opp in sorted_opps[:20]:
             print(
@@ -343,7 +407,7 @@ class SafeCompounder:
 
     async def _fetch_all_markets(self) -> List[Dict]:
         """Fetch all active markets from Kalshi via events API.
-        
+
         The /markets endpoint now only returns MVE (parlay) tickers (KXMVE*).
         Real individual markets live under events, so we fetch events with
         nested markets to get the actual tradeable universe.
@@ -351,7 +415,7 @@ class SafeCompounder:
         """
         all_markets = []
         seen_tickers = set()
-        
+
         # Primary: fetch via events API (gets real individual markets)
         cursor = None
         page = 0
@@ -360,14 +424,14 @@ class SafeCompounder:
                 params = {"status": "open", "limit": 100, "with_nested_markets": "true"}
                 if cursor:
                     params["cursor"] = cursor
-                
+
                 resp = await self.client._make_authenticated_request(
                     "GET", "/trade-api/v2/events", params=params
                 )
                 events = resp.get("events", [])
                 if not events:
                     break
-                
+
                 for event in events:
                     for m in event.get("markets", []):
                         ticker = m.get("ticker", "")
@@ -377,19 +441,19 @@ class SafeCompounder:
                             m["_event_category"] = event.get("category", "")
                             m["_event_title"] = event.get("title", "")
                             all_markets.append(m)
-                
+
                 cursor = resp.get("cursor")
                 if not cursor:
                     break
-                
+
                 page += 1
                 if page > 100:  # Safety cap
                     break
-                
+
                 await asyncio.sleep(0.1)
         except Exception as e:
             logger.warning("Events API failed, falling back to /markets: %s", e)
-        
+
         # Fallback: also fetch /markets for any we missed (includes MVE)
         if len(all_markets) < 100:
             logger.info("Few markets from events (%d), also fetching /markets", len(all_markets))
@@ -400,7 +464,7 @@ class SafeCompounder:
                     params = {"status": "open", "limit": 200}
                     if cursor:
                         params["cursor"] = cursor
-                    
+
                     resp = await self.client.get_markets(**params)
                     markets = resp.get("markets", [])
                     for m in markets:
@@ -408,21 +472,23 @@ class SafeCompounder:
                         if ticker and ticker not in seen_tickers:
                             seen_tickers.add(ticker)
                             all_markets.append(m)
-                    
+
                     cursor = resp.get("cursor")
                     if not cursor or not markets:
                         break
-                    
+
                     page += 1
                     if page > 50:
                         break
-                    
+
                     await asyncio.sleep(0.1)
                 except Exception as e:
                     logger.error("Error fetching markets page %d: %s", page, e)
                     break
-        
-        logger.info("Fetched %d unique markets (%d from events)", len(all_markets), len(seen_tickers))
+
+        logger.info(
+            "Fetched %d unique markets (%d from events)", len(all_markets), len(seen_tickers)
+        )
         return all_markets
 
     def _find_no_candidates(self, markets: List[Dict]) -> List[Dict]:
@@ -463,28 +529,35 @@ class SafeCompounder:
 
             true_no_prob = estimate_true_no_prob(yes_last, hours_to_expiry)
 
-            candidates.append({
-                **m,
-                "_true_no_prob": true_no_prob,
-                "_hours_to_expiry": round(hours_to_expiry, 1),
-                "_days_to_expiry": round(hours_to_expiry / 24, 1),
-            })
+            candidates.append(
+                {
+                    **m,
+                    "_true_no_prob": true_no_prob,
+                    "_hours_to_expiry": round(hours_to_expiry, 1),
+                    "_days_to_expiry": round(hours_to_expiry / 24, 1),
+                }
+            )
 
         logger.info("Found %d NO-side candidates (YES last <= $0.20)", len(candidates))
-        
+
         # Sort by estimated edge potential: lowest YES price + highest volume + soonest expiry
         # Then cap to top 500 to keep orderbook checks under ~1 minute
         MAX_ORDERBOOK_CHECKS = 200
         if len(candidates) > MAX_ORDERBOOK_CHECKS:
-            candidates.sort(key=lambda c: (
-                -c["_true_no_prob"],  # Highest estimated NO probability first
-                -float(c.get("volume_fp", 0) or c.get("volume", 0) or 0),  # Highest volume
-                c["_hours_to_expiry"],  # Soonest expiry
-            ))
-            logger.info("Capping to top %d candidates (from %d) for orderbook checks",
-                        MAX_ORDERBOOK_CHECKS, len(candidates))
+            candidates.sort(
+                key=lambda c: (
+                    -c["_true_no_prob"],  # Highest estimated NO probability first
+                    -float(c.get("volume_fp", 0) or c.get("volume", 0) or 0),  # Highest volume
+                    c["_hours_to_expiry"],  # Soonest expiry
+                )
+            )
+            logger.info(
+                "Capping to top %d candidates (from %d) for orderbook checks",
+                MAX_ORDERBOOK_CHECKS,
+                len(candidates),
+            )
             candidates = candidates[:MAX_ORDERBOOK_CHECKS]
-        
+
         return candidates
 
     async def _check_orderbook_and_price(self, candidates: List[Dict]) -> List[Dict]:
@@ -508,9 +581,7 @@ class SafeCompounder:
 
             conf_score, conf_reason = market_confidence_score(ticker, ob, m)
             if conf_score < self.min_confidence:
-                logger.debug(
-                    "Low confidence (%.2f) %s — %s", conf_score, ticker, conf_reason
-                )
+                logger.debug("Low confidence (%.2f) %s — %s", conf_score, ticker, conf_reason)
                 continue
 
             # Handle both new and old orderbook formats
@@ -564,34 +635,36 @@ class SafeCompounder:
             # Convert cents to dollars if needed
             if yes_last_val > 1.0:
                 yes_last_val = yes_last_val / 100.0
-            
-            opportunities.append({
-                "ticker": ticker,
-                "title": m.get("title", "")[:70],
-                "side": "no",
-                "yes_last": yes_last_val,
-                "true_no_prob": true_no_prob,
-                "lowest_no_ask": lowest_no_ask,
-                "our_price": our_price,
-                "edge": edge,
-                "profit": profit_per_contract,
-                "roi_pct": roi_pct,
-                "annualized_roi": annualized_roi,
-                "volume": int(float(m.get("volume_fp", 0) or m.get("volume", 0) or 0)),
-                "days_to_expiry": m["_days_to_expiry"],
-                "close_time": m.get("close_time", "")[:10],
-                "best_no_bid": best_no_bid,
-            })
+
+            opportunities.append(
+                {
+                    "ticker": ticker,
+                    "title": m.get("title", "")[:70],
+                    "side": "no",
+                    "yes_last": yes_last_val,
+                    "true_no_prob": true_no_prob,
+                    "lowest_no_ask": lowest_no_ask,
+                    "our_price": our_price,
+                    "edge": edge,
+                    "profit": profit_per_contract,
+                    "roi_pct": roi_pct,
+                    "annualized_roi": annualized_roi,
+                    "volume": int(float(m.get("volume_fp", 0) or m.get("volume", 0) or 0)),
+                    "days_to_expiry": m["_days_to_expiry"],
+                    "close_time": m.get("close_time", "")[:10],
+                    "best_no_bid": best_no_bid,
+                }
+            )
 
             if (i + 1) % 25 == 0:
                 logger.info(
                     "Checked %d/%d orderbooks, %d viable",
-                    i + 1, len(candidates), len(opportunities),
+                    i + 1,
+                    len(candidates),
+                    len(opportunities),
                 )
 
-        logger.info(
-            "%d opportunities with edge > $%.2f", len(opportunities), self.min_edge
-        )
+        logger.info("%d opportunities with edge > $%.2f", len(opportunities), self.min_edge)
         return opportunities
 
     async def _place_resting_orders(
@@ -602,9 +675,7 @@ class SafeCompounder:
         try:
             positions_resp = await self.client.get_positions()
             positions = positions_resp.get("market_positions", [])
-            pos_tickers = {
-                p["ticker"] for p in positions if abs(p.get("position", 0)) > 0
-            }
+            pos_tickers = {p["ticker"] for p in positions if abs(p.get("position", 0)) > 0}
         except Exception:
             pos_tickers = set()
 
@@ -647,7 +718,9 @@ class SafeCompounder:
 
             price = opp["our_price"]
             cost = contracts * price * 100  # Convert dollars to cents for cost calculation
-            profit = contracts * opp["profit"] * 100  # Convert dollars to cents for profit calculation
+            profit = (
+                contracts * opp["profit"] * 100
+            )  # Convert dollars to cents for profit calculation
 
             if self.dry_run:
                 kelly_info = ""
@@ -744,7 +817,7 @@ class SafeCompounder:
             for o in yes_orders:
                 try:
                     await self.client.cancel_order(o["order_id"])
-                    yes_price = o.get('yes_price', 0)
+                    yes_price = o.get("yes_price", 0)
                     if isinstance(yes_price, (int, float)) and yes_price > 0:
                         # Convert cents to dollars if needed for display
                         if yes_price > 1.0:
@@ -805,7 +878,9 @@ class SafeCompounder:
                 if isinstance(price, (int, float)) and price > 1.0:
                     price_display = f"${price/100:.2f}"
                 else:
-                    price_display = f"${price:.2f}" if isinstance(price, (int, float)) else f"{price}¢"
+                    price_display = (
+                        f"${price:.2f}" if isinstance(price, (int, float)) else f"{price}¢"
+                    )
                 print(f"  {created} | {side} x{count} @ {price_display} | {ticker}", flush=True)
         except Exception:
             pass

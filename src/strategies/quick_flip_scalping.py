@@ -362,9 +362,10 @@ REASON: [brief explanation]
             position.id = position_id
 
             # Execute the position
+            from src.jobs.broker import should_trade_live
             from src.jobs.execute import execute_position
 
-            live_mode = getattr(settings.trading, "live_trading_enabled", False)
+            live_mode = should_trade_live()
 
             success = await execute_position(
                 position=position,
@@ -491,7 +492,9 @@ REASON: [brief explanation]
                 "type_": "market",
             }
 
-            live_mode = getattr(settings.trading, "live_trading_enabled", False)
+            from src.jobs.broker import should_trade_live
+
+            live_mode = should_trade_live()
 
             if live_mode:
                 response = await self.kalshi_client.place_order(**order_params)

@@ -22,29 +22,29 @@ from typing import Optional
 
 from src.clients.kalshi_client import KalshiClient
 from src.clients.xai_client import XAIClient
-from src.utils.database import DatabaseManager
 from src.config.settings import settings
-from src.utils.logging_setup import get_trading_logger
-
-# Import the new unified system
-from src.strategies.unified_trading_system import (
-    run_unified_trading_system,
-    TradingSystemConfig,
-    TradingSystemResults
-)
 
 # Import individual jobs for fallback
 from src.jobs.decide import make_decision_for_market
 from src.jobs.execute import execute_position
 
+# Import the new unified system
+from src.strategies.unified_trading_system import (
+    TradingSystemConfig,
+    TradingSystemResults,
+    run_unified_trading_system,
+)
+from src.utils.database import DatabaseManager
+from src.utils.logging_setup import get_trading_logger
+
 
 async def run_trading_job() -> Optional[TradingSystemResults]:
     """
     Enhanced trading job using the Unified Advanced Trading System.
-    
+
     This replaces the old sequential approach (decide -> execute) with
     a sophisticated multi-strategy system that maximizes capital efficiency.
-    
+
     Process:
     1. Unified strategy analysis across ALL markets (no time limits!)
     2. Market making + directional trading + arbitrage
@@ -53,45 +53,42 @@ async def run_trading_job() -> Optional[TradingSystemResults]:
     5. Real-time performance monitoring
     """
     logger = get_trading_logger("trading_job")
-    
+
     try:
         logger.info("🚀 Starting Enhanced Trading Job - Beast Mode Activated!")
-        
+
         # Initialize clients
         db_manager = DatabaseManager()
         kalshi_client = KalshiClient()
         xai_client = XAIClient(db_manager=db_manager)  # Pass db_manager for LLM logging
-        
+
         # Configure the unified system
         # Use default settings unless overridden
         config = TradingSystemConfig(
             # Capital allocation (can be adjusted based on market conditions)
-            market_making_allocation=getattr(settings.trading, 'market_making_allocation', 0.40),
-            directional_trading_allocation=getattr(settings.trading, 'directional_allocation', 0.50),
-            arbitrage_allocation=getattr(settings.trading, 'arbitrage_allocation', 0.10),
-            
+            market_making_allocation=getattr(settings.trading, "market_making_allocation", 0.40),
+            directional_trading_allocation=getattr(
+                settings.trading, "directional_allocation", 0.50
+            ),
+            arbitrage_allocation=getattr(settings.trading, "arbitrage_allocation", 0.10),
             # Risk management
-            max_portfolio_volatility=getattr(settings.trading, 'max_volatility', 0.20),
-            max_correlation_exposure=getattr(settings.trading, 'max_correlation', 0.70),
-            max_single_position=getattr(settings.trading, 'max_single_position', 0.15),
-            
+            max_portfolio_volatility=getattr(settings.trading, "max_volatility", 0.20),
+            max_correlation_exposure=getattr(settings.trading, "max_correlation", 0.70),
+            max_single_position=getattr(settings.trading, "max_single_position", 0.15),
             # Performance targets
-            target_sharpe_ratio=getattr(settings.trading, 'target_sharpe', 2.0),
-            target_annual_return=getattr(settings.trading, 'target_return', 0.30),
-            max_drawdown_limit=getattr(settings.trading, 'max_drawdown', 0.15),
-            
+            target_sharpe_ratio=getattr(settings.trading, "target_sharpe", 2.0),
+            target_annual_return=getattr(settings.trading, "target_return", 0.30),
+            max_drawdown_limit=getattr(settings.trading, "max_drawdown", 0.15),
             # Rebalancing
-            rebalance_frequency_hours=getattr(settings.trading, 'rebalance_hours', 6),
-            profit_taking_threshold=getattr(settings.trading, 'profit_threshold', 0.25),
-            loss_cutting_threshold=getattr(settings.trading, 'loss_threshold', 0.10)
+            rebalance_frequency_hours=getattr(settings.trading, "rebalance_hours", 6),
+            profit_taking_threshold=getattr(settings.trading, "profit_threshold", 0.25),
+            loss_cutting_threshold=getattr(settings.trading, "loss_threshold", 0.10),
         )
-        
+
         # Execute the unified trading system
         logger.info("🎯 Executing Unified Advanced Trading System")
-        results = await run_unified_trading_system(
-            db_manager, kalshi_client, xai_client, config
-        )
-        
+        results = await run_unified_trading_system(db_manager, kalshi_client, xai_client, config)
+
         # Log comprehensive results
         if results.total_positions > 0:
             logger.info(
@@ -114,9 +111,9 @@ async def run_trading_job() -> Optional[TradingSystemResults]:
                 f"📊 Trading job complete - no new positions created this cycle\n"
                 f"   Reasons: Market conditions, risk limits, or insufficient opportunities"
             )
-        
+
         return results
-        
+
     except Exception as e:
         logger.error(f"Error in enhanced trading job: {e}")
         # Fallback to legacy system if unified system fails
@@ -129,56 +126,66 @@ async def _fallback_legacy_trading() -> Optional[TradingSystemResults]:
     Fallback to the original sequential decision-making if unified system fails.
     """
     logger = get_trading_logger("trading_job_fallback")
-    
+
     try:
         logger.info("🔄 Executing fallback legacy trading system")
-        
+
         # Initialize components
         db_manager = DatabaseManager()
         kalshi_client = KalshiClient()
         xai_client = XAIClient()
-        
+
+        # Resolve DRY/LIVE once per cycle. Both switches must agree before any
+        # real order is possible.
+        from src.jobs.broker import should_trade_live
+
+        live_mode = should_trade_live()
+        logger.info(f"{'LIVE' if live_mode else 'DRY'} trading cycle")
+
         # Get eligible markets
         markets = await db_manager.get_eligible_markets(
             volume_min=20000,  # Balanced volume for actual trading opportunities
-            max_days_to_expiry=365  # Accept any timeline with dynamic exits
+            max_days_to_expiry=365,  # Accept any timeline with dynamic exits
         )
         if not markets:
             logger.warning("No eligible markets found")
             return TradingSystemResults()
-        
+
         # Process markets using legacy approach
         positions_created = 0
         total_exposure = 0.0
-        
+
         for market in markets[:5]:  # Limit to top 5 to control costs
             try:
                 # Make decision
                 position = await make_decision_for_market(
                     market, db_manager, xai_client, kalshi_client
                 )
-                
+
                 if position:
                     # Execute position
-                    success = await execute_position(position, kalshi_client, db_manager)
+                    # Was execute_position(position, kalshi_client, db_manager), which
+                    # binds live_mode=kalshi_client (a truthy object, so LIVE) and omits
+                    # the required kalshi_client argument entirely -> TypeError.
+                    success = await execute_position(position, live_mode, db_manager, kalshi_client)
                     if success:
                         positions_created += 1
                         total_exposure += position.entry_price * position.quantity
                         logger.info(f"✅ Legacy: Created position for {market.market_id}")
-                
+
             except Exception as e:
                 logger.error(f"Error processing market {market.market_id}: {e}")
                 continue
-        
+
         # Return simple results
         return TradingSystemResults(
             directional_positions=positions_created,
             directional_exposure=total_exposure,
             total_capital_used=total_exposure,
             total_positions=positions_created,
-            capital_efficiency=total_exposure / 10000 if total_exposure > 0 else 0.0
+            capital_efficiency=total_exposure / 10000 if total_exposure > 0 else 0.0,
         )
-        
+
     except Exception as e:
         logger.error(f"Error in fallback trading system: {e}")
         return TradingSystemResults()
@@ -189,4 +196,4 @@ async def run_legacy_trading():
     """Legacy entry point - redirects to enhanced system."""
     logger = get_trading_logger("legacy_redirect")
     logger.info("🔄 Legacy trading call redirected to enhanced system")
-    return await run_trading_job() 
+    return await run_trading_job()
