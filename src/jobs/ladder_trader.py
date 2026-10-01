@@ -336,6 +336,31 @@ class UpDownTrader:
         market = self.feed.nearest()
         signal = self.evaluate(market)
         self.book.last_error = ""
+        # Name the guard that actually refused, so the log says why. Returning a
+        # bare "no quotable contract" for a contract that is quoted but inside the
+        # settlement window is exactly the kind of wrong reason that makes a log
+        # useless for diagnosis.
+        if signal is None:
+            refusal = (
+                "no contract is quoted"
+                if market is None
+                else (
+                    f"{market.ticker} is not quoted on both sides"
+                    if self.book.skipped_unquoted
+                    else (
+                        f"spot tick is {self.spot.age:.1f}s old"
+                        if self.spot.price <= 0 or self.spot.age > self.config.max_spot_age
+                        else (
+                            f"{market.seconds_left:.0f}s to settlement - inside the "
+                            f"{self.config.min_seconds_left:.0f}s no-entry window"
+                            if (market.seconds_left or 0) < self.config.min_seconds_left
+                            else "no usable reading"
+                        )
+                    )
+                )
+            )
+        else:
+            refusal = ""
 
         took: Optional[Dict[str, Any]] = None
         blocked = ""
@@ -386,7 +411,7 @@ class UpDownTrader:
                 "spot_vs_target": signal.spot_vs_target if signal else None,
                 "fair_up": signal.fair if signal else None,
                 "kalshi_up": signal.kalshi_price if signal else None,
-                "reason": signal.reason if signal else "no quotable contract",
+                "reason": (signal.reason if signal else refusal) or "no quotable contract",
             }
         )
         return result
