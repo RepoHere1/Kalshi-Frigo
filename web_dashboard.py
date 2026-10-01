@@ -78,7 +78,7 @@ strategy_state = {
     "beast_mode": {"running": False, "pid": None, "mode": "paper"},
     "market_making": {"running": False, "pid": None, "mode": "paper"},
     "quick_flip": {"running": False, "pid": None, "mode": "paper"},
-    "btc_ladder": {"running": False, "pid": None, "mode": "paper"},
+    "btc_updown": {"running": False, "pid": None, "mode": "paper"},
 }
 
 # The command each strategy is actually run with. Every one is a distinct
@@ -112,7 +112,7 @@ STRATEGY_COMMANDS: Dict[str, List[str]] = {
         "180",
     ],
     "quick_flip": ["cli.py", "run", "--quick-flip", "--paper", "--loop", "--interval", "120"],
-    "btc_ladder": ["cli.py", "run", "--btc-ladder", "--paper", "--loop", "--interval", "0"],
+    "btc_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
 }
 
 # `trade_logs.strategy` and `positions.strategy` are written by the strategies
@@ -135,9 +135,7 @@ STRATEGY_ALIASES = {
     "quick_flip_scalping": "quick_flip",
     "quick flip": "quick_flip",
     "quick_flip_scalping_strategy": "quick_flip",
-    "btc_ladder": "btc_ladder",
-    "btc ladder": "btc_ladder",
-    "ladder": "btc_ladder",
+    "btc_updown": "btc_updown",
 }
 
 # Alert webhooks
@@ -495,13 +493,14 @@ STRATEGY_DOCS = {
         "Quick flip scalping",
         "Short-horizon strategy that enters on momentum and exits on a small " "favourable move.",
     ),
-    "btc_ladder": (
-        "BTC ladder",
-        "Compares the live Coinbase BTC spot feed against Kalshi's own BTC "
-        "price-ladder quotes and trades only when they disagree by more than the "
-        "configured edge. $5 per clip, one position at a time. Kalshi's BTC series "
-        "settles hourly - there is no 15-minute up/down contract - so the ladder is "
-        "the real shape of this trade.",
+    "btc_updown": (
+        "BTC 15-min up/down",
+        'Reads Kalshi\'s own KXBTC15M contract - "BTC price up in next 15 mins?" - '
+        "and compares its Up/Down price against live Coinbase spot. Takes one $5 "
+        "clip only when the two disagree by more than the configured edge, never "
+        "inside the noise band around the target, and never inside the 60-second "
+        "settlement window. Settlement is CF Benchmarks BRTI, so spot is a proxy "
+        "for it.",
     ),
 }
 
@@ -1426,7 +1425,11 @@ def dashboard():
     return render_template_string(
         _TEMPLATE,
         s=snap,
-        m={"spot": context["spot"], "kalshi": context["kalshi"]},
+        m={
+            "spot": context["spot"],
+            "kalshi": context["kalshi"],
+            "series": context["series"],
+        },
         lead=context["lead"],
         acct=acct,
     )
@@ -1965,14 +1968,19 @@ def _market_context() -> Dict[str, Any]:
     lead = market.get("lead") or {}
     return {
         "spot": market.get("spot", {}),
-        "kalshi": market.get("kalshi", {"nearest": None}),
+        "kalshi": market.get("kalshi", {}),
+        "series": market.get("series", []),
         "lead": {
             "spot": lead.get("spot"),
-            "implied_spot": lead.get("implied_spot"),
-            "delta": lead.get("delta"),
+            "target": lead.get("target"),
+            "spot_vs_target": lead.get("spot_vs_target"),
+            "up_price": lead.get("up_price"),
+            "down_price": lead.get("down_price"),
+            "seconds_left": lead.get("seconds_left"),
+            "series": (market.get("kalshi", {}) or {}).get("series"),
             "usable": bool(lead.get("usable")),
             "measured_at": lead.get("measured_at"),
-            "note": lead.get("note") or "Measuring the lead from the live feeds.",
+            "note": lead.get("note") or "Reading the live 15-minute contract.",
         },
     }
 
@@ -2578,22 +2586,22 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   {% else %}
   <div class="tile">
     <div class="k">DRY cash</div>
-    <div class="v" id="tBalance">{{ '$%.2f'|format(dry.cash) }}</div>
+    <div class="v" id="dCashTile">{{ '$%.2f'|format(dry.cash) }}</div>
     <div class="s">simulated &middot; no real money</div>
   </div>
   <div class="tile">
     <div class="k">DRY positions</div>
-    <div class="v" id="tLivePos">{{ s.open_dry.positions if s.open_dry else 0 }}</div>
+    <div class="v" id="dPosTile">{{ s.open_dry.positions if s.open_dry else 0 }}</div>
     <div class="s">simulated fills</div>
   </div>
   <div class="tile">
     <div class="k">DRY deployed</div>
-    <div class="v" id="tExposure">{{ '$%.2f'|format(s.open_dry.capital) if s.open_dry else '$0.00' }}</div>
+    <div class="v" id="dDepTile">{{ '$%.2f'|format(s.open_dry.capital) if s.open_dry else '$0.00' }}</div>
     <div class="s">of {{ '$%.2f'|format(dry.equity) }} equity</div>
   </div>
   <div class="tile">
     <div class="k">DRY realized P&amp;L</div>
-    <div class="v {{ 'up' if dry.realized > 0 else ('down' if dry.realized < 0 else 'flat') }}" id="tKalshiPnl">{{ '$%.2f'|format(dry.total_pnl) }}</div>
+    <div class="v {{ 'up' if dry.realized > 0 else ('down' if dry.realized < 0 else 'flat') }}" id="dRealTile">{{ '$%.2f'|format(dry.total_pnl) }}</div>
     <div class="s">{{ dry.ledger_entries }} simulated fill{{ '' if dry.ledger_entries == 1 else 's' }}</div>
   </div>
   {% endif %}
@@ -2831,11 +2839,22 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 
       <div class="card" style="cursor:default">
         <div class="ctop">
-          <div><div class="clabel">Kalshi BTC ladder</div><div class="mono cname" id="ladderTicker">{{ (m.kalshi.nearest.ticker if m.kalshi.nearest else 'KXBTC') }}</div></div>
-          <span class="pill" id="ladderPill">--</span>
+          <div>
+            <div class="clabel">Kalshi BTC 15-min</div>
+            <div class="mono cname" id="k15Ticker">{{ (m.kalshi.market.ticker if m.kalshi.get('market') else 'KXBTC15M') }}</div>
+          </div>
+          <span class="pill" id="k15Pill">--</span>
         </div>
-        <div class="cchart" style="height:130px"><canvas id="ladderChart"></canvas></div>
-        <div class="cfoot"><span class="mono" style="color:var(--faint)" id="ladderDetail">waiting for a two-sided quote</span></div>
+        <div class="cchart" style="height:130px"><canvas id="k15Chart"></canvas></div>
+        <div class="cstats" style="grid-template-columns:repeat(2,1fr);gap:4px 10px">
+          <div><b id="k15Up">--</b><span>UP ask</span></div>
+          <div><b id="k15Down">--</b><span>DOWN ask</span></div>
+          <div><b id="k15Target">--</b><span>target</span></div>
+          <div><b id="k15Clock">--</b><span>settles in</span></div>
+        </div>
+        <div class="cfoot">
+          <span class="mono" style="color:var(--faint)" id="k15Detail">waiting for the next contract</span>
+        </div>
       </div>
 
       <div class="card" style="cursor:default" id="accountCard">
@@ -2857,10 +2876,10 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
     </div>
     <p style="color:var(--faint);font-size:11.5px;margin-top:10px">
       {{ lead.note }}
-      Kalshi's BTC series settles on an <b>hourly</b> snapshot and quotes a ladder of strikes
-      &mdash; there is no 15-minute up/down BTC contract to trade.
-      Measured lead: <b class="mono">{{ ('$%.2f'|format(lead.delta)) if lead.delta is not none else '--' }}</b>
-      between live spot and the price Kalshi's own quote implies.
+      The contract resolves on the 60-second average of <b>CF Benchmarks BRTI</b> against the
+      previous window, so live spot is a <b>proxy</b> for the settlement value, not the value itself.
+      Spot vs target right now:
+      <b class="mono">{{ ('%+.2f'|format(lead.spot_vs_target)) if lead.spot_vs_target is not none else '--' }}</b>
     </p>
   </div>
 </div>
@@ -3067,13 +3086,30 @@ function paint(s) {
   }
 
   const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
-  set('tBalance', s.balance == null ? '-' : '$' + Number(s.balance).toFixed(2));
-  set('tLivePos', (k.market_count || 0) + (k.event_count || 0));
   const money = v => '$' + Number(v || 0).toFixed(2);
-  set('tExposure', money(k.exposure));
-  set('tKalshiPnl', money(k.realized));
-  const kr = document.getElementById('tKalshiPnl');
-  if (kr) kr.className = 'v ' + sgn(k.realized || 0);
+
+  // The headline tiles are mode-specific markup, and each set of ids is written
+  // from its OWN book. The DRY and LIVE tiles previously shared element ids, so
+  // this line wrote the real Kalshi balance, position count, exposure and
+  // realized P&L into the DRY tiles ten seconds after load - the page
+  // contradicting its own DRY MODE flag. Live ids do not exist in DRY and vice
+  // versa, so each write is a no-op in the other mode rather than a leak.
+  if (s.mode && s.mode.mode === 'live') {
+    set('tBalance', s.balance == null ? '-' : money(s.balance));
+    set('tLivePos', (k.market_count || 0) + (k.event_count || 0));
+    set('tExposure', money(k.exposure));
+    set('tKalshiPnl', money(k.realized));
+    const kr = document.getElementById('tKalshiPnl');
+    if (kr) kr.className = 'v ' + sgn(k.realized || 0);
+  } else {
+    const dry = (s.mode && s.mode.dry) || {}, od = s.open_dry || {};
+    set('dCashTile', money(dry.cash));
+    set('dPosTile', od.positions || 0);
+    set('dDepTile', money(od.capital));
+    set('dRealTile', money(dry.total_pnl));
+    const dr = document.getElementById('dRealTile');
+    if (dr) dr.className = 'v ' + sgn(dry.total_pnl || 0);
+  }
 
   const t = s.trades || {}, d = s.data || {};
   set('tBotPnl', money(t.realized_pnl));
@@ -3273,8 +3309,13 @@ function paintMode(d) {
   set('dPnl', money(pnl));
   const p = $('dPnl');
   if (p) p.className = pnl > 0 ? 'up' : (pnl < 0 ? 'down' : 'flat');
-  const f2 = d.funding || {};
-  set('fBalance', money(f2.balance));
+  // The real balance is shown only where it belongs. In DRY the funding panel
+  // is labelled as the live account, so it keeps its number; in LIVE it is the
+  // DRY book that is simulated and must not borrow it.
+  if (d.mode === 'live') {
+    const f3 = d.funding || {};
+    set('fBalance', money(f3.balance));
+  }
 }
 
 // --- controls ---
@@ -3413,33 +3454,67 @@ function paintMarket(md) {
   }]);
 
   const k = md.kalshi || {};
-  const kpts = k.points || [];
-  if (k.nearest) $('ladderTicker').textContent = k.nearest.ticker;
-  const lp = $('ladderPill');
-  if (lp) {
-    lp.className = 'pill ' + (k.nearest ? 'ok' : 'warn');
-    lp.textContent = k.nearest ? 'quoted' : 'no quote';
+  const kpts = md.series || [];
+  const contract = k.market || null;
+  if (contract) $('k15Ticker').textContent = contract.ticker;
+  const kp = $('k15Pill');
+  if (kp) {
+    kp.className = 'pill ' + (contract ? 'ok' : 'warn');
+    kp.textContent = contract ? 'quoted' : 'no quote';
   }
-  $('ladderDetail').textContent = k.nearest
-    ? k.nearest.label + '  ·  YES ' + (k.nearest.yes != null ? k.nearest.yes : '--')
-      + '  ·  ' + k.levels + ' strikes'
-    : 'waiting for a two-sided quote';
-  drawFeed('ladderChart', kpts.map(p => hhmmss(p.t)), [
+  const set15 = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  set15('k15Up', contract && contract.up_ask != null ? Math.round(contract.up_ask * 100) + '¢' : '--');
+  set15('k15Down', contract && contract.down_ask != null ? Math.round(contract.down_ask * 100) + '¢' : '--');
+  set15('k15Target', contract && contract.target != null ? '$' + Number(contract.target).toLocaleString() : '--');
+  // Countdown runs locally between polls so it ticks smoothly instead of
+  // jumping every five seconds.
+  if (contract && contract.close_time) {
+    DEADLINE = new Date(contract.close_time).getTime() / 1000;
+  }
+  tickClock();
+  $('k15Detail').textContent = contract
+    ? (contract.title || 'up or down') + ' · ' + (k.tradable || 0) + ' quotable of ' + (k.open_markets || 0)
+      + (k.error ? ' · ' + k.error : '')
+    : 'waiting for the next contract';
+  drawFeed('k15Chart', kpts.map(p => hhmmss(p.t)), [
     {
       label: 'spot', borderColor: '#f7a600', backgroundColor: 'rgba(247,166,0,.08)',
       data: kpts.map(p => p.spot), tension: 0.2, pointRadius: 0, borderWidth: 1.5,
     },
     {
-      label: 'Kalshi implied', borderColor: '#4d9fff', backgroundColor: 'rgba(77,159,255,.10)',
-      data: kpts.map(p => p.implied), tension: 0.2, pointRadius: 0, borderWidth: 1.5, borderDash: [4, 3],
+      label: 'target', borderColor: '#8fa3bd', borderDash: [3, 3],
+      data: kpts.map(p => p.target), tension: 0, pointRadius: 0, borderWidth: 1.2,
     },
   ], { scales: { x: { ticks: { color: '#5b6a80', maxTicksLimit: 4, font: { size: 9 } } },
-                  y: { ticks: { color: '#5b6a80', font: { size: 9 } } } } });
+                  y: { ticks: { color: '#5b6a80', font: { size: 9 } },
+                       // Spot and target are ~$84k; a zero-based axis would
+                       // flatten both into a single line.
+                       min: (function () {
+                         const vals = kpts.flatMap(p => [p.spot, p.target]).filter(v => v != null);
+                         return vals.length ? Math.min.apply(null, vals) - 40 : undefined;
+                       })(),
+                       max: (function () {
+                         const vals = kpts.flatMap(p => [p.spot, p.target]).filter(v => v != null);
+                         return vals.length ? Math.max.apply(null, vals) + 40 : undefined;
+                       })(),
+                  } } });
 
   const lead = md.lead || {};
   $('feedNote').textContent = lead.usable
-    ? 'streaming · lead measured live'
+    ? 'streaming · ' + (lead.series || 'KXBTC15M') + ' live'
     : (k.error ? 'streaming · Kalshi: ' + k.error : 'streaming');
+}
+
+let DEADLINE = 0;
+function tickClock() {
+  const el = $('k15Clock');
+  if (!el) return;
+  if (!DEADLINE) { el.textContent = '--'; return; }
+  const left = Math.max(0, DEADLINE - Date.now() / 1000);
+  const m = Math.floor(left / 60);
+  const s = Math.floor(left % 60);
+  el.textContent = m + ':' + String(s).padStart(2, '0');
+  el.className = left < 60 ? 'down' : '';
 }
 
 function paintAccount(a) {
@@ -3644,6 +3719,7 @@ refreshFeeds();
 setInterval(refresh, 10000);
 setInterval(loadLogs, 30000);
 setInterval(refreshFeeds, 5000);
+setInterval(tickClock, 500);
 </script>
 </body>
 </html>

@@ -76,22 +76,23 @@ def cmd_run(args: argparse.Namespace) -> None:
         )
         return
 
-    # --btc-ladder mode: fast spot feed vs Kalshi's own BTC ladder quotes
-    if getattr(args, "btc_ladder", False):
-        from src.jobs.ladder_trader import LadderConfig, run_ladder_trader
+    # --btc-updown mode: live spot vs Kalshi's own 15-minute up/down quotes
+    if getattr(args, "btc_updown", False):
+        from src.jobs.ladder_trader import UpDownConfig, run_updown_trader
 
-        print("📈 BTC LADDER MODE")
-        print("   Live spot feed vs Kalshi BTC ladder | $5 per clip | 1 position at a time")
+        print("📈 BTC 15-MIN UP/DOWN MODE")
+        print("   KXBTC15M | live spot vs Kalshi's own quote")
+        print("   $5 per clip | 1 position at a time | no trade inside the noise band")
         try:
             asyncio.run(
-                run_ladder_trader(
-                    LadderConfig(),
+                run_updown_trader(
+                    UpDownConfig(),
                     loop=getattr(args, "loop", True),
-                    interval=float(getattr(args, "interval", 0) or 4),
+                    interval=float(getattr(args, "interval", 0) or 0),
                 )
             )
         except KeyboardInterrupt:
-            print("\nBTC ladder trader stopped by user.")
+            print("\nBTC up/down trader stopped by user.")
         return
 
     # --quick-flip mode: short-horizon momentum scalping
@@ -838,10 +839,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Quick flip scalping: short-horizon momentum entries and exits",
     )
     strategy_group.add_argument(
-        "--btc-ladder",
+        "--btc-updown",
         action="store_true",
-        dest="btc_ladder",
-        help="BTC ladder: trade only when live spot and Kalshi's BTC ladder disagree",
+        dest="btc_updown",
+        help="BTC 15-minute up/down: trade only when live spot and Kalshi's own "
+        "KXBTC15M quote disagree",
     )
     p_run.add_argument(
         "--loop",

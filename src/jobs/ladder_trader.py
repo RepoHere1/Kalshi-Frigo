@@ -1,100 +1,94 @@
-"""BTC ladder trader: a fast spot feed against Kalshi's own BTC quotes.
+"""BTC 15-minute up/down trader: a fast spot feed against Kalshi's own quotes.
 
-THE PREMISE, AND WHAT WAS ACTUALLY FOUND
-----------------------------------------
-The idea this implements is: a real-time spot feed moves before Kalshi's slower
-quote does, so when the two disagree, Kalshi's price is the stale one. That is a
-testable claim, so this module tests it instead of assuming it:
-
-* newhedge.io returns HTTP 403 to every programmatic request from this host, so
-  it cannot be the feed. Coinbase's public BTC-USD websocket is used instead -
-  measured at tens of milliseconds - and it is the same underlying spot market.
-* Kalshi's `KXBTC` series settles on an **hourly** snapshot and quotes a ladder
-  of strikes ("$73,249.99 or below"), not a 15-minute up/down binary. There is no
-  15-minute BTC contract to trade. `KXBTC15`, `KXBTCUP` and `KXCRYPTO` all return
-  zero markets. So the ladder below is the real shape of the opportunity.
+THE MARKET
+----------
+`KXBTC15M-26OCT011715-15` - "BTC price up in next 15 mins?" Resolves Yes if the
+average of sixty CF Benchmarks BRTI prints in the final minute is at least the
+same average measured over the previous window. Kalshi quotes Up and Down
+directly, in `*_dollars` fields.
 
 THE RULE
 --------
-For each quoted strike, Kalshi's own YES price q is an opinion about whether spot
-settles on one side of the strike. This module forms its own opinion from the live
-spot price, and trades only when the two disagree by more than `MIN_EDGE`:
+The target price is the previous window's settlement average, so "is it up?" is
+arithmetic against a number the contract already publishes. The tradeable
+question is what Kalshi *charges* for that answer:
 
-    fair  = P(settles above strike) implied by the live spot price
-    edge  = fair - kalshi_yes          (for the YES side)
+    fair_up = 1 if spot is above target by more than NOISE else the market's own
+              probability, and the trade is taken only when Kalshi's quote
+              disagrees with that by more than MIN_EDGE.
 
-A positive edge means Kalshi is quoting the contract cheaper than the live spot
-justifies. That is the whole trade. If the feeds agree - which they will, most of
-the time, and always once any supposed lead has been arbitraged away - the module
-does nothing. No trade is taken on a lead it has not measured.
+NOISE exists because the settlement value is a 60-second average of a composite
+index, not a spot print. Without a deadband, every tick of noise would look like
+an edge and the strategy would pay the spread on nothing. The deadband is the
+honest part of this: inside it, no trade, regardless of how tempting the number
+looks.
 
 MONEY
 -----
-`$5` notional per trade and at most one open ladder position at a time, as
-specified. Both are hard limits in `LadderConfig`, not defaults that can be
-loosened by a caller. Orders route through `src.jobs.broker`, so DRY runs the
-identical validation and cannot transmit.
+`$5` notional per clip and at most one open position at a time, as specified.
+Both are hard limits in `UpDownConfig`. Orders route through the canonical
+`execute_position` path, so DRY runs identical validation and cannot transmit.
 """
 import asyncio
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from src.jobs.market_data import KalshiLadder, LadderLevel, SpotFeed, _f
+from src.jobs.market_data import Btc15mFeed, SpotFeed, UpDownMarket
 
 
 @dataclass
-class LadderConfig:
+class UpDownConfig:
     """Hard limits. Sized so a single bad call cannot damage the account."""
 
     notional_usd: float = 5.0
-    # One ladder position at a time: no stacking, no doubling up on the same
-    # thesis while it is still open.
     max_open_positions: int = 1
-    # Required disagreement before trading. 0.06 = six points of probability.
+    # Required disagreement with Kalshi's own price before trading.
     min_edge: float = 0.06
-    # Ignore strikes this far from spot: they are effectively decided and the
-    # spread, not the edge, is what you would be paying.
-    max_distance_usd: float = 150.0
-    # Kalshi's minimum order is $1.00; $5 of notional clears it easily.
+    # Deadband around the target, in dollars. Settlement is a 60-second average
+    # of a composite index, so sub-noise moves are not information.
+    noise_usd: float = 15.0
+    # Kalshi's minimum order is $1.00.
     min_order_usd: float = 1.0
-    # How many ladder levels to consider per cycle.
-    max_levels: int = 12
+    # Stop opening new positions this close to expiry: the settlement window is
+    # the 60 seconds before close, and a fill inside it is a coin toss.
+    min_seconds_left: float = 45.0
     poll_seconds: float = 4.0
-    # The spot tick must be this fresh to be used at all.
     max_spot_age: float = 5.0
 
 
 @dataclass
-class LadderSignal:
+class UpDownSignal:
     ticker: str
-    strike: float
-    above: bool
+    bucket: Optional[str]
+    side: str  # "up" | "down" | ""
+    target: Optional[float]
+    spot: float
+    spot_vs_target: float
     fair: float
-    kalshi_yes: float
+    kalshi_price: Optional[float]
     edge: float
-    buy: str  # "yes" | "no" | ""
     ask: Optional[float]
     contracts: int
     notional: float
+    seconds_left: Optional[float]
     reason: str
 
     @property
     def actionable(self) -> bool:
-        return bool(self.buy) and self.contracts > 0
+        return bool(self.side) and self.contracts > 0
 
 
 @dataclass
-class LadderBook:
-    """What this strategy currently holds, and what it has decided."""
-
-    signals: List[LadderSignal] = field(default_factory=list)
+class UpDownBook:
+    signals: List[UpDownSignal] = field(default_factory=list)
     open_positions: List[Dict[str, Any]] = field(default_factory=list)
     max_open: int = 1
     trades_today: int = 0
     skipped_no_edge: int = 0
     skipped_stale: int = 0
-    skipped_distance: int = 0
+    skipped_too_close: int = 0
+    skipped_unquoted: int = 0
     last_error: str = ""
     dry: bool = True
 
@@ -107,112 +101,158 @@ class LadderBook:
             "trades_today": self.trades_today,
             "skipped_no_edge": self.skipped_no_edge,
             "skipped_stale": self.skipped_stale,
-            "skipped_distance": self.skipped_distance,
+            "skipped_too_close": self.skipped_too_close,
+            "skipped_unquoted": self.skipped_unquoted,
             "last_error": self.last_error,
             "dry": self.dry,
         }
 
 
-def fair_probability(spot: float, strike: float, band: float = 250.0) -> float:
-    """P(settlement above `strike`) implied by the live spot price.
+def fair_up_probability(spot: float, target: float, noise_usd: float = 15.0) -> float:
+    """P(the next window settles at or above the target), from live spot.
 
-    A crude logistic centred on the strike, deliberately: the point is to compare
-    an independent opinion against Kalshi's, not to be a pricing model. The same
-    shape is used on both sides so a level quoted "or below" is just the
-    complement.
+    A logistic in the distance past the target, in units of the noise band. At
+    the target it is exactly 0.5, which is the right prior for a market that has
+    not moved yet; far past it, it saturates near 1.
     """
-    if band <= 0:
+    if noise_usd <= 0:
         return 0.5
-    z = max(-6.0, min(6.0, (spot - strike) / band))
+    z = max(-6.0, min(6.0, (spot - target) / noise_usd))
     return float(1.0 / (1.0 + math.exp(-z)))
 
 
-class LadderTrader:
-    """Evaluates the ladder against live spot and takes one $5 trade at a time."""
+class UpDownTrader:
+    """Scores the next 15-minute contract against live spot and takes one clip."""
 
     def __init__(
         self,
         spot: SpotFeed,
-        ladder: KalshiLadder,
-        config: Optional[LadderConfig] = None,
+        feed: Btc15mFeed,
+        config: Optional[UpDownConfig] = None,
         db_manager: Any = None,
     ):
         self.spot = spot
-        self.ladder = ladder
-        self.config = config or LadderConfig()
+        self.feed = feed
+        self.config = config or UpDownConfig()
         self.db_manager = db_manager
         self._client: Any = None
-        self.book = LadderBook(max_open=self.config.max_open_positions)
+        self.book = UpDownBook(max_open=self.config.max_open_positions)
 
-    # ------------------------------------------------------------------
-    # Signals
-    # ------------------------------------------------------------------
-    def evaluate(self, levels: List[LadderLevel]) -> List[LadderSignal]:
-        """Score every nearby two-sided level. Read-only: no orders here."""
-        signals: List[LadderSignal] = []
-        if self.spot.price <= 0:
+    def evaluate(self, market: Optional[UpDownMarket]) -> Optional[UpDownSignal]:
+        """Score the next contract. Read-only: no orders here."""
+        if market is None:
+            self.book.skipped_unquoted += 1
+            return None
+        if not market.tradable or market.target is None:
+            self.book.skipped_unquoted += 1
+            return None
+        if self.spot.price <= 0 or self.spot.age > self.config.max_spot_age:
             self.book.skipped_stale += 1
-            return signals
-        if self.spot.age > self.config.max_spot_age:
-            # A stale spot price is worse than no price: it is exactly the
-            # condition under which this strategy is wrong.
-            self.book.skipped_stale += 1
-            return signals
+            return None
+        if (market.seconds_left or 0) < self.config.min_seconds_left:
+            # The settlement window is the final 60 seconds. Inside it, spot is
+            # no longer leading anything.
+            self.book.skipped_too_close += 1
+            return None
 
-        for level in levels[: self.config.max_levels]:
-            if not level.tradable:
-                continue
-            if abs(level.strike - self.spot.price) > self.config.max_distance_usd:
-                self.book.skipped_distance += 1
-                continue
-
-            fair = fair_probability(self.spot.price, level.strike)
-            yes = float(level.mid or 0.0)
-            edge = fair - yes
-            buy = ""
-            ask = None
-            reason = ""
-
-            if edge >= self.config.min_edge:
-                buy, ask = "yes", level.yes_ask
-                reason = (
-                    f"spot ${self.spot.price:,.0f} vs strike ${level.strike:,.0f}: "
-                    f"fair {fair:.2f} vs Kalshi {yes:.2f}"
-                )
-            elif edge <= -self.config.min_edge:
-                buy, ask = "no", (1.0 - level.yes_bid) if level.yes_bid is not None else None
-                reason = (
-                    f"spot ${self.spot.price:,.0f} vs strike ${level.strike:,.0f}: "
-                    f"fair {fair:.2f} vs Kalshi {yes:.2f} (NO side)"
-                )
-            else:
-                self.book.skipped_no_edge += 1
-                reason = f"no edge: fair {fair:.2f} vs Kalshi {yes:.2f}"
-
-            contracts = self._size(ask) if buy else 0
-            signals.append(
-                LadderSignal(
-                    ticker=level.ticker,
-                    strike=level.strike,
-                    above=level.above,
-                    fair=round(fair, 4),
-                    kalshi_yes=round(yes, 4),
-                    edge=round(edge, 4),
-                    buy=buy,
-                    ask=ask,
-                    contracts=contracts,
-                    notional=round((ask or 0.0) * contracts, 2),
-                    reason=reason,
-                )
+        spot = self.spot.price
+        target = float(market.target)
+        delta = round(spot - target, 2)
+        # Hard deadband. Settlement is the 60-second average of a composite
+        # index, so inside this band spot carries no directional information at
+        # all. Without an explicit refusal the logistic still produces a small
+        # "edge" from pure noise, and the strategy pays the spread on nothing.
+        if abs(delta) <= self.config.noise_usd:
+            self.book.skipped_no_edge += 1
+            signal = UpDownSignal(
+                ticker=market.ticker,
+                bucket=market.bucket,
+                side="",
+                target=target,
+                spot=spot,
+                spot_vs_target=delta,
+                fair=0.5,
+                kalshi_price=market.up_price,
+                edge=0.0,
+                ask=None,
+                contracts=0,
+                notional=0.0,
+                seconds_left=round(market.seconds_left or 0.0, 1),
+                reason=(
+                    f"spot {spot:,.0f} is {delta:+,.0f} from target {target:,.0f} - "
+                    f"inside the ${self.config.noise_usd:,.0f} noise band, no trade"
+                ),
             )
-        signals.sort(key=lambda s: -abs(s.edge))
-        self.book.signals = signals
-        return signals
+            self.book.signals = [signal]
+            return signal
+
+        fair = fair_up_probability(spot, target, self.config.noise_usd)
+
+        up_ask = market.up_price
+        down_ask = market.down_price
+
+        # Symmetric comparison: what this contract is worth to us, minus what
+        # Kalshi charges for it. Both sides are a probability in [0, 1], so the
+        # edge is directly comparable.
+        #
+        # The DOWN side is `1 - fair_up`, not `fair_up - down_ask`: if spot sits
+        # $300 below the target then DOWN is nearly certain, so the edge on DOWN
+        # is what we are actually being offered. Getting that backwards made the
+        # strategy refuse precisely the trades it exists to take.
+        up_edge = (fair - up_ask) if up_ask is not None else 0.0
+        down_edge = ((1.0 - fair) - down_ask) if down_ask is not None else 0.0
+
+        side = ""
+        ask: Optional[float] = None
+        kalshi: Optional[float] = None
+        edge = 0.0
+        if up_edge >= self.config.min_edge and up_edge >= down_edge:
+            side, ask, kalshi, edge = "up", up_ask, up_ask, up_edge
+        elif down_edge >= self.config.min_edge:
+            side, ask, kalshi, edge = "down", down_ask, down_ask, down_edge
+
+        if not side:
+            self.book.skipped_no_edge += 1
+            reason = (
+                f"spot {spot:,.0f} vs target {target:,.0f} ({delta:+,.0f}): "
+                f"fair {fair:.2f}, Kalshi up "
+                f"{('%.2f' % up_ask) if up_ask is not None else '--'} / down "
+                f"{('%.2f' % down_ask) if down_ask is not None else '--'} - inside the edge"
+            )
+        else:
+            reason = (
+                f"spot {spot:,.0f} vs target {target:,.0f} ({delta:+,.0f}): "
+                f"fair {('%.2f' % (fair if side == 'up' else 1.0 - fair))} vs Kalshi "
+                f"{float(kalshi or 0.0):.2f} on {side.upper()} - edge {edge:+.3f}"
+            )
+
+        contracts = self._size(ask) if side else 0
+        signal = UpDownSignal(
+            ticker=market.ticker,
+            bucket=market.bucket,
+            side=side,
+            target=target,
+            spot=spot,
+            spot_vs_target=delta,
+            fair=round(fair, 4),
+            kalshi_price=round(float(kalshi), 4) if kalshi is not None else None,
+            edge=round(edge, 4),
+            ask=ask,
+            contracts=contracts,
+            notional=round(float(ask or 0.0) * contracts, 2),
+            seconds_left=round(market.seconds_left or 0.0, 1),
+            reason=reason,
+        )
+        self.book.signals = [signal]
+        return signal
 
     def _size(self, ask: Optional[float]) -> int:
         """Contracts for one $5 clip. Zero when the price cannot clear the floor."""
-        price = _f(ask)
-        if price is None or price <= 0 or price > 1.0:
+        try:
+            price = float(ask) if ask is not None else 0.0
+        except (TypeError, ValueError):
+            return 0
+        if price <= 0 or price > 1.0:
             return 0
         contracts = int(self.config.notional_usd / price)
         if contracts * price < self.config.min_order_usd:
@@ -222,91 +262,17 @@ class LadderTrader:
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
-    async def cycle(self) -> Dict[str, Any]:
-        """One pass: fetch the ladder, score it, and take at most one trade.
-
-        Order routing is delegated to the broker, so DRY runs the same validation
-        and the same sizing and books a simulated fill; LIVE requires
-        `should_trade_live()`, which needs both the env var and a persisted
-        dashboard mode of "live".
-        """
-        from src.jobs.broker import should_trade_live
-        from src.utils.database import DatabaseManager
-        from src.utils.mode import TradingMode
-
-        if self.db_manager is None:
-            self.db_manager = DatabaseManager()
-            # The dashboard creates the schema, but a strategy started on its own
-            # may be the first process to touch this database.
-            await self.db_manager.initialize()
-
-        live = should_trade_live()
-        self.book.dry = not live
-        # Awaited directly. `mode.run()` builds a fresh event loop, which raises
-        # "Cannot run the event loop while another loop is running" from inside
-        # this coroutine - that killed the strategy on its very first cycle.
-        mode = await TradingMode(db_path=str(self._db_path())).current()
-
-        try:
-            await self.ladder.fetch()
-        except Exception as exc:  # noqa: BLE001
-            self.book.last_error = f"ladder fetch: {type(exc).__name__}: {exc}"
-            return self.book.summary()
-
-        signals = self.evaluate(self.ladder.last.levels)
-        # One ladder position at a time. No pyramiding, no doubling in.
-        if len(self.book.open_positions) >= self.config.max_open_positions:
-            self.book.last_error = ""
-            return self.book.summary()
-
-        taken = None
-        for sig in signals:
-            if not sig.actionable:
-                continue
-            placed = await self._place(sig, live)
-            if placed:
-                taken = sig
-                self.book.open_positions.append(
-                    {
-                        "ticker": sig.ticker,
-                        "side": sig.buy,
-                        "contracts": sig.contracts,
-                        "notional": sig.notional,
-                        "edge": sig.edge,
-                        "mode": mode,
-                    }
-                )
-                self.book.trades_today += 1
-                break
-        self.book.last_error = ""
-        result = self.book.summary()
-        result["took"] = (
-            {
-                "ticker": taken.ticker,
-                "side": taken.buy,
-                "contracts": taken.contracts,
-                "notional": taken.notional,
-                "edge": taken.edge,
-                "reason": taken.reason,
-                "mode": mode,
-            }
-            if taken
-            else None
-        )
-        return result
-
     def _db_path(self) -> str:
         import os
 
-        return os.environ.get("DB_PATH", "trading_system.db")
+        return os.environ.get("DB_PATH", "").strip() or "trading_system.db"
 
-    async def _place(self, sig: LadderSignal, live: bool) -> bool:
+    async def _place(self, signal: UpDownSignal, live: bool) -> bool:
         """Submit one clip through the canonical order path.
 
-        This deliberately calls `execute_position` rather than assembling an order
-        itself, so a ladder trade is validated, funded-checked, sized against the
-        active book and recorded exactly like every other trade in the system -
-        and, critically, so DRY cannot transmit.
+        Delegating to `execute_position` means a clip is validated, funded-checked
+        and recorded exactly like every other trade in the system - and that DRY
+        cannot transmit.
         """
         from src.clients.kalshi_client import KalshiClient
         from src.jobs.execute import execute_position
@@ -314,6 +280,7 @@ class LadderTrader:
 
         if self.db_manager is None:
             self.db_manager = DatabaseManager()
+            await self.db_manager.initialize()
         if self._client is None:
             try:
                 self._client = KalshiClient()
@@ -321,22 +288,21 @@ class LadderTrader:
                 self.book.last_error = f"no Kalshi client: {type(exc).__name__}: {exc}"
                 return False
 
-        # NO side: the ask we pay is the complement of the YES bid.
-        ask = float(sig.ask or 0.0)
-        price = ask if sig.buy == "yes" else 1.0 - ask
+        ask = float(signal.ask or 0.0)
+        price = ask if signal.side == "up" else 1.0 - ask
         position = Position(
-            market_id=sig.ticker,
-            side="YES" if sig.buy == "yes" else "NO",
-            entry_price=round(float(price), 4),
-            quantity=sig.contracts,
+            market_id=signal.ticker,
+            side="YES" if signal.side == "up" else "NO",
+            entry_price=round(price, 4),
+            quantity=signal.contracts,
             timestamp=_utcnow(),
             rationale=(
-                f"BTC LADDER {sig.reason} | edge {sig.edge:+.3f} | "
-                f"{sig.contracts} @ ${price:.3f}"
+                f"BTC 15M UP/DOWN {signal.reason} | {signal.contracts} @ ${price:.3f} | "
+                f"{signal.seconds_left}s left"
             ),
-            confidence=abs(sig.edge),
+            confidence=abs(signal.edge),
             live=False,
-            strategy="btc_ladder",
+            strategy="btc_updown",
             mode="live" if live else "dry",
         )
         try:
@@ -345,6 +311,86 @@ class LadderTrader:
             self.book.last_error = f"submit failed: {type(exc).__name__}: {exc}"
             return False
 
+    async def cycle(self) -> Dict[str, Any]:
+        """One pass: refresh the series, score it, take at most one trade."""
+        from src.jobs.broker import should_trade_live
+        from src.utils.database import DatabaseManager
+        from src.utils.mode import TradingMode
+
+        if self.db_manager is None:
+            self.db_manager = DatabaseManager()
+            await self.db_manager.initialize()
+
+        live = should_trade_live()
+        self.book.dry = not live
+        # Awaited directly: mode.run() builds a fresh event loop, which raises
+        # from inside this coroutine.
+        mode = await TradingMode(db_path=self._db_path()).current()
+
+        try:
+            await self.feed.fetch()
+        except Exception as exc:  # noqa: BLE001
+            self.book.last_error = f"series fetch: {type(exc).__name__}: {exc}"
+            return self.book.summary()
+
+        market = self.feed.nearest()
+        signal = self.evaluate(market)
+        self.book.last_error = ""
+
+        took: Optional[Dict[str, Any]] = None
+        blocked = ""
+        # One position at a time. No pyramiding, no doubling in.
+        if signal is not None and signal.actionable:
+            if len(self.book.open_positions) >= self.config.max_open_positions:
+                blocked = (
+                    f"already holding {len(self.book.open_positions)} position(s); "
+                    "max is one at a time"
+                )
+            elif await self._place(signal, live):
+                self.book.open_positions.append(
+                    {
+                        "ticker": signal.ticker,
+                        "side": signal.side,
+                        "contracts": signal.contracts,
+                        "notional": signal.notional,
+                        "edge": signal.edge,
+                        "mode": mode,
+                    }
+                )
+                self.book.trades_today += 1
+                took = {
+                    "ticker": signal.ticker,
+                    "side": signal.side,
+                    "contracts": signal.contracts,
+                    "notional": signal.notional,
+                    "edge": signal.edge,
+                    "reason": signal.reason,
+                    "mode": mode,
+                }
+
+        # One flat summary: the book counters plus this cycle's reading.
+        result = self.book.summary()
+        result.update(
+            {
+                "took": took,
+                "blocked": blocked,
+                "contract": market.ticker if market else None,
+                "bucket": market.bucket if market else None,
+                "seconds_left": (
+                    round(market.seconds_left, 1)
+                    if market is not None and market.seconds_left is not None
+                    else None
+                ),
+                "target": market.target if market else None,
+                "spot": round(self.spot.price, 2) if self.spot.price else None,
+                "spot_vs_target": signal.spot_vs_target if signal else None,
+                "fair_up": signal.fair if signal else None,
+                "kalshi_up": signal.kalshi_price if signal else None,
+                "reason": signal.reason if signal else "no quotable contract",
+            }
+        )
+        return result
+
 
 def _utcnow():
     from datetime import datetime, timezone
@@ -352,23 +398,24 @@ def _utcnow():
     return datetime.now(timezone.utc)
 
 
-async def run_ladder_trader(
-    config: Optional[LadderConfig] = None,
+async def run_updown_trader(
+    config: Optional[UpDownConfig] = None,
     loop: bool = False,
-    interval: float = 4.0,
+    interval: float = 0.0,
 ) -> None:
-    """Run the ladder trader, optionally on a loop until interrupted."""
+    """Run the 15-minute up/down trader, optionally on a loop until interrupted."""
     from src.jobs.market_data import MarketDataHub
 
     hub = MarketDataHub()
     await hub.start()
-    trader = LadderTrader(hub.spot, hub.ladder, config)
+    trader = UpDownTrader(hub.spot, hub.feed, config)
+    sleep_for = interval or (config and config.poll_seconds) or 4.0
     try:
         while True:
             result = await trader.cycle()
             print(result)
             if not loop:
                 return
-            await asyncio.sleep(interval or (config and config.poll_seconds) or 4.0)
+            await asyncio.sleep(sleep_for)
     finally:
         await hub.stop()

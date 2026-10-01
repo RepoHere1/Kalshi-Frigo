@@ -1,24 +1,33 @@
-"""Real-time BTC market data for the dashboard and the ladder strategy.
+"""Real-time BTC market data for the dashboard and the 15-minute trader.
 
-Two feeds, deliberately kept apart:
+THE MARKET THAT ACTUALLY EXISTS
+-------------------------------
+Series `KXBTC15M`, event `KXBTC15M-26OCT011715`, market
+`KXBTC15M-26OCT011715-15` - "BTC price up in next 15 mins?", a binary
+`greater_or_equal` contract on CF Benchmarks' BRTI.
 
-* `SpotFeed` - Coinbase's public BTC-USD websocket. Measured at well under a
-  second from this host, and it is the same underlying spot market Kalshi's BTC
-  ladder settles against.
-* `KalshiLadder` - Kalshi's own quotes for the `KXBTC` price-range ladders,
-  polled over REST. Kalshi's ticker websocket is on a hostname that does not
-  resolve from here and the authenticated endpoint requires credentials, so REST
-  is the reliable path.
+Three details of this feed are easy to get wrong, and each one silently
+produced "no quote" before:
 
-WHAT THIS DOES NOT ASSUME. The premise that a free spot feed runs ~45 seconds
-ahead of Kalshi is not taken on faith here. `LeadEstimator` measures the offset
-between the spot feed and Kalshi's own quoted mid for the same contract, and
-reports what it actually sees. If the lead is absent the strategy refuses to
-size up rather than trading on a number nobody verified.
+1. The horizon is a *suffix on the ticker* (`-15`, `-30`, ...). The bucket is
+   the event ticker; one event carries several horizons. Filtering on
+   `series_ticker` alone returns all of them.
+2. Prices live in the `*_dollars` string fields (`yes_bid_dollars: "0.5200"`).
+   The integer-cent `yes_bid`/`yes_ask` fields are null on this series, so
+   reading those reports an empty book on a market that is actively trading.
+3. `floor_strike` is the target price the contract resolves against.
 
-The ladder shape is also not assumed. Kalshi's `KXBTC` series settles on an
-HOURLY snapshot and quotes a ladder of strikes ("$73,249.99 or below"), not a
-15-minute up/down binary. `nearest_ladder` reports what is actually tradeable.
+SETTLEMENT, AND WHY THE EDGE IS NOT WHAT IT LOOKS LIKE
+-----------------------------------------------------
+Resolution is the simple average of sixty CF Benchmarks BRTI prints in the final
+minute before expiry, compared against the same average for the previous window
+(see `rules_primary`). So:
+
+* The settlement price is a 60-second *average of a composite index*, not a spot
+  print. A retail spot feed is a proxy for it, never the thing itself.
+* Nothing here claims CF Benchmarks' index lags spot by any particular amount.
+  The trader measures the gap between the live spot feed and Kalshi's own quote
+  and refuses to trade when it cannot see one.
 """
 import asyncio
 import json
@@ -32,14 +41,11 @@ import aiohttp
 
 KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
 COINBASE_WS = "wss://ws-feed.exchange.coinbase.com"
-BTC_SERIES = "KXBTC"
+BTC15M_SERIES = "KXBTC15M"
 
-# The spot feed has to be treated as fresh. A stale tick used as a "leading"
-# price would invert the entire premise, so anything older than this is dropped
-# rather than plotted.
+# A spot tick older than this is not used to make a trading decision. Trading on
+# a stale "leading" price inverts the entire premise.
 SPOT_MAX_AGE_SEC = 5.0
-
-# How many points the charts keep.
 SERIES_POINTS = 180
 
 
@@ -47,8 +53,54 @@ def _now() -> float:
     return time.time()
 
 
-def _hhmm(ts: str) -> str:
-    return (ts or "")[:16]
+def _f(v: Any) -> Optional[float]:
+    """Parse a dollar field, which Kalshi sends as a string ('0.5200')."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ws_messages(ws: Any) -> Any:
+    """aiohttp's message iterator, typed past the stub's missing attribute."""
+    return cast(Any, ws).messages
+
+
+def _parse_bucket(event_ticker: str) -> Optional[str]:
+    """Return the `26OCT011715` quarter-hour stamp from a ticker or bare stamp.
+
+    Accepts either form because the bucket appears in two places: on the event
+    ticker (`KXBTC15M-26OCT011715`) and on the market ticker's middle segment
+    (`KXBTC15M-26OCT011715-15`).
+
+    YY(2) MON(3) DD(2) HH(2) MM(2) - the month is alphabetic, so the numeric
+    fields cannot simply be sliced off the front as one digit run.
+    """
+    raw = (event_ticker or "").strip()
+    if "-" in raw:
+        parts = raw.split("-")
+        if len(parts) != 2 or parts[0] != "KXBTC15M":
+            return None
+        stamp = parts[1]
+    else:
+        stamp = raw
+    digits = (slice(0, 2), slice(5, 7), slice(7, 9), slice(9, 11))
+    if len(stamp) != 11 or not stamp[2:5].isalpha():
+        return None
+    if not all(stamp[s].isdigit() for s in digits):
+        return None
+    return stamp
+
+
+def _iso(ts: Optional[str]) -> Optional[float]:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -66,154 +118,59 @@ class SpotTick:
 
 
 @dataclass
-class LadderLevel:
-    """One strike on Kalshi's BTC price ladder."""
+class UpDownMarket:
+    """One 15-minute up/down contract."""
 
     ticker: str
-    strike: float
-    above: bool  # True = "at or above", False = "or below"
+    event_ticker: str
+    bucket: Optional[str]
+    horizon: int
+    title: str
+    target: Optional[float]
     yes_bid: Optional[float] = None
     yes_ask: Optional[float] = None
+    no_bid: Optional[float] = None
+    no_ask: Optional[float] = None
     last: Optional[float] = None
-    volume: Optional[int] = None
+    volume: Optional[float] = None
+    close_ts: Optional[float] = None
+    open_ts: Optional[float] = None
 
     @property
-    def label(self) -> str:
-        side = "at or above" if self.above else "or below"
-        return f"${self.strike:,.2f} {side}"
-
-    @property
-    def mid(self) -> Optional[float]:
-        if self.yes_bid is not None and self.yes_ask is not None:
-            return round((self.yes_bid + self.yes_ask) / 2, 4)
-        return self.last
+    def seconds_left(self) -> Optional[float]:
+        if self.close_ts is None:
+            return None
+        return max(0.0, self.close_ts - _now())
 
     @property
     def tradable(self) -> bool:
-        """Both sides quoted. A one-sided market cannot be traded or charted."""
         return self.yes_bid is not None and self.yes_ask is not None
 
-
-def _f(v: Any) -> Optional[float]:
-    try:
-        return float(v) if v is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _ws_messages(ws: Any) -> Any:
-    """aiohttp's message iterator, typed past the stub's missing attribute."""
-    return cast(Any, ws).messages
-
-
-@dataclass
-class LadderSnapshot:
-    levels: List[LadderLevel] = field(default_factory=list)
-    ts: float = 0.0
-    expires_at: Optional[str] = None
-    title: str = ""
+    @property
+    def up_price(self) -> Optional[float]:
+        """Price of one contract on UP (which is the YES side)."""
+        return self.yes_ask
 
     @property
-    def age(self) -> float:
-        return max(0.0, _now() - self.ts) if self.ts else float("inf")
+    def down_price(self) -> Optional[float]:
+        """Price of one contract on DOWN (the NO side)."""
+        return self.no_ask
 
+    def side_ask(self, side: str) -> Optional[float]:
+        return self.yes_ask if side == "up" else self.no_ask
 
-class KalshiLadder:
-    """Kalshi's BTC price-range ladder, read over REST.
-
-    Kalshi quotes 318 open markets in this series; one request returns all of
-    them, so a poll is a single call regardless of how wide the ladder is.
-    """
-
-    def __init__(self, series: str = BTC_SERIES):
-        self.series = series
-        self.last: LadderSnapshot = LadderSnapshot()
-
-    @staticmethod
-    def _parse(ticker: str) -> Optional[Tuple[str, float, bool]]:
-        """`KXBTC-26OCT0117-T73250` -> (expiry, 73250.0, above).
-
-        Shape is YY + MON + DD + HH, so the snapshot is hourly: the exchange
-        publishes no shorter BTC cadence, which is why nothing here assumes a
-        15-minute market.
-        """
-        parts = (ticker or "").split("-")
-        if len(parts) != 3 or parts[0] != "KXBTC":
-            return None
-        expiry, tail = parts[1], parts[2]
-        if not expiry or len(tail) < 2 or tail[0] not in ("T", "B"):
-            return None
-        try:
-            return expiry, float(tail[1:]), tail[0] == "T"
-        except ValueError:
-            return None
-
-    async def fetch(self, session: Optional[aiohttp.ClientSession] = None) -> LadderSnapshot:
-        own = session is None
-        session = session or aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=15),
-            headers={"User-Agent": "kalshi-frigo/1.0"},
-        )
-        try:
-            async with session.get(
-                f"{KALSHI_API}/markets",
-                params={"limit": 1000, "status": "open", "series_ticker": self.series},
-            ) as r:
-                r.raise_for_status()
-                payload = await r.json()
-        finally:
-            if own:
-                await session.close()
-
-        levels: List[LadderLevel] = []
-        for m in payload.get("markets", []):
-            parsed = self._parse(m.get("ticker", ""))
-            if not parsed:
-                continue
-            expiry, strike, above = parsed
-            levels.append(
-                LadderLevel(
-                    ticker=m["ticker"],
-                    strike=strike,
-                    above=above,
-                    yes_bid=_f(m.get("yes_bid")),
-                    yes_ask=_f(m.get("yes_ask")),
-                    last=_f(m.get("last_price")),
-                    volume=m.get("volume"),
-                )
-            )
-        levels.sort(key=lambda x: x.strike)
-        snap = LadderSnapshot(levels=levels, ts=_now())
-        # Keep only the nearest expiry bucket: strikes from next week cannot be
-        # compared against today's spot without being meaningless.
-        first = self._parse(levels[0].ticker) if levels else None
-        if first is not None:
-            snap.expires_at = first[0]
-            nearest = first[0]
-            snap.levels = [
-                x
-                for x in levels
-                if (parsed := self._parse(x.ticker)) is not None and parsed[0] == nearest
-            ]
-        self.last = snap
-        return snap
-
-    def nearest_strike(self, spot: float) -> Optional[LadderLevel]:
-        """The closest quoted strike to spot - the contract actually at issue."""
-        tradable = [x for x in self.last.levels if x.tradable]
-        if not tradable:
-            return None
-        return min(tradable, key=lambda x: abs(x.strike - spot))
+    def side_bid(self, side: str) -> Optional[float]:
+        return self.yes_bid if side == "up" else self.no_bid
 
 
 class SpotFeed:
     """Coinbase BTC-USD ticker over websocket, with a REST fallback.
 
-    The websocket is the point: it delivers trades in tens of milliseconds, so
-    the spot side of the lead measurement is not itself the bottleneck. If the
-    socket cannot be established the REST ticker keeps the charts alive at ~1 Hz
-    and the feed reports itself as degraded, because a slow spot price must never
-    be silently used as a leading indicator.
+    The websocket is the point: it delivers in tens of milliseconds, so the spot
+    side of the comparison is not itself the bottleneck. If the socket cannot be
+    established the REST ticker keeps the charts alive at ~0.5 Hz and the feed
+    reports itself as degraded, because a slow spot price must never be silently
+    used as a leading indicator.
     """
 
     def __init__(self) -> None:
@@ -221,6 +178,7 @@ class SpotFeed:
         self.ts: float = 0.0
         self.connected = False
         self.source = "none"
+        self.last_error = ""
         self.history: Deque[Tuple[float, float]] = deque(maxlen=SERIES_POINTS)
         self._stop: Optional[asyncio.Event] = None
 
@@ -236,8 +194,7 @@ class SpotFeed:
         self.price = price
         self.ts = _now()
         self.source = source
-        if not self.history or self.history[-1][0] != self.ts:
-            self.history.append((self.ts, price))
+        self.history.append((self.ts, price))
 
     async def start(self) -> None:
         self._stop = asyncio.Event()
@@ -251,9 +208,8 @@ class SpotFeed:
     async def _ws_loop(self) -> None:
         while not (self._stop and self._stop.is_set()):
             try:
-                async with aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as session:
+                timeout = aiohttp.ClientTimeout(total=30)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.ws_connect(COINBASE_WS) as ws:
                         await ws.send_str(
                             json.dumps(
@@ -265,6 +221,7 @@ class SpotFeed:
                             )
                         )
                         self.connected = True
+                        self.last_error = ""
                         async for msg in _ws_messages(ws):
                             if self._stop and self._stop.is_set():
                                 return
@@ -278,12 +235,12 @@ class SpotFeed:
                                 self._record(float(data["price"]), "coinbase-ws")
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - reconnect on any failure
+            except Exception as exc:  # noqa: BLE001 - reconnect on any failure
                 self.connected = False
+                self.last_error = f"{type(exc).__name__}: {exc}"
                 await asyncio.sleep(3)
 
     async def _rest_loop(self) -> None:
-        """Backstop poll, and the primary path if the socket never connects."""
         url = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
         while not (self._stop and self._stop.is_set()):
             try:
@@ -294,7 +251,7 @@ class SpotFeed:
                         data = await r.json()
                 price = _f(data.get("price"))
                 if price:
-                    # Do not overwrite a fresher websocket tick with a slower one.
+                    # Never let a slower poll overwrite a fresher socket tick.
                     if not self.fresh:
                         self._record(price, "coinbase-rest")
             except asyncio.CancelledError:
@@ -304,86 +261,159 @@ class SpotFeed:
             await asyncio.sleep(2)
 
 
+class Btc15mFeed:
+    """Kalshi's 15-minute BTC up/down markets, read over REST.
+
+    One request returns every open horizon in the series, so a poll is a single
+    call regardless of how many 15-minute buckets are live.
+    """
+
+    def __init__(self, series: str = BTC15M_SERIES):
+        self.series = series
+        self.markets: List[UpDownMarket] = []
+        self.ts: float = 0.0
+        self.refreshes = 0
+        self.last_error = ""
+
+    @staticmethod
+    def _parse(ticker: str) -> Tuple[Optional[str], Optional[str], int]:
+        """`KXBTC15M-26OCT011715-15` -> (event_ticker, bucket, horizon_minutes)."""
+        parts = (ticker or "").split("-")
+        if len(parts) != 3 or parts[0] != "KXBTC15M":
+            return None, None, 0
+        event_ticker = f"{parts[0]}-{parts[1]}"
+        try:
+            horizon = int(parts[2])
+        except ValueError:
+            horizon = 0
+        return event_ticker, _parse_bucket(parts[1]), horizon
+
+    async def fetch(self, session: Optional[aiohttp.ClientSession] = None) -> List[UpDownMarket]:
+        own = session is None
+        session = session or aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=15),
+            headers={"User-Agent": "kalshi-frigo/1.0"},
+        )
+        try:
+            async with session.get(
+                f"{KALSHI_API}/markets",
+                params={"limit": 500, "status": "open", "series_ticker": self.series},
+            ) as r:
+                r.raise_for_status()
+                payload = await r.json()
+        finally:
+            if own:
+                await session.close()
+
+        markets: List[UpDownMarket] = []
+        for m in payload.get("markets", []):
+            ticker = m.get("ticker", "")
+            event_ticker, bucket, horizon = self._parse(ticker)
+            if event_ticker is None:
+                continue
+            markets.append(
+                UpDownMarket(
+                    ticker=ticker,
+                    event_ticker=event_ticker,
+                    bucket=bucket,
+                    horizon=horizon,
+                    title=m.get("title", ""),
+                    target=_f(m.get("floor_strike")),
+                    # The *_dollars fields are the only quotes this series sets.
+                    yes_bid=_f(m.get("yes_bid_dollars")),
+                    yes_ask=_f(m.get("yes_ask_dollars")),
+                    no_bid=_f(m.get("no_bid_dollars")),
+                    no_ask=_f(m.get("no_ask_dollars")),
+                    last=_f(m.get("last_price_dollars")),
+                    volume=_f(m.get("volume_fp")),
+                    close_ts=_iso(m.get("close_time")),
+                    open_ts=_iso(m.get("open_time")),
+                )
+            )
+        # Soonest expiry first; that is the contract about to settle.
+        markets.sort(key=lambda x: (x.close_ts or float("inf"), x.horizon))
+        self.markets = markets
+        self.ts = _now()
+        self.refreshes += 1
+        return markets
+
+    def nearest(self) -> Optional[UpDownMarket]:
+        """The next contract to expire - the one a 15-minute strategy trades."""
+        tradable = [m for m in self.markets if m.tradable]
+        if not tradable:
+            return None
+        return tradable[0]
+
+    def for_bucket(self, bucket: str) -> List[UpDownMarket]:
+        return [m for m in self.markets if m.bucket == bucket]
+
+
 @dataclass
 class LeadReading:
-    """A measured spot-vs-Kalshi offset, not an assumed one."""
+    """A measured spot-vs-Kalshi comparison, not an assumed one."""
 
     spot: float = 0.0
     spot_age: float = 0.0
     ticker: str = ""
-    strike: float = 0.0
-    kalshi_yes: Optional[float] = None
-    implied_spot: Optional[float] = None
-    lead_sec: Optional[float] = None
+    target: Optional[float] = None
+    up_price: Optional[float] = None
+    down_price: Optional[float] = None
+    seconds_left: Optional[float] = None
+    spot_vs_target: Optional[float] = None
     ts: float = 0.0
 
     @property
     def usable(self) -> bool:
-        """True only when both feeds are fresh and close enough to compare."""
+        """True only when the spot tick is fresh and the contract is quotable."""
         return (
             self.spot > 0
-            and self.implied_spot is not None
-            and self.lead_sec is not None
+            and self.up_price is not None
             and self.spot_age <= SPOT_MAX_AGE_SEC
+            and (self.seconds_left or 0) > 0
         )
 
 
 class LeadEstimator:
-    """Turns a Kalshi ladder quote into the spot price Kalshi is implying.
+    """Tracks the live spot feed against Kalshi's own up/down quote.
 
-    For a strike quoted at probability q, the market's own view of the settlement
-    price sits `q` of the way from one side of the strike to the other. Comparing
-    that with the live spot price gives the actual offset in dollars - and,
-    because the ladder is polled on a fixed cadence, how long the quote has been
-    sitting there.
+    Two distinct quantities, deliberately not conflated:
 
-    This is deliberately conservative: `implied_spot` is only reported for levels
-    with a real two-sided quote, and the sign convention is documented on the
-    value so a wrong reading cannot be mistaken for an edge.
+    * `spot_vs_target` - how far live spot sits from the contract's target. This
+      is the settlement question, and it is arithmetic, not an edge.
+    * the Kalshi quote itself - what the market charges for each side.
+
+    When spot has already moved decisively past the target but Kalshi still
+    prices the same side near even money, the quote is the stale number. That
+    comparison is what the strategy trades; nothing about a fixed 45-second lead
+    is assumed or encoded anywhere.
     """
 
     def __init__(self) -> None:
         self.history: Deque[Dict[str, Any]] = deque(maxlen=SERIES_POINTS)
         self.last: LeadReading = LeadReading()
 
-    @staticmethod
-    def implied_spot(level: LadderLevel) -> Optional[float]:
-        """Spot price the Kalshi quote implies, or None if unquotable.
-
-        For "at or above S" trading at q, the market is pricing the settlement
-        probability of finishing above S. Treating that as a linear position
-        between the strike and a nominal band either side gives an implied spot;
-        it is a rough inversion, deliberately crude, and the caller only uses it
-        to size a lead, never as a price.
-        """
-        q = level.mid
-        if q is None or not (0.02 < q < 0.98):
-            # Outside this band the quote carries no information about where the
-            # settlement price sits, so no implied spot is claimed.
-            return None
-        band = 250.0  # ~0.3% of spot; the ladder's own strike spacing
-        if level.above:
-            return round(level.strike + (q - 0.5) * 2 * band, 2)
-        return round(level.strike - (0.5 - q) * 2 * band, 2)
-
-    def observe(self, spot: SpotFeed, ladder: KalshiLadder) -> LeadReading:
-        level = ladder.nearest_strike(spot.price)
+    def observe(self, spot: SpotFeed, feed: Btc15mFeed) -> LeadReading:
+        market = feed.nearest()
         reading = LeadReading(spot=spot.price, spot_age=spot.age, ts=_now())
-        if level is not None:
-            reading.ticker = level.ticker
-            reading.strike = level.strike
-            reading.kalshi_yes = level.mid
-            reading.implied_spot = self.implied_spot(level)
-        if reading.implied_spot and reading.spot:
-            reading.lead_sec = 0.0  # filled in by the caller that owns the clock
+        if market is not None:
+            reading.ticker = market.ticker
+            reading.target = market.target
+            reading.up_price = market.up_price
+            reading.down_price = market.down_price
+            reading.seconds_left = (
+                round(market.seconds_left, 1) if market.seconds_left is not None else None
+            )
+            if market.target:
+                reading.spot_vs_target = round(spot.price - market.target, 2)
         self.last = reading
         self.history.append(
             {
                 "ts": reading.ts,
                 "spot": reading.spot,
-                "implied": reading.implied_spot,
+                "target": reading.target,
+                "up": reading.up_price,
+                "down": reading.down_price,
                 "ticker": reading.ticker,
-                "yes": reading.kalshi_yes,
             }
         )
         return reading
@@ -394,12 +424,10 @@ class MarketDataHub:
 
     def __init__(self) -> None:
         self.spot = SpotFeed()
-        self.ladder = KalshiLadder()
+        self.feed = Btc15mFeed()
         self.lead = LeadEstimator()
         self._task: Optional[asyncio.Task[Any]] = None
         self._stop: Optional[asyncio.Event] = None
-        self.ladder_refreshes = 0
-        self.last_error = ""
 
     async def start(self) -> None:
         await self.spot.start()
@@ -412,88 +440,97 @@ class MarketDataHub:
             self._stop.set()
 
     async def _loop(self) -> None:
-        session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=15),
-            headers={"User-Agent": "kalshi-frigo/1.0"},
-        )
-        try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(
+            timeout=timeout, headers={"User-Agent": "kalshi-frigo/1.0"}
+        ) as session:
             while not (self._stop and self._stop.is_set()):
                 try:
-                    await self.ladder.fetch(session)
-                    self.ladder_refreshes += 1
-                    self.last_error = ""
+                    await self.feed.fetch(session)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
-                    self.last_error = f"{type(exc).__name__}: {exc}"
-                self.lead.observe(self.spot, self.ladder)
-                await asyncio.sleep(4)
-        finally:
-            await session.close()
+                    self.feed.last_error = f"{type(exc).__name__}: {exc}"
+                self.lead.observe(self.spot, self.feed)
+                await asyncio.sleep(2)
 
     def chart_payload(self) -> Dict[str, Any]:
-        """Both charts plus the measured lead, ready to hand to Chart.js."""
+        """Both charts, the contract, and the measured comparison."""
         spot_points = [{"t": int(ts), "p": round(px, 2)} for ts, px in self.spot.history]
-        ladder_points = [
-            {
-                "t": int(h["ts"]),
-                "spot": round(h["spot"], 2) if h["spot"] else None,
-                "implied": round(h["implied"], 2) if h["implied"] else None,
-                "ticker": h["ticker"],
-                "yes": h["yes"],
+        reading = self.last_reading()
+        market = self.feed.nearest()
+
+        contract: Dict[str, Any] = {
+            "series": self.feed.series,
+            "refreshes": self.feed.refreshes,
+            "error": self.feed.last_error,
+            "open_markets": len(self.feed.markets),
+            "tradable": sum(1 for m in self.feed.markets if m.tradable),
+            "buckets": sorted({m.bucket for m in self.feed.markets if m.bucket}),
+        }
+        if market is not None:
+            contract["market"] = {
+                "ticker": market.ticker,
+                "event": market.event_ticker,
+                "bucket": market.bucket,
+                "horizon": market.horizon,
+                "title": market.title,
+                "target": market.target,
+                "up_bid": market.yes_bid,
+                "up_ask": market.yes_ask,
+                "down_bid": market.no_bid,
+                "down_ask": market.no_ask,
+                "last": market.last,
+                "volume": market.volume,
+                "seconds_left": (
+                    round(market.seconds_left, 1) if market.seconds_left is not None else None
+                ),
+                "close_time": (
+                    datetime.fromtimestamp(market.close_ts, timezone.utc).isoformat(
+                        timespec="seconds"
+                    )
+                    if market.close_ts
+                    else None
+                ),
             }
-            for h in self.lead.history
-            if h["ticker"]
-        ]
-        reading = self.lead.last
-        near = self.ladder.nearest_strike(self.spot.price) if self.spot.price else None
+
         return {
             "spot": {
                 "source": self.spot.source,
                 "connected": self.spot.connected,
+                "error": self.spot.last_error,
                 "price": round(self.spot.price, 2) if self.spot.price else None,
                 "age_sec": round(self.spot.age, 2) if self.spot.ts else None,
                 "fresh": self.spot.fresh,
                 "points": spot_points,
             },
-            "kalshi": {
-                "series": BTC_SERIES,
-                "refreshes": self.ladder_refreshes,
-                "error": self.last_error,
-                "expires_at": self.ladder.last.expires_at,
-                "levels": len(self.ladder.last.levels),
-                "nearest": (
-                    {
-                        "ticker": near.ticker,
-                        "strike": near.strike,
-                        "label": near.label,
-                        "yes_bid": near.yes_bid,
-                        "yes_ask": near.yes_ask,
-                        "yes": near.mid,
-                        "volume": near.volume,
-                    }
-                    if near
-                    else None
-                ),
-                "points": ladder_points,
-            },
+            "kalshi": contract,
             "lead": {
                 "spot": reading.spot,
-                "implied_spot": reading.implied_spot,
-                "delta": (
-                    round(reading.spot - reading.implied_spot, 2) if reading.implied_spot else None
-                ),
+                "target": reading.target,
+                "spot_vs_target": reading.spot_vs_target,
+                "up_price": reading.up_price,
+                "down_price": reading.down_price,
+                "seconds_left": reading.seconds_left,
                 "usable": reading.usable,
-                "measured_at": (
-                    datetime.fromtimestamp(reading.ts, timezone.utc).isoformat(timespec="seconds")
-                    if reading.ts
-                    else None
-                ),
-                # Stated plainly so nobody reads a claim into the page that the
-                # code does not measure.
                 "note": (
-                    "Lead is measured from the live feeds, not assumed. A negative "
-                    "delta means Kalshi's own quote already reflects the spot price."
+                    "Up/Down prices are Kalshi's own quotes for the next 15-minute "
+                    "contract, polled live. Settlement is the 60-second average of "
+                    "CF Benchmarks BRTI, so spot is a proxy for it - the comparison "
+                    "is measured, not assumed."
                 ),
             },
+            "series": [
+                {
+                    "t": int(h["ts"]),
+                    "spot": round(h["spot"], 2) if h["spot"] else None,
+                    "target": h["target"],
+                    "up": h["up"],
+                    "down": h["down"],
+                }
+                for h in self.lead.history
+            ],
         }
+
+    def last_reading(self) -> LeadReading:
+        return self.lead.last

@@ -1,204 +1,253 @@
-"""Tests for the BTC ladder trader and the market-data layer.
+"""Tests for the BTC 15-minute up/down trader and its market-data layer.
 
-These cover the places a wrong number would be invisible on the page: ticker
-parsing (which encodes the hourly cadence), the edge rule, position sizing, and
-the stale-spot refusal that is the strategy's main failure mode.
+The contract's shape is the thing most easily got wrong: the horizon is a ticker
+suffix, the quotes live in `*_dollars` string fields while the integer-cent
+fields are null, and settlement is a 60-second average of CF Benchmarks BRTI.
+Each of those was a silent "no quote" before.
 """
 import time
 
 import pytest
 
-from src.jobs.ladder_trader import LadderConfig, LadderTrader, fair_probability
-from src.jobs.market_data import KalshiLadder, LadderLevel, LeadEstimator, SpotFeed
+from src.jobs.ladder_trader import (
+    UpDownConfig,
+    UpDownTrader,
+    fair_up_probability,
+)
+from src.jobs.market_data import Btc15mFeed, SpotFeed, UpDownMarket
 
 
 # ---------------------------------------------------------------------------
-# Ticker parsing. Kalshi's cadence lives in the ticker string.
+# Ticker shape
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "ticker,expected",
     [
-        ("KXBTC-26OCT0117-T73250", ("26OCT0117", 73250.0, True)),
-        ("KXBTC-26OCT0117-B92250", ("26OCT0117", 92250.0, False)),
-        ("KXBTCD-26OCT0116-T92299.99", None),  # wrong series
-        ("NOPE-1-T5", None),
-        ("KXBTC-26OCT0117-X73250", None),  # unknown side
-        ("KXBTC-26OCT0117-Tnotanumber", None),
+        ("KXBTC15M-26OCT011715-15", ("KXBTC15M-26OCT011715", "26OCT011715", 15)),
+        ("KXBTC15M-26OCT011715-30", ("KXBTC15M-26OCT011715", "26OCT011715", 30)),
+        ("KXBTC-26OCT0117-T73250", (None, None, 0)),
+        # An event ticker has no horizon suffix, so it is not a market.
+        ("KXBTC15M-26OCT011715", (None, None, 0)),
+        ("garbage", (None, None, 0)),
     ],
 )
 def test_ticker_parsing(ticker, expected):
-    assert KalshiLadder._parse(ticker) == expected
+    assert Btc15mFeed._parse(ticker) == expected
 
 
-def test_settlement_hour_is_encoded_in_the_ticker():
-    """The buckets are hourly. A 15-minute market does not exist to trade."""
-    expiry, _, _ = KalshiLadder._parse("KXBTC-26OCT0117-T73250")
-    assert expiry == "26OCT0117"
-    assert len(expiry) == 9  # YYMMDDHH - hour resolution, not minute resolution
+def test_bucket_is_a_quarter_hour_stamp():
+    _, bucket, horizon = Btc15mFeed._parse("KXBTC15M-26OCT011715-15")
+    assert bucket == "26OCT011715"
+    assert horizon == 15
+    # YY MON DD HH MM - the minute field is the last two characters.
+    assert bucket[9:11] in ("00", "15", "30", "45"), "bucket must be a 15-minute step"
 
 
-def test_nearest_strike_ignores_unquoted_levels():
-    ladder = KalshiLadder()
-    ladder.last.levels = [
-        LadderLevel(ticker="a", strike=80000.0, above=True, yes_bid=0.40, yes_ask=0.44),
-        LadderLevel(ticker="b", strike=84100.0, above=True, yes_bid=None, yes_ask=None),
-        LadderLevel(ticker="c", strike=84200.0, above=True, yes_bid=0.60, yes_ask=0.64),
-    ]
-    nearest = ladder.nearest_strike(84250.0)
-    assert nearest is not None
-    assert nearest.strike == 84200.0, "an unquoted level must not be selected"
-
-
-# ---------------------------------------------------------------------------
-# The edge rule
-# ---------------------------------------------------------------------------
-def _spot(price, age=0.0):
-    feed = SpotFeed()
-    feed.price = price
-    feed.ts = time.time() - age
-    feed.source = "test"
-    feed.connected = True
-    return feed
-
-
-def _level(strike, bid, ask, above=True):
-    return LadderLevel(
-        ticker=f"KXBTC-T{strike}",
-        strike=float(strike),
-        above=above,
-        yes_bid=bid,
-        yes_ask=ask,
+def _dollars(**kw):
+    """A market quoted the way this series actually quotes."""
+    return UpDownMarket(
+        ticker=kw.pop("ticker", "KXBTC15M-26OCT011715-15"),
+        event_ticker="KXBTC15M-26OCT011715",
+        bucket="26OCT011715",
+        horizon=15,
+        title="BTC price up in next 15 mins?",
+        target=kw.pop("target", 84609.34),
+        close_ts=time.time() + kw.pop("seconds_left", 600),
+        **kw,
     )
 
 
-def test_fair_probability_is_centred_and_monotonic():
-    assert fair_probability(84000, 84000) == 0.5
-    assert fair_probability(84500, 84000) > 0.5
-    assert fair_probability(83500, 84000) < 0.5
-    assert fair_probability(84500, 84000) > fair_probability(84100, 84000)
+def test_tradable_requires_both_sides_quoted():
+    assert _dollars(yes_bid=0.52, yes_ask=0.53, no_bid=0.47, no_ask=0.48).tradable
+    assert not _dollars(yes_bid=None, yes_ask=None, no_bid=0.47, no_ask=0.48).tradable
 
 
-def test_no_trade_when_the_feeds_agree():
-    """The common case: Kalshi already reflects spot, so nothing is taken."""
-    trader = LadderTrader(_spot(84100.0), KalshiLadder())
-    # Kalshi prices YES at ~0.62, which is roughly what that spot implies.
-    signals = trader.evaluate([_level(84000, 0.60, 0.64)])
-    assert signals
-    assert abs(signals[0].edge) < 0.06
-    assert signals[0].buy == ""
-    assert not signals[0].actionable
+def test_nearest_skips_unquoted_contracts():
+    feed = Btc15mFeed()
+    feed.markets = [
+        # Closes sooner but has no quotes at all.
+        _dollars(
+            ticker="unquoted", seconds_left=60, yes_bid=None, yes_ask=None, no_bid=None, no_ask=None
+        ),
+        _dollars(
+            ticker="quoted", seconds_left=600, yes_bid=0.52, yes_ask=0.53, no_bid=0.47, no_ask=0.48
+        ),
+    ]
+    assert feed.nearest().ticker == "quoted"
+
+
+# ---------------------------------------------------------------------------
+# The fair-value rule
+# ---------------------------------------------------------------------------
+def test_fair_probability_is_half_at_the_target():
+    assert fair_up_probability(84609.34, 84609.34) == 0.5
+
+
+def test_fair_probability_rises_above_the_target_and_falls_below():
+    assert fair_up_probability(84800, 84609.34) > 0.9
+    assert fair_up_probability(84400, 84609.34) < 0.1
+
+
+def test_noise_band_is_respected():
+    """Inside the deadband, spot is treated as no information at all."""
+    c = UpDownConfig(noise_usd=15.0, min_edge=0.06)
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed(), c)
+    # $10 above target with Kalshi at an even 0.50/0.50: fair is barely above
+    # 0.5, so there is no edge and nothing should be traded.
+    spot = SpotFeed()
+    spot.price = 84619.34
+    spot.ts = time.time()
+    trader.spot = spot
+    market = _dollars(yes_bid=0.49, yes_ask=0.51, no_bid=0.49, no_ask=0.51, target=84609.34)
+    signal = trader.evaluate(market)
+    assert signal is not None
+    assert signal.side == ""
+    assert not signal.actionable
+
+
+def test_buys_up_when_spot_is_well_past_target_but_kalshi_is_even():
+    c = UpDownConfig(noise_usd=15.0, min_edge=0.06)
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed(), c)
+    spot = SpotFeed()
+    spot.price = 84900.0
+    spot.ts = time.time()
+    trader.spot = spot
+    market = _dollars(yes_bid=0.49, yes_ask=0.51, no_bid=0.49, no_ask=0.51, target=84609.34)
+    signal = trader.evaluate(market)
+    assert signal.side == "up"
+    assert signal.edge >= 0.06
+    assert signal.actionable
+
+
+def test_buys_down_when_spot_is_below_target_but_kalshi_is_even():
+    c = UpDownConfig(noise_usd=15.0, min_edge=0.06)
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed(), c)
+    spot = SpotFeed()
+    spot.price = 84300.0
+    spot.ts = time.time()
+    trader.spot = spot
+    market = _dollars(yes_bid=0.49, yes_ask=0.51, no_bid=0.49, no_ask=0.51, target=84609.34)
+    signal = trader.evaluate(market)
+    assert signal.side == "down"
+    # Edge is always "worth minus price" on the side being bought, so a good
+    # trade is positive on either side.
+    assert signal.edge >= 0.06
+    assert signal.actionable
+
+
+def test_no_trade_when_kalshi_already_agrees_with_spot():
+    c = UpDownConfig(noise_usd=15.0, min_edge=0.06)
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed(), c)
+    spot = SpotFeed()
+    spot.price = 84900.0
+    spot.ts = time.time()
+    trader.spot = spot
+    # Kalshi already charges 0.95 for UP, which is what the spot implies.
+    market = _dollars(yes_bid=0.94, yes_ask=0.96, no_bid=0.04, no_ask=0.06, target=84609.34)
+    signal = trader.evaluate(market)
+    assert signal.side == ""
     assert trader.book.skipped_no_edge == 1
 
 
-def test_buys_yes_when_kalshi_underprices_the_strike():
-    trader = LadderTrader(_spot(84250.0), KalshiLadder())
-    # Spot is $150 above the strike; Kalshi prices YES at 0.52 where spot implies
-    # ~0.65, so the contract is cheap against the live feed.
-    signals = trader.evaluate([_level(84100, 0.50, 0.54)])
-    top = signals[0]
-    assert top.buy == "yes"
-    assert top.edge >= 0.06
-    assert top.actionable
+# ---------------------------------------------------------------------------
+# Refusals: the conditions under which this strategy is wrong
+# ---------------------------------------------------------------------------
+def test_refuses_on_a_stale_spot_tick():
+    c = UpDownConfig(max_spot_age=5.0)
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed(), c)
+    spot = SpotFeed()
+    spot.price = 84900.0
+    spot.ts = time.time() - 30
+    trader.spot = spot
+    assert trader.evaluate(_dollars(yes_bid=0.49, yes_ask=0.51)) is None
+    assert trader.book.skipped_stale == 1
 
 
-def test_buys_no_when_kalshi_overprices_the_strike():
-    trader = LadderTrader(_spot(83750.0), KalshiLadder())
-    signals = trader.evaluate([_level(83900, 0.55, 0.59)])
-    top = signals[0]
-    assert top.buy == "no"
-    assert top.edge <= -0.06
+def test_refuses_inside_the_settlement_window():
+    """The final 60 seconds are the settlement window; spot leads nothing."""
+    c = UpDownConfig(min_seconds_left=45.0)
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed(), c)
+    spot = SpotFeed()
+    spot.price = 84900.0
+    spot.ts = time.time()
+    trader.spot = spot
+    market = _dollars(yes_bid=0.49, yes_ask=0.51, no_bid=0.49, no_ask=0.51, seconds_left=20)
+    assert trader.evaluate(market) is None
+    assert trader.book.skipped_too_close == 1
 
 
-def test_refuses_to_trade_on_a_stale_spot_tick():
-    """A stale spot price is the exact condition under which this is wrong."""
-    trader = LadderTrader(_spot(84500.0, age=30.0), KalshiLadder())
-    signals = trader.evaluate([_level(84000, 0.55, 0.59)])
-    assert signals == []
-    assert trader.book.skipped_stale >= 1
+def test_refuses_when_the_contract_is_unquoted():
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed())
+    spot = SpotFeed()
+    spot.price = 84900.0
+    spot.ts = time.time()
+    trader.spot = spot
+    market = _dollars(yes_bid=None, yes_ask=None, no_bid=None, no_ask=None)
+    assert trader.evaluate(market) is None
+    assert trader.book.skipped_unquoted == 1
 
 
-def test_refuses_to_trade_with_no_spot_price():
-    trader = LadderTrader(_spot(0.0), KalshiLadder())
-    assert trader.evaluate([_level(84000, 0.55, 0.59)]) == []
-
-
-def test_skips_levels_too_far_from_spot():
-    trader = LadderTrader(_spot(84000.0), KalshiLadder(), LadderConfig(max_distance_usd=150.0))
-    trader.evaluate([_level(90000.0, 0.01, 0.02)])
-    assert trader.book.skipped_distance == 1
-    assert not trader.book.signals
-
-
-def test_skips_unquoted_levels():
-    trader = LadderTrader(_spot(84000.0), KalshiLadder())
-    assert trader.evaluate([_level(84000, None, None)]) == []
+def test_refuses_when_there_is_no_contract_at_all():
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed())
+    assert trader.evaluate(None) is None
 
 
 # ---------------------------------------------------------------------------
-# Sizing: $5 a clip, Kalshi's $1 floor, never negative.
+# Sizing and limits
 # ---------------------------------------------------------------------------
 def test_size_targets_five_dollars():
-    trader = LadderTrader(_spot(84000.0), KalshiLadder())
-    assert trader._size(0.50) == 10  # 10 * 0.50 = $5.00
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed())
+    assert trader._size(0.50) == 10
     assert trader._size(0.10) == 50
-    assert trader._size(0.95) == 5  # 5 * 0.95 = $4.75, next would be $5.70
+    assert trader._size(0.95) == 5
 
 
 def test_size_never_returns_a_fractional_or_negative_count():
-    trader = LadderTrader(_spot(84000.0), KalshiLadder())
-    for price in (0.001, 0.0, None, -0.5, 1.5):
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed())
+    for price in (0.0, None, -0.5, 1.5):
         n = trader._size(price)
         assert isinstance(n, int)
         assert n >= 0
 
 
-def test_one_position_at_a_time_is_the_default():
-    assert LadderConfig().max_open_positions == 1
-    assert LadderConfig().notional_usd == 5.0
+def test_limits_are_hard_defaults():
+    c = UpDownConfig()
+    assert c.notional_usd == 5.0
+    assert c.max_open_positions == 1
 
 
 def test_book_summary_reports_the_limits_it_enforces():
-    trader = LadderTrader(_spot(84000.0), KalshiLadder())
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed())
     trader.book.open_positions = [{}]
-    summary = trader.book.summary()
-    assert summary["open_positions"] == 1
-    assert summary["max_open_positions"] == 1
+    s = trader.book.summary()
+    assert s["open_positions"] == 1
+    assert s["max_open_positions"] == 1
 
 
 # ---------------------------------------------------------------------------
-# The lead estimator measures; it does not assume.
+# The feed must not invent a lead
 # ---------------------------------------------------------------------------
-def test_implied_spot_only_for_two_sided_quotes():
-    estimator = LeadEstimator()
-    assert estimator.implied_spot(_level(84000, None, None)) is None
-    # A quote pinned at the extremes says nothing about where spot settles.
-    assert estimator.implied_spot(_level(84000, 0.99, 0.99)) is None
-    assert estimator.implied_spot(_level(84000, 0.01, 0.01)) is None
-    value = estimator.implied_spot(_level(84000, 0.60, 0.64))
-    assert value is not None and value > 84000
-
-
-def test_lead_is_measured_from_the_ladder_not_hardcoded():
-    """The 45-second claim must not appear anywhere in the code as a constant."""
-    ladder = KalshiLadder()
-    ladder.last.levels = [_level(84000, 0.70, 0.74)]
-    estimator = LeadEstimator()
-    reading = estimator.observe(_spot(84250.0), ladder)
-    assert reading.ticker == "KXBTC-T84000"
-    assert reading.implied_spot is not None
-    assert reading.spot == 84250.0
-
-
-def test_payload_reports_delta_and_says_it_is_measured():
-    from src.jobs.market_data import MarketDataHub
+def test_payload_reports_the_real_contract_and_no_45_second_claim():
+    from src.jobs.market_data import LeadEstimator, MarketDataHub
 
     hub = MarketDataHub()
-    hub.spot.price = 84250.0
+    hub.spot.price = 84900.0
     hub.spot.ts = time.time()
     hub.spot.source = "test"
-    hub.ladder.last.levels = [_level(84000, 0.70, 0.74)]
-    hub.lead.observe(hub.spot, hub.ladder)
+    hub.feed.markets = [
+        _dollars(yes_bid=0.52, yes_ask=0.53, no_bid=0.47, no_ask=0.48, target=84609.34)
+    ]
+    hub.feed.refreshes = 3
+    hub.lead = LeadEstimator()
+    hub.lead.observe(hub.spot, hub.feed)
     payload = hub.chart_payload()
-    assert payload["lead"]["delta"] is not None
-    assert "not assumed" in payload["lead"]["note"]
-    assert payload["spot"]["price"] == 84250.0
+
+    contract = payload["kalshi"]["market"]
+    assert contract["ticker"] == "KXBTC15M-26OCT011715-15"
+    assert contract["up_ask"] == 0.53
+    assert contract["down_ask"] == 0.48
+    assert contract["target"] == 84609.34
+    assert payload["lead"]["spot_vs_target"] == pytest.approx(290.66)
+    assert "proxy" in payload["lead"]["note"]
+    # The measured reading, not a hardcoded lead.
+    assert "45" not in payload["lead"]["note"]

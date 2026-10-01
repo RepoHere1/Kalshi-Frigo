@@ -4,7 +4,7 @@ Database manager for the Kalshi trading system.
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import aiosqlite
 
@@ -152,13 +152,27 @@ class LLMQuery:
     id: Optional[int] = None
 
 
+def _default_db_path() -> str:
+    """The database path, honouring DB_PATH.
+
+    The literal default "trading_system.db" silently overrode the deployment's
+    DB_PATH, so a strategy spawned by the dashboard wrote to the container
+    filesystem while the dashboard read the volume-mounted database. The two then
+    disagreed about everything: 644 markets ingested in one file, "0 markets" on
+    the page, and a pipeline that looked like it had never run.
+    """
+    import os
+
+    return os.environ.get("DB_PATH", "").strip() or "trading_system.db"
+
+
 class DatabaseManager(TradingLoggerMixin):
     """Manages database operations for the trading system."""
 
-    def __init__(self, db_path: str = "trading_system.db"):
+    def __init__(self, db_path: Optional[str] = None):
         """Initialize database connection."""
-        self.db_path = db_path
-        self.logger.info("Initializing database manager", db_path=db_path)
+        self.db_path = db_path or _default_db_path()
+        self.logger.info("Initializing database manager", db_path=self.db_path)
 
     async def initialize(self) -> None:
         """Initialize database schema and run migrations."""
