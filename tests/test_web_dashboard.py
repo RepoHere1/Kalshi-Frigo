@@ -243,7 +243,7 @@ def test_dry_headline_shows_the_simulated_book_not_real_money(client):
         html = client.get("/").get_data(as_text=True)
     finally:
         gen.close()
-    tiles = html.split('<div class="tiles">', 1)[1].split("<!-- ============ readiness", 1)[0]
+    tiles = html.split('<div class="tiles">', 1)[1].split("<!-- DRY account", 1)[0]
     assert "DRY cash" in tiles
     assert "DRY positions" in tiles
     assert "DRY deployed" in tiles
@@ -298,17 +298,48 @@ def test_dry_open_positions_are_counted_separately(client):
     assert snap["open_dry"]["capital"] == 0.0
 
 
-def test_kalshi_positions_stand_in_for_empty_db(client):
-    """With an empty DB the Kalshi account is the only source of positions."""
+def test_kalshi_positions_stand_in_for_empty_db_only_in_live(client, auth, monkeypatch):
+    """The Kalshi account can stand in for an empty DB - but only in LIVE.
+
+    In DRY the fallback put the real account's positions on the DRY screen
+    whenever the simulated book happened to be empty, which is precisely the
+    identity leak the DRY/LIVE split exists to prevent.
+    """
     gen = _load_kalshi(client)
     next(gen)
     try:
+        # DRY: no fallback. The real account's positions stay off this page.
         snap = client.get("/api/snapshot").get_json()
+        assert snap["open"]["positions"] == 0
+        assert snap["positions"] == []
     finally:
         gen.close()
-    assert snap["open"]["positions"] == 0  # nothing in SQLite
-    assert len(snap["positions"]) == 2  # but two live from Kalshi
+    # LIVE: the real account IS the book, so its positions are the book's own.
+    # The mode switch gates on funding, so provide a funded account stub.
+    from src.utils.mode import TradingMode
+
+    async def funded(_self, private_key_path=None):
+        return {
+            "connected": True,
+            "balance": 5000.0,
+            "balance_cents": 500000,
+            "can_fund": True,
+            "reason": "",
+        }
+
+    monkeypatch.setattr(TradingMode, "funding", funded)
+    r = client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
+    assert r.status_code == 200
+    gen2 = _load_kalshi(client)
+    next(gen2)
+    try:
+        snap = client.get("/api/snapshot").get_json()
+    finally:
+        gen2.close()
+    assert len(snap["positions"]) == 2
     assert all(p["strategy"] == "kalshi_api" for p in snap["positions"])
+    # Back to DRY for any test that follows.
+    client.post("/api/mode", json={"mode": "dry", "confirm": True}, headers=auth)
 
 
 def test_as_float_handles_none_and_garbage():
@@ -1878,3 +1909,170 @@ def test_websocket_iterator_does_not_use_the_missing_messages_attribute():
     ws = FakeWs()
     assert not hasattr(ws, "messages")
     assert _ws_messages(ws) is ws
+
+
+# ---------------------------------------------------------------------------
+# The page order the operator asked for: ENGINE tiles on top, DRY account under
+# them, the live-feeds row under that. Everything else follows.
+# ---------------------------------------------------------------------------
+def test_page_order_tiles_then_account_then_feeds(client):
+    html = client.get("/").get_data(as_text=True)
+    order = [
+        html.index('<div class="tiles">'),
+        html.index("<!-- DRY account"),
+        html.index("<!-- ============ live feeds"),
+        html.index("<!-- ============ readiness"),
+    ]
+    assert order == sorted(order), "tiles -> DRY account -> feeds -> readiness"
+    # The feeds row must sit between the account row and readiness.
+    assert html.index('id="spotChart"') > html.index("<!-- DRY account")
+
+
+def test_dry_page_funding_card_is_the_simulated_account(client, monkeypatch):
+    """The funding card once answered with the real Kalshi balance in DRY."""
+    monkeypatch.setattr(wd, "dashboard_state", wd.dashboard_state)
+    wd.dashboard_state["balance"] = 41.05  # the real account
+    html = client.get("/").get_data(as_text=True)
+    funding = html.split("Funding source", 1)[1].split("</dl>", 1)[0]
+    assert "simulated ledger" in funding
+    assert "DRY cash available" in funding
+    # The real balance must not be the funding answer on the DRY screen.
+    assert "$41.05" not in funding
+
+
+def test_dry_snapshot_carries_no_real_balance(client, monkeypatch):
+    """The real balance must not ride along in the DRY payload at all."""
+    wd.dashboard_state["balance"] = 41.05
+    snap = client.get("/api/snapshot").get_json()
+    assert snap["mode"]["funding"]["balance"] == 0.0
+    # The reference panel's own data is separate and explicitly labelled.
+    assert snap["mode"]["dry_funding"]["balance"] != 41.05
+
+
+def test_live_page_funding_card_is_the_real_account(client, auth, monkeypatch):
+    from src.utils.mode import TradingMode
+
+    async def funded(_self, private_key_path=None):
+        return {"connected": True, "balance": 41.05, "can_fund": True, "reason": ""}
+
+    monkeypatch.setattr(TradingMode, "funding", funded)
+    r = client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
+    assert r.status_code == 200
+    html = client.get("/").get_data(as_text=True)
+    funding = html.split("Funding source", 1)[1].split("</dl>", 1)[0]
+    assert "real Kalshi account" in funding
+    assert "$41.05" in funding
+    assert "simulated ledger" not in funding
+    client.post("/api/mode", json={"mode": "dry", "confirm": True}, headers=auth)
+
+
+# ---------------------------------------------------------------------------
+# Every trade-derived figure is scoped to the book the switch is in.
+# ---------------------------------------------------------------------------
+def _seed_two_book_trades():
+    _db()
+
+    async def seed():
+        async with aiosqlite.connect(wd.DB_PATH) as conn:
+            for i, (pnl, mode, strategy) in enumerate(
+                [
+                    (1.0, "dry", "ai_directional"),
+                    (-2.0, "dry", "ai_directional"),
+                    (100.0, "live", "ai_directional"),
+                ]
+            ):
+                await conn.execute(
+                    "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
+                    " quantity, pnl, entry_timestamp, exit_timestamp, rationale,"
+                    " strategy, mode) VALUES (?, 'yes', 0.40, 0.45, 5, ?,"
+                    " '2026-10-01T00:00:00', ?, 'book test', ?, ?)",
+                    (f"KXB{i}", pnl, f"2026-10-01T0{i + 1}:00:00", strategy, mode),
+                )
+            for i, (mode,) in enumerate([("dry",), ("live",)]):
+                await conn.execute(
+                    "INSERT INTO positions (market_id, side, entry_price, quantity,"
+                    " timestamp, live, status, strategy, mode)"
+                    " VALUES (?, 'YES', 0.30, 10, '2026-10-01T00:00:00',"
+                    " ?, 'open', 'ai_directional', ?)",
+                    (f"KXPOS{i}", 0 if mode == "dry" else 1, mode),
+                )
+            await conn.commit()
+
+    asyncio.run(seed())
+
+
+def test_trade_totals_are_book_scoped(client):
+    _seed_two_book_trades()
+    snap = client.get("/api/snapshot").get_json()
+    # DRY: two closes, +1.00 and -2.00. The LIVE +100.00 must not appear.
+    assert snap["trades"]["trades"] == 2
+    assert snap["trades"]["realized_pnl"] == -1.0
+    assert len(snap["positions"]) == 1
+    assert snap["positions"][0]["market_id"] == "KXPOS0"
+
+
+def test_equity_curve_and_recent_trades_are_book_scoped(client):
+    _seed_two_book_trades()
+    snap = client.get("/api/snapshot").get_json()
+    assert snap["equity"]["pnl"] == [1.0, -1.0]
+    recent = snap["recent_trades"]
+    assert len(recent) == 2
+    assert all(abs(r["pnl"]) <= 2 for r in recent)
+
+
+def test_by_strategy_is_book_scoped(client):
+    _seed_two_book_trades()
+    snap = client.get("/api/snapshot").get_json()
+    strategies = {s["strategy"]: s for s in snap["by_strategy"]}
+    assert strategies["ai_directional"]["pnl"] == -1.0
+    assert strategies["ai_directional"]["trades"] == 2
+
+
+# ---------------------------------------------------------------------------
+# The Start button follows the DRY/LIVE switch; DRY cannot spawn LIVE and the
+# reverse without the switch actually being there.
+# ---------------------------------------------------------------------------
+def test_toggle_defaults_to_the_current_book(client, auth, monkeypatch):
+    """A Start pressed in DRY spawns --paper; the same press in LIVE spawns --live."""
+    _RecordingPopen.instances = []
+    monkeypatch.setattr(wd.subprocess, "Popen", _RecordingPopen)
+    monkeypatch.setattr(wd, "_child_procs", {})
+    monkeypatch.setenv("KALSHI_API_KEY", "kid")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nxyz\n")
+    for st in wd.strategy_state.values():
+        st.update({"running": False, "pid": None, "stop_reason": ""})
+
+    # DRY book: the toggle request carries no mode and must resolve to paper.
+    r = client.post("/api/strategy/quick_flip/toggle", json={}, headers=auth)
+    assert r.status_code == 200
+    args = list(_RecordingPopen.instances[-1].args[0])
+    assert "--paper" in args
+    assert "--live" not in args
+    # Simulate the stop so the next start is clean.
+    _RecordingPopen.instances[-1].poll = lambda: 1
+    wd.strategy_state["quick_flip"].update({"running": False, "pid": None})
+
+    # Flip to LIVE (funded), then the same bare toggle resolves to live.
+    from src.utils.mode import TradingMode
+
+    async def funded(_self, private_key_path=None):
+        return {"connected": True, "balance": 5000.0, "can_fund": True, "reason": ""}
+
+    monkeypatch.setattr(TradingMode, "funding", funded)
+    assert (
+        client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth).status_code
+        == 200
+    )
+    r = client.post("/api/strategy/quick_flip/toggle", json={}, headers=auth)
+    assert r.status_code == 200
+    args = list(_RecordingPopen.instances[-1].args[0])
+    assert "--live" in args
+    assert "--paper" not in args
+    client.post("/api/mode", json={"mode": "dry", "confirm": True}, headers=auth)
+
+
+def test_start_all_button_label_follows_the_book(client):
+    html = client.get("/").get_data(as_text=True)
+    btn = html.split('id="startAllBtn"', 1)[1].split("</button>", 1)[0]
+    assert "Start all in DRY" in btn
+    assert "LIVE" not in btn

@@ -761,6 +761,19 @@ DATA_TABLES = (
     "analysis_reports",
 )
 
+
+def _book_filter(book: str) -> str:
+    """SQL that selects exactly one book's rows.
+
+    Everything the page reports - trade totals, the equity curve, the recent
+    trades table, per-strategy performance, open positions - must answer with
+    the book the switch says it is in. A DRY page quoting LIVE closes (or the
+    reverse) is the identity leak this whole function exists to prevent.
+    """
+    wanted = "live" if str(book).strip().lower() == "live" else "dry"
+    return f"COALESCE(NULLIF(mode, ''), 'dry') = '{wanted}'"
+
+
 _SQL_TRADES = (
     "SELECT COUNT(*) AS trades,"
     " COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,"
@@ -769,13 +782,13 @@ _SQL_TRADES = (
     " COALESCE(AVG(pnl), 0.0) AS avg_pnl,"
     " COALESCE(MAX(pnl), 0.0) AS best_trade,"
     " COALESCE(MIN(pnl), 0.0) AS worst_trade"
-    " FROM trade_logs"
+    " FROM trade_logs WHERE {book}"
 )
 _SQL_OPEN = (
     "SELECT COUNT(*) AS positions,"
     " COALESCE(SUM(quantity * entry_price), 0.0) AS capital,"
     " COALESCE(SUM(CASE WHEN live = 1 THEN 1 ELSE 0 END), 0) AS live"
-    " FROM positions WHERE status = 'open'"
+    " FROM positions WHERE status = 'open' AND {book}"
 )
 # The simulated book only. `live = 0` is what marks a DRY position, because
 # execute_position deliberately does not promote DRY fills.
@@ -799,14 +812,17 @@ _SQL_STRATEGY = (
     " COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,"
     " COALESCE(MAX(pnl), 0.0) AS best,"
     " COALESCE(MIN(pnl), 0.0) AS worst"
-    " FROM trade_logs GROUP BY strategy ORDER BY pnl DESC"
+    " FROM trade_logs WHERE {book} GROUP BY strategy ORDER BY pnl DESC"
 )
 _SQL_RECENT = (
     "SELECT market_id, side, entry_price, exit_price, quantity, pnl,"
-    " exit_timestamp, rationale, strategy FROM trade_logs"
+    " exit_timestamp, rationale, strategy FROM trade_logs WHERE {book}"
     " ORDER BY exit_timestamp DESC LIMIT 25"
 )
-_SQL_EQUITY = "SELECT exit_timestamp, pnl FROM trade_logs ORDER BY exit_timestamp DESC LIMIT 200"
+_SQL_EQUITY = (
+    "SELECT exit_timestamp, pnl FROM trade_logs WHERE {book}"
+    " ORDER BY exit_timestamp DESC LIMIT 200"
+)
 # Every close, oldest first, so each strategy's own curve can be reconstructed.
 # This is the persistent backing for the per-strategy charts: the series is
 # rebuilt from the trade log rather than accumulated in memory, so it survives a
@@ -820,7 +836,7 @@ _SQL_STRATEGY_CURVE = (
 _SQL_POSITIONS = (
     "SELECT market_id, side, entry_price, quantity, strategy, stop_loss_price,"
     " take_profit_price, status, timestamp, mode FROM positions"
-    " WHERE status = 'open' ORDER BY timestamp DESC"
+    " WHERE status = 'open' AND {book} ORDER BY timestamp DESC"
 )
 
 
@@ -992,18 +1008,23 @@ def build_snapshot() -> Dict[str, Any]:
     and by /api/snapshot, so the client-side refresh and the server-rendered
     markup can never disagree. Every SQL statement is issued in one batch so the
     whole snapshot costs a single connection and event loop.
+
+    Every trade/position figure is scoped to the book the switch is in, so a
+    DRY page can only ever quote DRY rows and a LIVE page only LIVE rows.
     """
+    book = _current_book_mode()
+    where = _book_filter(book)
     batch = _db_many(
         [
-            (_SQL_TRADES, ()),
-            (_SQL_OPEN, ()),
+            (_SQL_TRADES.format(book=where), ()),
+            (_SQL_OPEN.format(book=where), ()),
             (_SQL_OPEN_DRY, ()),
             (_SQL_AI, ()),
             (_SQL_LLM, ()),
-            (_SQL_STRATEGY, ()),
-            (_SQL_RECENT, ()),
-            (_SQL_EQUITY, ()),
-            (_SQL_POSITIONS, ()),
+            (_SQL_STRATEGY.format(book=where), ()),
+            (_SQL_RECENT.format(book=where), ()),
+            (_SQL_EQUITY.format(book=where), ()),
+            (_SQL_POSITIONS.format(book=where), ()),
             (_SQL_STRATEGY_CURVE, ()),
         ]
         + [(f"SELECT COUNT(*) AS n FROM {t}", ()) for t in DATA_TABLES]
@@ -1031,8 +1052,10 @@ def build_snapshot() -> Dict[str, Any]:
 
     positions = _row_positions(pos_r)
     account = _kalshi_account()
-    if not positions and account["connected"]:
-        # Kalshi is the source of truth for anything the local DB missed.
+    if not positions and account["connected"] and book == "live":
+        # Kalshi is the source of truth for the LIVE book's own rows. Falling
+        # back to it in DRY put the real account's positions on the DRY screen
+        # whenever the simulated book happened to be empty.
         positions = [
             {
                 "market_id": r["ticker"],
@@ -1053,7 +1076,6 @@ def build_snapshot() -> Dict[str, Any]:
     running = _running_strategies()
     errors: List[Dict[str, Any]] = cast(List[Dict[str, Any]], dashboard_state["errors"])
     events: List[Dict[str, Any]] = cast(List[Dict[str, Any]], dashboard_state["events"])
-    book = _current_book_mode()
     cards = _strategy_cards(curve_r, pos_r, book)
 
     def _count(index: int) -> int:
@@ -1152,6 +1174,12 @@ def _safe_mode_payload() -> Dict[str, Any]:
                 "closed_trades": 0,
                 "ledger_entries": 0,
                 "return_pct": 0.0,
+            },
+            "dry_funding": {
+                "connected": True,
+                "balance": 300.0,
+                "can_fund": True,
+                "reason": "",
             },
             "funding": {"connected": False, "balance": 0.0, "can_fund": False, "reason": str(e)},
         }
@@ -1262,6 +1290,7 @@ def _mode_payload() -> Dict[str, Any]:
     # Reconcile before reporting, so the DRY headline is derived from the
     # persisted book rather than from a counter that can drift from it.
     drift = run(mgr.reconcile_dry())
+    dry = run(mgr.dry_account())
     payload: Dict[str, Any] = {
         "mode": mode,
         "token_set": token_required(),
@@ -1269,18 +1298,36 @@ def _mode_payload() -> Dict[str, Any]:
         # Both books are reported, always scoped to themselves. The page renders
         # the one it is in, but a DRY view that merely *hid* the real account
         # would still be one refactor away from showing it again.
-        "dry": run(mgr.dry_account()),
+        "dry": dry,
         "live": run(mgr.live_account()),
         "funding": {},
+        # The DRY book funds itself out of simulated cash. Reporting the real
+        # Kalshi balance here is what made the DRY screen "pose" the live
+        # account: the funding card answered with live money under a DRY heading.
+        "dry_funding": {
+            "connected": True,
+            "balance": dry["cash"],
+            "can_fund": dry["cash"] >= 1.0,
+            "reason": ""
+            if dry["cash"] >= 1.0
+            else (
+                f"DRY cash ${dry['cash']:.2f} is below Kalshi's $1.00 minimum order "
+                "size - reset the DRY account to keep rehearsing"
+            ),
+        },
     }
     # Only the live path needs the network, so only probe it in LIVE mode.
     if mode == MODE_LIVE:
         payload["funding"] = run(mgr.funding(materialize_private_key()))
     else:
+        # DRY's payload must not carry the real balance at all. Nothing on the
+        # DRY screen reads funding.balance - the funding card reads dry_funding -
+        # so shipping it anyway only smuggled a live number onto a DRY page,
+        # buried in the snapshot JSON where nobody could see it disappear.
         payload["funding"] = {
             "connected": dashboard_state["has_kalshi_creds"],
-            "balance": dashboard_state["balance"],
-            "can_fund": bool(dashboard_state["balance"]),
+            "balance": 0.0,
+            "can_fund": False,
             "reason": "",
         }
     assert MODE_DRY  # keeps the import meaningful for readers
@@ -1686,11 +1733,13 @@ def api_strategy_detail(name):
     if name not in strategy_state:
         return jsonify({"error": f"Unknown strategy: {name}"}), 404
 
+    book = _current_book_mode()
+    where = _book_filter(book)
     batch = _db_many(
         [
             (_SQL_STRATEGY_CURVE, ()),
-            (_SQL_POSITIONS, ()),
-            (_SQL_RECENT, ()),
+            (_SQL_POSITIONS.format(book=where), ()),
+            (_SQL_RECENT.format(book=where), ()),
             # Not filtered in SQL: `strategy` is written by each strategy under
             # its own name (quick_flip_scalping, directional_trading, ...), so an
             # equality filter against the button name would match nothing. The
@@ -1698,6 +1747,7 @@ def api_strategy_detail(name):
             (
                 "SELECT market_id, side, entry_price, exit_price, quantity, pnl,"
                 " exit_timestamp, rationale, strategy, mode FROM trade_logs"
+                f" WHERE {where}"
                 " ORDER BY COALESCE(exit_timestamp, entry_timestamp) DESC LIMIT 400",
                 (),
             ),
@@ -1705,7 +1755,6 @@ def api_strategy_detail(name):
     )
     curve_r, pos_r, _recent_r, trades_r = batch
 
-    book = _current_book_mode()
     cards = _strategy_cards(curve_r, pos_r, book)
     card = next((c for c in cards if c["name"] == name), None)
     if card is None:
@@ -1769,7 +1818,12 @@ def api_strategy_toggle(name):
         return jsonify({"error": f"Unknown strategy: {name}"}), 404
 
     st = strategy_state[name]
-    mode = (request.json or {}).get("mode", "paper")
+    # The button follows the switch. Omitting the mode means "whatever the
+    # dashboard is in", so a Start pressed in DRY can never spawn a LIVE process
+    # and the reverse - the request must explicitly opt into the other book.
+    mode = (request.json or {}).get("mode") or (
+        "live" if _current_book_mode() == "live" else "paper"
+    )
     if mode not in ("paper", "live"):
         return jsonify({"error": "mode must be 'paper' or 'live'"}), 400
     if mode == "live" and not os.environ.get("KALSHI_API_KEY"):
@@ -1782,17 +1836,6 @@ def api_strategy_toggle(name):
         _recorded_state()
         _broadcast("strategy", {"name": name, "action": "stopped"})
         return jsonify({"name": name, "running": False, "exit_code": code})
-
-    if mode == "live":
-        return (
-            jsonify(
-                {
-                    "error": "Live trading is disabled on this deployment. "
-                    "Set KALSHI_PRIVATE_KEY via the Railway dashboard and redeploy to enable."
-                }
-            ),
-            403,
-        )
 
     # Even paper mode boots a KalshiClient, which dies immediately without
     # credentials ("Private key file not found"). Refuse up front so the button
@@ -1813,9 +1856,13 @@ def api_strategy_toggle(name):
 
     # sys.executable guarantees the child uses the same interpreter (and venv)
     # as the dashboard, rather than whatever 'python' resolves to on PATH.
-    # Only paper commands are reachable: the live branch above returns 403.
     py = sys.executable or "python"
     cmd = [py, *STRATEGY_COMMANDS.get(name, STRATEGY_COMMANDS["ai_directional"])]
+    if mode == "live":
+        # The command tables are written in paper; LIVE is the same process with
+        # the real-money flag. should_trade_live() inside the child re-checks the
+        # persisted mode, so the switch - not this flag - is the money gate.
+        cmd = [c if c != "--paper" else "--live" for c in cmd]
 
     # The child needs a private key it can actually open. Railway injects
     # KALSHI_PRIVATE_KEY as PEM *text*, but KalshiClient loads a *path*, so
@@ -2457,9 +2504,9 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 {% if s.mode.mode == 'live' %}
 <div class="note-box live" style="margin-bottom:14px">
   <b>LIVE MODE &mdash; real orders, real money.</b>
-  Every fill below is a real Kalshi trade against the production account
-  (funding source: <b>{{ '$%.2f'|format(s.mode.funding.get('balance', 0)) if s.mode.funding.get('balance') is not none else 'unavailable' }}</b>).
-  Realized P&amp;L of <b>{{ '$%.2f'|format(s.mode.funding.get('balance', 0) or 0) }}</b> is the account balance, not a simulation.
+  Every fill below is a real Kalshi trade against the production account.
+  Account balance: <b>{{ '$%.2f'|format(s.mode.funding.get('balance', 0) or 0) }}</b>.
+  Every strategy started from here will place real orders until you switch back to DRY.
 </div>
 {% endif %}
 
@@ -2480,75 +2527,6 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   strategy start/stop, config, alerts) returns <code>503</code>. This is deliberate:
   the dashboard is public, and with Kalshi credentials present an open
   <code>/api/strategy/&lt;name&gt;/toggle</code> would let anyone spawn a trading process.
-</div>
-{% endif %}
-
-<!-- DRY account: the only simulated thing in the system -->
-<div class="row two">
-  <div class="panel">
-    <div class="ph">
-      <h2>{{ 'DRY account' if s.mode.mode != 'live' else 'DRY account (paused while LIVE)' }}</h2>
-      <span class="note">
-        <span id="tDryCash">{{ '$%.2f'|format(s.mode.dry.cash) }}</span> cash
-      </span>
-    </div>
-    <div class="pb">
-      <dl class="kv">
-        <dt>Starting balance</dt><dd>{{ '$%.2f'|format(s.mode.dry.starting_balance) }}</dd>
-        <dt>Cash</dt><dd id="dCash">{{ '$%.2f'|format(s.mode.dry.cash) }}</dd>
-        <dt>Deployed in open positions</dt><dd id="dDeployed">{{ '$%.2f'|format(s.mode.dry.deployed) }}</dd>
-        <dt>Equity</dt><dd id="dEquity">{{ '$%.2f'|format(s.mode.dry.equity) }}</dd>
-        <dt>Realized</dt><dd id="dRealized">{{ '$%.2f'|format(s.mode.dry.realized) }}</dd>
-        <dt>Total P&amp;L vs start</dt>
-        <dd id="dPnl" class="{{ 'up' if s.mode.dry.total_pnl > 0 else ('down' if s.mode.dry.total_pnl < 0 else 'flat') }}">{{ '$%.2f'|format(s.mode.dry.total_pnl) }}</dd>
-        <dt>Return</dt><dd id="dRet">{{ s.mode.dry.return_pct }}%</dd>
-        <dt>Simulated fills</dt><dd id="dLedger">{{ s.mode.dry.ledger_entries }}</dd>
-      </dl>
-      <div class="bar" style="margin-top:12px">
-        <button onclick="resetDry()">Reset DRY account to {{ '$%.0f'|format(s.mode.dry.starting_balance) }}</button>
-        <span id="dryStatus" style="font-size:11px;color:var(--faint)"></span>
-      </div>
-      <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
-        Prices, markets and P&amp;L inputs are the real production API. Only the
-        order fill and the cash ledger are simulated, so the DRY book exercises
-        the same code path as LIVE without spending money.
-      </p>
-    </div>
-  </div>
-
-  <div class="panel">
-    <div class="ph"><h2>Funding source</h2><span class="note">live Kalshi account</span></div>
-    <div class="pb">
-      <dl class="kv">
-        <dt>API connection</dt>
-        <dd>{% if s.mode.funding.get('connected') %}<span class="pill ok">connected</span>{% else %}<span class="pill no">offline</span>{% endif %}</dd>
-        <dt>Available balance</dt><dd id="fBalance">{{ '$%.2f'|format(s.mode.funding.get('balance', 0) or 0) }}</dd>
-        <dt>Can fund an order</dt>
-        <dd>{% if s.mode.funding.get('can_fund') %}<span class="pill ok">yes</span>{% else %}<span class="pill no">no</span>{% endif %}</dd>
-      </dl>
-      {% if s.mode.funding.get('reason') %}
-      <div class="note-box" style="margin-top:12px"><b>Cannot go LIVE:</b> {{ s.mode.funding.get('reason') }}</div>
-      {% elif s.mode.mode != 'live' %}
-      <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
-        Kalshi rejects orders below $1.00. This balance is
-        {{ '$%.2f'|format(s.mode.funding.get('balance', 0) or 0) }}, so at the current
-        {{ s.config.max_position_size_pct if s.config.get('max_position_size_pct') else 3.0 }}% position size a
-        single order would be about
-        {{ '$%.2f'|format((s.mode.funding.get('balance', 0) or 0) * (s.config.max_position_size_pct if s.config.get('max_position_size_pct') else 3.0) / 100) }}
-        &mdash; under the minimum, so the LIVE switch is armed but orders would be refused by
-        validation until the account is funded further or a position-size floor is added.
-      </p>
-      {% endif %}
-    </div>
-  </div>
-</div>
-
-{% if not s.public_domain %}
-<div class="note-box" style="margin-bottom:14px">
-  <b>Heads up:</b> you are viewing this over a hostname other than the Railway public domain.
-  The canonical address is <code>kalshi-frigo-production.up.railway.app</code> &mdash;
-  <code>kalshi-frigo.up.railway.app</code> does not exist, because Railway always names
-  service domains <code>&lt;service&gt;-&lt;environment&gt;.up.railway.app</code>.
 </div>
 {% endif %}
 
@@ -2629,6 +2607,149 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
     <div class="k">Strategies live</div>
     <div class="v" id="tRunning">{{ s.running_count if s.running_count is defined else 0 }}</div>
     <div class="s">of {{ s.bots|length }} available</div>
+  </div>
+</div>
+
+<!-- DRY account: the only simulated thing in the system -->
+<div class="row two">
+  <div class="panel">
+    <div class="ph">
+      <h2>{{ 'DRY account' if s.mode.mode != 'live' else 'DRY account (paused while LIVE)' }}</h2>
+      <span class="note">
+        <span id="tDryCash">{{ '$%.2f'|format(s.mode.dry.cash) }}</span> cash
+      </span>
+    </div>
+    <div class="pb">
+      <dl class="kv">
+        <dt>Starting balance</dt><dd>{{ '$%.2f'|format(s.mode.dry.starting_balance) }}</dd>
+        <dt>Cash</dt><dd id="dCash">{{ '$%.2f'|format(s.mode.dry.cash) }}</dd>
+        <dt>Deployed in open positions</dt><dd id="dDeployed">{{ '$%.2f'|format(s.mode.dry.deployed) }}</dd>
+        <dt>Equity</dt><dd id="dEquity">{{ '$%.2f'|format(s.mode.dry.equity) }}</dd>
+        <dt>Realized</dt><dd id="dRealized">{{ '$%.2f'|format(s.mode.dry.realized) }}</dd>
+        <dt>Total P&amp;L vs start</dt>
+        <dd id="dPnl" class="{{ 'up' if s.mode.dry.total_pnl > 0 else ('down' if s.mode.dry.total_pnl < 0 else 'flat') }}">{{ '$%.2f'|format(s.mode.dry.total_pnl) }}</dd>
+        <dt>Return</dt><dd id="dRet">{{ s.mode.dry.return_pct }}%</dd>
+        <dt>Simulated fills</dt><dd id="dLedger">{{ s.mode.dry.ledger_entries }}</dd>
+      </dl>
+      <div class="bar" style="margin-top:12px">
+        <button onclick="resetDry()">Reset DRY account to {{ '$%.0f'|format(s.mode.dry.starting_balance) }}</button>
+        <span id="dryStatus" style="font-size:11px;color:var(--faint)"></span>
+      </div>
+      <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
+        Prices, markets and P&amp;L inputs are the real production API. Only the
+        order fill and the cash ledger are simulated, so the DRY book exercises
+        the same code path as LIVE without spending money.
+      </p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="ph">
+      <h2>Funding source</h2>
+      <span class="note">{{ 'real Kalshi account' if live else 'DRY account &middot; simulated cash' }}</span>
+    </div>
+    <div class="pb">
+      <dl class="kv">
+        {% if live %}
+        <dt>API connection</dt>
+        <dd>{% if s.mode.funding.get('connected') %}<span class="pill ok">connected</span>{% else %}<span class="pill no">offline</span>{% endif %}</dd>
+        <dt>Available balance</dt><dd id="fBalance">{{ '$%.2f'|format(s.mode.funding.get('balance', 0) or 0) }}</dd>
+        <dt>Can fund an order</dt>
+        <dd>{% if s.mode.funding.get('can_fund') %}<span class="pill ok">yes</span>{% else %}<span class="pill no">no</span>{% endif %}</dd>
+        {% else %}
+        <dt>Source</dt>
+        <dd><span class="pill ok">simulated ledger</span></dd>
+        <dt>DRY cash available</dt><dd id="fBalance">{{ '$%.2f'|format(s.mode.dry_funding.get('balance', 0) or 0) }}</dd>
+        <dt>Can fund an order</dt>
+        <dd>{% if s.mode.dry_funding.get('can_fund') %}<span class="pill ok">yes</span>{% else %}<span class="pill no">no</span>{% endif %}</dd>
+        {% endif %}
+      </dl>
+      {% if not live and s.mode.dry_funding.get('reason') %}
+      <div class="note-box" style="margin-top:12px"><b>DRY cannot place orders:</b> {{ s.mode.dry_funding.get('reason') }}</div>
+      {% elif live and s.mode.funding.get('reason') %}
+      <div class="note-box" style="margin-top:12px"><b>Cannot trade LIVE:</b> {{ s.mode.funding.get('reason') }}</div>
+      {% elif not live %}
+      <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
+        This is the DRY book's own money: the simulated ledger that starts at
+        {{ '$%.2f'|format(s.mode.dry.starting_balance) }}. The real Kalshi balance is
+        in the <b>Real Kalshi account</b> panel below and is never spent while the
+        switch reads DRY.
+      </p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+{% if not s.public_domain %}
+<div class="note-box" style="margin-bottom:14px">
+  <b>Heads up:</b> you are viewing this over a hostname other than the Railway public domain.
+  The canonical address is <code>kalshi-frigo-production.up.railway.app</code> &mdash;
+  <code>kalshi-frigo.up.railway.app</code> does not exist, because Railway always names
+  service domains <code>&lt;service&gt;-&lt;environment&gt;.up.railway.app</code>.
+</div>
+{% endif %}
+
+<!-- ============ live feeds + account ============ -->
+<div class="panel" style="margin-bottom:12px">
+  <div class="ph">
+    <h2>Live feeds &amp; account</h2>
+    <span class="note" id="feedNote">streaming</span>
+  </div>
+  <div class="pb">
+    <div class="row three">
+      <div class="card" style="cursor:default">
+        <div class="ctop">
+          <div><div class="clabel">BTC spot</div><div class="mono cname" id="spotSource">connecting...</div></div>
+          <span class="pill" id="spotPill">--</span>
+        </div>
+        <div class="cchart" style="height:130px"><canvas id="spotChart"></canvas></div>
+        <div class="cfoot"><span class="mono" style="color:var(--faint)" id="spotAge">no tick yet</span></div>
+      </div>
+
+      <div class="card" style="cursor:default">
+        <div class="ctop">
+          <div>
+            <div class="clabel">Kalshi BTC 15-min</div>
+            <div class="mono cname" id="k15Ticker">{{ (m.kalshi.market.ticker if m.kalshi.get('market') else 'KXBTC15M') }}</div>
+          </div>
+          <span class="pill" id="k15Pill">--</span>
+        </div>
+        <div class="cchart" style="height:130px"><canvas id="k15Chart"></canvas></div>
+        <div class="cstats" style="grid-template-columns:repeat(2,1fr);gap:4px 10px">
+          <div><b id="k15Up">--</b><span>UP ask</span></div>
+          <div><b id="k15Down">--</b><span>DOWN ask</span></div>
+          <div><b id="k15Target">--</b><span>target</span></div>
+          <div><b id="k15Clock">--</b><span>settles in</span></div>
+        </div>
+        <div class="cfoot">
+          <span class="mono" style="color:var(--faint)" id="k15Detail">waiting for the next contract</span>
+        </div>
+      </div>
+
+      <div class="card" style="cursor:default" id="accountCard">
+        <div class="ctop">
+          <div><div class="clabel" id="acctLabel">{{ acct.label }}</div><div class="mono cname">{{ acct.book }} book</div></div>
+          <span class="pill {{ 'ok' if acct.book == 'dry' else 'warn' }}" id="acctPill">{{ acct.book|upper }}</span>
+        </div>
+        <div class="cchart" style="height:130px"><canvas id="accountChart"></canvas></div>
+        <div class="cstats">
+          <div><b id="acctEquity">{{ '$%.2f'|format(acct.equity) }}</b><span>equity</span></div>
+          <div><b id="acctToday" class="{{ 'up' if acct.today.pnl > 0 else ('down' if acct.today.pnl < 0 else 'flat') }}">{{ '$%.2f'|format(acct.today.pnl) }}</b><span>today</span></div>
+          <div><b id="acctWin">{{ acct.today.win_rate }}%</b><span>today WR</span></div>
+          <div><b id="acctOpen">{{ acct.open_positions }}</b><span>open</span></div>
+        </div>
+        <div class="cfoot">
+          <span class="mono" style="color:var(--faint)" id="acctFoot">cash {{ '$%.2f'|format(acct.cash) }} &middot; {{ acct.today.trades }} trades today</span>
+        </div>
+      </div>
+    </div>
+    <p style="color:var(--faint);font-size:11.5px;margin-top:10px">
+      {{ lead.note }}
+      The contract resolves on the 60-second average of <b>CF Benchmarks BRTI</b> against the
+      previous window, so live spot is a <b>proxy</b> for the settlement value, not the value itself.
+      Spot vs target right now:
+      <b class="mono">{{ ('%+.2f'|format(lead.spot_vs_target)) if lead.spot_vs_target is not none else '--' }}</b>
+    </p>
   </div>
 </div>
 
@@ -2824,76 +2945,12 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   </div>
 </div>
 
-<!-- ============ live feeds + account ============ -->
-<div class="panel" style="margin-bottom:12px">
-  <div class="ph">
-    <h2>Live feeds &amp; account</h2>
-    <span class="note" id="feedNote">streaming</span>
-  </div>
-  <div class="pb">
-    <div class="row three">
-      <div class="card" style="cursor:default">
-        <div class="ctop">
-          <div><div class="clabel">BTC spot</div><div class="mono cname" id="spotSource">connecting...</div></div>
-          <span class="pill" id="spotPill">--</span>
-        </div>
-        <div class="cchart" style="height:130px"><canvas id="spotChart"></canvas></div>
-        <div class="cfoot"><span class="mono" style="color:var(--faint)" id="spotAge">no tick yet</span></div>
-      </div>
-
-      <div class="card" style="cursor:default">
-        <div class="ctop">
-          <div>
-            <div class="clabel">Kalshi BTC 15-min</div>
-            <div class="mono cname" id="k15Ticker">{{ (m.kalshi.market.ticker if m.kalshi.get('market') else 'KXBTC15M') }}</div>
-          </div>
-          <span class="pill" id="k15Pill">--</span>
-        </div>
-        <div class="cchart" style="height:130px"><canvas id="k15Chart"></canvas></div>
-        <div class="cstats" style="grid-template-columns:repeat(2,1fr);gap:4px 10px">
-          <div><b id="k15Up">--</b><span>UP ask</span></div>
-          <div><b id="k15Down">--</b><span>DOWN ask</span></div>
-          <div><b id="k15Target">--</b><span>target</span></div>
-          <div><b id="k15Clock">--</b><span>settles in</span></div>
-        </div>
-        <div class="cfoot">
-          <span class="mono" style="color:var(--faint)" id="k15Detail">waiting for the next contract</span>
-        </div>
-      </div>
-
-      <div class="card" style="cursor:default" id="accountCard">
-        <div class="ctop">
-          <div><div class="clabel" id="acctLabel">{{ acct.label }}</div><div class="mono cname">{{ acct.book }} book</div></div>
-          <span class="pill {{ 'ok' if acct.book == 'dry' else 'warn' }}" id="acctPill">{{ acct.book|upper }}</span>
-        </div>
-        <div class="cchart" style="height:130px"><canvas id="accountChart"></canvas></div>
-        <div class="cstats">
-          <div><b id="acctEquity">{{ '$%.2f'|format(acct.equity) }}</b><span>equity</span></div>
-          <div><b id="acctToday" class="{{ 'up' if acct.today.pnl > 0 else ('down' if acct.today.pnl < 0 else 'flat') }}">{{ '$%.2f'|format(acct.today.pnl) }}</b><span>today</span></div>
-          <div><b id="acctWin">{{ acct.today.win_rate }}%</b><span>today WR</span></div>
-          <div><b id="acctOpen">{{ acct.open_positions }}</b><span>open</span></div>
-        </div>
-        <div class="cfoot">
-          <span class="mono" style="color:var(--faint)" id="acctFoot">cash {{ '$%.2f'|format(acct.cash) }} &middot; {{ acct.today.trades }} trades today</span>
-        </div>
-      </div>
-    </div>
-    <p style="color:var(--faint);font-size:11.5px;margin-top:10px">
-      {{ lead.note }}
-      The contract resolves on the 60-second average of <b>CF Benchmarks BRTI</b> against the
-      previous window, so live spot is a <b>proxy</b> for the settlement value, not the value itself.
-      Spot vs target right now:
-      <b class="mono">{{ ('%+.2f'|format(lead.spot_vs_target)) if lead.spot_vs_target is not none else '--' }}</b>
-    </p>
-  </div>
-</div>
-
 <!-- ============ strategy cards ============ -->
 <div class="panel" style="margin-bottom:12px">
   <div class="ph">
     <h2>Strategies</h2>
     <span class="note">click a card for everything about that strategy</span>
-    <span class="bar"><button onclick="startAll()">Start all in DRY</button><button onclick="stopAll()">Stop all</button></span>
+    <span class="bar"><button id="startAllBtn" onclick="startAll()">Start all in DRY</button><button onclick="stopAll()">Stop all</button></span>
   </div>
   <div class="pb">
     <div class="cards">
@@ -3126,8 +3183,10 @@ function paint(s) {
 
   SNAPSHOT.equity = s.equity || SNAPSHOT.equity;
   paintCards(s.strategy_cards);
-  set('pnlSummary', SNAPSHOT.equity.pn.length
-    ? SNAPSHOT.equity.pn.length + ' closed trades'
+  const eq = SNAPSHOT.equity || {};
+  const closes = (eq.pnl || []).length;
+  set('pnlSummary', closes
+    ? closes + ' closed trades'
     : 'no closed trades yet');
 }
 
@@ -3313,13 +3372,13 @@ function paintMode(d) {
   set('dPnl', money(pnl));
   const p = $('dPnl');
   if (p) p.className = pnl > 0 ? 'up' : (pnl < 0 ? 'down' : 'flat');
-  // The real balance is shown only where it belongs. In DRY the funding panel
-  // is labelled as the live account, so it keeps its number; in LIVE it is the
-  // DRY book that is simulated and must not borrow it.
-  if (d.mode === 'live') {
-    const f3 = d.funding || {};
-    set('fBalance', money(f3.balance));
-  }
+  // The funding card answers with the money the CURRENT book can actually spend:
+  // the real Kalshi balance in LIVE, the simulated ledger in DRY. Reading the
+  // real balance into the DRY card is what made DRY "pose" the live account.
+  set('fBalance', money((d.mode === 'live' ? d.funding : d.dry_funding || {}).balance));
+  // The bulk-start button must say - and do - what the switch says.
+  const sab = $('startAllBtn');
+  if (sab) sab.textContent = d.mode === 'live' ? 'Start all LIVE' : 'Start all in DRY';
 }
 
 // --- controls ---
@@ -3327,14 +3386,15 @@ async function toggleStrategy(name, quiet) {
   // Start or stop based on the card's actual state, so a bulk "start all" can
   // never be turned into a bulk "stop all" by a stale button label.
   const card = (SNAPSHOT.strategy_cards || []).find(c => c.name === name);
+  const body = {}; // no mode: the server uses whatever the DRY/LIVE switch says
   if (card && card.running) {
     await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
-      method: 'POST', headers: authHeaders(), body: JSON.stringify({ mode: 'paper' }),
+      method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
     });
     if (!quiet) note(name + ': stopped');
   } else {
     const r = await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
-      method: 'POST', headers: authHeaders(), body: JSON.stringify({ mode: 'paper' }),
+      method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
     });
     const d = await r.json().catch(() => ({}));
     if (!quiet) note(d.error ? name + ': ' + d.error : name + ': ' + (d.running ? 'started' : 'stopped'));
