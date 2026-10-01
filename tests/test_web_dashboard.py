@@ -895,3 +895,92 @@ def test_page_renders_mode_switch_and_dry_account(client):
 def test_page_shows_write_lock_notice_when_token_unset(unlocked):
     html = unlocked.get("/").get_data(as_text=True)
     assert "Write actions are locked" in html
+
+
+# ---------------------------------------------------------------------------
+# Mode must be unmistakable.
+# Clicking LIVE and being refused (or cancelling) used to look identical to
+# actually being in LIVE, so the page now carries the state in several
+# independent places: a full-viewport frame, a body attribute, a text flag,
+# the document title and the favicon.
+# ---------------------------------------------------------------------------
+def test_page_carries_mode_in_body_attribute(client):
+    html = client.get("/").get_data(as_text=True)
+    assert '<body data-mode="dry">' in html
+
+
+def test_page_has_full_viewport_mode_frame(client):
+    html = client.get("/").get_data(as_text=True)
+    assert "position:fixed;inset:0;z-index:9999" in html
+    assert "@keyframes livepulse" in html, "LIVE needs an animation, not just a colour"
+
+
+def test_page_shows_a_text_mode_flag(client):
+    html = client.get("/").get_data(as_text=True)
+    assert 'id="modeFlag"' in html
+    assert 'id="modeFlagText"' in html
+    assert "DRY MODE" in html
+
+
+def test_page_title_and_favicon_track_mode(client):
+    """The browser tab itself shows which mode is active."""
+    html = client.get("/").get_data(as_text=True)
+    assert "DRY Trading Dashboard" in html
+    assert 'id="favicon"' in html
+    # Both colours are present: the template picks per mode.
+    assert "%232ee6a8" in html and "%23ff5c7a" in html
+
+
+def test_page_embeds_write_token_so_controls_do_not_prompt(client):
+    html = client.get("/").get_data(as_text=True)
+    assert f'const WRITE_TOKEN = "{TEST_TOKEN}"' in html
+    assert "ensureToken" not in html, "the prompt path should be gone"
+
+
+def test_snapshot_endpoint_does_not_leak_the_token(client):
+    """The token goes to the HTML only - /api/snapshot is an open GET."""
+    body = client.get("/api/snapshot").get_json()
+    assert "token" not in body
+    assert TEST_TOKEN not in str(body)
+
+
+def test_mode_payload_does_not_leak_the_token(client):
+    body = client.get("/api/mode").get_json()
+    assert "token" not in body
+    assert body.get("token_set") is True
+    assert TEST_TOKEN not in str(body)
+
+
+def test_live_mode_renders_red_indicators(client, auth, monkeypatch):
+    """When the persisted mode is LIVE the page must say so unambiguously."""
+    from src.utils.mode import TradingMode, run
+
+    async def funded(_self, private_key_path=None):
+        return {
+            "connected": True,
+            "balance": 5000.0,
+            "balance_cents": 500000,
+            "can_fund": True,
+            "reason": "",
+        }
+
+    monkeypatch.setattr(TradingMode, "funding", funded)
+    r = client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
+    assert r.get_json()["mode"] == "live"
+
+    html = client.get("/").get_data(as_text=True)
+    assert '<body data-mode="live">' in html
+    assert '<span id="modeFlagText">LIVE MODE</span>' in html
+    assert "LIVE Trading Dashboard" in html
+    assert "REAL ORDERS, REAL MONEY" in html or "real orders" in html.lower()
+
+
+def test_refused_live_switch_leaves_the_page_in_dry(client, auth):
+    """A refused switch must not leave any trace of LIVE on the page."""
+    r = client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
+    assert r.status_code == 400, "balance is $0 in tests, so LIVE must refuse"
+    html = client.get("/").get_data(as_text=True)
+    assert '<body data-mode="dry">' in html
+    # Check the rendered flag element, not the JS source, which mentions both.
+    assert '<span id="modeFlagText">DRY MODE</span>' in html
+    assert '<span id="modeFlagText">LIVE MODE</span>' not in html

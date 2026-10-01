@@ -1043,6 +1043,12 @@ def dashboard():
             "status": dashboard_state["status"],
             "errors": [{"time": _now(), "error": f"snapshot failed: {e}"}],
         }
+    # The write token is handed to the template only - never to /api/snapshot,
+    # which is an unauthenticated GET. Embedding it lets the page's controls work
+    # without a prompt, at the cost of anyone who loads the page being able to
+    # write. That is an accepted trade for a single-operator dashboard; drop this
+    # line and the controls fall back to prompting.
+    snap["token"] = _configured_token()
     return render_template_string(_TEMPLATE, s=snap)
 
 
@@ -1564,7 +1570,9 @@ _TEMPLATE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kalshi-Frigo — Live Trading Dashboard</title>
+<title>Kalshi-Frigo — {{ 'LIVE' if s.mode.mode == 'live' else 'DRY' }} Trading Dashboard</title>
+<!-- Favicon colour tracks the mode, so the tab itself shows which one is active. -->
+<link rel="icon" id="favicon" href="data:image/svg+xml,{{ '<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><rect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%23ff5c7a%22/><text x=%2216%22 y=%2223%22 font-size=%2219%22 font-weight=%22bold%22 text-anchor=%22middle%22 fill=%22%23000%22>L</text></svg>' if s.mode.mode == 'live' else '<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><rect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%232ee6a8%22/><text x=%2216%22 y=%2223%22 font-size=%2219%22 font-weight=%22bold%22 text-anchor=%22middle%22 fill=%22%23000%22>D</text></svg>' }}">
 <style>
 :root{
   --bg:#080b12; --panel:#0f1420; --panel2:#141b2a; --line:#1f2937; --line2:#2b3648;
@@ -1610,6 +1618,41 @@ h1 span{color:var(--dim);font-weight:400}
 .modebtn:disabled{opacity:.5;cursor:not-allowed}
 .note-box.live{background:rgba(255,92,122,.08);border-color:rgba(255,92,122,.28)}
 .note-box.live b{color:var(--down)}
+
+/* ---------- Mode is a whole-page state, not a badge you have to find ----------
+   A 5px frame around the entire viewport plus a pulsing glow. Green = simulated
+   money only. Red and animating = real orders leaving the account. This has to
+   be impossible to mistake, because the earlier behaviour (click LIVE, get
+   refused, sit in DRY) was indistinguishable from actually being LIVE. */
+body::before{
+  content:"";position:fixed;inset:0;z-index:9999;pointer-events:none;
+  border:5px solid var(--mode-color, var(--up));
+  box-shadow:inset 0 0 22px var(--mode-glow, rgba(46,230,168,.30));
+  transition:border-color .18s ease, box-shadow .18s ease;
+}
+body[data-mode="dry"]{--mode-color:var(--up);--mode-glow:rgba(46,230,168,.32)}
+body[data-mode="live"]{
+  --mode-color:var(--down);--mode-glow:rgba(255,92,122,.55);
+  animation:livepulse 1.4s ease-in-out infinite;
+}
+@keyframes livepulse{
+  0%,100%{box-shadow:inset 0 0 22px rgba(255,92,122,.55)}
+  50%    {box-shadow:inset 0 0 46px rgba(255,92,122,1)}
+}
+/* Redundant, non-colour signal so the state survives colour-blindness. */
+body[data-mode="live"] .brand .logo{background:linear-gradient(145deg,#ff2d55,#ff5c7a)}
+body[data-mode="dry"]  .brand .logo{background:linear-gradient(145deg,#2b6cff,#8b5cf6)}
+
+.modeflag{
+  display:inline-flex;align-items:center;gap:8px;
+  font-size:13px;font-weight:800;letter-spacing:.14em;
+  padding:5px 14px;border-radius:9px;border:2px solid currentColor;
+}
+.modeflag.dry {color:var(--up);background:rgba(46,230,168,.10)}
+.modeflag.live{color:var(--down);background:rgba(255,92,122,.14)}
+.modeflag .dot{width:9px;height:9px}
+body[data-mode="live"] .modeflag.live{animation:blink 1.1s steps(1) infinite}
+@keyframes blink{0%,60%{opacity:1}61%,100%{opacity:.25}}
 .url{
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:var(--blue);
   background:rgba(77,159,255,.09);border:1px solid rgba(77,159,255,.25);
@@ -1721,19 +1764,24 @@ code{background:var(--bg);border:1px solid var(--line2);border-radius:5px;paddin
 footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 </style>
 </head>
-<body>
+<body data-mode="{{ s.mode.mode }}">
 <div class="wrap">
 
 <header>
   <div class="brand">
     <div class="logo">&#129504;</div>
     <div>
-      <h1>Kalshi-Frigo <span>&middot; live trading dashboard</span></h1>
+      <h1>Kalshi-Frigo <span>&middot; {{ 'LIVE' if s.mode.mode == 'live' else 'DRY' }} trading dashboard</span></h1>
       <div class="sub">LLM-driven Kalshi automation &middot; paper &amp; live &middot; multi-strategy</div>
     </div>
   </div>
   <div class="headright">
-    <!-- DRY / LIVE switch: the one control that decides whether orders are real -->
+    <!-- Unmistakable state flag: text, colour and a blinking dot. -->
+    <div id="modeFlag" class="modeflag {{ 'live' if s.mode.mode == 'live' else 'dry' }}">
+      <span class="dot"></span>
+      <span id="modeFlagText">{{ 'LIVE MODE' if s.mode.mode == 'live' else 'DRY MODE' }}</span>
+    </div>
+    <!-- DRY / LIVE switch -->
     <div class="modeswitch">
       <button id="modeDry"  class="modebtn {{ 'on' if s.mode.mode != 'live' else '' }}" onclick="setMode('dry')">DRY</button>
       <button id="modeLive" class="modebtn live {{ 'on' if s.mode.mode == 'live' else '' }}" onclick="setMode('live')">LIVE</button>
@@ -2156,6 +2204,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 // Server-rendered snapshot: the page is already correct before any fetch runs,
 // and the poller below refreshes the exact same payload in place.
 const SNAPSHOT = {{ s | tojson }};
+SNAPSHOT.mode = SNAPSHOT.mode || { mode: 'dry' };
 const EQUITY = { labels: [], pnl: [] };
 Object.assign(EQUITY, SNAPSHOT.equity || {});
 const $ = id => document.getElementById(id);
@@ -2262,23 +2311,31 @@ async function refresh() {
 }
 
 // --- DRY / LIVE mode -----------------------------------------------------
-// The token is held in sessionStorage, never in the URL, so it does not leak
-// into shared links or Referer headers.
+// The write token is embedded server-side so the controls work without a
+// prompt. WARNING: this dashboard is on a public hostname, so anyone who can
+// load the page can also read this value out of view-source and therefore use
+// every write endpoint (mode switch, strategy start/stop, config). The token
+// gate still stops drive-by POSTs from scripts that never loaded the page; it
+// is no longer a boundary against a determined visitor.
+const WRITE_TOKEN = {{ s.token | tojson }};
+sessionStorage.setItem('frigoToken', WRITE_TOKEN);
+
 function authHeaders(extra) {
   return Object.assign({ 'Content-Type': 'application/json' },
-    { 'X-Auth-Token': sessionStorage.getItem('frigoToken') || '' }, extra || {});
+    { 'X-Auth-Token': WRITE_TOKEN }, extra || {});
 }
 
 function setMode(mode) {
   if (mode === 'live') {
-    const ok = confirm(
+    const ok = prompt(
       'GO LIVE?\n\n' +
       'Every order from now on is a REAL order on the Kalshi PRODUCTION account ' +
       'with REAL money. Simulated fills stop.\n\n' +
       'Type LIVE to confirm:');
-    if (ok === null) return;
+    if (ok === null) { note('LIVE cancelled'); paintMode(SNAPSHOT.mode); return; }
     if (String(ok).trim().toUpperCase() !== 'LIVE') {
       note('LIVE cancelled - confirmation did not match');
+      paintMode(SNAPSHOT.mode);
       return;
     }
   }
@@ -2286,19 +2343,49 @@ function setMode(mode) {
 }
 
 async function postMode(mode, confirmLive) {
-  const r = await fetch('/api/mode', {
-    method: 'POST',
-    headers: authHeaders(),
-    body: JSON.stringify({ mode: mode, confirm: !!confirmLive }),
-  });
-  const d = await r.json().catch(() => ({}));
-  if (d.error) {
-    note('mode switch blocked: ' + d.error);
-    alert(d.error);
-    return;
+  try {
+    const r = await fetch('/api/mode', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ mode: mode, confirm: !!confirmLive }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (d.error) {
+      // Refused - stay visibly DRY and say exactly why.
+      note('mode switch blocked: ' + d.error);
+      paintMode(SNAPSHOT.mode);
+      flashBanner('STILL IN DRY MODE - ' + d.error, false);
+      return;
+    }
+    note('trading mode is now ' + String(d.mode).toUpperCase());
+    paintMode(d);
+    flashBanner(d.mode === 'live'
+      ? 'LIVE MODE - REAL ORDERS ARE NOW LEAVING THE ACCOUNT'
+      : 'DRY MODE - simulated fills only, no real money', d.mode === 'live');
+  } catch (e) {
+    note('mode switch failed: ' + e.message);
+    paintMode(SNAPSHOT.mode);
   }
-  note('trading mode is now ' + String(d.mode).toUpperCase());
-  paintMode(d);
+}
+
+// A temporary full-width banner so a mode change is impossible to miss even if
+// you looked away at the moment it happened.
+let bannerTimer = null;
+function flashBanner(text, isLive) {
+  let el = $('modeBanner');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'modeBanner';
+    el.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:10000;' +
+      'padding:14px 18px;text-align:center;font-weight:800;letter-spacing:.12em;' +
+      'font-size:14px;box-shadow:0 6px 24px rgba(0,0,0,.5)';
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  el.style.background = isLive ? '#ff5c7a' : '#2ee6a8';
+  el.style.color = '#000';
+  clearTimeout(bannerTimer);
+  bannerTimer = setTimeout(() => { el.remove(); }, 6000);
 }
 
 async function resetDry() {
@@ -2311,11 +2398,32 @@ async function resetDry() {
 
 function money(v) { return '$' + Number(v || 0).toFixed(2); }
 
+// One function owns every mode indicator: frame colour, body attribute, flag
+// text, button state, title and favicon. They cannot drift apart.
 function paintMode(d) {
   if (!d) return;
-  const live = d.mode === 'live';
+  // Missing mode must read as DRY, never as an ambiguous third state.
+  const m = d.mode === undefined ? 'dry' : d.mode;
+  const live = m === 'live';
+
+  document.body.dataset.mode = live ? 'live' : 'dry';
   $('modeDry').classList.toggle('on', !live);
   $('modeLive').classList.toggle('on', live);
+  const flag = $('modeFlag');
+  flag.className = 'modeflag ' + (live ? 'live' : 'dry');
+  $('modeFlagText').textContent = live ? 'LIVE MODE' : 'DRY MODE';
+
+  document.title = 'Kalshi-Frigo — ' + (live ? 'LIVE' : 'DRY') + ' Trading Dashboard';
+  const f = $('favicon');
+  if (f) {
+    const bg = live ? '%23ff5c7a' : '%232ee6a8';
+    const ch = live ? 'L' : 'D';
+    f.href = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">' +
+      '<rect width="32" height="32" rx="8" fill="' + bg + '"/>' +
+      '<text x="16" y="23" font-size="19" font-weight="bold" text-anchor="middle" fill="#000">' +
+      ch + '</text></svg>';
+  }
+
   const dry = d.dry || {};
   const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
   set('dCash', money(dry.cash));
@@ -2329,22 +2437,9 @@ function paintMode(d) {
   set('dPnl', money(pnl));
   const p = $('dPnl');
   if (p) p.className = pnl > 0 ? 'up' : (pnl < 0 ? 'down' : 'flat');
-  const f = d.funding || {};
-  set('fBalance', money(f.balance));
+  const f2 = d.funding || {};
+  set('fBalance', money(f2.balance));
 }
-
-// Token prompt: the write controls need it, reads do not.
-function ensureToken() {
-  if (sessionStorage.getItem('frigoToken')) return true;
-  const t = prompt('Dashboard write actions need DASHBOARD_TOKEN:');
-  if (t) { sessionStorage.setItem('frigoToken', t.trim()); return true; }
-  return false;
-}
-const _oldNote = note;
-note = function (msg) {
-  if (/blocked|unauthorized|locked|needs DASHBOARD_TOKEN/i.test(msg)) ensureToken();
-  _oldNote(msg);
-};
 
 // --- controls ---
 async function toggleStrategy(name) {
@@ -2432,6 +2527,7 @@ function drawChart() {
 // --- init ---
 drawChart();
 loadLogs();
+paintMode({ mode: SNAPSHOT.mode.mode });
 refresh();
 setInterval(refresh, 10000);
 setInterval(loadLogs, 30000);
