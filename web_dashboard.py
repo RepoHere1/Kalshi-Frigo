@@ -2047,7 +2047,12 @@ def api_marketdata():
 
 @app.route("/api/chart/pnl")
 def api_chart_pnl():
-    """Return P&L data for Chart.js."""
+    """Return P&L data for Chart.js, scoped to the current book.
+
+    Unused by the current page (the equity chart reads the snapshot), but kept
+    honest anyway: an endpoint that answered with both books mixed was a leak
+    waiting for the next refactor to pick it up.
+    """
     try:
         db = _db()
         perf = _run_async(db.get_performance_by_strategy())
@@ -2058,11 +2063,13 @@ def api_chart_pnl():
         try:
             import aiosqlite
 
+            where = _book_filter(_current_book_mode())
+
             async def _read_trades():
                 async with aiosqlite.connect(db.db_path) as conn:
                     cur = await conn.execute(
                         "SELECT exit_timestamp, pnl FROM trade_logs "
-                        "ORDER BY exit_timestamp ASC LIMIT 200"
+                        f"WHERE {where} ORDER BY exit_timestamp ASC LIMIT 200"
                     )
                     return await cur.fetchall()
 
