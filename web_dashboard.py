@@ -670,15 +670,31 @@ def _strategy_cards(
     from in-process counters, so a strategy's chart still has its history after a
     redeploy. A card with no closes yet renders an explicit empty state instead
     of a flat zero line that reads like a real result.
+
+    The `running` flag is checked against the DATABASE, not the in-memory
+    `strategy_state` dict. That dict is per-process and can be stale across
+    gunicorn workers. The database is the shared source of truth, and we
+    filter by book mode so a LIVE-running strategy does not show as "running"
+    on the DRY page and vice versa.
     """
+    store = _runtime_store()
+    recorded = _run_async(store.snapshot())
+
     cards: Dict[str, Dict[str, Any]] = {}
     for name, st in strategy_state.items():
         label, description = STRATEGY_DOCS.get(name, (name, ""))
+        db_row = recorded.get(name) or {}
+        db_pid = db_row.get("pid")
+        db_mode = db_row.get("mode")
+        # A strategy is "running" for this book only if the DB says it is,
+        # the pid is alive, AND the mode matches this book.
+        db_running = bool(db_pid) and _pid_alive(db_pid)
+        running_for_this_book = db_running and db_mode == book
         cards[name] = {
             "name": name,
             "label": label,
             "description": description,
-            "running": bool(st.get("running")),
+            "running": bool(running_for_this_book),
             "pid": st.get("pid"),
             "mode": st.get("mode", "paper"),
             "command": " ".join(STRATEGY_COMMANDS.get(name, [])),
@@ -1843,8 +1859,29 @@ def api_strategy_toggle(name):
         return jsonify({"error": "Live mode needs KALSHI_API_KEY configured"}), 400
 
     store = _runtime_store()
-    if st.get("running"):
-        code = _stop_child(st)
+
+    # Check the DATABASE for the current state — not just the in-memory dict.
+    # strategy_state is per-process and can be stale across gunicorn workers.
+    # The database is the shared source of truth.
+    recorded = _run_async(store.snapshot())
+    db_row = recorded.get(name) or {}
+    db_pid = db_row.get("pid")
+    db_mode = db_row.get("mode")
+    db_running = bool(db_pid) and _pid_alive(db_pid)
+
+    # Identity isolation: a strategy running in the OTHER book must not be
+    # touched from this book. Refuse cross-book starts.
+    if db_running and db_mode and db_mode != mode:
+        return jsonify(
+            {
+                "error": f"Strategy '{name}' is already running in {db_mode} mode (pid {db_pid}). "
+                f"Stop it in {db_mode} before starting it in {mode}."
+            }
+        ), 409
+
+    # If the strategy is already running in THIS book, stop it first.
+    if db_running:
+        code = _stop_child({"pid": db_pid, "running": True})
         _run_async(store.record_stop(name, "stopped by operator"))
         _recorded_state()
         _broadcast("strategy", {"name": name, "action": "stopped"})
