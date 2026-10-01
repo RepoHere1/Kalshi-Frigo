@@ -1818,12 +1818,25 @@ def api_strategy_toggle(name):
         return jsonify({"error": f"Unknown strategy: {name}"}), 404
 
     st = strategy_state[name]
-    # The button follows the switch. Omitting the mode means "whatever the
-    # dashboard is in", so a Start pressed in DRY can never spawn a LIVE process
-    # and the reverse - the request must explicitly opt into the other book.
-    mode = (request.json or {}).get("mode") or (
-        "live" if _current_book_mode() == "live" else "paper"
-    )
+    # Get the current persisted book mode (dry/live). This is the SOURCE OF TRUTH
+    # for which book we are in. The request MUST match it — a button pressed while
+    # the switch reads DRY cannot spawn a LIVE process, and vice versa.
+    persisted_mode = _current_book_mode()
+    requested_mode = (request.json or {}).get("mode")
+
+    # If the caller explicitly provides a mode, it MUST match the persisted mode.
+    # If they don't provide one, we use the persisted mode. Any mismatch = 400.
+    if requested_mode is not None:
+        if requested_mode != persisted_mode:
+            return jsonify(
+                {
+                    "error": f"Mode mismatch: request asked for '{requested_mode}' but the current book is '{persisted_mode}'. Cannot start a strategy in a different book."
+                }
+            ), 400
+        mode = requested_mode
+    else:
+        mode = "live" if persisted_mode == "live" else "paper"
+
     if mode not in ("paper", "live"):
         return jsonify({"error": "mode must be 'paper' or 'live'"}), 400
     if mode == "live" and not os.environ.get("KALSHI_API_KEY"):
@@ -2617,6 +2630,48 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   </div>
 </div>
 
+<!-- ============ strategy cards ============ -->
+<div class="panel" style="margin-bottom:12px">
+  <div class="ph">
+    <h2>Strategies</h2>
+    <span class="note">click a card for everything about that strategy</span>
+    <span class="bar"><button id="startAllBtn" onclick="startAll()">Start all in DRY</button><button onclick="stopAll()">Stop all</button></span>
+  </div>
+  <div class="pb">
+    <div class="cards">
+      {%- for c in s.strategy_cards %}
+      <div class="card{{ ' hot' if c.running else '' }}" id="card-{{ c.name }}" onclick="openStrategy('{{ c.name }}')">
+        <div class="ctop">
+          <div>
+            <div class="clabel">{{ c.label }}</div>
+            <div class="mono cname">{{ c.name }}</div>
+          </div>
+          <span class="pill {{ 'ok' if c.running else 'no' }}" id="pill-{{ c.name }}">{% if c.running %}<span class="dot pulse"></span>running{% elif c.stop_reason %}stopped{% else %}not started{% endif %}</span>
+        </div>
+        <div class="cchart"><canvas id="spark-{{ c.name }}" height="54"></canvas></div>
+        <div class="cstats">
+          <div><b id="c-{{ c.name }}-trades">{{ c.trades }}</b><span>trades</span></div>
+          <div><b id="c-{{ c.name }}-pnl" class="{{ 'up' if c.realized > 0 else ('down' if c.realized < 0 else 'flat') }}">${{ '%.2f'|format(c.realized) }}</b><span>realized</span></div>
+          <div><b id="c-{{ c.name }}-win">{{ c.win_rate }}%</b><span>win rate</span></div>
+          <div><b id="c-{{ c.name }}-open">{{ c.open_positions }}</b><span>open</span></div>
+        </div>
+        <div class="cfoot">
+          <span class="mono" style="color:var(--faint)">$<span id="c-{{ c.name }}-dep">{{ '%.2f'|format(c.deployed) }}</span> deployed{% if not c.running and c.stop_reason %} &middot; {{ c.stop_reason }}{% endif %}</span>
+          <span class="bar" onclick="event.stopPropagation()">
+            <button id="btn-{{ c.name }}" onclick="toggleStrategy('{{ c.name }}')">{% if c.running %}Stop{% else %}Start{% endif %}</button>
+            <button class="danger" onclick="killBot('{{ c.name }}')">Kill</button>
+          </span>
+        </div>
+      </div>
+      {%- endfor %}
+    </div>
+    <p style="color:var(--faint);font-size:11.5px;margin-top:10px">
+      Curves are rebuilt from <code>trade_logs</code>, so a strategy keeps its history across restarts and deploys.
+      Cards show the <b>{{ s.book|upper }}</b> book only.
+    </p>
+  </div>
+</div>
+
 <!-- DRY account: the only simulated thing in the system -->
 <div class="row two">
   <div class="panel">
@@ -2949,48 +3004,6 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
     {%- else %}
     <div class="empty">No closed trades recorded yet.</div>
     {%- endif %}
-  </div>
-</div>
-
-<!-- ============ strategy cards ============ -->
-<div class="panel" style="margin-bottom:12px">
-  <div class="ph">
-    <h2>Strategies</h2>
-    <span class="note">click a card for everything about that strategy</span>
-    <span class="bar"><button id="startAllBtn" onclick="startAll()">Start all in DRY</button><button onclick="stopAll()">Stop all</button></span>
-  </div>
-  <div class="pb">
-    <div class="cards">
-      {%- for c in s.strategy_cards %}
-      <div class="card{{ ' hot' if c.running else '' }}" id="card-{{ c.name }}" onclick="openStrategy('{{ c.name }}')">
-        <div class="ctop">
-          <div>
-            <div class="clabel">{{ c.label }}</div>
-            <div class="mono cname">{{ c.name }}</div>
-          </div>
-          <span class="pill {{ 'ok' if c.running else 'no' }}" id="pill-{{ c.name }}">{% if c.running %}<span class="dot pulse"></span>running{% elif c.stop_reason %}stopped{% else %}not started{% endif %}</span>
-        </div>
-        <div class="cchart"><canvas id="spark-{{ c.name }}" height="54"></canvas></div>
-        <div class="cstats">
-          <div><b id="c-{{ c.name }}-trades">{{ c.trades }}</b><span>trades</span></div>
-          <div><b id="c-{{ c.name }}-pnl" class="{{ 'up' if c.realized > 0 else ('down' if c.realized < 0 else 'flat') }}">${{ '%.2f'|format(c.realized) }}</b><span>realized</span></div>
-          <div><b id="c-{{ c.name }}-win">{{ c.win_rate }}%</b><span>win rate</span></div>
-          <div><b id="c-{{ c.name }}-open">{{ c.open_positions }}</b><span>open</span></div>
-        </div>
-        <div class="cfoot">
-          <span class="mono" style="color:var(--faint)">$<span id="c-{{ c.name }}-dep">{{ '%.2f'|format(c.deployed) }}</span> deployed{% if not c.running and c.stop_reason %} &middot; {{ c.stop_reason }}{% endif %}</span>
-          <span class="bar" onclick="event.stopPropagation()">
-            <button id="btn-{{ c.name }}" onclick="toggleStrategy('{{ c.name }}')">{% if c.running %}Stop{% else %}Start{% endif %}</button>
-            <button class="danger" onclick="killBot('{{ c.name }}')">Kill</button>
-          </span>
-        </div>
-      </div>
-      {%- endfor %}
-    </div>
-    <p style="color:var(--faint);font-size:11.5px;margin-top:10px">
-      Curves are rebuilt from <code>trade_logs</code>, so a strategy keeps its history across restarts and deploys.
-      Cards show the <b>{{ s.book|upper }}</b> book only.
-    </p>
   </div>
 </div>
 

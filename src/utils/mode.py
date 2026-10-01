@@ -120,6 +120,31 @@ class TradingMode:
                     "requires an explicit confirmation."
                 )
 
+            # CRITICAL: Clean up the other book's rows to enforce absolute identity
+            # isolation. The other book's trade_logs and positions must not exist
+            # when we switch, or they leak across the boundary.
+            if mode == MODE_DRY:
+                # Going DRY: wipe all LIVE rows
+                await conn.execute(
+                    "DELETE FROM trade_logs WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'live'"
+                )
+                await conn.execute(
+                    "DELETE FROM positions WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'live'"
+                )
+                # Reset DRY cash to starting balance
+                starting = await self._get(conn, _START_KEY)
+                starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
+                await self._set(conn, _CASH_KEY, str(round(starting_f, 2)))
+            else:
+                # Going LIVE: wipe all DRY rows
+                await conn.execute(
+                    "DELETE FROM trade_logs WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'"
+                )
+                await conn.execute(
+                    "DELETE FROM positions WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'"
+                )
+                await conn.execute("DELETE FROM dry_ledger")
+
             await self._set(conn, _MODE_KEY, mode)
             await conn.commit()
             return mode
@@ -224,6 +249,9 @@ class TradingMode:
         mode switch exists to prevent. `live = 0` is the historical marker for a
         simulated row, so both the new `mode` column and the old flag are
         honoured for rows written before the migration.
+
+        The LIVE book has no simulated cash ledger - its starting balance is 0
+        and its cash comes from the real Kalshi API (supplied by the caller).
         """
         mode = MODE_LIVE if str(mode).strip().lower() == MODE_LIVE else MODE_DRY
         book_filter = (
@@ -234,10 +262,14 @@ class TradingMode:
         params: List[Any] = [MODE_DRY] if mode == MODE_DRY else []
 
         async with self._conn() as conn:
-            starting = await self._get(conn, _START_KEY)
-            cash = await self._get(conn, _CASH_KEY)
-            starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
-            cash_f = float(cash) if cash is not None else starting_f
+            if mode == MODE_DRY:
+                starting = await self._get(conn, _START_KEY)
+                cash = await self._get(conn, _CASH_KEY)
+                starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
+                cash_f = float(cash) if cash is not None else starting_f
+            else:
+                starting_f = 0.0
+                cash_f = 0.0
 
             deployed = float(
                 await self._scalar(
@@ -276,8 +308,6 @@ class TradingMode:
                 else 0
             )
 
-        # The live book has no simulated cash ledger: its cash is the real
-        # Kalshi balance, which the caller supplies from the API.
         return {
             "book": mode,
             "starting_balance": round(starting_f, 2),
