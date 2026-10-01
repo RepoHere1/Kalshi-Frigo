@@ -224,10 +224,74 @@ def test_kalshi_rows_carry_real_values(client):
         gen.close()
     assert "KXPRES-26-BIDEN" in html
     assert "KXMLB-26" in html
-    assert "$1.85" in html, "exposure not rendered"
-    assert "$0.30" in html, "Kalshi realized P&L not rendered"
     # The old code emitted a literal "?" for the missing `side` field.
     assert ">?<" not in html
+
+
+def test_dry_headline_shows_the_simulated_book_not_real_money(client):
+    """In DRY the headline must be the $300 simulated account.
+
+    It used to lead with the real Kalshi balance, real position count and real
+    realized P&L, so a DRY page contradicted its own DRY MODE flag.
+    """
+    gen = _load_kalshi(client)
+    next(gen)
+    try:
+        html = client.get("/").get_data(as_text=True)
+    finally:
+        gen.close()
+    tiles = html.split('<div class="tiles">', 1)[1].split("<!-- ============ readiness", 1)[0]
+    assert "DRY cash" in tiles
+    assert "DRY positions" in tiles
+    assert "DRY deployed" in tiles
+    assert "DRY realized P&amp;L" in tiles
+    # The real account's money must not appear in the DRY headline.
+    assert "$300.00" in tiles
+    assert "Kalshi balance" not in tiles
+    assert "Live positions" not in tiles
+
+
+def test_dry_page_labels_the_real_account_as_not_being_traded(client):
+    gen = _load_kalshi(client)
+    next(gen)
+    try:
+        html = client.get("/").get_data(as_text=True)
+    finally:
+        gen.close()
+    assert "Real Kalshi account — NOT what DRY is trading" in html
+    assert "none of these figures are its performance" in html
+
+
+def test_live_headline_shows_the_real_account(client, auth, monkeypatch):
+    """LIVE flips the headline back to real money."""
+    from src.utils.mode import TradingMode, run
+
+    async def funded(_self, private_key_path=None):
+        return {
+            "connected": True,
+            "balance": 5000.0,
+            "balance_cents": 500000,
+            "can_fund": True,
+            "reason": "",
+        }
+
+    monkeypatch.setattr(TradingMode, "funding", funded)
+    client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
+
+    html = client.get("/").get_data(as_text=True)
+    tiles = html.split('<div class="tiles">', 1)[1].split("<!-- ============ readiness", 1)[0]
+    assert "Real balance" in tiles
+    assert "Live positions" in tiles
+    assert "Real exposure" in tiles
+    assert "DRY cash" not in tiles
+
+
+def test_dry_open_positions_are_counted_separately(client):
+    """DRY positions are live=0, so the simulated book has its own count."""
+    snap = client.get("/api/snapshot").get_json()
+    assert "open_dry" in snap
+    assert snap["open_dry"]["positions"] == 0
+    assert snap["open_dry"]["capital"] == 0.0
 
 
 def test_kalshi_positions_stand_in_for_empty_db(client):

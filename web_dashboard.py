@@ -503,6 +503,13 @@ _SQL_OPEN = (
     " COALESCE(SUM(CASE WHEN live = 1 THEN 1 ELSE 0 END), 0) AS live"
     " FROM positions WHERE status = 'open'"
 )
+# The simulated book only. `live = 0` is what marks a DRY position, because
+# execute_position deliberately does not promote DRY fills.
+_SQL_OPEN_DRY = (
+    "SELECT COUNT(*) AS positions,"
+    " COALESCE(SUM(quantity * entry_price), 0.0) AS capital"
+    " FROM positions WHERE status = 'open' AND live = 0"
+)
 _SQL_AI = (
     "SELECT COALESCE(SUM(cost_usd), 0.0) AS cost, COUNT(*) AS analyses"
     " FROM market_analyses WHERE date(analysis_timestamp) = date('now')"
@@ -531,6 +538,15 @@ _SQL_POSITIONS = (
     " take_profit_price, status, timestamp FROM positions"
     " WHERE status = 'open' ORDER BY timestamp DESC"
 )
+
+
+def _row_open_dry(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The simulated book's own open positions - never the real ones."""
+    row = rows[0] if rows else {}
+    return {
+        "positions": int(row.get("positions") or 0),
+        "capital": round(float(row.get("capital") or 0.0), 2),
+    }
 
 
 def _row_trades(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -696,6 +712,7 @@ def build_snapshot() -> Dict[str, Any]:
         [
             (_SQL_TRADES, ()),
             (_SQL_OPEN, ()),
+            (_SQL_OPEN_DRY, ()),
             (_SQL_AI, ()),
             (_SQL_LLM, ()),
             (_SQL_STRATEGY, ()),
@@ -705,8 +722,8 @@ def build_snapshot() -> Dict[str, Any]:
         ]
         + [(f"SELECT COUNT(*) AS n FROM {t}", ()) for t in DATA_TABLES]
     )
-    trades_r, open_r, ai_r, llm_r, strat_r, recent_r, equity_r, pos_r = batch[:8]
-    counts = batch[8:]
+    trades_r, open_r, dry_open_r, ai_r, llm_r, strat_r, recent_r, equity_r, pos_r = batch[:9]
+    counts = batch[9:]
 
     # Equity curve is fetched newest-first; flip it so the chart reads left to right.
     equity_rows = list(reversed(equity_r))
@@ -764,6 +781,7 @@ def build_snapshot() -> Dict[str, Any]:
         "public_domain": os.environ.get("RAILWAY_PUBLIC_DOMAIN", ""),
         "trades": _row_trades(trades_r),
         "open": _row_open(open_r),
+        "open_dry": _row_open_dry(dry_open_r),
         "data": _row_data(counts, ai_r, llm_r),
         "positions": positions,
         "recent_trades": recent,
@@ -1855,12 +1873,17 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
       </dl>
       {% if s.mode.funding.get('reason') %}
       <div class="note-box" style="margin-top:12px"><b>Cannot go LIVE:</b> {{ s.mode.funding.get('reason') }}</div>
-      {% endif %}
+      {% elif s.mode.mode != 'live' %}
       <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
-        Kalshi rejects orders below $1.00. Until the production account is funded,
-        the LIVE switch stays locked by design &mdash; this is the guard that stops a
-        mis-click from becoming a failed or partial order.
+        Kalshi rejects orders below $1.00. This balance is
+        {{ '$%.2f'|format(s.mode.funding.get('balance', 0) or 0) }}, so at the current
+        {{ s.config.max_position_size_pct if s.config.get('max_position_size_pct') else 3.0 }}% position size a
+        single order would be about
+        {{ '$%.2f'|format((s.mode.funding.get('balance', 0) or 0) * (s.config.max_position_size_pct if s.config.get('max_position_size_pct') else 3.0) / 100) }}
+        &mdash; under the minimum, so the LIVE switch is armed but orders would be refused by
+        validation until the account is funded further or a position-size floor is added.
       </p>
+      {% endif %}
     </div>
   </div>
 </div>
@@ -1875,16 +1898,24 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 {% endif %}
 
 <!-- ============ headline tiles ============ -->
+{% set live = s.mode.mode == 'live' %}
+{% set dry = s.mode.dry %}
+<!-- Headline tiles describe the book the bot is ACTUALLY trading.
+     DRY -> the simulated account. LIVE -> the real Kalshi account.
+     Never the other one: in DRY the real balance and real positions sitting in
+     the headline made the page contradict its own DRY MODE flag. -->
 <div class="tiles">
   <div class="tile">
     <div class="k">Engine</div>
     <div class="v">{% if s.status == 'online' %}<span class="pill ok"><span class="dot pulse"></span>ONLINE</span>{% else %}<span class="pill no">OFF</span>{% endif %}</div>
     <div class="s" id="tUptime">up {{ (s.uptime_sec // 60) if s.uptime_sec is defined else 0 }}m</div>
   </div>
+
+  {% if live %}
   <div class="tile">
-    <div class="k">Kalshi balance</div>
+    <div class="k">Real balance</div>
     <div class="v" id="tBalance">{{ '$%.2f'|format(s.balance) if s.balance is not none else '-' }}</div>
-    <div class="s">{% if s.has_kalshi_creds %}API connected{% else %}no credentials{% endif %}</div>
+    <div class="s">live Kalshi account</div>
   </div>
   <div class="tile">
     <div class="k">Live positions</div>
@@ -1892,15 +1923,38 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
     <div class="s">{{ s.kalshi.market_count if s.kalshi else 0 }} market &middot; {{ s.kalshi.event_count if s.kalshi else 0 }} event</div>
   </div>
   <div class="tile">
-    <div class="k">Exposure</div>
+    <div class="k">Real exposure</div>
     <div class="v" id="tExposure">{{ '$%.2f'|format(s.kalshi.exposure) if s.kalshi else '$0.00' }}</div>
     <div class="s">cost basis {{ '$%.2f'|format(s.kalshi.cost_basis) if s.kalshi else '$0.00' }}</div>
   </div>
   <div class="tile">
-    <div class="k">Kalshi realized P&amp;L</div>
+    <div class="k">Real realized P&amp;L</div>
     <div class="v {{ 'up' if s.kalshi and s.kalshi.realized > 0 else ('down' if s.kalshi and s.kalshi.realized < 0 else 'flat') }}" id="tKalshiPnl">{{ '$%.2f'|format(s.kalshi.realized) if s.kalshi else '$0.00' }}</div>
     <div class="s">fees {{ '$%.2f'|format(s.kalshi.fees) if s.kalshi else '$0.00' }}</div>
   </div>
+  {% else %}
+  <div class="tile">
+    <div class="k">DRY cash</div>
+    <div class="v" id="tBalance">{{ '$%.2f'|format(dry.cash) }}</div>
+    <div class="s">simulated &middot; no real money</div>
+  </div>
+  <div class="tile">
+    <div class="k">DRY positions</div>
+    <div class="v" id="tLivePos">{{ s.open_dry.positions if s.open_dry else 0 }}</div>
+    <div class="s">simulated fills</div>
+  </div>
+  <div class="tile">
+    <div class="k">DRY deployed</div>
+    <div class="v" id="tExposure">{{ '$%.2f'|format(s.open_dry.capital) if s.open_dry else '$0.00' }}</div>
+    <div class="s">of {{ '$%.2f'|format(dry.equity) }} equity</div>
+  </div>
+  <div class="tile">
+    <div class="k">DRY realized P&amp;L</div>
+    <div class="v {{ 'up' if dry.realized > 0 else ('down' if dry.realized < 0 else 'flat') }}" id="tKalshiPnl">{{ '$%.2f'|format(dry.total_pnl) }}</div>
+    <div class="s">{{ dry.ledger_entries }} simulated fill{{ '' if dry.ledger_entries == 1 else 's' }}</div>
+  </div>
+  {% endif %}
+
   <div class="tile">
     <div class="k">Bot realized P&amp;L</div>
     <div class="v {{ 'up' if s.trades and s.trades.realized_pnl > 0 else ('down' if s.trades and s.trades.realized_pnl < 0 else 'flat') }}" id="tBotPnl">{{ '$%.2f'|format(s.trades.realized_pnl) if s.trades else '$0.00' }}</div>
@@ -1978,10 +2032,19 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 
 <!-- ============ Kalshi account ============ -->
 <div class="panel" style="margin-bottom:12px">
-  <div class="ph">
-    <h2>Kalshi account &mdash; live from the API</h2>
-    <span class="note">{% if s.last_update %}synced {{ s.last_update }}{% else %}not synced yet{% endif %}</span>
-  </div>
+    <div class="ph">
+      <h2>{{ 'Kalshi account — real, and being traded' if s.mode.mode == 'live' else 'Real Kalshi account — NOT what DRY is trading' }}</h2>
+      <span class="note">{% if s.last_update %}synced {{ s.last_update }}{% else %}not synced yet{% endif %}</span>
+    </div>
+    {% if s.mode.mode != 'live' %}
+    <div class="pb" style="padding-bottom:0">
+      <p class="note" style="font-size:11.5px;color:var(--faint)">
+        Read-only reference. The bot is in <b>DRY</b>, so it is not trading this
+        account and none of these figures are its performance. The simulated
+        $300 book above is what DRY is trading.
+      </p>
+    </div>
+    {% endif %}
   {%- if s.kalshi and s.kalshi.connected %}
   <div class="row two" style="padding:14px 16px 0;margin:0">
     <div class="pb" style="padding:0">
@@ -2400,6 +2463,7 @@ function money(v) { return '$' + Number(v || 0).toFixed(2); }
 
 // One function owns every mode indicator: frame colour, body attribute, flag
 // text, button state, title and favicon. They cannot drift apart.
+let lastMode = document.body.dataset.mode || 'dry';
 function paintMode(d) {
   if (!d) return;
   // Missing mode must read as DRY, never as an ambiguous third state.
@@ -2422,6 +2486,16 @@ function paintMode(d) {
       '<rect width="32" height="32" rx="8" fill="' + bg + '"/>' +
       '<text x="16" y="23" font-size="19" font-weight="bold" text-anchor="middle" fill="#000">' +
       ch + '</text></svg>';
+  }
+
+  // The headline tiles are different markup per mode - DRY shows the simulated
+  // book, LIVE the real account - so they cannot be patched in place. Repaint the
+  // safety indicators immediately, then reload for correct tiles. This also
+  // catches a mode change made from another browser.
+  if (m !== lastMode) {
+    lastMode = m;
+    setTimeout(() => location.reload(), 450);
+    return;
   }
 
   const dry = d.dry || {};

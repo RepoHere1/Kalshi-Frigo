@@ -312,7 +312,13 @@ def _patch_mode(monkeypatch, db_path):
     monkeypatch.setattr(ex, "default_mode_manager", lambda p: TradingMode(db_path=p))
 
 
-def test_execute_dry_marks_position_and_never_places(monkeypatch, tmp_path):
+def test_execute_dry_does_not_promote_the_position(monkeypatch, tmp_path):
+    """`live` is how a real position is told from a simulated one.
+
+    DRY used to call update_position_to_live, which made simulated fills
+    indistinguishable from real ones everywhere downstream (Kalshi fallback,
+    per-strategy P&L, exposure figures).
+    """
     from src.jobs.execute import execute_position
 
     _patch_mode(monkeypatch, tmp_path / "m.db")
@@ -323,11 +329,24 @@ def test_execute_dry_marks_position_and_never_places(monkeypatch, tmp_path):
     ok = asyncio.run(execute_position(_position(), False, db, client))
 
     assert ok is True
-    db.update_position_to_live.assert_awaited_once()
+    db.update_position_to_live.assert_not_called(), "DRY must not mark a position live"
     client.place_order.assert_not_called(), "DRY must never transmit"
     # The simulated ledger recorded the real notional.
     mgr = TradingMode(db_path=str(tmp_path / "m.db"))
     assert run(mgr.dry_account())["cash"] == pytest.approx(295.80)
+
+
+def test_execute_live_promotes_the_position(monkeypatch, tmp_path):
+    from src.jobs.execute import execute_position
+
+    _patch_mode(monkeypatch, tmp_path / "m.db")
+    db = MagicMock()
+    db.update_position_to_live = AsyncMock()
+    client = _client(NORMAL_MARKET)
+    client.get_balance = AsyncMock(return_value={"balance": 50_000})
+
+    assert asyncio.run(execute_position(_position(), True, db, client)) is True
+    db.update_position_to_live.assert_awaited_once()
 
 
 def test_execute_dry_rejects_untradeable_market(monkeypatch, tmp_path):

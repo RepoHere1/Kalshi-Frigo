@@ -110,12 +110,17 @@ async def execute_position(
                 f"no id, so it could not be marked live. Order ID: {order_id}"
             )
             return False
-        await db_manager.update_position_to_live(position.id, fill_price)
 
         if live_mode:
+            await db_manager.update_position_to_live(position.id, fill_price)
             logger.info(f"✅ LIVE ORDER PLACED for {position.market_id}. Order ID: {order_id}")
             logger.info(f"💰 Real money used: ${request.notional:.2f}")
         else:
+            # Deliberately NOT promoted to live. `live` is what distinguishes a
+            # real position from a simulated one everywhere downstream - the
+            # dashboard's Kalshi fallback, per-strategy P&L and the Kalshi
+            # exposure figures all read it. Marking DRY fills as live=1 made the
+            # simulated book indistinguishable from the real one.
             logger.info(
                 f"✅ DRY ORDER SIMULATED for {position.market_id}. Simulated order ID: {order_id}"
             )
