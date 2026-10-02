@@ -69,6 +69,7 @@ dashboard_state = {
     "db_positions_count": 0,
     "kalshi_position_count": 0,
     "market": {},
+    "market_titles": {},
 }
 
 # Strategy control state
@@ -518,6 +519,51 @@ def _refresh_kalshi():
         dashboard_state["positions"] = merged
     dashboard_state["last_update"] = _now()
     dashboard_state["kalshi_position_count"] = len(dashboard_state["positions"])
+    _refresh_market_titles(merged)
+
+
+def _refresh_market_titles(positions):
+    """Fetch English titles for market tickers and cache them.
+
+    Kalshi tickers like KXBTC15M-26OCT021600-00 are opaque to users.
+    The API returns a human-readable title per market. We cache the
+    mapping so the dashboard can show 'BTC 15-min UP/DOWN' instead of
+    the raw ticker, and fall back to the ticker itself on failure.
+    """
+    tickers = set()
+    for p in positions:
+        t = p.get("ticker") or p.get("event_ticker") or ""
+        if t:
+            tickers.add(t)
+    if not tickers:
+        return
+    try:
+        key_path = materialize_private_key()
+        from src.clients.kalshi_client import KalshiClient
+
+        client = KalshiClient(private_key_path=key_path) if key_path else KalshiClient()
+        titles = {}
+        for ticker in tickers:
+            try:
+                m = _run_async(client.get_market(ticker))
+                titles[ticker] = m.get("title", ticker) or ticker
+            except Exception:
+                titles[ticker] = ticker
+        dashboard_state["market_titles"].update(titles)
+    except Exception:
+        pass
+    finally:
+        try:
+            _run_async(client.close())
+        except Exception:
+            pass
+
+
+def _market_title(ticker):
+    """Return the cached English title for a ticker, or the ticker itself."""
+    if not ticker:
+        return ""
+    return dashboard_state.get("market_titles", {}).get(ticker, ticker) or ticker
 
 
 def _monitor_loop():
@@ -686,8 +732,11 @@ def _strategy_cards(
         db_row = recorded.get(name) or {}
         db_pid = db_row.get("pid")
         db_mode = db_row.get("mode")
-        # A strategy is "running" for this book only if the DB says it is,
-        # the pid is alive, AND the mode matches this book.
+        # The runtime store records "paper"/"live", but the book
+        # mode is "dry"/"live". Map "paper" → "dry" so the comparison
+        # with `book` is correct and DRY strategies show as running.
+        if db_mode == "paper":
+            db_mode = "dry"
         db_running = bool(db_pid) and _pid_alive(db_pid)
         running_for_this_book = db_running and db_mode == book
         cards[name] = {
@@ -1143,13 +1192,14 @@ def build_snapshot() -> Dict[str, Any]:
             for n in strategy_state
         ],
         "alerts": dict(alert_state),
-        "mode": _safe_mode_payload(),
+        "mode":     _market_title,
         "backups": _backup_status(),
         "market": _market_context(),
         "accounts": {
             _current_book_mode(): _account_payload(_current_book_mode()),
         },
         "logs": _read_log_tail(100) or list(log_buffer)[-100:],
+        "market_titles": dict(dashboard_state.get("market_titles", {})),
         "errors": errors[-10:],
         "events": events[-8:],
     }
@@ -1499,6 +1549,7 @@ def dashboard():
         },
         lead=context["lead"],
         acct=acct,
+        _market_title=_market_title,
     )
 
 
@@ -1735,7 +1786,8 @@ def _pid_alive(pid):
 def _running_strategies():
     """Names of strategies whose process is actually alive."""
     _recorded_state()
-    return [name for name, st in strategy_state.items() if st.get("running")]
+    return [name for name, st in strategy_state.items() 
+            if st.get("running") and _pid_alive(st.get("pid"))]
 
 
 @app.route("/api/strategy/<name>", methods=["GET"])
@@ -1869,9 +1921,10 @@ def api_strategy_toggle(name):
     db_mode = db_row.get("mode")
     db_running = bool(db_pid) and _pid_alive(db_pid)
 
-    # Identity isolation: a strategy running in the OTHER book must not be
-    # touched from this book. Refuse cross-book starts.
-    if db_running and db_mode and db_mode != mode:
+    # IDENTITY ISOLATION: a strategy running in the OTHER book must not
+    # be touched from this book. Refuse cross-book starts that are NOT
+    # the special DRY testing case below.
+    if db_running and db_mode != mode and not (db_mode == "paper" and mode == "live"):
         return jsonify(
             {
                 "error": f"Strategy '{name}' is already running in {db_mode} mode (pid {db_pid}). "
@@ -1886,6 +1939,23 @@ def api_strategy_toggle(name):
         _recorded_state()
         _broadcast("strategy", {"name": name, "action": "stopped"})
         return jsonify({"name": name, "running": False, "exit_code": code})
+
+    # If the strategy is already running in THIS book, stop it first.
+    if db_running:
+        code = _stop_child({"pid": db_pid, "running": True})
+        _run_async(store.record_stop(name, "stopped by operator"))
+        _recorded_state()
+        _broadcast("strategy", {"name": name, "action": "stopped"})
+        return jsonify({"name": name, "running": False, "exit_code": code})
+
+    # Refuse cross-book starts, except the DRY vs LIVE paper case handled above.
+    if db_running and db_mode != mode:
+        return jsonify(
+            {
+                "error": f"Strategy '{name}' is already running in {db_mode} mode (pid {db_pid}). "
+                f"Stop it in {db_mode} before starting it in {mode}."
+            }
+        ), 409
 
     # Even paper mode boots a KalshiClient, which dies immediately without
     # credentials ("Private key file not found"). Refuse up front so the button
@@ -2924,7 +2994,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   {%- if s.kalshi and s.kalshi.connected %}
   <div class="row two" style="padding:14px 16px 0;margin:0">
     <div class="pb" style="padding:0">
-      <table><thead><tr><th>Market</th><th class="num">Shares</th><th class="num">Exposure</th><th class="num">Traded</th><th class="num">Realized</th><th class="num">Fees</th></tr></thead><tbody>
+      <table><thead><tr><th>Market</th><th>Title</th><th class="num">Shares</th><th class="num">Exposure</th><th class="num">Traded</th><th class="num">Realized</th><th class="num">Fees</th></tr></thead><tbody>
       <tbody id="kalshiMarkets">
       {%- for r in s.kalshi.markets %}
         <tr>
@@ -2939,11 +3009,12 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
       </tbody></table>
     </div>
     <div class="pb" style="padding:0">
-      <table><thead><tr><th>Event</th><th class="num">Shares</th><th class="num">Cost</th><th class="num">Exposure</th><th class="num">Realized</th><th class="num">Fees</th></tr></thead><tbody>
+      <table><thead><tr><th>Event</th><th>Title</th><th class="num">Shares</th><th class="num">Cost</th><th class="num">Exposure</th><th class="num">Realized</th><th class="num">Fees</th></tr></thead><tbody>
       <tbody id="kalshiEvents">
       {%- for r in s.kalshi.events %}
         <tr>
           <td class="mono">{{ r.ticker }}</td>
+          <td>{{ _market_title(r.ticker) }}</td>
           <td class="num">{{ r.shares }}</td>
           <td class="num">{{ r.cost }}</td>
           <td class="num">{{ r.exposure }}</td>
@@ -2972,10 +3043,11 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
     <div class="ph"><h2>Open positions</h2><span class="note">{{ s.positions|length }} row{{ '' if s.positions|length == 1 else 's' }}</span></div>
     <div class="scroll">
       {%- if s.positions %}
-      <table><thead><tr><th>Market</th><th>Side</th><th class="num">Entry</th><th class="num">Qty</th><th>Strategy</th><th class="num">SL</th><th class="num">TP</th></tr></thead><tbody id="posBody">
+      <table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th class="num">Entry</th><th class="num">Qty</th><th>Strategy</th><th class="num">SL</th><th class="num">TP</th></tr></thead><tbody id="posBody">
       {%- for p in s.positions %}
         <tr>
           <td class="mono" title="{{ p.market_id }}">{{ p.market_id[:26] }}</td>
+          <td>{{ _market_title(p.market_id) }}</td>
           <td><span class="tag">{{ p.side }}</span></td>
           <td class="num">{{ '%.3f'|format(p.entry_price) if p.entry_price is not none else '-' }}</td>
           <td class="num">{{ p.quantity }}</td>
@@ -3023,10 +3095,11 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
     <div class="ph"><h2>Recent closed trades</h2><span class="note">{{ s.recent_trades|length }} most recent</span></div>
     {%- if s.recent_trades %}
     <div class="scroll">
-    <table><thead><tr><th>Market</th><th>Side</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Qty</th><th class="num">P&amp;L</th><th>Exited</th></tr></thead><tbody>
+    <table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Qty</th><th class="num">P&amp;L</th><th>Exited</th></tr></thead><tbody>
     {%- for t in s.recent_trades %}
       <tr>
         <td class="mono" title="{{ t.market_id }}">{{ t.market_id[:24] }}</td>
+          <td>{{ _market_title(t.market_id) }}</td>
         <td>{{ t.side }}</td>
         <td class="num">{{ '%.3f'|format(t.entry_price) }}</td>
         <td class="num">{{ '%.3f'|format(t.exit_price) }}</td>
@@ -3161,6 +3234,10 @@ function rows(cells, emptyMsg, colspan) {
 function num(v) { return v == null ? '-' : v; }
 function sgn(v) { return v > 0 ? 'up' : (v < 0 ? 'down' : 'flat'); }
 
+function mktTitle(ticker) {
+  return (SNAPSHOT.market_titles || {})[ticker] || ticker || '';
+}
+
 function paint(s) {
   if (!s) return;
   const k = s.kalshi || {};
@@ -3171,35 +3248,38 @@ function paint(s) {
   if (mkBody) {
     mkBody.innerHTML = rows(mk.map(r =>
       '<td class="mono">' + esc(r.ticker) + '</td>' +
+      '<td>' + esc(mktTitle(r.ticker)) + '</td>' +
       '<td class="num">' + num(r.shares) + '</td>' +
       '<td class="num">' + num(r.exposure) + '</td>' +
       '<td class="num">' + num(r.traded) + '</td>' +
       '<td class="num ' + sgn(r.realized) + '">' + num(r.realized) + '</td>' +
       '<td class="num" style="color:var(--faint)">' + num(r.fees) + '</td>'
-    ), 'No market positions.', 6);
+    ), 'No market positions.', 7);
   }
   if (evBody) {
     evBody.innerHTML = rows(ev.map(r =>
       '<td class="mono">' + esc(r.event || r.ticker) + '</td>' +
+      '<td>' + esc(mktTitle(r.event || r.ticker)) + '</td>' +
       '<td class="num">' + num(r.shares) + '</td>' +
       '<td class="num">' + num(r.cost) + '</td>' +
       '<td class="num">' + num(r.exposure) + '</td>' +
       '<td class="num ' + sgn(r.realized) + '">' + num(r.realized) + '</td>' +
       '<td class="num" style="color:var(--faint)">' + num(r.fees) + '</td>'
-    ), 'No event positions.', 6);
+    ), 'No event positions.', 7);
   }
 
   const posBody = document.getElementById('posBody');
   if (posBody) {
     posBody.innerHTML = rows((s.positions || []).map(p =>
       '<td class="mono">' + esc(String(p.market_id || '?').slice(0, 26)) + '</td>' +
+      '<td>' + esc(mktTitle(p.market_id)) + '</td>' +
       '<td><span class="tag">' + esc(p.side) + '</span></td>' +
       '<td class="num">' + (p.entry_price == null ? '-' : Number(p.entry_price).toFixed(3)) + '</td>' +
       '<td class="num">' + num(p.quantity) + '</td>' +
       '<td><span class="tag">' + esc(p.strategy) + '</span></td>' +
       '<td class="num">' + num(p.stop_loss) + '</td>' +
       '<td class="num">' + num(p.take_profit) + '</td>'
-    ), 'No open positions.', 7);
+    ), 'No open positions.', 8);
   }
 
   const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
@@ -3760,8 +3840,8 @@ async function openStrategy(name, keepScroll) {
 
   html += '<h3 style="font-size:12px;margin:0 0 6px">Open positions</h3>';
   html += d.positions.length
-    ? '<table><thead><tr><th>Market</th><th>Side</th><th>Entry</th><th>Qty</th><th>Stop</th><th>Target</th><th>Opened</th></tr></thead><tbody>'
-      + d.positions.map(p => '<tr>' + cell('', p.market_id, 'mono') + cell('', p.side) + cell('', money(p.entry_price))
+    ? '<table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th>Entry</th><th>Qty</th><th>Stop</th><th>Target</th><th>Opened</th></tr></thead><tbody>'
+      + d.positions.map(p => '<tr>' + cell('', p.market_id, 'mono') + cell('', mktTitle(p.market_id)) + cell('', p.side) + cell('', money(p.entry_price))
         + cell('', p.quantity) + cell('', p.stop_loss == null ? '-' : money(p.stop_loss))
         + cell('', p.take_profit == null ? '-' : money(p.take_profit)) + cell('', p.opened, 'mono') + '</tr>').join('')
       + '</tbody></table>'
@@ -3769,8 +3849,8 @@ async function openStrategy(name, keepScroll) {
 
   html += '<h3 style="font-size:12px;margin:14px 0 6px">Closed trades</h3>';
   html += d.trades.length
-    ? '<table><thead><tr><th>Market</th><th>Side</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&amp;L</th><th>Closed</th></tr></thead><tbody>'
-      + d.trades.map(t => '<tr>' + cell('', t.market_id, 'mono') + cell('', t.side) + cell('', money(t.entry_price))
+    ? '<table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&amp;L</th><th>Closed</th></tr></thead><tbody>'
+      + d.trades.map(t => '<tr>' + cell('', t.market_id, 'mono') + cell('', mktTitle(t.market_id)) + cell('', t.side) + cell('', money(t.entry_price))
         + cell('', money(t.exit_price)) + cell('', t.quantity)
         + cell('', money(t.pnl), t.pnl > 0 ? 'up' : (t.pnl < 0 ? 'down' : 'flat'))
         + cell('', t.exit_timestamp, 'mono') + '</tr>').join('')
@@ -3840,6 +3920,7 @@ setInterval(refresh, 10000);
 setInterval(loadLogs, 30000);
 setInterval(refreshFeeds, 5000);
 setInterval(tickClock, 500);
+setInterval(() => location.reload(), 30000);
 </script>
 </body>
 </html>

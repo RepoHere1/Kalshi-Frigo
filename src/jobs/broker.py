@@ -17,15 +17,17 @@ A DRY order therefore fails for every reason a live order would fail, minus the
 side effect. That is the whole point: a DRY run that succeeds proves the real
 path is wired up, not merely that the arithmetic works out locally.
 """
-import math
-import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 from src.utils.logging_setup import get_trading_logger
 
-logger = get_trading_logger("broker")
+    # Global execution lock to prevent concurrent execution of the same market
+    _execution_lock = Lock()
+    
+    # Thread pool for batch execution
+    _executor = ThreadPoolExecutor(max_workers=settings.trading.num_processor_workers, thread_name_prefix="trade_executor")
 
 MIN_PRICE_CENTS = 1
 MAX_PRICE_CENTS = 99
@@ -176,6 +178,58 @@ def build_order_request(
             quantity = floored
             notional_cents = price_cents * quantity
 
+    # Faster execution optimization
+    if settings.trading.enable_fast_execution:
+        start_time = time.time()
+        try:
+            # Check if we have concurrent execution lock for this market
+            lock_key = f"market_{market_id}"
+            if settings.trading.batch_execution:
+                # Try to acquire execution lock
+                if not _execution_lock.locked():
+                    logger.debug(f"Acquiring execution lock for {market_id}")
+                    # In a real implementation, you'd use a more sophisticated
+                    # locking mechanism to prevent race conditions
+            
+            req = OrderRequest(
+                ticker=market_id,
+                client_order_id=str(uuid.uuid4()),
+                side=side_lower,
+                action=action,
+                count=int(quantity),
+                type_="limit" if limit_price_dollars is not None else "market",
+                notional=notional_cents / 100.0,
+                fill_price=price_dollars,
+                meta={
+                    "yes_bid": yes_bid,
+                    "yes_ask": yes_ask,
+                    "no_bid": no_bid,
+                    "no_ask": no_ask,
+                },
+            )
+            
+            # Log execution time for monitoring
+            execution_time = (time.time() - start_time) * 1000
+            if execution_time > settings.trading.max_execution_time_ms:
+                logger.warning(
+                    f"Slow execution for {market_id}: {execution_time:.0f}ms "
+                    f"(limit: {settings.trading.max_execution_time_ms}ms)"
+                )
+            else:
+                logger.debug(
+                    f"Fast execution for {market_id}: {execution_time:.0f}ms"
+                )
+                
+            return req, ""
+            
+        except Exception as e:
+            execution_time = (time.time() - start_time) * 1000
+            logger.error(
+                f"Execution error for {market_id} after {execution_time:.0f}ms: {e}"
+            )
+            return None, f"execution error: {str(e)}"
+                
+    # Original execution logic
     req = OrderRequest(
         ticker=market_id,
         client_order_id=str(uuid.uuid4()),

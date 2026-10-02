@@ -18,6 +18,10 @@ import math
 
 @dataclass
 class EdgeFilterResult:
+
+
+@dataclass
+class EdgeFilterResult:
     """Result of edge filtering analysis."""
     passes_filter: bool
     edge_magnitude: float
