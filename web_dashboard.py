@@ -48,6 +48,10 @@ DB_PATH = os.environ.get("DB_PATH", str(BASE_DIR / "trading_system.db"))
 LOG_DIR = Path(os.environ.get("LOG_DIR", str(BASE_DIR / "logs")))
 MAX_ERRORS = 50
 MAX_EVENTS = 100
+# Consecutive respawns the supervisor will attempt for one strategy before it
+# gives up and leaves it stopped. A strategy that cannot start at all (missing
+# credentials, a syntax error) must fail loudly, not become a spawn loop.
+_SUPERVISOR_MAX_ATTEMPTS = 5
 
 # ---------------------------------------------------------------------------
 # State
@@ -102,7 +106,7 @@ STRATEGY_COMMANDS: Dict[str, List[str]] = {
         "--interval",
         "300",
     ],
-    "beast_mode": ["cli.py", "run", "--beast", "--paper"],
+    "beast_mode": ["cli.py", "run", "--beast", "--paper", "--loop", "--interval", "300"],
     "market_making": [
         "cli.py",
         "run",
@@ -677,6 +681,88 @@ def _market_data_loop():
             backoff = min(backoff * 2, 30.0)
 
     threading.Thread(target=_thread_main, daemon=True, name="market-data").start()
+
+
+def _strategy_supervisor_loop():
+    """Keep every strategy the operator asked for actually running.
+
+    A strategy process is a child, and children die: an unhandled exception in a
+    trading cycle, an OOM kill, a transient API failure during boot. Until now
+    that was terminal - the card flipped to "exited on its own" and stayed there
+    until somebody noticed and pressed Start again. The intent to run is recorded
+    separately from the pid (`desired`), so a crash can be recovered from without
+    the operator being present.
+
+    This only ever restarts strategies the operator explicitly started. Nothing is
+    started on boot that was not asked for, and Stop clears `desired`, so pressing
+    Stop means stopped.
+    """
+    # Backoff per strategy, and a hard cap on consecutive respawns. Without the
+    # cap a strategy that cannot start (bad credentials, a syntax error) becomes
+    # a spawn loop that buries the real error in the log.
+    failures: Dict[str, float] = {}
+    attempts: Dict[str, int] = {}
+
+    while True:
+        try:
+            store = _runtime_store()
+            for name, row in _run_async(store.desired()).items():
+                if name not in strategy_state:
+                    continue
+                row_pid = row.get("pid")
+                if row_pid and _pid_alive(row_pid, row):
+                    failures.pop(name, None)
+                    attempts[name] = 0
+                    continue
+
+                # Not alive. Was it ever really ours? A pid from a previous
+                # instance of the app is stale, not a crash, so it is cleared
+                # rather than "restarted".
+                from src.utils.strategy_runtime import INSTANCE, owns_process
+
+                if row_pid and (row.get("instance") or "") != INSTANCE:
+                    _run_async(store.record_stop(name, "stopped by app restart"))
+                    _run_async(store.set_desired(name, False))
+                    continue
+
+                if not _creds_present():
+                    continue  # nothing to start with; wait for configuration
+
+                mode = row.get("mode") or "paper"
+                backoff = failures.get(name, 0.0)
+                if attempts.get(name, 0) >= _SUPERVISOR_MAX_ATTEMPTS:
+                    if backoff == 0.0:
+                        _push_error(
+                            f"Supervisor gave up on {name} after "
+                            f"{_SUPERVISOR_MAX_ATTEMPTS} failed starts — it will not "
+                            f"be restarted again until you press Start."
+                        )
+                        failures[name] = -1.0
+                    continue
+                if backoff > 0:
+                    time.sleep(min(backoff, 30.0))
+
+                try:
+                    started = _spawn_strategy(name, mode)
+                    attempts[name] = attempts.get(name, 0) + 1
+                    failures[name] = min(max(backoff * 2, 2.0), 30.0)
+                    _push_error(
+                        f"Supervisor restarted {name} (pid {started['pid']}) after it died."
+                    )
+                    _broadcast("strategy", {"name": name, "action": "restarted"})
+                except Exception as exc:  # noqa: BLE001
+                    attempts[name] = attempts.get(name, 0) + 1
+                    failures[name] = min(max(backoff * 2, 2.0), 30.0)
+                    _push_error(f"Supervisor could not start {name}: {type(exc).__name__}: {exc}")
+        except Exception as exc:  # noqa: BLE001 - the supervisor must never die
+            _push_error(f"Strategy supervisor: {type(exc).__name__}: {exc}")
+        time.sleep(10)
+
+
+def _creds_present() -> bool:
+    return bool(os.environ.get("KALSHI_API_KEY")) and bool(
+        os.environ.get("KALSHI_PRIVATE_KEY") or os.environ.get("KALSHI_PRIVATE_KEY_PATH")
+    )
 
 
 def _log_tail_loop():
@@ -1780,33 +1866,48 @@ def _recorded_state() -> Dict[str, Dict[str, Any]]:
     `strategy_state` alone produced a page that said "stopped" for strategies
     that were running, because the flag was written by whichever request started
     the process and never learned what happened afterwards.
+
+    Liveness is decided by `owns_process`, not by a bare pid check. A pid recorded
+    before a redeploy names some other process now, and treating that stranger as
+    a live strategy made the dashboard report running bots that did not exist and
+    sent Stop's SIGTERM to an innocent process.
     """
+    from src.utils.strategy_runtime import INSTANCE, owns_process
+
     recorded = _run_async(_runtime_store().snapshot())
     for name, st in strategy_state.items():
         row = recorded.get(name) or {}
-        pid = row.get("pid")
-        if pid and not _pid_alive(pid):
-            # Died without us being told. Say so instead of implying it never ran.
-            _run_async(_runtime_store().record_stop(name, "exited on its own"))
+        if row.get("pid") and not _pid_alive(row["pid"], row):
+            # Died without us being told. Say what actually happened rather than
+            # implying it chose to leave: a pid from a previous instance of the
+            # app is stale by definition, not a strategy that exited on its own.
+            if (row.get("instance") or "") != INSTANCE:
+                reason = "stopped by app restart"
+            else:
+                reason = "exited on its own"
+            _run_async(_runtime_store().record_stop(name, reason))
             st["pid"] = None
             st["running"] = False
-            st["stop_reason"] = "exited on its own"
+            st["stop_reason"] = reason
             continue
-        st["pid"] = pid if pid else None
-        st["running"] = bool(pid)
+        st["pid"] = row.get("pid") if row.get("pid") else None
+        st["running"] = bool(row.get("pid"))
         st["started_at"] = row.get("started_at")
         st["command"] = row.get("command")
         st["stop_reason"] = row.get("stop_reason") or ""
     return cast(Dict[str, Dict[str, Any]], recorded)
 
 
-def _pid_alive(pid):
-    """True if a strategy process is still running.
+def _pid_alive(pid, row=None):
+    """True if the strategy process recorded in `row` is still running.
 
     Delegates to the runtime store so the check is platform-safe: on Windows
     os.kill(pid, 0) would terminate the process being probed, and the Popen
-    handle only exists in the process that spawned it.
+    handle only exists in the process that spawned it. When the originating row
+    is supplied the check is exact - pid plus the instance and kernel start-time
+    that were recorded with it - so a recycled pid cannot pass as a live bot.
     """
+    from src.utils.strategy_runtime import owns_process
     from src.utils.strategy_runtime import pid_alive as safe_pid_alive
 
     if not pid:
@@ -1815,6 +1916,8 @@ def _pid_alive(pid):
     if proc is not None:
         # Authoritative when we own the handle.
         return proc.poll() is None
+    if row is not None:
+        return owns_process(row)
     return safe_pid_alive(pid)
 
 
@@ -1972,7 +2075,10 @@ def api_strategy_toggle(name):
     db_row = recorded.get(name) or {}
     db_pid = db_row.get("pid")
     db_mode = db_row.get("mode")
-    db_running = bool(db_pid) and _pid_alive(db_pid)
+    # Exact check, not a bare pid: see `_pid_alive`. Without this a pid left over
+    # from a previous instance of the app reads as a live strategy, and Stop then
+    # signals an unrelated process instead of a bot.
+    db_running = bool(db_pid) and _pid_alive(db_pid, db_row)
 
     # Identity isolation: a strategy running in the OTHER book must not be
     # touched from this book. Refuse cross-book starts.
@@ -1995,6 +2101,10 @@ def api_strategy_toggle(name):
         _broadcast("strategy", {"name": name, "action": "stopped"})
         return jsonify({"name": name, "running": False, "exit_code": code})
 
+    # Stopping is recorded as an explicit instruction, not just a cleared pid, so
+    # the supervisor knows this strategy is meant to stay down.
+    _run_async(store.set_desired(name, False))
+
     # Even paper mode boots a KalshiClient, which dies immediately without
     # credentials ("Private key file not found"). Refuse up front so the button
     # does not report success for a process that is about to exit.
@@ -2011,6 +2121,24 @@ def api_strategy_toggle(name):
             ),
             400,
         )
+
+    try:
+        result = _spawn_strategy(name, mode)
+    except Exception as e:  # noqa: BLE001
+        _push_error(f"Strategy start ({name}): {e}")
+        return jsonify({"error": f"Failed to start: {e}"}), 500
+
+    _broadcast("strategy", {"name": name, "action": "started", "pid": result["pid"]})
+    return jsonify(result)
+
+
+def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
+    """Launch one strategy process and record it. Raises on failure.
+
+    Shared by the Start button and the supervisor so both paths produce an
+    identical child: same command, same environment, same persisted record.
+    """
+    store = _runtime_store()
 
     # sys.executable guarantees the child uses the same interpreter (and venv)
     # as the dashboard, rather than whatever 'python' resolves to on PATH.
@@ -2033,9 +2161,9 @@ def api_strategy_toggle(name):
     # Children must share the volume-mounted database, not a fresh container one.
     child_env["DB_PATH"] = str(DB_PATH)
 
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    out = open(LOG_DIR / f"strategy_{name}.log", "ab", buffering=0)
     try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        out = open(LOG_DIR / f"strategy_{name}.log", "ab", buffering=0)
         proc = subprocess.Popen(
             cmd,
             cwd=str(BASE_DIR),
@@ -2045,21 +2173,20 @@ def api_strategy_toggle(name):
             env=child_env,
             start_new_session=True,
         )
+    finally:
         out.close()
-    except Exception as e:
-        _push_error(f"Strategy start ({name}): {e}")
-        return jsonify({"error": f"Failed to start: {e}"}), 500
 
     _child_procs[proc.pid] = proc
+    st = strategy_state.setdefault(name, {"running": False, "pid": None, "mode": mode})
     st["running"] = True
     st["pid"] = proc.pid
     st["mode"] = mode
+    st["stop_reason"] = ""
     # Persist before answering: the next request may be served by a different
     # process, and a button that reports "started" for a process nobody can see
     # is exactly the lie this store exists to remove.
     _run_async(store.record_start(name, proc.pid, mode, " ".join(cmd[1:])))
-    _broadcast("strategy", {"name": name, "action": "started", "pid": proc.pid})
-    return jsonify({"name": name, "running": True, "pid": proc.pid})
+    return {"name": name, "running": True, "pid": proc.pid}
 
 
 # 4. Charting data (P&L)
@@ -3993,7 +4120,13 @@ def start_background_workers():
     if _workers_started:
         return
     _workers_started = True
-    for target in (_monitor_loop, _log_tail_loop, _backup_loop, _market_data_loop):
+    for target in (
+        _monitor_loop,
+        _log_tail_loop,
+        _backup_loop,
+        _market_data_loop,
+        _strategy_supervisor_loop,
+    ):
         threading.Thread(target=target, daemon=True).start()
 
 
