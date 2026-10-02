@@ -2788,10 +2788,10 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 </div>
 {% endif %}
 
-<!-- ============ live feeds + account ============ -->
+<!-- ============ feeds + account ============ -->
 <div class="panel" style="margin-bottom:12px">
   <div class="ph">
-    <h2>Live feeds &amp; account</h2>
+    <h2>{{ 'LIVE feeds &amp; account — real money' if s.mode.mode == 'live' else 'DRY feeds &amp; account — simulated' }}</h2>
     <span class="note" id="feedNote">streaming</span>
   </div>
   <div class="pb">
@@ -2909,16 +2909,15 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 <!-- ============ Kalshi account ============ -->
 <div class="panel" style="margin-bottom:12px">
     <div class="ph">
-      <h2>{{ 'Kalshi account — real, and being traded' if s.mode.mode == 'live' else 'Real Kalshi account — NOT what DRY is trading' }}</h2>
+      <h2>Kalshi account — real, and being traded</h2>
       <span class="note">{% if s.last_update %}synced {{ s.last_update }}{% else %}not synced yet{% endif %}</span>
     </div>
     {%- if s.mode.mode != 'live' %}
     <div class="pb" style="padding-bottom:0">
       <p class="note" style="font-size:11.5px;color:var(--faint)">
-        Read-only reference, and <b>managed outside this bot</b>. This deployment
-        does not trade it: the strategy loop has never placed an order here, and
-        the book is driven by a separate system. The simulated $300 book above is
-        what DRY is trading, so none of these figures describe the bot's results.
+        This is the real Kalshi account. The bot trades it only when the
+        mode switch reads LIVE. While the switch reads DRY, this account
+        is untouched — the simulated $300 book above is what DRY is trading.
       </p>
     </div>
     {%- endif %}
