@@ -79,39 +79,29 @@ class TradingConfig:
     min_volume: float = 500.0           # SANE: Higher volume requirement (was 200 beast mode)
     max_time_to_expiry_days: int = 14   # SANE: Shorter timeframes (was 30)
     
-# AI decision making — DATA-DRIVEN THRESHOLDS  
-    min_confidence_to_trade: float = 0.35   # LOOSENED: 35% confidence minimum (was 60%, approved 2026-03-29)
-                                       # Based on analysis: 65% was too conservative, bot finding 0 eligible markets
-                                       # NCAAB NO-side showed 74% WR at +10% ROI, suggesting value at lower thresholds
+    # AI decision making — DATA-DRIVEN THRESHOLDS  
+    min_confidence_to_trade: float = 0.45   # LOOSENED: 45% confidence minimum (was 60%, approved 2026-03-29)
+                                           # Based on analysis: 65% was too conservative, bot finding 0 eligible markets
+                                           # NCAAB NO-side showed 74% WR at +10% ROI, suggesting value at lower thresholds
     
-    # Dynamic position sizing optimization
-    enable_dynamic_sizing: bool = True         # Enable dynamic position sizing based on confidence
-    kelly_fraction_base: float = 0.20          # Base Kelly fraction (20% of bankroll)
-    confidence_adjustment_range: float = 0.5   # Range for confidence adjustments (0-0.5)
-    max_position_cap: float = 0.04            # Maximum position cap (4% of bankroll)
-    min_position_size: float = 0.01           # Minimum position size (1% of bankroll)
+    # Category-specific confidence adjustments (applied as multipliers to base threshold)
+    category_confidence_adjustments: Dict[str, float] = field(default_factory=lambda: {
+        "sports": 0.90,      # Sports showed best performance (NCAAB 74% WR), lower threshold
+        "economics": 1.15,   # Economics showed -70% ROI, higher threshold required  
+        "politics": 1.05,    # Slight increase for political volatility
+        "default": 1.0       # Base multiplier for other categories
+    })
     
     scan_interval_seconds: int = 60      # SANE: 60-second scan interval (was 30)
     
-    # AI model configuration - CHEAP MODEL ROUTING FOR LOWER-RISK TRADES
-    primary_model: str = "anthropic/claude-sonnet-4.5"  # Primary model via OpenRouter (anthropic)
-    fallback_model: str = "deepseek/deepseek-v3.2"  # Fallback model via OpenRouter (deepseek)
-    backup_model: str = "google/gemini-3.1-pro"  # Backup cheaper model via OpenRouter (google)
+    # AI model configuration
+    primary_model: str = "anthropic/claude-sonnet-4.5"  # Primary model via OpenRouter
+    fallback_model: str = "deepseek/deepseek-v3.2"  # Fallback model via OpenRouter
     ai_temperature: float = 0  # Lower temperature for more consistent JSON output
     ai_max_tokens: int = 8000    # Reasonable limit for reasoning models (grok-4 works better with 8000)
     
-    # Model routing for risk levels - CHEAPER MODELS FOR LOWER-RISK TRADES
-    risk_based_model_routing: bool = True  # Enable dynamic model selection based on trade risk
-    low_risk_models: List[str] = ["deepseek/deepseek-v3.2", "google/gemini-3.1-pro"]  # CHEAPER MODELS
-    medium_risk_models: List[str] = ["anthropic/claude-sonnet-4.5"]  # MID-TIER MODELS  
-    high_risk_models: List[str] = ["x-ai/grok-4.1-fast"]  # PREMIUM MODELS
-    
-    # Faster execution settings
-    enable_fast_execution: bool = True     # Enable optimized order execution
-    max_execution_time_ms: int = 500       # Maximum time per order execution
-    retry_attempts: int = 3                # Number of retry attempts for failed orders
-    batch_execution: bool = True          # Enable batch execution for multiple orders
-    execution_timeout_seconds: int = 30   # Timeout for order execution
+    # Position sizing (LEGACY - now using Kelly-primary approach)
+    default_position_size: float = 3.0  # REDUCED: Now using Kelly Criterion as primary method (was 5%, now 3%)
     position_size_multiplier: float = 1.0  # Multiplier for AI confidence
     
     # Kelly Criterion settings (PRIMARY position sizing method) — DISCIPLINED
@@ -123,15 +113,16 @@ class TradingConfig:
     live_trading_enabled: bool = field(default_factory=lambda: os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true")
     paper_trading_mode: bool = field(default_factory=lambda: os.getenv("LIVE_TRADING_ENABLED", "false").lower() != "true")
     
-        # Position sizing (LEGACY - now using Kelly-primary approach)
-    default_position_size: float = 3.0  # REDUCED: Now using Kelly Criterion as primary method (was 5%, now 3%)
-    position_size_multiplier: float = 1.0  # Multiplier for AI confidence
+    # Trading frequency - MORE FREQUENT
+    market_scan_interval: int = 30          # DECREASED: Scan every 30 seconds (was 60)
+    position_check_interval: int = 15       # DECREASED: Check positions every 15 seconds (was 30)
+    max_trades_per_hour: int = 20           # INCREASED: Allow more trades per hour (was 10, now 20)
+    run_interval_minutes: int = 10          # DECREASED: Run more frequently (was 15, now 10)
+    num_processor_workers: int = 5      # Number of concurrent market processor workers
     
-    # Correlation limits for sector exposure
-    enable_correlation_limits: bool = True     # Enable correlation checking for sector exposure
-    max_correlation_threshold: float = 0.7     # Maximum correlation between positions (0-1)
-    correlation_lookback_days: int = 30        # Lookback period for correlation calculation
-    max_positions_per_sector: int = 3          # Maximum positions allowed per sector
+    # Market selection preferences
+    preferred_categories: List[str] = field(default_factory=lambda: [])
+    excluded_categories: List[str] = field(default_factory=lambda: [])
     
     # High-confidence, near-expiry strategy
     enable_high_confidence_strategy: bool = True

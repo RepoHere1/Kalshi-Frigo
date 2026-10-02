@@ -1920,7 +1920,7 @@ def test_page_order_tiles_then_account_then_feeds(client):
     order = [
         html.index('<div class="tiles">'),
         html.index("<!-- DRY account"),
-        html.index("<!-- ============ live feeds"),
+        html.index("<!-- ============ feeds + account"),
         html.index("<!-- ============ readiness"),
     ]
     assert order == sorted(order), "tiles -> DRY account -> feeds -> readiness"

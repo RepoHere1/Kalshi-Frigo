@@ -93,6 +93,24 @@ class TradingMode:
             (key, str(value), _now()),
         )
 
+    async def _exec_optional(self, conn, sql: str, params: Optional[List[Any]] = None) -> bool:
+        """Run a statement, tolerating a table that does not exist yet.
+
+        `trade_logs`, `positions` and `dry_ledger` are not all owned by this
+        module's `_SCHEMA` - the first two are created by DatabaseManager. On a
+        fresh database (a new Railway volume, or any container where the trading
+        loop has not run yet) those tables are simply absent, and an unguarded
+        DELETE raises `no such table`, which surfaced as a 500 from /api/mode and
+        left the DRY/LIVE switch permanently stuck.
+
+        Returns True if the statement ran, False if the table was missing.
+        """
+        try:
+            await conn.execute(sql, tuple(params or ()))
+            return True
+        except Exception:  # noqa: BLE001 - a missing table is an expected state
+            return False
+
     # ------------------------------------------------------------------
     # Mode
     # ------------------------------------------------------------------
@@ -125,11 +143,13 @@ class TradingMode:
             # when we switch, or they leak across the boundary.
             if mode == MODE_DRY:
                 # Going DRY: wipe all LIVE rows
-                await conn.execute(
-                    "DELETE FROM trade_logs WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'live'"
+                await self._exec_optional(
+                    conn,
+                    "DELETE FROM trade_logs WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'live'",
                 )
-                await conn.execute(
-                    "DELETE FROM positions WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'live'"
+                await self._exec_optional(
+                    conn,
+                    "DELETE FROM positions WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'live'",
                 )
                 # Reset DRY cash to starting balance
                 starting = await self._get(conn, _START_KEY)
@@ -137,13 +157,15 @@ class TradingMode:
                 await self._set(conn, _CASH_KEY, str(round(starting_f, 2)))
             else:
                 # Going LIVE: wipe all DRY rows
-                await conn.execute(
-                    "DELETE FROM trade_logs WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'"
+                await self._exec_optional(
+                    conn,
+                    "DELETE FROM trade_logs WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'",
                 )
-                await conn.execute(
-                    "DELETE FROM positions WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'"
+                await self._exec_optional(
+                    conn,
+                    "DELETE FROM positions WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'",
                 )
-                await conn.execute("DELETE FROM dry_ledger")
+                await self._exec_optional(conn, "DELETE FROM dry_ledger")
 
             await self._set(conn, _MODE_KEY, mode)
             await conn.commit()

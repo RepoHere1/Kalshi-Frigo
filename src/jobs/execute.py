@@ -224,7 +224,7 @@ async def place_sell_limit_order(
 async def place_profit_taking_orders(
     db_manager: DatabaseManager,
     kalshi_client: KalshiClient,
-    profit_threshold: float = 0.50,  # 50% profit target
+    profit_threshold: float = 0.25,  # 25% profit target
     live_mode: bool = False,
 ) -> Dict[str, int]:
     """
@@ -233,7 +233,7 @@ async def place_profit_taking_orders(
     Args:
         db_manager: Database manager
         kalshi_client: Kalshi API client
-        profit_threshold: Minimum profit percentage to trigger sell order (0.50 = 50%)
+        profit_threshold: Minimum profit percentage to trigger sell order
 
     Returns:
         Dictionary with results: {'orders_placed': int, 'positions_processed': int}
@@ -250,7 +250,7 @@ async def place_profit_taking_orders(
             logger.info("No open positions to process for profit taking")
             return results
 
-        logger.info(f"📊 Checking {len(positions)} positions for profit-taking opportunities (50% target)")
+        logger.info(f"📊 Checking {len(positions)} positions for profit-taking opportunities")
 
         for position in positions:
             try:

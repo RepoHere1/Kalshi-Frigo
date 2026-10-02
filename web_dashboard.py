@@ -522,6 +522,10 @@ def _refresh_kalshi():
     _refresh_market_titles(merged)
 
 
+_title_client: Any = None
+_TITLE_CACHE_MAX = 400
+
+
 def _refresh_market_titles(positions):
     """Fetch English titles for market tickers and cache them.
 
@@ -529,34 +533,44 @@ def _refresh_market_titles(positions):
     The API returns a human-readable title per market. We cache the
     mapping so the dashboard can show 'BTC 15-min UP/DOWN' instead of
     the raw ticker, and fall back to the ticker itself on failure.
+
+    Only tickers we have not resolved yet are fetched, and the client is kept
+    for the life of the process: building a KalshiClient per cycle would
+    re-read and re-parse the private key on every refresh, on the same thread
+    that drives the rest of the poll.
     """
-    tickers = set()
+    global _title_client
+
+    cached = dashboard_state["market_titles"]
+    if len(cached) > _TITLE_CACHE_MAX:
+        cached.clear()
+
+    missing = set()
     for p in positions:
         t = p.get("ticker") or p.get("event_ticker") or ""
-        if t:
-            tickers.add(t)
-    if not tickers:
+        if t and t not in cached:
+            missing.add(t)
+    if not missing:
         return
-    try:
-        key_path = materialize_private_key()
-        from src.clients.kalshi_client import KalshiClient
+    if not os.environ.get("KALSHI_API_KEY"):
+        return
 
-        client = KalshiClient(private_key_path=key_path) if key_path else KalshiClient()
-        titles = {}
-        for ticker in tickers:
+    try:
+        if _title_client is None:
+            key_path = materialize_private_key()
+            from src.clients.kalshi_client import KalshiClient
+
+            _title_client = KalshiClient(private_key_path=key_path) if key_path else KalshiClient()
+        for ticker in missing:
             try:
-                m = _run_async(client.get_market(ticker))
-                titles[ticker] = m.get("title", ticker) or ticker
+                m = _run_async(_title_client.get_market(ticker))
+                cached[ticker] = (m or {}).get("title") or ticker
             except Exception:
-                titles[ticker] = ticker
-        dashboard_state["market_titles"].update(titles)
+                # Cache the ticker itself so a permanently unresolvable market is
+                # not retried on every single refresh cycle.
+                cached[ticker] = ticker
     except Exception:
-        pass
-    finally:
-        try:
-            _run_async(client.close())
-        except Exception:
-            pass
+        return
 
 
 def _market_title(ticker):
@@ -613,14 +627,22 @@ def _market_data_loop():
     request - which would tear down the socket on every poll - one thread holds a
     single event loop and one long-lived connection, and the routes read the
     cached payload it produces.
+
+    This used to be fire-and-forget: `hub.start()` sat outside the inner
+    try/except, so a single failure at startup (a refused socket, a DNS blip, an
+    import that resolved differently in the container) ended the thread
+    permanently. The page then rendered the empty initial payload forever -
+    "connecting...", "no tick yet", "waiting for the next contract" - with no
+    error anywhere, because the one error that explained it had been raised once
+    and then scrolled out of the buffer. The only cure was a redeploy. The whole
+    hub is now rebuilt on failure instead.
     """
     import asyncio
 
     from src.jobs.market_data import MarketDataHub
 
-    hub = MarketDataHub()
-
     async def _run() -> None:
+        hub = MarketDataHub()
         await hub.start()
         while True:
             try:
@@ -630,17 +652,29 @@ def _market_data_loop():
             await asyncio.sleep(2)
 
     def _thread_main() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(_run())
-        except Exception as e:  # noqa: BLE001
-            _push_error(f"Market data thread: {e}")
-        finally:
+        backoff = 1.0
+        while True:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             try:
-                loop.close()
-            except Exception:  # noqa: BLE001
-                pass
+                dashboard_state["market_started_at"] = time.time()
+                loop.run_until_complete(_run())
+                backoff = 1.0
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                _push_error(f"Market data feed restarting: {type(e).__name__}: {e}")
+                dashboard_state["market_error"] = f"{type(e).__name__}: {e}"
+            finally:
+                try:
+                    loop.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            # Never leave the feed dark for long: retry, backing off so a hard
+            # outage does not turn into a busy loop.
+            dashboard_state["market"] = {}
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
 
     threading.Thread(target=_thread_main, daemon=True, name="market-data").start()
 
@@ -1192,7 +1226,7 @@ def build_snapshot() -> Dict[str, Any]:
             for n in strategy_state
         ],
         "alerts": dict(alert_state),
-        "mode":     _market_title,
+        "mode": _safe_mode_payload(),
         "backups": _backup_status(),
         "market": _market_context(),
         "accounts": {
@@ -1546,6 +1580,7 @@ def dashboard():
             "spot": context["spot"],
             "kalshi": context["kalshi"],
             "series": context["series"],
+            "feed_error": context["feed_error"],
         },
         lead=context["lead"],
         acct=acct,
@@ -1786,8 +1821,11 @@ def _pid_alive(pid):
 def _running_strategies():
     """Names of strategies whose process is actually alive."""
     _recorded_state()
-    return [name for name, st in strategy_state.items() 
-            if st.get("running") and _pid_alive(st.get("pid"))]
+    return [
+        name
+        for name, st in strategy_state.items()
+        if st.get("running") and _pid_alive(st.get("pid"))
+    ]
 
 
 @app.route("/api/strategy/<name>", methods=["GET"])
@@ -1886,27 +1924,42 @@ def api_strategy_toggle(name):
         return jsonify({"error": f"Unknown strategy: {name}"}), 404
 
     st = strategy_state[name]
-    # Get the current persisted book mode (dry/live). This is the SOURCE OF TRUTH
-    # for which book we are in. The request MUST match it — a button pressed while
-    # the switch reads DRY cannot spawn a LIVE process, and vice versa.
-    persisted_mode = _current_book_mode()
-    requested_mode = (request.json or {}).get("mode")
+    # The persisted book mode is the SOURCE OF TRUTH for which book we are in.
+    # A button pressed while the switch reads DRY cannot spawn a LIVE process,
+    # and vice versa.
+    #
+    # Two vocabularies meet here and they are NOT the same words. The book is
+    # "dry" or "live"; the strategy runtime store records "paper" or "live".
+    # The UI sends the runtime word ("paper"). Comparing the request against the
+    # book word directly meant `requested="paper"` never equalled
+    # `persisted="dry"`, so EVERY DRY start was refused with a 400 mode
+    # mismatch - which is why no strategy would ever start on the DRY page.
+    # Both sides are therefore normalised onto the runtime vocabulary first.
+    book_mode = _current_book_mode()
+    runtime_mode = "live" if book_mode == "live" else "paper"
 
-    # If the caller explicitly provides a mode, it MUST match the persisted mode.
-    # If they don't provide one, we use the persisted mode. Any mismatch = 400.
-    if requested_mode is not None:
-        if requested_mode != persisted_mode:
-            return jsonify(
+    raw_requested = (request.json or {}).get("mode")
+    requested_mode: Optional[str] = None
+    if raw_requested is not None:
+        requested_mode = str(raw_requested).strip().lower()
+        # Accept the book word as a synonym so both callers work.
+        if requested_mode == "dry":
+            requested_mode = "paper"
+        elif requested_mode not in ("paper", "live"):
+            return jsonify({"error": "mode must be 'paper' or 'live'"}), 400
+
+    if requested_mode is not None and requested_mode != runtime_mode:
+        return (
+            jsonify(
                 {
-                    "error": f"Mode mismatch: request asked for '{requested_mode}' but the current book is '{persisted_mode}'. Cannot start a strategy in a different book."
+                    "error": f"Mode mismatch: request asked for '{requested_mode}' but the "
+                    f"current book is '{book_mode}'. Cannot start a strategy in a different book."
                 }
-            ), 400
-        mode = requested_mode
-    else:
-        mode = "live" if persisted_mode == "live" else "paper"
+            ),
+            400,
+        )
 
-    if mode not in ("paper", "live"):
-        return jsonify({"error": "mode must be 'paper' or 'live'"}), 400
+    mode = requested_mode or runtime_mode
     if mode == "live" and not os.environ.get("KALSHI_API_KEY"):
         return jsonify({"error": "Live mode needs KALSHI_API_KEY configured"}), 400
 
@@ -1921,16 +1974,18 @@ def api_strategy_toggle(name):
     db_mode = db_row.get("mode")
     db_running = bool(db_pid) and _pid_alive(db_pid)
 
-    # IDENTITY ISOLATION: a strategy running in the OTHER book must not
-    # be touched from this book. Refuse cross-book starts that are NOT
-    # the special DRY testing case below.
-    if db_running and db_mode != mode and not (db_mode == "paper" and mode == "live"):
-        return jsonify(
-            {
-                "error": f"Strategy '{name}' is already running in {db_mode} mode (pid {db_pid}). "
-                f"Stop it in {db_mode} before starting it in {mode}."
-            }
-        ), 409
+    # Identity isolation: a strategy running in the OTHER book must not be
+    # touched from this book. Refuse cross-book starts.
+    if db_running and db_mode and db_mode != mode:
+        return (
+            jsonify(
+                {
+                    "error": f"Strategy '{name}' is already running in {db_mode} mode (pid {db_pid}). "
+                    f"Stop it in {db_mode} before starting it in {mode}."
+                }
+            ),
+            409,
+        )
 
     # If the strategy is already running in THIS book, stop it first.
     if db_running:
@@ -1939,23 +1994,6 @@ def api_strategy_toggle(name):
         _recorded_state()
         _broadcast("strategy", {"name": name, "action": "stopped"})
         return jsonify({"name": name, "running": False, "exit_code": code})
-
-    # If the strategy is already running in THIS book, stop it first.
-    if db_running:
-        code = _stop_child({"pid": db_pid, "running": True})
-        _run_async(store.record_stop(name, "stopped by operator"))
-        _recorded_state()
-        _broadcast("strategy", {"name": name, "action": "stopped"})
-        return jsonify({"name": name, "running": False, "exit_code": code})
-
-    # Refuse cross-book starts, except the DRY vs LIVE paper case handled above.
-    if db_running and db_mode != mode:
-        return jsonify(
-            {
-                "error": f"Strategy '{name}' is already running in {db_mode} mode (pid {db_pid}). "
-                f"Stop it in {db_mode} before starting it in {mode}."
-            }
-        ), 409
 
     # Even paper mode boots a KalshiClient, which dies immediately without
     # credentials ("Private key file not found"). Refuse up front so the button
@@ -2141,6 +2179,12 @@ def _market_context() -> Dict[str, Any]:
         "spot": market.get("spot", {}),
         "kalshi": market.get("kalshi", {}),
         "series": market.get("series", []),
+        # A dead feed used to be indistinguishable from a feed that had simply
+        # not ticked yet: both rendered "connecting...". Surfacing the reason
+        # and the age of the feed is the difference between a visible fault and
+        # a silent one.
+        "feed_error": dashboard_state.get("market_error") or "",
+        "feed_started_at": dashboard_state.get("market_started_at"),
         "lead": {
             "spot": lead.get("spot"),
             "target": lead.get("target"),
@@ -2979,7 +3023,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 <!-- ============ Kalshi account ============ -->
 <div class="panel" style="margin-bottom:12px">
     <div class="ph">
-      <h2>Kalshi account — real, and being traded</h2>
+      <h2>{% if s.mode.mode == 'live' %}Kalshi account — real, and being traded{% else %}Real Kalshi account — NOT what DRY is trading{% endif %}</h2>
       <span class="note">{% if s.last_update %}synced {{ s.last_update }}{% else %}not synced yet{% endif %}</span>
     </div>
     {%- if s.mode.mode != 'live' %}
@@ -2988,6 +3032,8 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
         This is the real Kalshi account. The bot trades it only when the
         mode switch reads LIVE. While the switch reads DRY, this account
         is untouched — the simulated $300 book above is what DRY is trading.
+        Anything listed below is real, and is managed outside this bot —
+        none of these figures describe the bot's results.
       </p>
     </div>
     {%- endif %}
@@ -3637,6 +3683,7 @@ function hhmmss(t) { return new Date(t * 1000).toLocaleTimeString(); }
 
 function paintMarket(md) {
   if (!md || !md.spot) return;
+  var ctx_feed_error = {{ (m.feed_error | tojson) }};
   const spot = md.spot || {};
   const pts = spot.points || [];
   $('spotSource').textContent = spot.source || 'connecting...';
@@ -3676,6 +3723,9 @@ function paintMarket(md) {
     ? (contract.title || 'up or down') + ' · ' + (k.tradable || 0) + ' quotable of ' + (k.open_markets || 0)
       + (k.error ? ' · ' + k.error : '')
     : 'waiting for the next contract';
+  if (!contract && ctx_feed_error) {
+    $('k15Detail').textContent = 'feed offline — ' + ctx_feed_error;
+  }
   drawFeed('k15Chart', kpts.map(p => hhmmss(p.t)), [
     {
       label: 'spot', borderColor: '#f7a600', backgroundColor: 'rgba(247,166,0,.08)',
@@ -3920,7 +3970,6 @@ setInterval(refresh, 10000);
 setInterval(loadLogs, 30000);
 setInterval(refreshFeeds, 5000);
 setInterval(tickClock, 500);
-setInterval(() => location.reload(), 30000);
 </script>
 </body>
 </html>

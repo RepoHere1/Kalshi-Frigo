@@ -191,67 +191,6 @@ async def make_decision_for_market(
                         )
                         return position
 
-        # --- Momentum Indicator Analysis ---
-        """Calculate momentum indicator for entry timing."""
-        from src.utils.momentum_indicator import MomentumIndicator
-        
-        momentum_score = MomentumIndicator.calculate_market_momentum(
-            market.market_id,
-            settings.trading.momentum_lookback_hours,
-            settings.trading.momentum_threshold
-        )
-        
-        # Apply momentum filter before standard LLM analysis
-        if settings.trading.enable_momentum_indicator:
-            logger.info(f"Market momentum score: {momentum_score:.2f}")
-            if momentum_score < settings.trading.min_momentum_score:
-                logger.info(f"Market momentum score {momentum_score:.2f} below threshold {settings.trading.min_momentum_score}. Skipping.")
-                return None
-                
-        # --- Correlation Limits Check ---
-        from src.utils.correlation_check import CorrelationChecker
-        
-        correlation_result = await CorrelationChecker.check_correlation_limits(
-            market.market_id,
-            market.category,
-            settings.trading.max_correlation_threshold,
-            settings.trading.max_positions_per_sector
-        )
-        
-        # Apply correlation filter
-        if settings.trading.enable_correlation_limits:
-            logger.info(
-                f"Correlation check for {market.market_id}: "
-                f"correlation={correlation_result.get('correlation_score', 0):.2f}, "
-                f"positions_in_sector={correlation_result.get('positions_in_sector', 0)}"
-            )
-            
-            if correlation_result.get('exceeds_limit', False):
-                logger.info(f"Market {market.market_id} exceeds correlation/sector limits. Skipping.")
-                return None
-                
-        # --- Dual Confirmation Requirements ---
-        # Require both LLM confidence AND edge threshold for validation
-        if settings.trading.enable_dual_confirmation:
-            logger.info(f"Applying dual confirmation check for {market.market_id}")
-            
-            # Calculate edge threshold for dual confirmation
-            edge_threshold = settings.trading.edge_threshold_for_dual
-            
-            # Dual confirmation: both LLM confidence and edge must meet thresholds
-            llm_confirms = decision.confidence >= settings.trading.min_confidence_to_trade
-            edge_meets = (market.yes_price - decision.confidence) >= edge_threshold
-            
-            logger.info(
-                f"Dual confirmation for {market.market_id}: "
-                f"LLM_confirms={llm_confirms} (confidence={decision.confidence:.3f}), "
-                f"edge_meets={edge_meets} (threshold={edge_threshold})"
-            )
-            
-            if not (llm_confirms and edge_meets):
-                logger.info(f"Market {market.market_id} fails dual confirmation. Skipping.")
-                return None
-                
         # --- Standard LLM Decision-Making ---
         # Feature flags
         sentiment_analysis = getattr(settings, 'sentiment_analysis', False) or (
@@ -351,35 +290,6 @@ async def make_decision_for_market(
             market.market_id, decision_action, confidence, total_analysis_cost
         )
 
-        # --- Dual Confirmation Check ---
-        # Require both LLM confidence AND edge threshold for validation
-        if settings.trading.enable_dual_confirmation:
-            logger.info(f"Applying dual confirmation check for {market.market_id}")
-            
-            # Calculate edge threshold for dual confirmation
-            edge_threshold = settings.trading.edge_threshold_for_dual
-            
-            # Dual confirmation: both LLM confidence and edge must meet thresholds
-            llm_confirms = decision.confidence >= settings.trading.min_confidence_to_trade
-            edge_meets = (market.yes_price - decision.confidence) >= edge_threshold
-            
-            logger.info(
-                f"Dual confirmation for {market.market_id}: "
-                f"LLM_confirms={llm_confirms} (confidence={decision.confidence:.3f}), "
-                f"edge_meets={edge_meets} (threshold={edge_threshold})"
-            )
-            
-            if not (llm_confirms and edge_meets):
-                logger.info(f"Market {market.market_id} fails dual confirmation. Skipping.")
-                await db_manager.record_market_analysis(
-                    market.market_id, "SKIP", decision.confidence, total_analysis_cost, "dual_confirmation_failed"
-                )
-                return None
-                
-            # Log successful dual confirmation
-            logger.info(f"✅ DUAL CONFIRMATION PASSED: {market.market_id} - "
-                       f"LLM_confirms={llm_confirms}, edge_meets={edge_meets}")
-
         if decision.action == "BUY" and decision.confidence >= settings.trading.min_confidence_to_trade:
             price = market.yes_price if decision.side == "YES" else market.no_price
             
@@ -403,7 +313,6 @@ async def make_decision_for_market(
                 }
             )
             
-            
             if not should_trade:
                 logger.info(f"❌ EDGE FILTER REJECTED: {market.market_id} - {trade_reason}")
                 await db_manager.record_market_analysis(
@@ -412,35 +321,6 @@ async def make_decision_for_market(
                 return None
                 
             logger.info(f"✅ EDGE FILTER APPROVED: {market.market_id} - {trade_reason}")
-
-        # --- Dual Confirmation Check ---
-        # Require both LLM confidence AND edge threshold for validation
-        if settings.trading.enable_dual_confirmation:
-            logger.info(f"Applying dual confirmation check for {market.market_id}")
-            
-            # Calculate edge threshold for dual confirmation
-            edge_threshold = settings.trading.edge_threshold_for_dual
-            
-            # Dual confirmation: both LLM confidence and edge must meet thresholds
-            llm_confirms = decision.confidence >= settings.trading.min_confidence_to_trade
-            edge_meets = (market.yes_price - decision.confidence) >= edge_threshold
-            
-            logger.info(
-                f"Dual confirmation for {market.market_id}: "
-                f"LLM_confirms={llm_confirms} (confidence={decision.confidence:.3f}), "
-                f"edge_meets={edge_meets} (threshold={edge_threshold})"
-            )
-            
-            if not (llm_confirms and edge_meets):
-                logger.info(f"Market {market.market_id} fails dual confirmation. Skipping.")
-                await db_manager.record_market_analysis(
-                    market.market_id, "SKIP", decision.confidence, total_analysis_cost, "dual_confirmation_failed"
-                )
-                return None
-                
-            # Log successful dual confirmation
-            logger.info(f"✅ DUAL CONFIRMATION PASSED: {market.market_id} - "
-                       f"LLM_confirms={llm_confirms}, edge_meets={edge_meets}")
             
             # Check position limits before calculating quantity
             from src.utils.position_limits import check_can_add_position
