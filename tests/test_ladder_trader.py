@@ -1,4 +1,4 @@
-"""Tests for the BTC 15-minute up/down trader and its market-data layer.
+﻿"""Tests for the BTC 15-minute up/down trader and its market-data layer.
 
 The contract's shape is the thing most easily got wrong: the horizon is a ticker
 suffix, the quotes live in `*_dollars` string fields while the integer-cent
@@ -6,15 +6,41 @@ fields are null, and settlement is a 60-second average of CF Benchmarks BRTI.
 Each of those was a silent "no quote" before.
 """
 import time
+from datetime import datetime
 
 import pytest
 
-from src.jobs.ladder_trader import (
-    UpDownConfig,
-    UpDownTrader,
-    fair_up_probability,
-)
+from src.jobs.ladder_trader import UpDownConfig, UpDownSignal, UpDownTrader, fair_up_probability
 from src.jobs.market_data import Btc15mFeed, SpotFeed, UpDownMarket
+from src.utils.database import Position
+
+
+def _signal(ticker, *, side="up", ask=0.5, contracts=8, seconds_left=300.0):
+    """A tradable clip, as the scorer would emit one."""
+    return UpDownSignal(
+        ticker=ticker,
+        bucket="26OCT011715",
+        side=side,
+        target=84609.0,
+        spot=84900.0,
+        spot_vs_target=291.0,
+        fair=0.89,
+        kalshi_price=ask,
+        edge=0.28,
+        ask=ask,
+        contracts=contracts,
+        notional=round(ask * contracts, 4),
+        seconds_left=seconds_left,
+        reason="test",
+    )
+
+
+def _trader(db):
+    spot = SpotFeed()
+    spot.price = 84900.0
+    spot.ts = time.time()
+    spot.source = "test"
+    return UpDownTrader(spot, Btc15mFeed(), UpDownConfig())
 
 
 # ---------------------------------------------------------------------------
@@ -251,3 +277,92 @@ def test_payload_reports_the_real_contract_and_no_45_second_claim():
     assert "proxy" in payload["lead"]["note"]
     # The measured reading, not a hardcoded lead.
     assert "45" not in payload["lead"]["note"]
+
+
+# ---------------------------------------------------------------------------
+# A clip must be recorded before it is bought
+# ---------------------------------------------------------------------------
+async def test_clip_is_persisted_before_the_fill_is_sought(tmp_path, monkeypatch):
+    """The DRY ledger must never be debited for a position that was never saved.
+
+    This clip used to be handed to `execute_position` unsaved. The broker filled
+    it and debited simulated cash, and only then did execute_position notice the
+    missing id and bail. No position row existed, so the book still reported zero
+    open positions, the max-open guard never tripped, and every cycle bought the
+    same contract again - roughly $5 a pass, with nothing on the board.
+    """
+    from src.utils.database import DatabaseManager
+
+    db = DatabaseManager(db_path=str(tmp_path / "t.db"))
+    await db.initialize()
+
+    trader = _trader(db)
+    trader.db_manager = db
+    trader._client = object()  # never used: the fill is refused up front
+
+    submitted = []
+
+    async def _never(position, live_mode, db_manager, kalshi_client):
+        submitted.append(position.market_id)
+        return True
+
+    monkeypatch.setattr("src.jobs.execute.execute_position", _never)
+
+    signal = _signal("KXBTC15M-26OCT011715-15", side="up", ask=0.5, contracts=8)
+    assert await trader._place(signal, live=False) is True
+    assert submitted == ["KXBTC15M-26OCT011715-15"]
+
+    stored = await db.get_open_positions(mode="dry")
+    assert len(stored) == 1
+    assert stored[0].strategy == "btc_updown"
+
+
+async def test_a_second_clip_into_the_same_contract_is_refused(tmp_path, monkeypatch):
+    """`add_position` is the only guard against re-buying a held contract."""
+    from src.utils.database import DatabaseManager
+
+    db = DatabaseManager(db_path=str(tmp_path / "t.db"))
+    await db.initialize()
+
+    trader = _trader(db)
+    trader.db_manager = db
+    trader._client = object()
+
+    fills = []
+
+    async def _count(position, live_mode, db_manager, kalshi_client):
+        fills.append(position.market_id)
+        return True
+
+    monkeypatch.setattr("src.jobs.execute.execute_position", _count)
+
+    first = _signal("KXBTC15M-26OCT011715-15", side="up", ask=0.5, contracts=8)
+    assert await trader._place(first, live=False) is True
+
+    second = _signal("KXBTC15M-26OCT011715-15", side="up", ask=0.5, contracts=8)
+    assert await trader._place(second, live=False) is False
+    assert len(fills) == 1, "the held contract was bought a second time"
+
+
+async def test_execute_refuses_a_position_that_was_never_saved():
+    """No caller can spend money - simulated or real - on an unrecordable fill."""
+    from src.jobs.execute import execute_position
+
+    class _ExplodingBroker:
+        async def available_cents(self):
+            raise AssertionError("must not reach the broker with an unsaved position")
+
+    position = Position(
+        market_id="KXBTC15M-26OCT011715-15",
+        side="YES",
+        entry_price=0.5,
+        quantity=8,
+        timestamp=datetime.now(),
+        rationale="unsaved",
+        confidence=0.8,
+        live=False,
+        strategy="btc_updown",
+        mode="dry",
+    )
+    assert position.id is None
+    assert await execute_position(position, False, None, None) is False

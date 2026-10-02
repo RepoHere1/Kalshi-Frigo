@@ -57,6 +57,20 @@ async def execute_position(
     mode = MODE_LIVE if live_mode else MODE_DRY
     mode_manager = _mode_manager()
 
+    # Fail closed BEFORE anything is submitted. The order used to go first and the
+    # id check second, so a caller that forgot to persist its position still got a
+    # fill: the DRY ledger was debited (and, under LIVE, real money spent) and only
+    # then did this function discover there was no row to record the fill against.
+    # The cash was gone and the position did not exist, which is unrecoverable and
+    # silent. Refusing up front costs nothing and makes an unrecorded fill
+    # impossible rather than merely unlikely.
+    if position.id is None:
+        logger.error(
+            f"❌ Refusing to submit {position.market_id}: the position has no id, so "
+            f"the fill could not be recorded. Persist it (add_position) before executing."
+        )
+        return False
+
     try:
         # Live market data drives validation in both modes - a DRY run must see
         # the same prices the exchange would.
@@ -101,15 +115,6 @@ async def execute_position(
 
         order_id = response.get("order", {}).get("order_id", request.client_order_id)
         fill_price = position.entry_price or request.fill_price
-        if position.id is None:
-            # An unsaved position cannot be promoted to live; the fill is booked
-            # but there is no row to update, so surface it rather than silently
-            # reporting a success that left no trace.
-            logger.error(
-                f"❌ Order accepted for {position.market_id} but the position has "
-                f"no id, so it could not be marked live. Order ID: {order_id}"
-            )
-            return False
 
         if live_mode:
             await db_manager.update_position_to_live(position.id, fill_price)

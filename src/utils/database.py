@@ -616,11 +616,20 @@ class DatabaseManager(TradingLoggerMixin):
         import os
 
         resolved = mode or _resolve_current_mode(os.getenv("DB_PATH", self.db_path))
+        # An unlabelled row (mode IS NULL / '') is read as DRY, which is what the
+        # dashboard's COALESCE(NULLIF(mode,''),'dry') does with it. Letting the
+        # LIVE query match those rows too meant a position the books could not
+        # attribute was eligible for real sell orders in both books at once. DRY
+        # still inherits them (they are simulated by definition); LIVE no longer
+        # touches a row it cannot prove is its own.
+        book_clause = (
+            "(mode = ? OR mode IS NULL OR mode = '')" if resolved == "dry" else "(mode = ?)"
+        )
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT * FROM positions WHERE status = 'open'"
-                " AND (mode = ? OR mode IS NULL)"
+                f" AND {book_clause}"
                 " AND (live = 1 OR ? = 'dry')",
                 (resolved, resolved),
             )

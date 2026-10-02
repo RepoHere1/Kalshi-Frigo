@@ -305,6 +305,27 @@ class UpDownTrader:
             strategy="btc_updown",
             mode="live" if live else "dry",
         )
+        # Persist BEFORE executing. `execute_position` needs a row id to record the
+        # fill, and `add_position` is also the only thing that stops a second clip
+        # being bought into a market this book already holds.
+        #
+        # This clip used to be handed straight to `execute_position` unsaved. The
+        # DRY broker "filled" it and debited the simulated ledger, and only then
+        # did execute_position notice `position.id is None` and bail. No position
+        # row was written, so the book still reported zero open positions, the
+        # max-open guard never tripped, and the next cycle bought the same
+        # contract again a few seconds later - draining the DRY account at ~$5 a
+        # pass with nothing on the board to show for it.
+        try:
+            position_id = await self.db_manager.add_position(position)
+        except Exception as exc:  # noqa: BLE001
+            self.book.last_error = f"position insert failed: {type(exc).__name__}: {exc}"
+            return False
+        if position_id is None:
+            self.book.blocked = f"already holding {signal.ticker}"
+            return False
+        position.id = position_id
+
         try:
             return await execute_position(position, live, self.db_manager, self._client)
         except Exception as exc:  # noqa: BLE001
