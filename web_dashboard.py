@@ -715,15 +715,27 @@ def _strategy_supervisor_loop():
                     attempts[name] = 0
                     continue
 
-                # Not alive. Was it ever really ours? A pid from a previous
-                # instance of the app is stale, not a crash, so it is cleared
-                # rather than "restarted".
-                from src.utils.strategy_runtime import INSTANCE, owns_process
+                # Not alive. A pid from a previous instance of the app is stale
+                # by definition, not a crash.
+                from src.utils.strategy_runtime import INSTANCE
 
-                if row_pid and (row.get("instance") or "") != INSTANCE:
-                    _run_async(store.record_stop(name, "stopped by app restart"))
-                    _run_async(store.set_desired(name, False))
-                    continue
+                stale_instance = bool(row_pid) and (row.get("instance") or "") != INSTANCE
+                if stale_instance:
+                    # "Run until I say otherwise" has to survive a redeploy, or
+                    # every push silently stops the book. Resume it - but only in
+                    # paper. A LIVE strategy places real orders, and nothing may
+                    # start one without the operator asking in this instance, so
+                    # that intent is dropped and must be re-given by hand.
+                    if row.get("mode") != "paper":
+                        _run_async(store.record_stop(name, "stopped by app restart"))
+                        _run_async(store.set_desired(name, False))
+                        _push_error(
+                            f"{name} was running LIVE before a restart and was not "
+                            f"resumed. Press Start to trade real money again."
+                        )
+                        continue
+                    failures[name] = 0.0
+                    attempts[name] = 0
 
                 if not _creds_present():
                     continue  # nothing to start with; wait for configuration
@@ -746,9 +758,12 @@ def _strategy_supervisor_loop():
                     started = _spawn_strategy(name, mode)
                     attempts[name] = attempts.get(name, 0) + 1
                     failures[name] = min(max(backoff * 2, 2.0), 30.0)
-                    _push_error(
-                        f"Supervisor restarted {name} (pid {started['pid']}) after it died."
+                    why = (
+                        "resumed after an app restart"
+                        if stale_instance
+                        else "restarted after it died"
                     )
+                    _push_error(f"Supervisor {why}: {name} (pid {started['pid']}, {mode}).")
                     _broadcast("strategy", {"name": name, "action": "restarted"})
                 except Exception as exc:  # noqa: BLE001
                     attempts[name] = attempts.get(name, 0) + 1
