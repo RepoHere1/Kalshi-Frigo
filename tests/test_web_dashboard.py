@@ -2238,3 +2238,35 @@ def test_strategy_cards_are_wide_enough_to_read_their_curve():
     assert "minmax(430px,1fr)" in html
     assert ".cards .cchart{height:104px" in html
     assert 'id="spark-' in html and 'height="104"' in html
+
+
+def test_dry_page_has_no_real_tickers_anywhere(client):
+    """No real Kalshi ticker may appear on a DRY page - not even in a cache.
+
+    The market_titles map shipped the production account's tickers into the DRY
+    snapshot, because titles were resolved from the merged (DB + Kalshi)
+    position list. Same blur as the account panel, one map smaller.
+    """
+    gen = _load_kalshi(client)
+    next(gen)
+    try:
+        snap = client.get("/api/snapshot").get_json()
+    finally:
+        gen.close()
+
+    assert snap["kalshi"] is None
+    titles = snap.get("market_titles") or {}
+    assert "KXPRES-26-BIDEN" not in titles
+    assert not [t for t in titles if str(t).startswith("KXDJIA")]
+
+
+def test_dry_page_does_not_point_at_a_panel_it_does_not_render(client):
+    """The funding note used to reference a 'Real Kalshi account panel below'."""
+    gen = _load_kalshi(client)
+    next(gen)
+    try:
+        html = client.get("/").get_data(as_text=True)
+    finally:
+        gen.close()
+    assert "Real Kalshi account" not in html
+    assert "panel below" not in html

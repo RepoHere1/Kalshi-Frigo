@@ -523,11 +523,33 @@ def _refresh_kalshi():
         dashboard_state["positions"] = merged
     dashboard_state["last_update"] = _now()
     dashboard_state["kalshi_position_count"] = len(dashboard_state["positions"])
-    _refresh_market_titles(merged)
+    # Titles are resolved only for the book actually being traded. Caching them
+    # from `merged` shipped the production account's tickers inside the DRY
+    # snapshot's market_titles map - real tickers on an otherwise simulated page,
+    # which is the same blur as the account panel, one map smaller.
+    _refresh_market_titles(_current_book_tickers())
 
 
 _title_client: Any = None
 _TITLE_CACHE_MAX = 400
+
+
+def _current_book_tickers() -> List[Dict[str, Any]]:
+    """Position rows belonging to the book currently being traded, and no others.
+
+    In LIVE these come from Kalshi itself. In DRY they come from the database,
+    because the DRY book's positions are simulated and exist nowhere else - and
+    because reading them off Kalshi would put the real account's tickers into
+    the DRY page's title cache.
+    """
+    if _current_book_mode() == "live":
+        return list(dashboard_state.get("positions") or [])
+    try:
+        where = _book_filter("dry")
+        rows = _db_many([(_SQL_POSITIONS.format(book=where), ())])
+    except Exception:  # noqa: BLE001 - titles are cosmetic; never fail the sync
+        return []
+    return [{"ticker": r.get("market_id"), "event_ticker": r.get("market_id")} for r in rows]
 
 
 def _refresh_market_titles(positions):
@@ -3036,8 +3058,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
       <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
         This is the DRY book's own money: the simulated ledger that starts at
         {{ '$%.2f'|format(s.mode.dry.starting_balance) }}. The real Kalshi balance is
-        in the <b>Real Kalshi account</b> panel below and is never spent while the
-        switch reads DRY.
+        never spent while the switch reads DRY.
       </p>
       {% endif %}
     </div>
@@ -3171,13 +3192,13 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 </div>
 {% endif %}
 
+{%- if live %}
 <!-- ============ Kalshi account ============ -->
 <!-- LIVE ONLY. This panel is real money: real positions, real P&L, real fees.
      Rendering it while the switch reads DRY put the production account's
      positions in the middle of a page whose every other number was simulated,
      which is precisely the DRY/LIVE blur this page is supposed to make
      impossible. A DRY page now contains no real-account figures at all. -->
-{%- if live %}
 <div class="panel" style="margin-bottom:12px">
     <div class="ph">
       <h2>Kalshi account — real, and being traded</h2>
