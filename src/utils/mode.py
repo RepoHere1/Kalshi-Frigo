@@ -254,7 +254,20 @@ class TradingMode:
                 or 0.0
             )
             derived = round(starting_f + realized - deployed, 2)
-            await self._set(conn, _CASH_KEY, str(derived))
+            # Reported, NOT written.
+
+            # This used to assign the derived figure straight back to the
+            # balance, and `reconcile_dry()` runs on every GET /api/mode - so
+            # simply loading the page overwrote the cash balance with a number
+            # computed from `starting + realized - deployed`. That derivation
+            # cannot know about a fill whose close never happened, so every
+            # refresh nudged the balance and the book drifted further from its
+            # own ledger: it is why a $300 account read -$73.36, and why cash and
+            # the ledger could never agree no matter what else was fixed.
+
+            # A GET must not mutate state. The balance is the ledger's truth;
+            # this only says how far the two have parted, and
+            # `repair_dry_book()` reports the same thing in more detail.
             await conn.commit()
 
         return {

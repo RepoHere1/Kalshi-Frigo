@@ -1963,13 +1963,30 @@ def test_reconcile_derives_cash_from_the_book(client):
 
 def test_dry_account_is_self_consistent_after_reconciling(client):
     _seed_dry_book()
+    before = client.get("/api/mode").get_json()["dry"]
     book = client.get("/api/mode").get_json()["dry"]
-    # equity == starting + realized, always
-    assert book["equity"] == pytest.approx(book["starting_balance"] + book["realized"], abs=0.01)
-    assert book["cash"] == pytest.approx(book["equity"] - book["deployed"], abs=0.01)
-    assert book["cash"] == pytest.approx(293.0, abs=0.01)
+
+    # Equity is cash plus what is currently deployed - true by construction, and
+    # the only identity that survives a book whose ledger and positions disagree.
+    assert book["equity"] == pytest.approx(book["cash"] + book["deployed"], abs=0.01)
+    # Reading the page must not restate the balance. It used to: reconcile_dry()
+    # assigned `starting + realized - deployed` back to the cash key on every
+    # GET /api/mode, so loading the page rewrote the balance with a figure that
+    # cannot know about fills whose closes never happened. That is how a $300
+    # account ended up reporting -$73.36.
+    assert book["cash"] == pytest.approx(before["cash"], abs=0.01)
     # The live position's $50 cost basis is not in the DRY book.
     assert book["deployed"] == pytest.approx(7.0, abs=0.01)
+
+
+def test_reading_the_mode_never_rewrites_the_balance(client):
+    """A GET is a read. This is the invariant that was broken."""
+    _seed_dry_book()
+    first = client.get("/api/mode").get_json()["dry"]["cash"]
+    for _ in range(5):
+        client.get("/api/mode")
+    last = client.get("/api/mode").get_json()["dry"]["cash"]
+    assert first == pytest.approx(last, abs=0.01), "repeated reads moved the balance"
 
 
 def test_drift_is_reported_not_hidden(client):
@@ -1987,7 +2004,7 @@ def test_reconcile_is_idempotent(client):
     assert first == second
 
 
-def test_reconcile_includes_realized_proceeds(client):
+def test_reconcile_reports_realized_without_restating_cash(client):
     _db()
 
     async def seed():
@@ -2007,10 +2024,17 @@ def test_reconcile_includes_realized_proceeds(client):
             await conn.commit()
 
     asyncio.run(seed())
-    book = client.get("/api/mode").get_json()["dry"]
-    # 300 + 1.00 realized - 2.00 deployed = 299.00
-    assert book["cash"] == pytest.approx(299.0, abs=0.01)
-    assert book["realized"] == 1.0
+    from src.utils.mode import TradingMode, run as mode_run
+
+    ledger_cash = mode_run(TradingMode(db_path=str(wd.DB_PATH)).dry_account())["cash"]
+    mode = client.get("/api/mode").get_json()
+
+    # Realized is reported from the closes.
+    assert mode["dry"]["realized"] == pytest.approx(1.0, abs=0.01)
+    # The derivation that once overwrote the balance is still *reported* as drift.
+    assert mode["drift"]["derived_cash"] == pytest.approx(299.0, abs=0.01)
+    # But cash is untouched: it is the ledger's truth, not the page's opinion.
+    assert mode["dry"]["cash"] == pytest.approx(ledger_cash, abs=0.01)
 
 
 # ---------------------------------------------------------------------------
