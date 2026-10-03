@@ -361,6 +361,8 @@ def test_execute_dry_does_not_promote_the_position(monkeypatch, tmp_path):
     _patch_mode(monkeypatch, tmp_path / "m.db")
     db = MagicMock()
     db.update_position_to_live = AsyncMock()
+    # execute_position now enforces the per-strategy open-position cap.
+    db.get_open_positions = AsyncMock(return_value=[])
     client = _client(NORMAL_MARKET)
 
     ok = asyncio.run(execute_position(_position(), False, db, client))
@@ -379,6 +381,8 @@ def test_execute_live_promotes_the_position(monkeypatch, tmp_path):
     _patch_mode(monkeypatch, tmp_path / "m.db")
     db = MagicMock()
     db.update_position_to_live = AsyncMock()
+    # execute_position now enforces the per-strategy open-position cap.
+    db.get_open_positions = AsyncMock(return_value=[])
     client = _client(NORMAL_MARKET)
     client.get_balance = AsyncMock(return_value={"balance": 50_000})
 
@@ -393,6 +397,8 @@ def test_execute_dry_rejects_untradeable_market(monkeypatch, tmp_path):
     _patch_mode(monkeypatch, tmp_path / "m.db")
     db = MagicMock()
     db.update_position_to_live = AsyncMock()
+    # execute_position now enforces the per-strategy open-position cap.
+    db.get_open_positions = AsyncMock(return_value=[])
     client = _client(
         {"ticker": "KXCOLL", "yes_bid": 100, "yes_ask": 100, "no_bid": 100, "no_ask": 100}
     )
@@ -412,6 +418,8 @@ def test_execute_dry_rejects_when_simulated_cash_too_small(monkeypatch, tmp_path
     run(mgr.set_dry_cash(2.0))
     db = MagicMock()
     db.update_position_to_live = AsyncMock()
+    # execute_position now enforces the per-strategy open-position cap.
+    db.get_open_positions = AsyncMock(return_value=[])
     client = _client(NORMAL_MARKET)
 
     ok = asyncio.run(execute_position(_position(quantity=100), False, db, client))
@@ -428,6 +436,8 @@ def test_execute_live_still_places(monkeypatch, tmp_path):
     _patch_mode(monkeypatch, tmp_path / "m.db")
     db = MagicMock()
     db.update_position_to_live = AsyncMock()
+    # execute_position now enforces the per-strategy open-position cap.
+    db.get_open_positions = AsyncMock(return_value=[])
     client = _client(NORMAL_MARKET)
     client.get_balance = AsyncMock(return_value={"balance": 50_000})
 

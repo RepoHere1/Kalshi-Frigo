@@ -1206,6 +1206,43 @@ class DatabaseManager(TradingLoggerMixin):
             )
             return cursor.lastrowid
 
+    async def release_position_claim(self, position_id: int) -> bool:
+        """Hand a claimed close back, so the position can be retried.
+
+        Without this, any exit that fails after the claim - a refused \$0 price,
+        a rejected sell order - leaves the row stuck in 'closing'. It would drop
+        out of every `status='open'` query while still being a live obligation:
+        capital frozen and no exit ever retried.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "UPDATE positions SET status = 'open' WHERE id = ? AND status = 'closing'",
+                (int(position_id),),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def claim_position_for_close(self, position_id: int) -> bool:
+        """Take exclusive ownership of closing a position. True for exactly one caller.
+
+        Several strategy processes each run book-wide position tracking, so two of
+        them can read the same `status='open'` row, both decide to exit, both place
+        a sell, and both write a trade log. On the live DRY book that produced 17
+        closed rows for 11 actual closes - every result counted twice - plus a
+        duplicated ledger credit for each, which is how a $300 simulated account
+        ended up reporting three different realized figures at once.
+
+        The conditional UPDATE is the arbiter: whoever flips 'open' -> 'closing'
+        owns the close, and everyone else is told to leave it alone.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "UPDATE positions SET status = 'closing' WHERE id = ? AND status = 'open'",
+                (int(position_id),),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
     async def delete_position(self, position_id: int) -> bool:
         """Remove a position row that never became a fill.
 

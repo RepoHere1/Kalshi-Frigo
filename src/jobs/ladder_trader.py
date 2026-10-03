@@ -226,7 +226,13 @@ class UpDownTrader:
                 f"{float(kalshi or 0.0):.2f} on {side.upper()} - edge {edge:+.3f}"
             )
 
-        contracts = self._size(ask) if side else 0
+        # Size on the price the order will actually fill at, not on the raw ask.
+        # A DOWN clip buys NO, so it fills at (1 - ask). Sizing off `ask` alone
+        # meant a 6c NO ask produced 5/0.06 = 83 contracts, which then filled at
+        # 0.939 - a $5 clip turned into $76 of exposure. That single trade is the
+        # -$73.59 that emptied the DRY account.
+        fill_price = ask if side == "up" else (1.0 - ask if side else 0.0)
+        contracts = self._size(fill_price) if side else 0
         signal = UpDownSignal(
             ticker=market.ticker,
             bucket=market.bucket,
@@ -239,7 +245,7 @@ class UpDownTrader:
             edge=round(edge, 4),
             ask=ask,
             contracts=contracts,
-            notional=round(float(ask or 0.0) * contracts, 2),
+            notional=round(float(fill_price or 0.0) * contracts, 2),
             seconds_left=round(market.seconds_left or 0.0, 1),
             reason=reason,
         )

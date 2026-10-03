@@ -73,6 +73,11 @@ class TradingConfig:
     max_position_size_pct: float = 3.0  # SANE: 3% per position (was 5% "beast mode")
     max_daily_loss_pct: float = 10.0    # SANE: 10% daily loss limit (was 15%)
     max_positions: int = 10              # SANE: 10 concurrent positions (was 15)
+    # Per-strategy ceiling, enforced in execute_position so it applies to every
+    # strategy rather than only the ones that remember to check. Six processes
+    # sharing one book each saw the same global headroom and filled it between
+    # them; ai_directional alone reached 23 open positions.
+    max_positions_per_strategy: int = 3
     min_balance: float = 100.0          # SANE: $100 minimum balance (was $50)
     
     # Market filtering criteria — DISCIPLINED

@@ -1797,6 +1797,24 @@ def api_dry_ledger():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/dry/audit")
+def api_dry_audit():
+    """Check the DRY book against its own ledger and report what disagrees.
+
+    Read-only. Reports orphan positions (rows with no fill behind them),
+    duplicated closes, and a cash balance that cannot be derived from the
+    ledger - the three ways this book's headline numbers came to contradict
+    each other.
+    """
+    try:
+        from src.utils.mode import run
+
+        return jsonify(_run_async(_mode_manager().repair_dry_book()))
+    except Exception as e:
+        _push_error(f"DRY audit: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 # ---------------------------------------------------------------------------
 # Routes — HTML
 # ---------------------------------------------------------------------------

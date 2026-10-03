@@ -302,6 +302,20 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                 )
 
                 if should_exit:
+                    # Exactly one process may close a given position. Every
+                    # strategy runs book-wide tracking, so without this claim two
+                    # of them can read the same open row and both act on it -
+                    # two sells, two trade logs, two ledger credits for one
+                    # position. Claim before doing anything else.
+                    if position.id is not None and not await db_manager.claim_position_for_close(
+                        position.id
+                    ):
+                        logger.info(
+                            f"Position {position.market_id} was already claimed for closing "
+                            f"by another process; skipping."
+                        )
+                        continue
+
                     logger.info(
                         f"Exiting position {position.market_id} due to {exit_reason}. "
                         f"Entry: {position.entry_price:.3f}, Exit: {exit_price:.3f}"
@@ -323,6 +337,8 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                                 f"will retry next cycle."
                             )
                             exit_sell_failures += 1
+                            if position.id is not None:
+                                await db_manager.release_position_claim(position.id)
                             continue
 
                         from src.jobs.broker import current_mode
@@ -344,6 +360,8 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                                 f"position remains open. Will retry next cycle."
                             )
                             exit_sell_failures += 1
+                            if position.id is not None:
+                                await db_manager.release_position_claim(position.id)
                             continue
                         exit_sell_orders_placed += 1
 

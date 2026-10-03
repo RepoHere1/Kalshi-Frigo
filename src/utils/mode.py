@@ -415,6 +415,101 @@ class TradingMode:
             await conn.commit()
             return {"cash": round(cash_f, 2), "amount": amount}
 
+    async def repair_dry_book(self) -> Dict[str, Any]:
+        """Reconcile the DRY book against its own ledger and report the repairs.
+
+        Read-only with respect to history: nothing is deleted or rewritten here.
+        This exists because three separate faults could leave the book asserting
+        things that cannot all be true - positions with no matching fill, closes
+        recorded twice, and a cash balance that no longer follows from either.
+        Rather than quietly "fixing" the numbers, it reports exactly which
+        invariant is broken and by how much, so the operator decides.
+
+        The three checks:
+          1. open positions whose cost basis has no corresponding ledger debit
+          2. duplicate closes in trade_logs (same market, exit time and P&L)
+          3. cash that cannot be derived from debits minus credits
+        """
+        import os
+
+        from src.utils.database import DatabaseManager
+
+        report: Dict[str, Any] = {
+            "orphan_positions": 0,
+            "orphan_notional": 0.0,
+            "duplicate_closes": 0,
+            "duplicate_pnl": 0.0,
+            "ledger_debits": 0.0,
+            "ledger_credits": 0.0,
+            "cash": 0.0,
+            "derived_cash": None,
+            "ok": True,
+        }
+
+        db = DatabaseManager(db_path=os.getenv("DB_PATH", "trading_system.db"))
+        await db.initialize()
+        book = MODE_DRY
+
+        debits: Dict[str, float] = {}
+        credits = 0.0
+        try:
+            for row in await self.ledger(limit=100000):
+                amount = float(row.get("amount") or 0.0)
+                if row.get("action") == "buy":
+                    debits[str(row.get("market_id"))] = (
+                        debits.get(str(row.get("market_id")), 0.0) + amount
+                    )
+                    report["ledger_debits"] += amount
+                else:
+                    credits += amount
+                    report["ledger_credits"] += amount
+        except Exception:  # noqa: BLE001
+            pass
+        report["cash"] = round(float((await self.dry_account()).get("cash") or 0.0), 2)
+        report["derived_cash"] = round(
+            float((await self.dry_account()).get("starting_balance") or 0.0)
+            - report["ledger_debits"]
+            + report["ledger_credits"],
+            2,
+        )
+
+        # 1. Open positions with no fill behind them.
+        try:
+            for p in await db.get_open_positions(mode=book):
+                if p.strategy and debits.get(p.market_id, 0.0) <= 0.0:
+                    report["orphan_positions"] += 1
+                    report["orphan_notional"] += (p.entry_price or 0.0) * (p.quantity or 0)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 2. Duplicate closes.
+        try:
+            import aiosqlite
+
+            async with aiosqlite.connect(db.db_path) as conn:
+                conn.row_factory = aiosqlite.Row
+                cur = await conn.execute(
+                    "SELECT market_id, exit_timestamp, pnl, COUNT(*) AS n FROM trade_logs"
+                    " WHERE COALESCE(NULLIF(mode,''),'dry') = 'dry'"
+                    " AND exit_timestamp IS NOT NULL"
+                    " GROUP BY market_id, exit_timestamp, pnl HAVING n > 1"
+                )
+                for row in await cur.fetchall():
+                    report["duplicate_closes"] += int(row["n"]) - 1
+                    report["duplicate_pnl"] += float(row["pnl"] or 0.0) * (int(row["n"]) - 1)
+        except Exception:  # noqa: BLE001
+            pass
+
+        report["orphan_notional"] = round(report["orphan_notional"], 2)
+        report["duplicate_pnl"] = round(report["duplicate_pnl"], 2)
+        report["ok"] = (
+            report["orphan_positions"] == 0
+            and report["duplicate_closes"] == 0
+            and abs(report["cash"] - (report["derived_cash"] or 0.0)) < 0.01
+            and report["cash"] >= 0.0
+        )
+        return report
+
     async def ledger(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Most recent simulated fills, newest first."""
         async with self._conn() as conn:

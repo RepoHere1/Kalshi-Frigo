@@ -71,6 +71,31 @@ async def execute_position(
         )
         return False
 
+    # Per-strategy ceiling, enforced here so it binds every strategy rather than
+    # only the ones that remember to check. Each strategy process sizes its own
+    # clip against the *global* headroom, so six of them sharing one book filled
+    # it between them and one strategy reached 23 concurrent positions.
+    strategy_name = (position.strategy or "").strip()
+    if strategy_name:
+        cap = int(getattr(settings.trading, "max_positions_per_strategy", 0) or 0)
+        if cap > 0:
+            try:
+                already_open = [
+                    p
+                    for p in await db_manager.get_open_positions(mode=mode)
+                    if (p.strategy or "").strip() == strategy_name
+                ]
+                # This position's own row is already inserted at this point.
+                if len(already_open) > cap:
+                    logger.warning(
+                        f"❌ Refusing {position.market_id}: {strategy_name} already holds "
+                        f"{len(already_open) - 1} open position(s), cap is {cap}."
+                    )
+                    return False
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"Per-strategy cap check failed for {position.market_id}: {exc}")
+                return False
+
     try:
         # Live market data drives validation in both modes - a DRY run must see
         # the same prices the exchange would.
