@@ -2856,7 +2856,7 @@ _TEMPLATE = r"""<!doctype html>
 :root{
   --bg:#080b12; --panel:#0f1420; --panel2:#141b2a; --line:#1f2937; --line2:#2b3648;
   --fg:#e6edf6; --dim:#8494ab; --faint:#5b6a80;
-  --up:#2ee6a8; --down:#ff5c7a; --blue:#4d9fff; --amber:#ffb454; --violet:#a78bfa;
+  --up:#2ee6a8; --down:#ff2d20; --blue:#4d9fff; --amber:#ffb454; --violet:#a78bfa;
   --r:14px; --shadow:0 1px 0 rgba(255,255,255,.03) inset, 0 8px 30px rgba(0,0,0,.45);
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -3049,15 +3049,15 @@ pre{
 .card:hover{border-color:var(--blue);transform:translateY(-1px)}
 .card.hot{border-color:rgba(46,230,168,.45)}
 .ctop{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
-.clabel{font-size:13px;font-weight:650}
-.cname{font-size:10.5px;color:var(--faint);margin-top:1px}
+.clabel{font-size:15px;font-weight:650}
+.cname{font-size:11.5px;color:var(--dim);margin-top:1px}
 .cchart{height:54px;margin:8px 0 6px}
 /* Strategy cards get a taller curve than the compact feed cards - the per-card
    P&L line is the reason to open a card, and at 54px it was unreadable. */
 .cards .cchart{height:104px;margin:10px 0 8px}
 .cstats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;text-align:center}
-.cstats b{display:block;font-size:13px;font-weight:640}
-.cstats span{font-size:9.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.04em}
+.cstats b{display:block;font-size:16px;font-weight:640}
+.cstats span{font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em}
 .cfoot{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:9px;padding-top:8px;border-top:1px solid var(--line)}
 .cfoot button{padding:3px 9px;font-size:11px}
 code{background:var(--bg);border:1px solid var(--line2);border-radius:5px;padding:1px 5px;font-size:11px;font-family:ui-monospace,monospace}
@@ -4113,10 +4113,10 @@ function drawFeed(id, labels, datasets, opts) {
     data: { labels: labels, datasets: datasets },
     options: Object.assign({
       responsive: true, maintainAspectRatio: false, animation: false,
-      plugins: { legend: { labels: { color: '#e6edf6', boxWidth: 10, font: { size: 10 } } } },
+      plugins: { legend: { labels: { color: '#e6edf6', boxWidth: 12, font: { size: 12 } } } },
       scales: {
-        x: { ticks: { color: '#5b6a80', maxTicksLimit: 5, font: { size: 9 } }, grid: { color: 'rgba(255,255,255,.04)' } },
-        y: { ticks: { color: '#5b6a80', font: { size: 9 } }, grid: { color: 'rgba(255,255,255,.04)' } },
+        x: { ticks: { color: '#8494ab', maxTicksLimit: 5, font: { size: 11 } }, grid: { color: 'rgba(255,255,255,.06)' } },
+        y: { ticks: { color: '#8494ab', font: { size: 11 } }, grid: { color: 'rgba(255,255,255,.06)' } },
       },
     }, opts || {}),
   };
@@ -4130,7 +4130,31 @@ function paintMarket(md) {
   if (!md || !md.spot) return;
   var ctx_feed_error = {{ (m.feed_error | tojson) }};
   const spot = md.spot || {};
-  const pts = spot.points || [];
+
+  // The two charts answer different questions, so they get different windows:
+  // spot is a day of context ("where is BTC today"), the 15-minute contract is
+  // a quarter-hour ("where is it versus this contract's target"). One shared
+  // window made both useless - the contract chart spent most of its width on
+  // history belonging to contracts that had already settled.
+  const SPOT_WINDOW = 86400;   // 1 day
+  const K15_WINDOW = 900;      // 15 minutes
+  const nowS = Date.now() / 1000;
+  const within = function (pts, secs) {
+    return (pts || []).filter(function (p) { return nowS - p.t <= secs; });
+  };
+  // Green when the visible window closed higher, red when lower. This is the
+  // convention every price chart uses; a fixed amber line made direction
+  // unreadable at a glance, which is the one thing a price chart must convey.
+  const trend = function (vals) {
+    const clean = (vals || []).filter(function (v) { return v != null; });
+    if (clean.length < 2) return { line: '#8fa3bd', fill: 'rgba(143,163,189,.10)' };
+    const rising = clean[clean.length - 1] >= clean[0];
+    return rising
+      ? { line: '#2ee6a8', fill: 'rgba(46,230,168,.12)' }
+      : { line: '#ff2d20', fill: 'rgba(255,45,32,.12)' };
+  };
+
+  const pts = within(spot.points, SPOT_WINDOW);
   $('spotSource').textContent = spot.source || 'connecting...';
   $('spotAge').textContent = spot.price
     ? '$' + Number(spot.price).toLocaleString() + '  ·  ' + (spot.age_sec != null ? spot.age_sec.toFixed(1) + 's old' : '')
@@ -4140,13 +4164,14 @@ function paintMarket(md) {
     pill.className = 'pill ' + (spot.fresh ? 'ok' : 'warn');
     pill.textContent = spot.fresh ? 'live' : (spot.price ? 'stale' : 'waiting');
   }
+  const spotTrend = trend(pts.map(function (p) { return p.p; }));
   drawFeed('spotChart', pts.map(p => hhmmss(p.t)), [{
-    label: 'BTC-USD spot', borderColor: '#f7a600', backgroundColor: 'rgba(247,166,0,.10)',
-    data: pts.map(p => p.p), tension: 0.2, fill: true, pointRadius: 0, borderWidth: 1.5,
+    label: 'BTC-USD spot · 1 day', borderColor: spotTrend.line, backgroundColor: spotTrend.fill,
+    data: pts.map(p => p.p), tension: 0.2, fill: true, pointRadius: 0, borderWidth: 2,
   }]);
 
   const k = md.kalshi || {};
-  const kpts = md.series || [];
+  const kpts = within(md.series || [], K15_WINDOW);
   const contract = k.market || null;
   if (contract) $('k15Ticker').textContent = contract.ticker;
   const kp = $('k15Pill');
@@ -4171,17 +4196,18 @@ function paintMarket(md) {
   if (!contract && ctx_feed_error) {
     $('k15Detail').textContent = 'feed offline — ' + ctx_feed_error;
   }
+  const kTrend = trend(kpts.map(function (p) { return p.spot; }));
   drawFeed('k15Chart', kpts.map(p => hhmmss(p.t)), [
     {
-      label: 'spot', borderColor: '#f7a600', backgroundColor: 'rgba(247,166,0,.08)',
-      data: kpts.map(p => p.spot), tension: 0.2, pointRadius: 0, borderWidth: 1.5,
+      label: 'spot · 15 min', borderColor: kTrend.line, backgroundColor: kTrend.fill,
+      data: kpts.map(p => p.spot), tension: 0.2, pointRadius: 0, borderWidth: 2, fill: true,
     },
     {
       label: 'target', borderColor: '#8fa3bd', borderDash: [3, 3],
       data: kpts.map(p => p.target), tension: 0, pointRadius: 0, borderWidth: 1.2,
     },
-  ], { scales: { x: { ticks: { color: '#5b6a80', maxTicksLimit: 4, font: { size: 9 } } },
-                  y: { ticks: { color: '#5b6a80', font: { size: 9 } },
+  ], { scales: { x: { ticks: { color: '#8494ab', maxTicksLimit: 4, font: { size: 11 } } },
+                  y: { ticks: { color: '#8494ab', font: { size: 11 } },
                        // Spot and target are ~$84k; a zero-based axis would
                        // flatten both into a single line.
                        min: (function () {
@@ -4286,7 +4312,7 @@ function sparkOptions() {
     },
     scales: {
       x: { display: false },
-      y: { ticks: { color: '#5b6a80', maxTicksLimit: 3, font: { size: 9 } }, grid: { color: 'rgba(255,255,255,.04)' } },
+      y: { ticks: { color: '#8494ab', maxTicksLimit: 3, font: { size: 9 } }, grid: { color: 'rgba(255,255,255,.06)' } },
     },
   };
 }
