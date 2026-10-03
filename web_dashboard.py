@@ -365,12 +365,43 @@ async def _fetch_kalshi_data():
     try:
         balance = await client.get_balance()
         positions = await client.get_positions()
-        return balance, positions
+        return balance, _normalise_positions(positions)
     except Exception as e:
         _push_error(f"Kalshi fetch: {e}")
         return None, None
     finally:
         await client.close()
+
+
+def _normalise_positions(payload: Any) -> Dict[str, Any]:
+    """Coerce the positions response into the dict shape callers expect.
+
+    `/portfolio/positions` has answered in two shapes: a dict of
+    `market_positions` / `event_positions`, and a bare list. The dashboard read
+    it as a dict unconditionally, so a list response raised
+    `'list' object has no attribute 'get'` every refresh - which surfaced as a
+    permanent "Kalshi connect" error while the panel quietly kept rendering
+    whatever was last cached.
+
+    A bare list is classified by whether the row names an event, because an
+    event position settles differently from a single market.
+    """
+    if payload is None:
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list):
+        markets: List[Dict[str, Any]] = []
+        events: List[Dict[str, Any]] = []
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            if row.get("event_ticker"):
+                events.append(row)
+            else:
+                markets.append(row)
+        return {"market_positions": markets, "event_positions": events}
+    return {}
 
 
 def _run_async(coro):

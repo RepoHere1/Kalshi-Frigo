@@ -69,6 +69,36 @@ def test_no_title_leaks_the_raw_ticker_when_it_can_be_decoded():
 
 
 # ---------------------------------------------------------------------------
+# Positions response shape
+# ---------------------------------------------------------------------------
+def test_a_bare_list_of_positions_is_accepted():
+    """`/portfolio/positions` has answered as a dict and as a bare list.
+
+    Read as a dict unconditionally, a list response raised
+    `'list' object has no attribute 'get'` on every refresh - a permanent
+    "Kalshi connect" error on the page, while the account panel went on
+    rendering whatever had been cached.
+    """
+    rows = [
+        {"ticker": "KXTEST-26", "event_ticker": ""},
+        {"event_ticker": "KXSB-27", "event_ticker": "KXSB-27"},
+    ]
+    out = wd._normalise_positions(rows)
+    assert out["market_positions"] == [{"ticker": "KXTEST-26", "event_ticker": ""}]
+    assert out["event_positions"] == [{"event_ticker": "KXSB-27"}]
+
+
+def test_the_dict_shape_still_passes_through():
+    payload = {"market_positions": [1], "event_positions": [2]}
+    assert wd._normalise_positions(payload) is payload
+
+
+@pytest.mark.parametrize("payload", [None, {}, "unexpected", 7])
+def test_junk_responses_degrade_to_an_empty_dict(payload):
+    assert wd._normalise_positions(payload) == {}
+
+
+# ---------------------------------------------------------------------------
 # Card attribution
 # ---------------------------------------------------------------------------
 def test_internal_strategy_names_reach_the_right_card():

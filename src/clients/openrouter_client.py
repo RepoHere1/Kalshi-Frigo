@@ -66,11 +66,14 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
 }
 
 # Ordered fallback chain -- if the requested model fails, try the next one.
+# Kept SHORT on purpose. Each entry is a real paid frontier call, and a long
+# chain multiplied by MAX_RETRIES_PER_MODEL is what turned one market decision
+# into a dozen billable requests. Two models still gives redundancy; the third
+# bought ~nothing because failures are usually key/quota-wide rather than
+# model-specific, so every model fails anyway.
 DEFAULT_FALLBACK_ORDER: List[str] = [
-    "anthropic/claude-sonnet-4",
+    "anthropic/claude-sonnet-4.5",
     "openai/gpt-4.1",
-    "google/gemini-2.5-pro-preview",
-    "deepseek/deepseek-r1",
 ]
 
 
@@ -108,8 +111,13 @@ class OpenRouterClient(TradingLoggerMixin):
         * Daily cost tracking (mirrors DailyUsageTracker from xai_client)
     """
 
-    # Maximum number of retries for a single model before moving to fallback
-    MAX_RETRIES_PER_MODEL: int = 3
+    # Maximum number of retries for a single model before moving to fallback.
+    # Was 3. Combined with a 4-model fallback chain that allowed up to 12
+    # billable requests for ONE market decision. A failed call is charged by
+    # OpenRouter, so retrying a model that is already failing is pure waste --
+    # the fallback chain below is the correct response to a hard failure, not a
+    # third identical attempt at the same endpoint.
+    MAX_RETRIES_PER_MODEL: int = int(os.getenv("OPENROUTER_MAX_RETRIES", "1"))
     # Base delay (seconds) for exponential backoff
     BASE_BACKOFF: float = 1.0
     # Cap on backoff delay (seconds)
@@ -147,8 +155,17 @@ class OpenRouterClient(TradingLoggerMixin):
         self.total_cost: float = 0.0
         self.request_count: int = 0
 
-        # Daily usage tracker (same pattern as XAIClient)
-        self.usage_file = "logs/daily_openrouter_usage.pkl"
+        # Daily usage tracker (same pattern as XAIClient).
+        #
+        # Resolution order matters for budget safety. The old value was the bare
+        # relative path "logs/daily_openrouter_usage.pkl", which on Railway lands
+        # on the container's EPHEMERAL filesystem (this service declares no
+        # volume). Every redeploy/restart therefore wiped total_cost back to 0.0
+        # and is_exhausted back to False, handing the process a fresh full daily
+        # budget -- so _check_daily_limits() never actually blocked anything.
+        # Prefer an explicit durable path, then a mounted state dir, and only
+        # fall back to the repo-relative path for local runs.
+        self.usage_file = self._resolve_usage_file()
         self.daily_tracker: DailyUsageTracker = self._load_daily_tracker()
 
         self.logger.info(
@@ -164,11 +181,32 @@ class OpenRouterClient(TradingLoggerMixin):
     # Daily usage persistence (mirrors XAIClient)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _resolve_usage_file() -> str:
+        """Pick a durable location for the daily-usage tracker.
+
+        Order: $OPENROUTER_USAGE_FILE -> $KALSHI_STATE_DIR -> repo logs/.
+        The middle option is the Railway volume mount, so the cap survives a
+        redeploy. If none is configured we still fall back to logs/ so local
+        runs keep working unchanged.
+        """
+        explicit = os.getenv("OPENROUTER_USAGE_FILE", "").strip()
+        if explicit:
+            return explicit
+        state_dir = os.getenv("KALSHI_STATE_DIR", "").strip()
+        if state_dir:
+            return os.path.join(state_dir, "daily_openrouter_usage.pkl")
+        return os.path.join("logs", "daily_openrouter_usage.pkl")
+
     def _load_daily_tracker(self) -> DailyUsageTracker:
         """Load or create a daily usage tracker from disk."""
         today = datetime.now().strftime("%Y-%m-%d")
         daily_limit = getattr(settings.trading, "daily_ai_cost_limit", 50.0)
-        os.makedirs("logs", exist_ok=True)
+        parent = os.path.dirname(self.usage_file)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        else:
+            os.makedirs("logs", exist_ok=True)
 
         try:
             if os.path.exists(self.usage_file):
@@ -193,11 +231,18 @@ class OpenRouterClient(TradingLoggerMixin):
         return DailyUsageTracker(date=today, daily_limit=daily_limit)
 
     def _save_daily_tracker(self) -> None:
-        """Persist the daily tracker to disk."""
+        """Persist the daily tracker to disk (atomically, so a crash mid-write
+        cannot leave a truncated pickle that silently resets the daily cap)."""
         try:
-            os.makedirs("logs", exist_ok=True)
-            with open(self.usage_file, "wb") as fh:
+            parent = os.path.dirname(self.usage_file)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            else:
+                os.makedirs("logs", exist_ok=True)
+            tmp = f"{self.usage_file}.tmp"
+            with open(tmp, "wb") as fh:
                 pickle.dump(self.daily_tracker, fh)
+            os.replace(tmp, self.usage_file)
         except Exception as exc:
             self.logger.error(f"Failed to save daily tracker: {exc}")
 
