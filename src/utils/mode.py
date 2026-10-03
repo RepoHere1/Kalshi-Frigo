@@ -16,6 +16,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, AsyncIterator, Dict, List, Optional
 
+from src.utils.database import connect
+
 MODE_DRY = "dry"
 MODE_LIVE = "live"
 VALID_MODES = (MODE_DRY, MODE_LIVE)
@@ -69,13 +71,13 @@ class TradingMode:
     async def _conn(self) -> AsyncIterator[Any]:
         """Open a connection with the schema guaranteed.
 
-        `async with aiosqlite.connect(...)` must not be preceded by `await`:
+        `async with connect(...)` must not be preceded by `await`:
         aiosqlite's awaitable starts its worker thread, and __aenter__ awaits
         the same object again, which raises "threads can only be started once".
         """
         import aiosqlite
 
-        async with aiosqlite.connect(self.db_path) as conn:
+        async with connect(self.db_path) as conn:
             conn.row_factory = aiosqlite.Row
             await conn.executescript(_SCHEMA)
             yield conn
@@ -509,7 +511,7 @@ class TradingMode:
         try:
             import aiosqlite
 
-            async with aiosqlite.connect(db.db_path) as conn:
+            async with connect(db.db_path) as conn:
                 conn.row_factory = aiosqlite.Row
                 cur = await conn.execute(
                     "SELECT market_id, exit_timestamp, pnl, COUNT(*) AS n FROM trade_logs"

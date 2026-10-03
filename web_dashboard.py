@@ -50,9 +50,16 @@ LOG_DIR = Path(os.environ.get("LOG_DIR", str(BASE_DIR / "logs")))
 MAX_ERRORS = 50
 MAX_EVENTS = 100
 # Consecutive respawns the supervisor will attempt for one strategy before it
-# gives up and leaves it stopped. A strategy that cannot start at all (missing
+# gives up and leaves it stopped. A strategy that cannot start at all (bad
 # credentials, a syntax error) must fail loudly, not become a spawn loop.
-_SUPERVISOR_MAX_ATTEMPTS = 5
+#
+# This counts *consecutive* attempts only. A crash-loop that briefly succeeds is
+# not terminal - the counter resets whenever a process is found alive - so a
+# transient failure such as `database is locked` during startup cannot spend the
+# whole budget in a few seconds and permanently disable a strategy.
+_SUPERVISOR_MAX_ATTEMPTS = 8
+# A strategy must stay up this long to count as a real recovery.
+_SUPERVISOR_STABLE_SECONDS = 120
 
 # ---------------------------------------------------------------------------
 # State
@@ -539,6 +546,11 @@ def _refresh_kalshi():
 
 _title_client: Any = None
 _TITLE_CACHE_MAX = 400
+# Kalshi rate-limits the markets endpoint; the dashboard was calling it for every
+# unresolved ticker on every sync until the API answered 429.
+_TITLE_MIN_INTERVAL_SECONDS = 120
+_title_last_attempt = 0.0
+_title_backoff_until = 0.0
 
 
 def _current_book_tickers() -> List[Dict[str, Any]]:
@@ -562,17 +574,17 @@ def _current_book_tickers() -> List[Dict[str, Any]]:
 def _refresh_market_titles(positions):
     """Fetch English titles for market tickers and cache them.
 
-    Kalshi tickers like KXBTC15M-26OCT021600-00 are opaque to users.
-    The API returns a human-readable title per market. We cache the
-    mapping so the dashboard can show 'BTC 15-min UP/DOWN' instead of
-    the raw ticker, and fall back to the ticker itself on failure.
+    Kalshi tickers like KXBTC15M-26OCT021600-00 are opaque to users. The API
+    returns a human-readable title per market, and we cache the mapping so the
+    dashboard can show "BTC 15-minute" instead of the raw ticker.
 
-    Only tickers we have not resolved yet are fetched, and the client is kept
-    for the life of the process: building a KalshiClient per cycle would
-    re-read and re-parse the private key on every refresh, on the same thread
-    that drives the rest of the poll.
+    This is rate-limited deliberately. An unbounded lookup per unresolved ticker
+    on every sync drove the markets endpoint into HTTP 429, so every title
+    silently degraded to the ticker and the panel displayed the error. Calls are
+    floored to one small batch per interval, and a 429 pushes the next attempt
+    out instead of hammering a host that has already said no.
     """
-    global _title_client
+    global _title_client, _title_last_attempt, _title_backoff_until
 
     cached = dashboard_state["market_titles"]
     if len(cached) > _TITLE_CACHE_MAX:
@@ -583,24 +595,31 @@ def _refresh_market_titles(positions):
         t = p.get("ticker") or p.get("event_ticker") or ""
         if t and t not in cached:
             missing.add(t)
-    if not missing:
-        return
-    if not os.environ.get("KALSHI_API_KEY"):
+    if not missing or not os.environ.get("KALSHI_API_KEY"):
         return
 
+    now = time.time()
+    if now < _title_backoff_until or now - _title_last_attempt < _TITLE_MIN_INTERVAL_SECONDS:
+        return
+
+    # A bounded batch, so one sync cannot burst the endpoint.
+    batch = sorted(missing)[:25]
+    _title_last_attempt = now
     try:
         if _title_client is None:
             key_path = materialize_private_key()
             from src.clients.kalshi_client import KalshiClient
 
             _title_client = KalshiClient(private_key_path=key_path) if key_path else KalshiClient()
-        for ticker in missing:
+        for ticker in batch:
             try:
                 m = _run_async(_title_client.get_market(ticker))
                 cached[ticker] = (m or {}).get("title") or ticker
-            except Exception:
-                # Cache the ticker itself so a permanently unresolvable market is
-                # not retried on every single refresh cycle.
+            except Exception as exc:  # noqa: BLE001
+                if "429" in str(exc) or "Too Many Requests" in str(exc):
+                    _title_backoff_until = now + _TITLE_MIN_INTERVAL_SECONDS * 4
+                    _push_error("Kalshi rate-limited title lookup; backing off.")
+                    return
                 cached[ticker] = ticker
     except Exception:
         return
@@ -859,8 +878,26 @@ def _strategy_supervisor_loop():
                     continue
                 row_pid = row.get("pid")
                 if row_pid and _pid_alive(row_pid, row):
-                    failures.pop(name, None)
-                    attempts[name] = 0
+                    # A process that survives a settling period is a genuine
+                    # recovery, so the failure budget starts again. Without this
+                    # the budget was spent by a few rapid spawns during a brief
+                    # database lock and the strategy was never retried again.
+                    started = row.get("started_at")
+                    if started:
+                        try:
+                            born = datetime.fromisoformat(str(started))
+                            if (
+                                datetime.now() - born
+                            ).total_seconds() >= _SUPERVISOR_STABLE_SECONDS:
+                                if attempts.get(name):
+                                    _push_error(
+                                        f"{name} stayed up past "
+                                        f"{_SUPERVISOR_STABLE_SECONDS}s - recovery confirmed."
+                                    )
+                                attempts[name] = 0
+                                failures.pop(name, None)
+                        except Exception:  # noqa: BLE001
+                            pass
                     continue
 
                 # Not alive. A pid from a previous instance of the app is stale

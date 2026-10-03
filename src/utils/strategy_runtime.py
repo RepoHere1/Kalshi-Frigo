@@ -23,6 +23,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, AsyncIterator, Dict, List, Optional
 
+from src.utils.database import connect
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS strategy_runtime (
     name TEXT PRIMARY KEY,
@@ -148,7 +150,7 @@ async def _conn(db_path: str) -> AsyncIterator[Any]:
     """
     import aiosqlite
 
-    async with aiosqlite.connect(db_path) as conn:
+    async with connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
         await conn.executescript(SCHEMA)
         await _ensure_columns(conn)
