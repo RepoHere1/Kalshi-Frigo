@@ -414,6 +414,18 @@ class TradingMode:
         amount = round(quantity * price, 2)
 
         async with self._conn() as conn:
+            # Take the write lock BEFORE reading the balance. Under WAL two
+            # writers can both start a deferred transaction, both read the same
+            # cash figure, both compute a new one, and both insert their ledger
+            # row - but only the last cash write survives. That is how the DRY
+            # book ended up with a ledger whose newest `cash_after` disagreed
+            # with the stored balance, and a running total that did not add up.
+            # BEGIN IMMEDIATE serialises read-modify-write; nothing else here
+            # can, because the ledger row and the balance must move together.
+            try:
+                await conn.execute("BEGIN IMMEDIATE")
+            except Exception:  # noqa: BLE001 - already in a transaction
+                pass
             starting = await self._get(conn, _START_KEY)
             cash = await self._get(conn, _CASH_KEY)
             starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
@@ -468,6 +480,8 @@ class TradingMode:
             "ledger_credits": 0.0,
             "cash": 0.0,
             "derived_cash": None,
+            "ledger_cash_after": None,
+            "ledger_self_consistent": True,
             "ok": True,
         }
 
@@ -527,11 +541,29 @@ class TradingMode:
 
         report["orphan_notional"] = round(report["orphan_notional"], 2)
         report["duplicate_pnl"] = round(report["duplicate_pnl"], 2)
+
+        # 4. Does the ledger agree with itself?
+        #
+        # `cash_after` on the newest row is written inside the same transaction
+        # as the balance, so if the two disagree, a read-modify-write lost a race
+        # between processes. Comparing them is the cheapest way to catch a lost
+        # update: the derived total can look plausible while the running balance
+        # that produced each row says something else entirely.
+        try:
+            newest = await self.ledger(limit=1)
+            if newest:
+                recorded = float(newest[0].get("cash_after") or 0.0)
+                report["ledger_cash_after"] = round(recorded, 2)
+                report["ledger_self_consistent"] = abs(recorded - report["cash"]) < 0.01
+        except Exception:  # noqa: BLE001
+            report["ledger_self_consistent"] = True
+
         report["ok"] = (
             report["orphan_positions"] == 0
             and report["duplicate_closes"] == 0
             and abs(report["cash"] - (report["derived_cash"] or 0.0)) < 0.01
             and report["cash"] >= 0.0
+            and bool(report.get("ledger_self_consistent", True))
         )
         return report
 
