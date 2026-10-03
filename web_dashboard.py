@@ -373,6 +373,27 @@ async def _fetch_kalshi_data():
         await client.close()
 
 
+def _normalise_balance(payload: Any) -> Dict[str, Any]:
+    """Coerce the balance response into a dict.
+
+    Same shape drift as the positions endpoint: `/portfolio/balance` has
+    answered as an object and as a single-element list. Read as a dict, a list
+    raised `'list' object has no attribute 'get'` inside the monitor loop and the
+    whole sync was abandoned - which is why the account panel showed nothing at
+    all rather than stale numbers.
+    """
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list):
+        for row in payload:
+            if isinstance(row, dict):
+                return row
+        return {}
+    if payload is None:
+        return {}
+    return {"balance": payload}
+
+
 def _normalise_positions(payload: Any) -> Dict[str, Any]:
     """Coerce the positions response into the dict shape callers expect.
 
@@ -560,7 +581,8 @@ def _refresh_kalshi():
     balance, positions = _run_async(_fetch_kalshi_data())
     if balance:
         # Kalshi reports cents; the dashboard shows dollars.
-        dashboard_state["balance"] = balance.get("balance", 0) / 100.0
+        balance = _normalise_balance(balance)
+        dashboard_state["balance"] = float(balance.get("balance", 0) or 0) / 100.0
     if positions:
         # Kalshi uses different keys for event markets vs market tickers.
         merged = list(positions.get("market_positions") or [])
@@ -597,9 +619,21 @@ def _current_book_tickers() -> List[Dict[str, Any]]:
     try:
         where = _book_filter("dry")
         rows = _db_many([(_SQL_POSITIONS.format(book=where), ())])
+
+        # Inside the try, and tolerant of a row type that is not a dict: this
+        # runs on the monitor thread's critical path, and an exception here
+        # aborts the whole sync rather than just the title lookup.
+        def _ticker(r):
+            if isinstance(r, dict):
+                return r.get("market_id") or r.get("ticker")
+            try:
+                return r["market_id"]
+            except Exception:  # noqa: BLE001
+                return None
+
+        return [{"ticker": _ticker(r), "event_ticker": _ticker(r)} for r in rows]
     except Exception:  # noqa: BLE001 - titles are cosmetic; never fail the sync
         return []
-    return [{"ticker": r.get("market_id"), "event_ticker": r.get("market_id")} for r in rows]
 
 
 def _refresh_market_titles(positions):

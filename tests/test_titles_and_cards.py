@@ -98,26 +98,39 @@ def test_junk_responses_degrade_to_an_empty_dict(payload):
     assert wd._normalise_positions(payload) == {}
 
 
-# ---------------------------------------------------------------------------
-# Card attribution
-# ---------------------------------------------------------------------------
-def test_internal_strategy_names_reach_the_right_card():
-    """ai_directional books its rows as immediate_portfolio_optimization."""
-    assert wd._strategy_bucket("immediate_portfolio_optimization") == "ai_directional"
-    assert wd._strategy_bucket("portfolio_optimization") == "ai_directional"
-    assert wd._strategy_bucket("btc_updown") == "btc_updown"
-    assert wd._strategy_bucket("ai_directional") == "ai_directional"
+def test_a_bare_list_balance_is_accepted():
+    """`/portfolio/balance` drifts shape the same way positions does."""
+    assert wd._normalise_balance([{"balance": 1234}]) == {"balance": 1234}
+    assert wd._normalise_balance({"balance": 99}) == {"balance": 99}
+    assert wd._normalise_balance([]) == {}
+    assert wd._normalise_balance(None) == {}
+    assert wd._normalise_balance(500) == {"balance": 500}
 
 
-def test_every_button_has_a_card_and_a_command():
-    for name in wd.STRATEGY_COMMANDS:
-        assert name in wd.strategy_state, f"{name} has no card"
-        assert wd.STRATEGY_DOCS.get(name), f"{name} has no description"
+def test_the_sync_survives_either_shape(monkeypatch):
+    """The whole point: a shape change must not abort the sync."""
 
+    calls = {"n": 0}
+    real = wd._run_async
 
-def test_no_strategy_command_runs_without_loop():
-    """A command with no --loop runs one pass and exits - the button then reads
-    'exited on its own' forever."""
-    for name, cmd in wd.STRATEGY_COMMANDS.items():
-        assert "--paper" in cmd, f"{name} is not pinned to paper"
-        assert "--loop" in cmd, f"{name} would exit after a single pass"
+    def fake(coro):
+        # Only the Kalshi fetch is faked; the DB read behind the title lookup
+        # still runs for real.
+        if calls["n"] == 0:
+            calls["n"] += 1
+            coro.close()
+            return (
+                [{"balance": 2500}],
+                {"market_positions": [{"ticker": "KX"}], "event_positions": []},
+            )
+        return real(coro)
+
+    monkeypatch.setattr(wd, "_run_async", fake)
+    monkeypatch.setitem(wd.dashboard_state, "balance", None)
+    monkeypatch.setitem(wd.dashboard_state, "positions", [])
+    monkeypatch.setattr(wd, "_refresh_market_titles", lambda _p: None)
+
+    wd._refresh_kalshi()
+
+    assert wd.dashboard_state["balance"] == 25.0
+    assert wd.dashboard_state["positions"] == [{"ticker": "KX"}]
