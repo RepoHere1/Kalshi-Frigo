@@ -114,17 +114,32 @@ def test_charts_still_guard_each_construction_site(html):
 # ---------------------------------------------------------------------------
 # Supervisor: the two vocabularies for "paper"
 # ---------------------------------------------------------------------------
-def test_the_supervisor_accepts_both_spellings_of_paper(html):
+def _supervisor_source() -> str:
+    """The supervisor is Python, so it is asserted against source, not the page."""
+    import inspect
+
+    return inspect.getsource(wd._strategy_supervisor_loop)
+
+
+def test_the_supervisor_accepts_both_spellings_of_paper():
     """Resuming after a deploy dropped five of six strategies.
 
     The runtime store records `paper`; the book says `dry`. Requiring one exact
     spelling treated every row carrying the other as if it were LIVE, cleared the
     operator's intent, and left the strategy down after every deploy.
     """
-    assert 'row.get("mode") not in ("paper", "dry")' in html
-    assert 'row.get("mode") != "paper"' not in html
+    src = _supervisor_source()
+    assert 'not in ("paper", "dry")' in src
+    assert '!= "paper"' not in src
 
 
-def test_live_is_still_never_resumed_automatically(html):
+def test_live_is_still_never_resumed_automatically():
     """The safety half of that rule must survive the fix."""
-    assert "was running LIVE before a restart and was not" in html
+    assert "was running LIVE before a restart and was not" in _supervisor_source()
+
+
+def test_a_recovered_strategy_resets_the_failure_budget():
+    """A brief outage must not permanently disable a strategy."""
+    src = _supervisor_source()
+    assert "_SUPERVISOR_STABLE_SECONDS" in src
+    assert "recovery confirmed" in src
