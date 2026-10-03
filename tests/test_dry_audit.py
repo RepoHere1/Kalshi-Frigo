@@ -145,3 +145,77 @@ async def test_the_audit_never_mutates_history(tmp_path, monkeypatch):
 
     assert before_pos == after_pos
     assert len(ledger_before) == len(await mgr.ledger(limit=1000))
+
+
+async def test_a_reset_clears_the_whole_simulated_book(tmp_path, monkeypatch):
+    """A reset that only resets cash leaves an equity figure that cannot be true.
+
+    It used to empty the ledger and leave DRY positions and closes behind,
+    producing a book claiming $300 cash and $250.64 of deployed capital at the
+    same time - equity of $550.64 on a $300 account.
+    """
+    from src.utils.database import TradeLog
+
+    db = await _db(tmp_path)
+    # Same file in production: the mode tables and the trading tables share one
+    # database, which is what lets the reset clear both halves of the book.
+    mgr = TradingMode(db_path=db.db_path)
+    monkeypatch.setenv("DB_PATH", db.db_path)
+
+    await mgr.record_fill(market_id="KXTEST-26", side="NO", action="buy", quantity=10, price=0.25)
+    await db.add_position(_position(strategy="btc_updown"))
+    await db.add_trade_log(
+        TradeLog(
+            market_id="KXTEST-26",
+            side="NO",
+            entry_price=0.25,
+            exit_price=0.30,
+            quantity=10,
+            pnl=0.5,
+            entry_timestamp=datetime.now(),
+            exit_timestamp=datetime.now(),
+            rationale="x",
+            strategy="btc_updown",
+            exit_reason="take_profit",
+            mode="dry",
+        )
+    )
+    assert await db.get_open_positions(mode="dry")
+
+    account = await mgr.reset_dry_account()
+
+    assert account["cash"] == pytest.approx(300.0, abs=0.01)
+    assert account["open_positions"] == 0
+    assert account["closed_trades"] == 0
+    assert await db.get_open_positions(mode="dry") == []
+    report = await mgr.repair_dry_book()
+    assert report["orphan_positions"] == 0
+    assert report["ok"] is True
+
+
+async def test_a_reset_never_touches_the_live_book(tmp_path, monkeypatch):
+    db = await _db(tmp_path)
+    mgr = TradingMode(db_path=db.db_path)
+    monkeypatch.setenv("DB_PATH", db.db_path)
+
+    await db.add_position(
+        Position(
+            market_id="KXLIVE-26",
+            side="YES",
+            entry_price=0.5,
+            quantity=2,
+            timestamp=datetime.now(),
+            rationale="live",
+            confidence=0.8,
+            live=True,
+            strategy="ai_directional",
+            mode="live",
+        )
+    )
+    await db.add_position(_position(strategy="btc_updown"))
+
+    await mgr.reset_dry_account()
+
+    remaining = await db.get_open_positions(mode="live")
+    assert len(remaining) == 1
+    assert remaining[0].market_id == "KXLIVE-26"

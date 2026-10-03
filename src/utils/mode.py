@@ -361,12 +361,35 @@ class TradingMode:
             await conn.commit()
 
     async def reset_dry_account(self) -> Dict[str, Any]:
-        """Restore the DRY account to its starting balance and clear the ledger."""
+        """Restore the DRY book to a clean starting state.
+
+        This has to mean the *whole* simulated book, not just the cash figure.
+        It used to reset cash and empty the ledger while leaving DRY positions
+        and DRY trade_logs untouched, so a "reset" produced a book claiming
+        $300 cash *and* $250.64 of deployed capital - equity of $550.64 on a
+        $300 account, with 23 positions that no fill had ever paid for. A reset
+        that leaves the history behind is not a reset.
+
+        Only the DRY book is touched; LIVE rows are never in scope here.
+        """
         async with self._conn() as conn:
             starting = await self._get(conn, _START_KEY)
             starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
             await self._set(conn, _CASH_KEY, str(round(starting_f, 2)))
             await conn.execute("DELETE FROM dry_ledger")
+            # Positions and closes are the rest of the simulated book.
+            await self._exec_optional(
+                conn,
+                "DELETE FROM positions WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'",
+            )
+            await self._exec_optional(
+                conn,
+                "DELETE FROM trade_logs WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'",
+            )
+            await self._exec_optional(
+                conn,
+                "DELETE FROM blocked_trades WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'",
+            )
             await conn.commit()
         return await self.dry_account()
 
