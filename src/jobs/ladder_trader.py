@@ -327,10 +327,21 @@ class UpDownTrader:
         position.id = position_id
 
         try:
-            return await execute_position(position, live, self.db_manager, self._client)
+            filled = await execute_position(position, live, self.db_manager, self._client)
         except Exception as exc:  # noqa: BLE001
             self.book.last_error = f"submit failed: {type(exc).__name__}: {exc}"
-            return False
+            filled = False
+
+        if not filled:
+            # The row exists only because execute_position needs an id to record
+            # the fill against. With no fill, keeping it leaves an orphan that
+            # reads as open capital the book never spent - 23 positions against
+            # 12 ledger entries, and an equity figure that no longer reconciles.
+            try:
+                await self.db_manager.delete_position(position_id)
+            except Exception as exc:  # noqa: BLE001
+                self.book.last_error = f"orphan cleanup failed: {type(exc).__name__}: {exc}"
+        return filled
 
     async def cycle(self) -> Dict[str, Any]:
         """One pass: refresh the series, score it, take at most one trade."""

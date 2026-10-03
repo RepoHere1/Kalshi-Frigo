@@ -1206,6 +1206,32 @@ class DatabaseManager(TradingLoggerMixin):
             )
             return cursor.lastrowid
 
+    async def delete_position(self, position_id: int) -> bool:
+        """Remove a position row that never became a fill.
+
+        A position is persisted *before* its order is submitted, so that
+        `execute_position` has a row to record the fill against. If the order is
+        then refused - insufficient funds, an untradable price, a contract that
+        rolled - the row has no fill behind it, yet it still reads as `open`:
+        it counts toward open-position totals and its cost basis counts as
+        deployed capital, with no matching debit in the ledger.
+
+        That is how 23 positions came to exist against 12 ledger entries, and it
+        is why the book's own arithmetic stopped reconciling. Unwinding the insert
+        keeps the position table a record of fills rather than of attempts.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "DELETE FROM positions WHERE id = ? AND status = 'open'", (int(position_id),)
+            )
+            await db.execute(
+                "UPDATE markets SET has_position = 0 WHERE market_id ="
+                " (SELECT market_id FROM positions WHERE id = ?)",
+                (int(position_id),),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
     async def get_open_positions(self, mode: Optional[str] = None) -> List[Position]:
         """Get all open positions, optionally scoped to one DRY/LIVE book.
 
