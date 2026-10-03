@@ -1296,8 +1296,11 @@ def build_snapshot() -> Dict[str, Any]:
         "last_update": dashboard_state["last_update"],
         "has_kalshi_creds": kalshi_configured(),
         "has_openrouter_creds": bool(os.environ.get("OPENROUTER_API_KEY", "").strip()),
-        "balance": dashboard_state["balance"],
-        "kalshi": account,
+        # Real-money figures belong to the LIVE book. A DRY snapshot carries no
+        # real balance and no real positions at all, so the client cannot render
+        # them even if the markup were changed to ask for them.
+        "balance": dashboard_state["balance"] if book == "live" else None,
+        "kalshi": account if book == "live" else None,
         "db_path": str(DB_PATH),
         "db_exists": Path(DB_PATH).exists(),
         "db_persistent": not _is_ephemeral_db(),
@@ -1586,15 +1589,18 @@ def api_mode_set():
                     ),
                     400,
                 )
+            # An unreachable Kalshi is a genuine blocker. An empty balance is not:
+            # it used to refuse the switch outright, which trapped the operator in
+            # DRY and made the only way into LIVE a top-up. Affordability is
+            # enforced per order in build_order_request, which refuses anything the
+            # funding source cannot cover, so nothing unfunded can be sent by
+            # dropping the check here. The balance is still reported, loudly, on
+            # the LIVE page and in this response.
             if not funding.get("can_fund"):
-                return (
-                    jsonify(
-                        {
-                            "error": "Cannot go LIVE: "
-                            + str(funding.get("reason", "insufficient funds"))
-                        }
-                    ),
-                    400,
+                _push_error(
+                    "LIVE mode entered with an unfunded balance: "
+                    + str(funding.get("reason", "insufficient funds"))
+                    + " - orders will be refused until it is funded."
                 )
 
         mode = run(mgr.set(target, confirmed=confirmed))
@@ -3166,22 +3172,17 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 {% endif %}
 
 <!-- ============ Kalshi account ============ -->
+<!-- LIVE ONLY. This panel is real money: real positions, real P&L, real fees.
+     Rendering it while the switch reads DRY put the production account's
+     positions in the middle of a page whose every other number was simulated,
+     which is precisely the DRY/LIVE blur this page is supposed to make
+     impossible. A DRY page now contains no real-account figures at all. -->
+{%- if live %}
 <div class="panel" style="margin-bottom:12px">
     <div class="ph">
-      <h2>{% if s.mode.mode == 'live' %}Kalshi account — real, and being traded{% else %}Real Kalshi account — NOT what DRY is trading{% endif %}</h2>
+      <h2>Kalshi account — real, and being traded</h2>
       <span class="note">{% if s.last_update %}synced {{ s.last_update }}{% else %}not synced yet{% endif %}</span>
     </div>
-    {%- if s.mode.mode != 'live' %}
-    <div class="pb" style="padding-bottom:0">
-      <p class="note" style="font-size:11.5px;color:var(--faint)">
-        This is the real Kalshi account. The bot trades it only when the
-        mode switch reads LIVE. While the switch reads DRY, this account
-        is untouched — the simulated $300 book above is what DRY is trading.
-        Anything listed below is real, and is managed outside this bot —
-        none of these figures describe the bot's results.
-      </p>
-    </div>
-    {%- endif %}
   {%- if s.kalshi and s.kalshi.connected %}
   <div class="row two" style="padding:14px 16px 0;margin:0">
     <div class="pb" style="padding:0">
@@ -3227,6 +3228,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   </div>
   {%- endif %}
 </div>
+{%- endif %}
 
 <!-- ============ positions + equity ============ -->
 <div class="row two">
@@ -3602,10 +3604,12 @@ async function postMode(mode, confirmLive) {
     });
     const d = await r.json().catch(() => ({}));
     if (d.error) {
-      // Refused - stay visibly DRY and say exactly why.
+      // The request may have failed *after* the mode was already persisted, so
+      // never repaint from the snapshot this page booted with - that stale object
+      // says DRY, and trusting it is what threw the operator back to DRY after a
+      // switch that had actually taken. Ask the server what mode is in force.
       note('mode switch blocked: ' + d.error);
-      paintMode(SNAPSHOT.mode);
-      flashBanner('STILL IN DRY MODE - ' + d.error, false);
+      await syncModeFromServer('switch refused: ' + d.error);
       return;
     }
     note('trading mode is now ' + String(d.mode).toUpperCase());
@@ -3615,6 +3619,23 @@ async function postMode(mode, confirmLive) {
       : 'DRY MODE - simulated fills only, no real money', d.mode === 'live');
   } catch (e) {
     note('mode switch failed: ' + e.message);
+    await syncModeFromServer('switch failed: ' + e.message);
+  }
+}
+
+// Re-read the authoritative mode after any ambiguous switch attempt. SNAPSHOT is
+// a rendering of the page as it was served; it cannot describe a mode change that
+// happened after that.
+async function syncModeFromServer(why) {
+  try {
+    const d = await fetch('/api/mode').then(r => r.json());
+    const m = d.mode || 'dry';
+    SNAPSHOT.mode = d;
+    paintMode(d);
+    flashBanner(
+      'MODE IS ' + String(m).toUpperCase() + (why ? ' - ' + why : ''),
+      m === 'live');
+  } catch (_) {
     paintMode(SNAPSHOT.mode);
   }
 }

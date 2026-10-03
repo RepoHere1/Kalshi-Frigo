@@ -199,7 +199,25 @@ def _load_kalshi(client):
         wd.dashboard_state["positions"] = []
 
 
-def test_kalshi_account_normalises_both_shapes(client):
+def _go_live(client, auth, monkeypatch):
+    """Put the persisted book into LIVE with funding mocked out."""
+    from src.utils.mode import TradingMode
+
+    async def funded(_self, private_key_path=None):
+        return {
+            "connected": True,
+            "balance": 5000.0,
+            "balance_cents": 500000,
+            "can_fund": True,
+            "reason": "",
+        }
+
+    monkeypatch.setattr(TradingMode, "funding", funded)
+    client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
+
+
+def test_kalshi_account_normalises_both_shapes(client, auth, monkeypatch):
+    _go_live(client, auth, monkeypatch)
     gen = _load_kalshi(client)
     next(gen)
     try:
@@ -218,7 +236,26 @@ def test_kalshi_account_normalises_both_shapes(client):
     assert k["traded"] == 9.4
 
 
-def test_kalshi_rows_carry_real_values(client):
+def test_a_dry_snapshot_carries_no_real_account_data(client):
+    """The DRY snapshot must not hand real figures to the client at all.
+
+    Gating the markup is not enough on its own: the snapshot is the data the
+    page is rendered from and re-rendered from, so a DRY snapshot that still
+    carried the real balance and real positions could put them back on screen.
+    """
+    gen = _load_kalshi(client)
+    next(gen)
+    try:
+        snap = client.get("/api/snapshot").get_json()
+    finally:
+        gen.close()
+    assert snap["mode"]["mode"] == "dry"
+    assert snap["kalshi"] is None
+    assert snap["balance"] is None
+
+
+def test_kalshi_rows_carry_real_values(client, auth, monkeypatch):
+    _go_live(client, auth, monkeypatch)
     gen = _load_kalshi(client)
     next(gen)
     try:
@@ -254,16 +291,98 @@ def test_dry_headline_shows_the_simulated_book_not_real_money(client):
     assert "Live positions" not in tiles
 
 
-def test_dry_page_labels_the_real_account_as_not_being_traded(client):
+def test_dry_page_shows_no_real_account_figures_at_all(client):
+    """A DRY page must contain no real-money numbers whatsoever.
+
+    The panel used to render the production account's positions, P&L and fees in
+    the middle of a page whose every other figure was simulated, under a heading
+    that merely promised the reader to ignore it. Labelling real data was not
+    separation; removing it is. In LIVE the same panel is present.
+    """
     gen = _load_kalshi(client)
     next(gen)
     try:
         html = client.get("/").get_data(as_text=True)
     finally:
         gen.close()
-    assert "Real Kalshi account — NOT what DRY is trading" in html
-    assert "managed outside this bot" in html
-    assert "none of these figures describe the bot's results" in html
+
+    assert "Kalshi account — real, and being traded" not in html
+    assert "NOT what DRY is trading" not in html
+    # The live position tables themselves must be absent, not just relabelled.
+    assert 'id="kalshiMarkets"' not in html
+    assert 'id="kalshiEvents"' not in html
+    # And the real balance must not appear in the DRY headline either.
+    assert "Real balance" not in html
+    assert "Real exposure" not in html
+
+
+def test_live_page_still_shows_the_real_account(client, auth, monkeypatch):
+    """Hiding the panel in DRY must not hide it in LIVE."""
+    from src.utils.mode import TradingMode, run
+
+    async def funded(_self, private_key_path=None):
+        return {
+            "connected": True,
+            "balance": 5000.0,
+            "balance_cents": 500000,
+            "can_fund": True,
+            "reason": "",
+        }
+
+    monkeypatch.setattr(TradingMode, "funding", funded)
+    client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
+    gen = _load_kalshi(client)
+    next(gen)
+    try:
+        html = client.get("/").get_data(as_text=True)
+    finally:
+        gen.close()
+    assert "Kalshi account — real, and being traded" in html
+    assert 'id="kalshiMarkets"' in html
+
+
+def test_switching_to_live_is_not_blocked_by_the_balance(client, auth, monkeypatch):
+    """A low balance must not trap the operator in DRY.
+
+    The switch used to refuse whenever the real balance could not fund a $1
+    order, so clicking LIVE threw the operator back to DRY and the only way out
+    was to fund the account first. Affordability is enforced where it belongs -
+    per order, in build_order_request, which refuses anything the funding source
+    cannot cover - so the view switch no longer second-guesses it.
+    """
+    from src.utils.mode import TradingMode
+
+    async def broke(_self, private_key_path=None):
+        return {
+            "connected": True,
+            "balance": 0.0,
+            "balance_cents": 0,
+            "can_fund": False,
+            "reason": "$0.00 is below Kalshi's $1.00 minimum order size",
+        }
+
+    monkeypatch.setattr(TradingMode, "funding", broke)
+    r = client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
+    assert r.status_code == 200
+    assert r.get_json()["mode"] == "live"
+
+
+def test_switching_to_live_without_a_working_api_is_still_refused(client, auth, monkeypatch):
+    """Unreachable Kalshi is a genuine blocker - LIVE could not function."""
+    from src.utils.mode import TradingMode
+
+    async def down(_self, private_key_path=None):
+        return {
+            "connected": False,
+            "balance": 0.0,
+            "balance_cents": 0,
+            "can_fund": False,
+            "reason": "Private key file not found",
+        }
+
+    monkeypatch.setattr(TradingMode, "funding", down)
+    r = client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
+    assert r.status_code == 400
 
 
 def test_live_headline_shows_the_real_account(client, auth, monkeypatch):
@@ -859,8 +978,15 @@ def test_going_live_requires_explicit_confirmation(client, auth):
     assert client.get("/api/mode").get_json()["mode"] == "dry"
 
 
-def test_going_live_blocked_when_unfunded(client, auth, monkeypatch):
-    """A $0 balance must not be switchable to LIVE."""
+def test_going_live_with_no_balance_is_reported_not_refused(client, auth, monkeypatch):
+    """An unfunded account must not trap the operator in DRY.
+
+    This used to refuse the switch outright, so clicking LIVE threw the operator
+    back to DRY and the only way in was to fund the account first. Affordability
+    belongs to the order, not the view: build_order_request refuses anything the
+    funding source cannot cover, so an unfunded LIVE book cannot send an order it
+    cannot pay for. The condition is surfaced as a warning instead.
+    """
     from src.utils.mode import TradingMode
 
     async def unfunded(_self, private_key_path=None):
@@ -874,8 +1000,9 @@ def test_going_live_blocked_when_unfunded(client, auth, monkeypatch):
 
     monkeypatch.setattr(TradingMode, "funding", unfunded)
     r = client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
-    assert r.status_code == 400
-    assert "Cannot go LIVE" in r.get_json()["error"]
+    assert r.status_code == 200
+    assert r.get_json()["mode"] == "live"
+    assert client.get("/api/mode").get_json()["mode"] == "live"
 
 
 def test_dry_to_live_and_back(client, auth, monkeypatch):
