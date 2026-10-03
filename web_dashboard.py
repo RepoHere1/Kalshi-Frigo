@@ -976,7 +976,14 @@ def _strategy_supervisor_loop():
                     # paper. A LIVE strategy places real orders, and nothing may
                     # start one without the operator asking in this instance, so
                     # that intent is dropped and must be re-given by hand.
-                    if row.get("mode") != "paper":
+                    if row.get("mode") not in ("paper", "dry"):
+                        # Only a genuinely LIVE strategy is dropped. The two
+                        # vocabularies meet here - the runtime store writes
+                        # "paper", the book says "dry" - and requiring one exact
+                        # spelling silently discarded the operator's intent for
+                        # every row carrying the other. That is how five of six
+                        # strategies came back as "stopped by app restart" after a
+                        # deploy and stayed down.
                         _run_async(store.record_stop(name, "stopped by app restart"))
                         _run_async(store.set_desired(name, False))
                         _push_error(

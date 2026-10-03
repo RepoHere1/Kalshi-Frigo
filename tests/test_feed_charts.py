@@ -109,3 +109,22 @@ def test_the_feed_can_still_render_without_chartjs(html):
 
 def test_charts_still_guard_each_construction_site(html):
     assert html.count("typeof Chart === 'undefined'") >= 3
+
+
+# ---------------------------------------------------------------------------
+# Supervisor: the two vocabularies for "paper"
+# ---------------------------------------------------------------------------
+def test_the_supervisor_accepts_both_spellings_of_paper(html):
+    """Resuming after a deploy dropped five of six strategies.
+
+    The runtime store records `paper`; the book says `dry`. Requiring one exact
+    spelling treated every row carrying the other as if it were LIVE, cleared the
+    operator's intent, and left the strategy down after every deploy.
+    """
+    assert 'row.get("mode") not in ("paper", "dry")' in html
+    assert 'row.get("mode") != "paper"' not in html
+
+
+def test_live_is_still_never_resumed_automatically(html):
+    """The safety half of that rule must survive the fix."""
+    assert "was running LIVE before a restart and was not" in html
