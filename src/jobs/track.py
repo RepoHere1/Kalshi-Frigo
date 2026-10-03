@@ -16,6 +16,7 @@ from src.clients.kalshi_client import KalshiClient
 from src.config.settings import settings
 from src.utils.database import DatabaseManager, Position, TradeLog
 from src.utils.logging_setup import get_trading_logger, setup_logging
+from src.utils.market_prices import get_market_prices
 from src.utils.mode import MODE_LIVE
 
 
@@ -105,6 +106,20 @@ async def should_exit_position(
         return True, "market_resolution", exit_price
 
     # 2. ENHANCED Stop-loss exit using proper logic for YES/NO positions
+    #
+    # Every exit below this line prices against `current_price`. An unquoted
+    # market reports 0.0, and a NO position priced at 0.0 satisfies
+    # `0.0 <= take_profit_price` on every single pass - so it fires take-profit
+    # at exit_price 0.0, which the $0 sanity guard in track_positions then
+    # refuses to write. The position is stranded open, re-detected and re-refused
+    # every cycle, forever. That is what left the DRY book sitting at 17 open /
+    # 0 closed.
+    #
+    # There is no exit to take against a $0 quote anyway: nothing can be sold at
+    # zero. So hold, and let a later cycle act once the market is quoted again.
+    if current_price <= 0.0:
+        return False, "", current_price
+
     if position.stop_loss_price:
         from src.utils.stop_loss_calculator import StopLossCalculator
 
@@ -253,11 +268,19 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                     )
                     continue
 
-                # Get current prices
-                current_yes_price = (
-                    market_data.get("yes_price", 0) / 100
-                )  # Convert cents to dollars
-                current_no_price = market_data.get("no_price", 0) / 100
+                # Get current prices.
+                #
+                # `yes_price` / `no_price` do not exist in Kalshi API v2 - the
+                # quotes live in `*_dollars` string fields. Reading the old names
+                # defaulted to 0, so every exit was priced at $0.00: NO positions
+                # tripped take-profit on 0.0 <= target, YES positions tripped
+                # stop-loss on 0.0, and the $0 sanity guard then refused to write
+                # the close. Net effect - the entire exit system was dead and
+                # positions accumulated open forever (17 open, 0 closed).
+                # get_market_prices() handles both the v2 and legacy shapes.
+                yes_bid, yes_ask, no_bid, no_ask = get_market_prices(market_data)
+                current_yes_price = (yes_bid + yes_ask) / 2.0
+                current_no_price = (no_bid + no_ask) / 2.0
                 market_status = market_data.get("status", "unknown")
                 market_result = market_data.get("result")  # Market resolution result
 

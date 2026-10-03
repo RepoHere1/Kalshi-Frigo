@@ -9,7 +9,7 @@ This module provides a single helper that normalizes both formats
 to dollar values (0.0–1.0), plus a guard for non-tradeable
 collection/aggregate tickers (issue #42).
 """
-from typing import Dict, Any, Tuple
+from typing import Any, Dict, Tuple
 
 # Threshold above which both sides signal a collection/aggregate ticker
 # that is not directly tradeable on Kalshi (e.g. KXMVECROSSCATEGORY-*).
@@ -57,13 +57,25 @@ def get_market_prices(market_info: Dict[str, Any]) -> Tuple[float, float, float,
     if "yes_bid_dollars" in market_info:
         yes_bid = float(market_info.get("yes_bid_dollars", 0) or 0)
         yes_ask = float(market_info.get("yes_ask_dollars", 0) or 0)
-        no_bid  = float(market_info.get("no_bid_dollars",  0) or 0)
-        no_ask  = float(market_info.get("no_ask_dollars",  0) or 0)
+        no_bid = float(market_info.get("no_bid_dollars", 0) or 0)
+        no_ask = float(market_info.get("no_ask_dollars", 0) or 0)
     else:
         # Legacy API: values in cents (0–100)
         yes_bid = (market_info.get("yes_bid", 0) or 0) / 100
         yes_ask = (market_info.get("yes_ask", 0) or 0) / 100
-        no_bid  = (market_info.get("no_bid",  0) or 0) / 100
-        no_ask  = (market_info.get("no_ask",  0) or 0) / 100
+        no_bid = (market_info.get("no_bid", 0) or 0) / 100
+        no_ask = (market_info.get("no_ask", 0) or 0) / 100
+
+    # Last resort: the older single-price shape, `{"yes_price": 65}`. Kalshi v2
+    # dropped it, but a caller handing us such a dict would otherwise read four
+    # zeros and conclude the market is unquoted. Silence there is far worse than
+    # an imprecise price.
+    if not any((yes_bid, yes_ask, no_bid, no_ask)):
+        legacy_yes = market_info.get("yes_price")
+        legacy_no = market_info.get("no_price")
+        if legacy_yes:
+            yes_bid = yes_ask = float(legacy_yes) / 100
+        if legacy_no:
+            no_bid = no_ask = float(legacy_no) / 100
 
     return yes_bid, yes_ask, no_bid, no_ask

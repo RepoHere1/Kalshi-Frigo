@@ -269,13 +269,17 @@ async def place_profit_taking_orders(
                     logger.warning(f"Could not get market data for {position.market_id}")
                     continue
 
-                # Get current price based on position side
+                # Get current price based on position side.
+                #
+                # `yes_price` / `no_price` were removed from Kalshi API v2; quotes
+                # are `*_dollars` strings. Reading the old names defaulted to 0,
+                # and `if current_price > 0` then skipped the position entirely -
+                # so profit-taking and stop-losses silently did nothing, forever.
+                yes_bid, yes_ask, no_bid, no_ask = get_market_prices(market_data)
                 if position.side == "YES":
-                    current_price = (
-                        market_data.get("yes_price", 0) / 100
-                    )  # Convert cents to dollars
+                    current_price = (yes_bid + yes_ask) / 2.0
                 else:
-                    current_price = market_data.get("no_price", 0) / 100
+                    current_price = (no_bid + no_ask) / 2.0
 
                 # Calculate current profit
                 if current_price > 0:
@@ -373,11 +377,13 @@ async def place_stop_loss_orders(
                     logger.warning(f"Could not get market data for {position.market_id}")
                     continue
 
-                # Get current price based on position side
+                # Get current price based on position side (API v2 `*_dollars`
+                # fields - `yes_price` no longer exists; see place_profit_taking).
+                yes_bid, yes_ask, no_bid, no_ask = get_market_prices(market_data)
                 if position.side == "YES":
-                    current_price = market_data.get("yes_price", 0) / 100
+                    current_price = (yes_bid + yes_ask) / 2.0
                 else:
-                    current_price = market_data.get("no_price", 0) / 100
+                    current_price = (no_bid + no_ask) / 2.0
 
                 # Calculate current loss
                 if current_price > 0:
