@@ -385,14 +385,62 @@ class UpDownTrader:
 
         took: Optional[Dict[str, Any]] = None
         blocked = ""
+
+        # The entry guard has to read persisted positions, not just the ones this
+        # process remembers. `self.book.open_positions` is in-memory and starts
+        # empty on every redeploy, so it happily reported "holding 0" while the
+        # database held both sides of the same contract and several positions on
+        # contracts that had already settled. That is how one contract ended up
+        # held as YES *and* NO - a guaranteed loss of the spread - alongside three
+        # positions on long-expired buckets.
+        held: List[Dict[str, Any]] = []
+        stale_count = 0
+        if self.db_manager is not None:
+            try:
+                book_mode = "live" if live else "dry"
+                for p in await self.db_manager.get_open_positions(mode=book_mode):
+                    if (p.strategy or "") != "btc_updown":
+                        continue
+                    # A 15-minute contract that is not the current one has rolled:
+                    # it is settled, and nothing can be done about it here. Left to
+                    # position_tracking to close out, but it must not block entry.
+                    if market is not None and p.market_id != market.ticker:
+                        stale_count += 1
+                        continue
+                    held.append(
+                        {
+                            "ticker": p.market_id,
+                            "side": p.side,
+                            "notional": (p.entry_price or 0.0) * (p.quantity or 0),
+                            "contracts": p.quantity,
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001
+                self.book.last_error = f"position guard: {type(exc).__name__}: {exc}"
+
+        if stale_count:
+            self.book.blocked = f"{stale_count} position(s) on settled contracts awaiting close-out"
+
         # One position at a time. No pyramiding, no doubling in.
         if signal is not None and signal.actionable:
-            if len(self.book.open_positions) >= self.config.max_open_positions:
-                blocked = (
-                    f"already holding {len(self.book.open_positions)} position(s); "
-                    "max is one at a time"
-                )
-            elif await self._place(signal, live):
+            # Never hold both sides of one contract: the two payouts sum to $1.00
+            # while the combined cost is whatever was paid, so the pair is a
+            # certain loss of the spread.
+            opposite = {"up": "NO", "down": "YES"}
+            for p in held:
+                if p["ticker"] == signal.ticker and p["side"] == opposite.get(signal.side):
+                    blocked = (
+                        f"already hold the opposite side of {signal.ticker}; "
+                        "closing first (never both sides of one contract)"
+                    )
+                    break
+                if p["ticker"] == signal.ticker:
+                    blocked = f"already holding {signal.ticker}"
+                    break
+
+            if not blocked and len(held) >= self.config.max_open_positions:
+                blocked = f"already holding {len(held)} open position(s); " "max is one at a time"
+            elif not blocked and await self._place(signal, live):
                 self.book.open_positions.append(
                     {
                         "ticker": signal.ticker,

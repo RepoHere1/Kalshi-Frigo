@@ -18,6 +18,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -128,6 +129,12 @@ STRATEGY_ALIASES = {
     "ai directional": "ai_directional",
     "directional_trading": "ai_directional",
     "directional": "ai_directional",
+    # The AI directional strategy records its trades under the name of the
+    # routine that produced them. Without this, every trade and position it made
+    # landed in "unattributed" and the ai_directional card read 0 trades / $0.00
+    # realized while the bot had in fact been trading.
+    "immediate_portfolio_optimization": "ai_directional",
+    "portfolio_optimization": "ai_directional",
     "safe_compounder": "safe_compounder",
     "safe compounding": "safe_compounder",
     "safe_compounding": "safe_compounder",
@@ -599,11 +606,130 @@ def _refresh_market_titles(positions):
         return
 
 
-def _market_title(ticker):
-    """Return the cached English title for a ticker, or the ticker itself."""
+def _prettify_ticker(ticker: str) -> str:
+    """Turn an opaque Kalshi ticker into something a human can read.
+
+    Kalshi tickers are a series prefix plus a date/stake suffix, e.g.
+    `KXDJIA-26DEC31-54000`. When the API cannot supply the English title - the
+    markets endpoint is rate limited to the point of returning 429 under the
+    polling load this dashboard puts on it - the ticker is all the user sees, and
+    it reads as noise. This decodes the parts that are reliably decodable and
+    leaves anything it cannot explain as the original ticker rather than
+    inventing a confident wrong label.
+
+    Returns the ticker unchanged when nothing is recognisable.
+    """
     if not ticker:
         return ""
-    return dashboard_state.get("market_titles", {}).get(ticker, ticker) or ticker
+    parts = str(ticker).split("-")
+    if len(parts) < 2:
+        return str(ticker)
+
+    series = parts[0]
+    if not series.startswith("KX"):
+        return str(ticker)
+    name = series[2:]
+
+    # Date suffix: 26DEC31 -> Dec 31 2026. Also handles 26OCT021845 (15-min).
+    months = {
+        "JAN": "Jan",
+        "FEB": "Feb",
+        "MAR": "Mar",
+        "APR": "Apr",
+        "MAY": "May",
+        "JUN": "Jun",
+        "JUL": "Jul",
+        "AUG": "Aug",
+        "SEP": "Sep",
+        "OCT": "Oct",
+        "NOV": "Nov",
+        "DEC": "Dec",
+    }
+
+    def _date(raw: str) -> str:
+        m = re.match(r"^(\d{2})([A-Z]{3})(\d{1,2})$", raw or "")
+        if m and m.group(2) in months:
+            return f"{months[m.group(2)]} {int(m.group(3))} 20{m.group(1)}"
+        # Intraday: 26OCT022215 -> Oct 2 2026 22:15
+        m = re.match(r"^(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})$", raw or "")
+        if m and m.group(2) in months:
+            return (
+                f"{months[m.group(2)]} {int(m.group(3))} 20{m.group(1)}"
+                f" {m.group(4)}:{m.group(5)}"
+            )
+        return ""
+
+    # Series names Kalshi abbreviates to something unreadable.
+    series_names = {
+        "SB": "Super Bowl",
+        "NFL": "NFL",
+        "WNBA": "NBA Championship",
+        "NBAFINALS": "NBA Finals",
+        "NBA": "NBA",
+        "MLB": "MLB",
+        "NEXTTEAMNBA": "Next Team NBA",
+        "MLBW": "MLB World Series",
+        "NFLCHAMP": "NFL Championship",
+        "NFLAFCCHAMP": "NFL AFC Championship",
+        "NFLAFC": "NFL AFC",
+        "NFLCONFCHAMP": "NFL Conference Championship",
+        "DJIA": "Dow Jones Industrial Average",
+        "NASDAQ": "Nasdaq 100",
+        "SPX": "S&P 500",
+        "F1": "Formula 1",
+        "BTC15M": "BTC 15-minute",
+        "BTC": "Bitcoin",
+        "ETH": "Ethereum",
+        "GAS": "Gasoline",
+        "HIGH": "NYC high temperature",
+        "RAIN": "Rainfall",
+        "TEMP": "Temperature",
+    }
+    label_name = series_names.get(name, name)
+
+    tail = parts[1:]
+    date = ""
+    label = label_name
+    year = ""
+    for idx, tok in enumerate(tail):
+        d = _date(tok)
+        if d:
+            date = date or d
+        elif re.fullmatch(r"\d{2}", tok) and name in series_names:
+            # A bare 2-digit token on a known series is the season/year.
+            year = f"20{tok}"
+        elif re.fullmatch(r"\d{1,2}", tok):
+            # A horizon suffix (15m, 1h) carries no meaning for a human.
+            continue
+        elif tok.isdigit() and len(tok) >= 3:
+            # A strike. 54000 -> 54,000
+            label = f"{label_name} above {int(tok):,}"
+        else:
+            # A team/city code or a venue marker.
+            label = f"{label_name} · {tok}"
+
+    if year and not date:
+        date = year
+    if not label.strip(" ·"):
+        # Nothing decodable (e.g. "KX-"). Echo the ticker rather than a stub.
+        return str(ticker)
+    if date and label != label_name:
+        return f"{label} · {date}"
+    if date:
+        return f"{label_name} · {date}"
+    return label or str(ticker)
+
+
+def _market_title(ticker):
+    """Return the cached English title for a ticker, or a readable fallback."""
+    if not ticker:
+        return ""
+    cached = (dashboard_state.get("market_titles") or {}).get(ticker, "")
+    # A cached value equal to the ticker means the lookup failed; the prettifier
+    # is strictly more useful than echoing the ticker back.
+    if cached and cached != ticker:
+        return cached
+    return _prettify_ticker(ticker) or ticker
 
 
 def _monitor_loop():
@@ -894,7 +1020,7 @@ def _strategy_cards(
         # with `book` is correct and DRY strategies show as running.
         if db_mode == "paper":
             db_mode = "dry"
-        db_running = bool(db_pid) and _pid_alive(db_pid)
+        db_running = bool(db_pid) and _pid_alive(db_pid, db_row)
         running_for_this_book = db_running and db_mode == book
         cards[name] = {
             "name": name,
@@ -2996,90 +3122,21 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   </div>
 </div>
 
-<!-- DRY account: the only simulated thing in the system -->
-<div class="row two">
-  <div class="panel">
-    <div class="ph">
-      <h2>{{ 'DRY account' if s.mode.mode != 'live' else 'DRY account (paused while LIVE)' }}</h2>
+<!-- ============ feeds + account ============ -->
+<!-- Sits directly under the strategy cards and above the DRY account. The feed
+     tells you what the market is doing right now; the account tells you what the
+     book did about it. That order reads better than burying the live picture
+     under three panels of history. Collapsible because the numbers keep ticking
+     and the panel is tall. -->
+<div class="panel" id="feedsPanel" style="margin-bottom:12px">
+    <div class="ph" style="cursor:pointer" onclick="toggleFeeds()">
+      <h2>{{ 'LIVE feeds &amp; account — real money' if s.mode.mode == 'live' else 'DRY feeds &amp; account — simulated' }}</h2>
       <span class="note">
-        <span id="tDryCash">{{ '$%.2f'|format(s.mode.dry.cash) }}</span> cash
+        <span id="feedToggle" style="cursor:pointer;font-weight:600">hide</span>
+        &middot; {% if s.last_update %}synced {{ s.last_update }}{% else %}not synced yet{% endif %}
       </span>
     </div>
-    <div class="pb">
-      <dl class="kv">
-        <dt>Starting balance</dt><dd>{{ '$%.2f'|format(s.mode.dry.starting_balance) }}</dd>
-        <dt>Cash</dt><dd id="dCash">{{ '$%.2f'|format(s.mode.dry.cash) }}</dd>
-        <dt>Deployed in open positions</dt><dd id="dDeployed">{{ '$%.2f'|format(s.mode.dry.deployed) }}</dd>
-        <dt>Equity</dt><dd id="dEquity">{{ '$%.2f'|format(s.mode.dry.equity) }}</dd>
-        <dt>Realized</dt><dd id="dRealized">{{ '$%.2f'|format(s.mode.dry.realized) }}</dd>
-        <dt>Total P&amp;L vs start</dt>
-        <dd id="dPnl" class="{{ 'up' if s.mode.dry.total_pnl > 0 else ('down' if s.mode.dry.total_pnl < 0 else 'flat') }}">{{ '$%.2f'|format(s.mode.dry.total_pnl) }}</dd>
-        <dt>Return</dt><dd id="dRet">{{ s.mode.dry.return_pct }}%</dd>
-        <dt>Simulated fills</dt><dd id="dLedger">{{ s.mode.dry.ledger_entries }}</dd>
-      </dl>
-      <div class="bar" style="margin-top:12px">
-        <button onclick="resetDry()">Reset DRY account to {{ '$%.0f'|format(s.mode.dry.starting_balance) }}</button>
-        <span id="dryStatus" style="font-size:11px;color:var(--faint)"></span>
-      </div>
-      <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
-        Prices, markets and P&amp;L inputs are the real production API. Only the
-        order fill and the cash ledger are simulated, so the DRY book exercises
-        the same code path as LIVE without spending money.
-      </p>
-    </div>
-  </div>
-
-  <div class="panel">
-    <div class="ph">
-      <h2>Funding source</h2>
-      <span class="note">{{ 'real Kalshi account' if live else 'DRY account &middot; simulated cash' }}</span>
-    </div>
-    <div class="pb">
-      <dl class="kv">
-        {% if live %}
-        <dt>API connection</dt>
-        <dd>{% if s.mode.funding.get('connected') %}<span class="pill ok">connected</span>{% else %}<span class="pill no">offline</span>{% endif %}</dd>
-        <dt>Available balance</dt><dd id="fBalance">{{ '$%.2f'|format(s.mode.funding.get('balance', 0) or 0) }}</dd>
-        <dt>Can fund an order</dt>
-        <dd>{% if s.mode.funding.get('can_fund') %}<span class="pill ok">yes</span>{% else %}<span class="pill no">no</span>{% endif %}</dd>
-        {% else %}
-        <dt>Source</dt>
-        <dd><span class="pill ok">simulated ledger</span></dd>
-        <dt>DRY cash available</dt><dd id="fBalance">{{ '$%.2f'|format(s.mode.dry_funding.get('balance', 0) or 0) }}</dd>
-        <dt>Can fund an order</dt>
-        <dd>{% if s.mode.dry_funding.get('can_fund') %}<span class="pill ok">yes</span>{% else %}<span class="pill no">no</span>{% endif %}</dd>
-        {% endif %}
-      </dl>
-      {% if not live and s.mode.dry_funding.get('reason') %}
-      <div class="note-box" style="margin-top:12px"><b>DRY cannot place orders:</b> {{ s.mode.dry_funding.get('reason') }}</div>
-      {% elif live and s.mode.funding.get('reason') %}
-      <div class="note-box" style="margin-top:12px"><b>Cannot trade LIVE:</b> {{ s.mode.funding.get('reason') }}</div>
-      {% elif not live %}
-      <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
-        This is the DRY book's own money: the simulated ledger that starts at
-        {{ '$%.2f'|format(s.mode.dry.starting_balance) }}. The real Kalshi balance is
-        never spent while the switch reads DRY.
-      </p>
-      {% endif %}
-    </div>
-  </div>
-</div>
-
-{% if not s.public_domain %}
-<div class="note-box" style="margin-bottom:14px">
-  <b>Heads up:</b> you are viewing this over a hostname other than the Railway public domain.
-  The canonical address is <code>kalshi-frigo-production.up.railway.app</code> &mdash;
-  <code>kalshi-frigo.up.railway.app</code> does not exist, because Railway always names
-  service domains <code>&lt;service&gt;-&lt;environment&gt;.up.railway.app</code>.
-</div>
-{% endif %}
-
-<!-- ============ feeds + account ============ -->
-<div class="panel" style="margin-bottom:12px">
-  <div class="ph">
-    <h2>{{ 'LIVE feeds &amp; account — real money' if s.mode.mode == 'live' else 'DRY feeds &amp; account — simulated' }}</h2>
-    <span class="note" id="feedNote">streaming</span>
-  </div>
+  <div id="feedsBody">
   <div class="pb">
     <div class="row three">
       <div class="card" style="cursor:default">
@@ -3181,7 +3238,86 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
       </dl>
     </div>
   </div>
+  </div>
 </div>
+
+<!-- DRY account: the only simulated thing in the system -->
+<div class="row two">
+  <div class="panel">
+    <div class="ph">
+      <h2>{{ 'DRY account' if s.mode.mode != 'live' else 'DRY account (paused while LIVE)' }}</h2>
+      <span class="note">
+        <span id="tDryCash">{{ '$%.2f'|format(s.mode.dry.cash) }}</span> cash
+      </span>
+    </div>
+    <div class="pb">
+      <dl class="kv">
+        <dt>Starting balance</dt><dd>{{ '$%.2f'|format(s.mode.dry.starting_balance) }}</dd>
+        <dt>Cash</dt><dd id="dCash">{{ '$%.2f'|format(s.mode.dry.cash) }}</dd>
+        <dt>Deployed in open positions</dt><dd id="dDeployed">{{ '$%.2f'|format(s.mode.dry.deployed) }}</dd>
+        <dt>Equity</dt><dd id="dEquity">{{ '$%.2f'|format(s.mode.dry.equity) }}</dd>
+        <dt>Realized</dt><dd id="dRealized">{{ '$%.2f'|format(s.mode.dry.realized) }}</dd>
+        <dt>Total P&amp;L vs start</dt>
+        <dd id="dPnl" class="{{ 'up' if s.mode.dry.total_pnl > 0 else ('down' if s.mode.dry.total_pnl < 0 else 'flat') }}">{{ '$%.2f'|format(s.mode.dry.total_pnl) }}</dd>
+        <dt>Return</dt><dd id="dRet">{{ s.mode.dry.return_pct }}%</dd>
+        <dt>Simulated fills</dt><dd id="dLedger">{{ s.mode.dry.ledger_entries }}</dd>
+      </dl>
+      <div class="bar" style="margin-top:12px">
+        <button onclick="resetDry()">Reset DRY account to {{ '$%.0f'|format(s.mode.dry.starting_balance) }}</button>
+        <span id="dryStatus" style="font-size:11px;color:var(--faint)"></span>
+      </div>
+      <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
+        Prices, markets and P&amp;L inputs are the real production API. Only the
+        order fill and the cash ledger are simulated, so the DRY book exercises
+        the same code path as LIVE without spending money.
+      </p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="ph">
+      <h2>Funding source</h2>
+      <span class="note">{{ 'real Kalshi account' if live else 'DRY account &middot; simulated cash' }}</span>
+    </div>
+    <div class="pb">
+      <dl class="kv">
+        {% if live %}
+        <dt>API connection</dt>
+        <dd>{% if s.mode.funding.get('connected') %}<span class="pill ok">connected</span>{% else %}<span class="pill no">offline</span>{% endif %}</dd>
+        <dt>Available balance</dt><dd id="fBalance">{{ '$%.2f'|format(s.mode.funding.get('balance', 0) or 0) }}</dd>
+        <dt>Can fund an order</dt>
+        <dd>{% if s.mode.funding.get('can_fund') %}<span class="pill ok">yes</span>{% else %}<span class="pill no">no</span>{% endif %}</dd>
+        {% else %}
+        <dt>Source</dt>
+        <dd><span class="pill ok">simulated ledger</span></dd>
+        <dt>DRY cash available</dt><dd id="fBalance">{{ '$%.2f'|format(s.mode.dry_funding.get('balance', 0) or 0) }}</dd>
+        <dt>Can fund an order</dt>
+        <dd>{% if s.mode.dry_funding.get('can_fund') %}<span class="pill ok">yes</span>{% else %}<span class="pill no">no</span>{% endif %}</dd>
+        {% endif %}
+      </dl>
+      {% if not live and s.mode.dry_funding.get('reason') %}
+      <div class="note-box" style="margin-top:12px"><b>DRY cannot place orders:</b> {{ s.mode.dry_funding.get('reason') }}</div>
+      {% elif live and s.mode.funding.get('reason') %}
+      <div class="note-box" style="margin-top:12px"><b>Cannot trade LIVE:</b> {{ s.mode.funding.get('reason') }}</div>
+      {% elif not live %}
+      <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
+        This is the DRY book's own money: the simulated ledger that starts at
+        {{ '$%.2f'|format(s.mode.dry.starting_balance) }}. The real Kalshi balance is
+        never spent while the switch reads DRY.
+      </p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+{% if not s.public_domain %}
+<div class="note-box" style="margin-bottom:14px">
+  <b>Heads up:</b> you are viewing this over a hostname other than the Railway public domain.
+  The canonical address is <code>kalshi-frigo-production.up.railway.app</code> &mdash;
+  <code>kalshi-frigo.up.railway.app</code> does not exist, because Railway always names
+  service domains <code>&lt;service&gt;-&lt;environment&gt;.up.railway.app</code>.
+</div>
+{% endif %}
 
 {% if s.errors %}
 <div class="panel" style="margin-bottom:12px">
@@ -4146,6 +4282,28 @@ async function stopAll() {
   for (const n of names) await toggleStrategy(n, true);
   note('stopped: ' + (names.join(', ') || 'nothing was running'));
 }
+
+// Collapse the live feed panel. It is tall and its numbers tick continuously,
+// so it earns the right to be folded away once you have read it.
+function toggleFeeds() {
+  const body = $('feedsBody');
+  const label = $('feedToggle');
+  if (!body) return;
+  const nowHidden = body.style.display === 'none';
+  body.style.display = nowHidden ? '' : 'none';
+  if (label) label.textContent = nowHidden ? 'hide' : 'show';
+  try { localStorage.setItem('feedsHidden', nowHidden ? '0' : '1'); } catch (e) {}
+}
+(function restoreFeeds() {
+  let hidden = null;
+  try { hidden = localStorage.getItem('feedsHidden'); } catch (e) {}
+  if (hidden === '1') {
+    const body = $('feedsBody');
+    const label = $('feedToggle');
+    if (body) body.style.display = 'none';
+    if (label) label.textContent = 'show';
+  }
+})();
 
 // --- init ---
 // Live data first, and never let a chart library take the page down with it.

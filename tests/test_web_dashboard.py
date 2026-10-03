@@ -2042,17 +2042,32 @@ def test_websocket_iterator_does_not_use_the_missing_messages_attribute():
 # The page order the operator asked for: ENGINE tiles on top, DRY account under
 # them, the live-feeds row under that. Everything else follows.
 # ---------------------------------------------------------------------------
-def test_page_order_tiles_then_account_then_feeds(client):
+def test_page_order_tiles_then_feeds_then_account(client):
+    """Feeds moved under the strategy cards, above the DRY account.
+
+    The live picture of what the market is doing belongs next to the cards, not
+    three panels down beneath the account history.
+    """
     html = client.get("/").get_data(as_text=True)
     order = [
         html.index('<div class="tiles">'),
-        html.index("<!-- DRY account"),
-        html.index("<!-- ============ feeds + account"),
-        html.index("<!-- ============ readiness"),
+        html.index('id="feedsPanel"'),
+        html.index('id="tDryCash"'),
     ]
-    assert order == sorted(order), "tiles -> DRY account -> feeds -> readiness"
-    # The feeds row must sit between the account row and readiness.
-    assert html.index('id="spotChart"') > html.index("<!-- DRY account")
+    assert order == sorted(order), "tiles -> feeds -> DRY account"
+    # The feed charts must render above the account row.
+    assert html.index('id="spotChart"') > html.index('<div class="tiles">')
+    assert html.index('id="spotChart"') < html.index('id="tDryCash"')
+
+
+def test_the_feeds_panel_can_be_collapsed(client):
+    """A tall panel whose numbers tick every 5s needs a way out of the way."""
+    html = client.get("/").get_data(as_text=True)
+    assert 'id="feedsPanel"' in html
+    assert 'id="feedsBody"' in html
+    assert 'id="feedToggle"' in html
+    assert "function toggleFeeds()" in html
+    assert "feedsHidden" in html  # the choice survives a reload
 
 
 def test_dry_page_funding_card_is_the_simulated_account(client, monkeypatch):
