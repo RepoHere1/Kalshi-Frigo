@@ -2766,7 +2766,7 @@ pre{
 }
 .note-box b{color:var(--amber)}
 /* strategy cards: one per strategy, each with its own persistent curve */
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(258px,1fr));gap:10px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:12px}
 .row.three{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}
 .card{
   background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:11px 12px;
@@ -2778,6 +2778,9 @@ pre{
 .clabel{font-size:13px;font-weight:650}
 .cname{font-size:10.5px;color:var(--faint);margin-top:1px}
 .cchart{height:54px;margin:8px 0 6px}
+/* Strategy cards get a taller curve than the compact feed cards - the per-card
+   P&L line is the reason to open a card, and at 54px it was unreadable. */
+.cards .cchart{height:104px;margin:10px 0 8px}
 .cstats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;text-align:center}
 .cstats b{display:block;font-size:13px;font-weight:640}
 .cstats span{font-size:9.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.04em}
@@ -2941,7 +2944,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
           </div>
           <span class="pill {{ 'ok' if c.running else 'no' }}" id="pill-{{ c.name }}">{% if c.running %}<span class="dot pulse"></span>running{% elif c.stop_reason %}stopped{% else %}not started{% endif %}</span>
         </div>
-        <div class="cchart"><canvas id="spark-{{ c.name }}" height="54"></canvas></div>
+        <div class="cchart"><canvas id="spark-{{ c.name }}" height="104"></canvas></div>
         <div class="cstats">
           <div><b id="c-{{ c.name }}-trades">{{ c.trades }}</b><span>trades</span></div>
           <div><b id="c-{{ c.name }}-pnl" class="{{ 'up' if c.realized > 0 else ('down' if c.realized < 0 else 'flat') }}">${{ '%.2f'|format(c.realized) }}</b><span>realized</span></div>
@@ -3772,6 +3775,7 @@ function drawChart() {
   if (typeof Chart === 'undefined') return;
   const ctx = $('pnlChart');
   if (!ctx) return;
+  if (typeof Chart === 'undefined') return;
   if (chart) chart.destroy();
   const flat = !EQUITY.pn.length;
   chart = new Chart(ctx, {
@@ -3818,6 +3822,7 @@ function drawFeed(id, labels, datasets, opts) {
       },
     }, opts || {}),
   };
+  if (typeof Chart === 'undefined') return;
   if (feedCharts[id]) { feedCharts[id].destroy(); }
   feedCharts[id] = new Chart(ctx, cfg);
 }
@@ -3955,6 +3960,7 @@ function drawSparks(cards) {
   (cards || SNAPSHOT.strategy_cards || []).forEach(c => {
     const ctx = $('spark-' + c.name);
     if (!ctx) return;
+    if (typeof Chart === 'undefined') return;
     if (sparks[c.name]) sparks[c.name].destroy();
     const flat = !(c.equity && c.equity.pnl.length);
     sparks[c.name] = new Chart(ctx, {
@@ -4100,18 +4106,43 @@ async function stopAll() {
 }
 
 // --- init ---
-drawChart();
-drawSparks();
-paintMarket({{ (m | tojson) }});
-paintAccount({{ (acct | tojson) }});
-loadLogs();
-paintMode({ mode: SNAPSHOT.mode.mode });
-refresh();
-refreshFeeds();
+// Live data first, and never let a chart library take the page down with it.
+//
+// Chart.js comes from a CDN. If that request is slow, blocked by a proxy or an
+// ad blocker, or simply offline, `Chart` is undefined and the first `new Chart`
+// threw - which aborted this whole script *before* the feed polling below was
+// registered. The result was a page whose prices stayed on their hardcoded
+// "connecting..." / "--" defaults forever even though /api/marketdata was
+// serving live data the whole time.
+//
+// So: register the pollers first, make every chart call conditional, and run
+// the renderers independently so one failure cannot silence the rest.
+const CHARTS_OK = typeof Chart !== 'undefined';
+if (!CHARTS_OK) {
+  console.warn('Chart.js unavailable - charts disabled, live data still updating.');
+}
+function safeDraw(fn, label) {
+  if (!CHARTS_OK) return;
+  try { fn(); } catch (e) { console.warn('chart ' + label + ' failed', e); }
+}
+function safeRun(fn, label) {
+  try { fn(); } catch (e) { console.warn(label + ' failed', e); }
+}
+
+// Pollers are registered before anything can throw.
 setInterval(refresh, 10000);
 setInterval(loadLogs, 30000);
 setInterval(refreshFeeds, 5000);
 setInterval(tickClock, 500);
+
+safeDraw(drawChart, 'account');
+safeDraw(drawSparks, 'sparks');
+safeRun(() => paintMarket({{ (m | tojson) }}), 'paintMarket');
+safeRun(() => paintAccount({{ (acct | tojson) }}), 'paintAccount');
+safeRun(loadLogs, 'loadLogs');
+safeRun(() => paintMode({ mode: SNAPSHOT.mode.mode }), 'paintMode');
+safeRun(refresh, 'refresh');
+safeRun(refreshFeeds, 'refreshFeeds');
 </script>
 </body>
 </html>

@@ -2076,3 +2076,38 @@ def test_start_all_button_label_follows_the_book(client):
     btn = html.split('id="startAllBtn"', 1)[1].split("</button>", 1)[0]
     assert "Start all in DRY" in btn
     assert "LIVE" not in btn
+
+
+def test_live_feeds_do_not_depend_on_the_chart_cdn():
+    """Chart.js failing must not silence the price feeds.
+
+    Chart.js is loaded from a CDN. When that request was blocked or slow, `Chart`
+    was undefined, the first `new Chart` threw, and it aborted the init script
+    before `setInterval(refreshFeeds, 5000)` was ever registered - so the feed
+    panel sat on its hardcoded "connecting..." / "--" defaults indefinitely while
+    /api/marketdata served live data throughout. Every `new Chart` is now guarded
+    and the pollers are registered first."""
+    html = wd.app.test_client().get("/").get_data(as_text=True)
+
+    # Pollers must be scheduled before the first chart is constructed.
+    init = html[html.index("// --- init ---") :]
+    assert init.index("setInterval(refreshFeeds, 5000)") < init.index("safeDraw(drawChart")
+
+    # Every construction site is conditional on the library existing.
+    assert html.count("typeof Chart === 'undefined'") >= 3
+    assert "const CHARTS_OK = typeof Chart !== 'undefined';" in html
+
+    # No unguarded construction or unguarded renderer is left on the init path.
+    assert "safeDraw(drawChart, 'account')" in init
+    assert "safeDraw(drawSparks, 'sparks')" in init
+    assert "\ndrawChart();" not in init
+    assert init.count("new Chart(") == 0
+
+
+def test_strategy_cards_are_wide_enough_to_read_their_curve():
+    """Cards were 258px wide with a 54px curve - too small to see a P&L line."""
+
+    html = wd.app.test_client().get("/").get_data(as_text=True)
+    assert "minmax(430px,1fr)" in html
+    assert ".cards .cchart{height:104px" in html
+    assert 'id="spark-' in html and 'height="104"' in html
