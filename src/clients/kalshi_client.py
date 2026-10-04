@@ -228,13 +228,48 @@ class KalshiClient(TradingLoggerMixin):
             params["ticker"] = ticker
         return await self._make_authenticated_request("GET", "/trade-api/v2/portfolio/positions", params=params)
     
-    async def get_fills(self, ticker: Optional[str] = None, limit: int = 100) -> Dict[str, Any]:
-        """Get order fills.""" 
-        params = {"limit": limit}
+    async def get_fills(
+        self,
+        ticker: Optional[str] = None,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get order fills, optionally continuing from a pagination cursor.
+
+        `limit` caps at 1000 server-side, and the endpoint defaults to 100 rows, so
+        a caller that needs the full history has to follow `cursor` or it silently
+        reads a truncated account.
+        """
+        params: Dict[str, Any] = {"limit": limit}
         if ticker:
             params["ticker"] = ticker
+        if cursor:
+            params["cursor"] = cursor
         return await self._make_authenticated_request("GET", "/trade-api/v2/portfolio/fills", params=params)
     
+    async def get_settlements(
+        self,
+        ticker: Optional[str] = None,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get settlement records for markets that have resolved.
+
+        This is the only endpoint that reports a completed round trip in full:
+        `/portfolio/positions` describes what is still held, so a market that has
+        settled and rolled off contributes nothing there, while `/portfolio/settlements`
+        reports its cost basis, revenue and fees. Account-level realized P&L cannot
+        be derived from positions alone.
+        """
+        params: Dict[str, Any] = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if cursor:
+            params["cursor"] = cursor
+        return await self._make_authenticated_request(
+            "GET", "/trade-api/v2/portfolio/settlements", params=params
+        )
+
     async def get_orders(self, ticker: Optional[str] = None, status: Optional[str] = None) -> Dict[str, Any]:
         """Get orders."""
         params = {}

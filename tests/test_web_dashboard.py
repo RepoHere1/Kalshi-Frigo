@@ -26,6 +26,16 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setitem(wd.dashboard_state, "errors", [])
     monkeypatch.setitem(wd.dashboard_state, "positions", [])
+    # The fill/settlement ledger is process-level state like the positions list,
+    # so a test that installs one would otherwise leak it into the next test and
+    # make the realized-P&L tile appear populated at random.
+    monkeypatch.setitem(wd.dashboard_state, "ledger", None)
+    # The snapshot memo is process-level too, and it caches the rendered payload
+    # rather than the inputs. Without this, a test that mutates dashboard_state and
+    # then reads /api/snapshot gets the *previous* test's payload back, so state
+    # changes appear to have no effect depending on test order.
+    monkeypatch.setitem(wd._SNAPSHOT_CACHE, "payload", None)
+    monkeypatch.setitem(wd._SNAPSHOT_CACHE, "at", 0.0)
     monkeypatch.setenv("DASHBOARD_TOKEN", TEST_TOKEN)
     with wd.app.test_client() as c:
         yield c
@@ -230,10 +240,16 @@ def test_kalshi_account_normalises_both_shapes(client, auth, monkeypatch):
     assert k["event_count"] == 1
     # Decimal strings must become floats, not stay as text.
     assert k["exposure"] == 1.85
-    assert k["cost_basis"] == 7.03
-    assert k["realized"] == 0.30  # 0.33 - 0.026
-    assert k["fees"] == 0.06  # 0.005 + 0.0506
     assert k["traded"] == 9.4
+    # With no fill/settlement history there is no account-wide total to report,
+    # and the tile must say so rather than quote the positions-row sum.
+    assert k["realized_known"] is False
+    assert k["realized"] == 0.0
+    assert k["fees"] == 0.0
+    assert k["cost_basis"] == 0.0
+    # The per-market figures are still correct and kept for the position tables.
+    assert k["positions_realized"] == 0.30  # 0.33 - 0.026
+    assert k["positions_fees"] == 0.06  # 0.005 + 0.0506
 
 
 def test_a_dry_snapshot_carries_no_real_account_data(client):
@@ -506,7 +522,7 @@ def test_fetch_kalshi_data_skips_network_without_credentials(client, monkeypatch
     import src.clients.kalshi_client as kc
 
     monkeypatch.setattr(kc, "KalshiClient", explode)
-    assert wd._run_async(wd._fetch_kalshi_data()) == (None, None)
+    assert wd._run_async(wd._fetch_kalshi_data()) == (None, None, [], [])
 
 
 def test_status_reports_uptime_and_db(client):
@@ -2343,3 +2359,263 @@ def test_dry_page_does_not_point_at_a_panel_it_does_not_render(client):
         gen.close()
     assert "Real Kalshi account" not in html
     assert "panel below" not in html
+
+
+# ---------------------------------------------------------------------------
+# The LIVE realized-P&L tile
+#
+# It used to sum `realized_pnl_dollars` over /portfolio/positions, which only
+# describes markets still held. Kalshi drops a ticker from that list once it
+# settles, taking its realized P&L with it, so the total reported the P&L of open
+# markets only: it read a fixed $11.54 that never moved while trades opened and
+# closed underneath it, next to a cost basis of $1144.22 and an exposure of $3.84
+# that could not both be true. The totals now come from the fill and settlement
+# history, which is complete by construction.
+# ---------------------------------------------------------------------------
+
+FILL_BUY_YES = {
+    "ticker": "KXBTC15M-TEST",
+    "outcome_side": "yes",
+    "book_side": "bid",
+    "count_fp": "10.00",
+    "yes_price_dollars": "0.400000",
+    "no_price_dollars": "0.600000",
+    "fee_cost": "0.010000",
+}
+FILL_SELL_YES = {
+    "ticker": "KXBTC15M-TEST",
+    "outcome_side": "yes",
+    "book_side": "ask",
+    "count_fp": "10.00",
+    "yes_price_dollars": "0.550000",
+    "no_price_dollars": "0.450000",
+    "fee_cost": "0.010000",
+}
+
+
+def test_a_sold_position_realizes_from_the_fills():
+    """Bought at 0.40, sold at 0.55 on 10 contracts = +1.50."""
+    led = wd._kalshi_ledger([FILL_BUY_YES, FILL_SELL_YES], [])
+    assert led["realized"] == pytest.approx(1.50, abs=0.01)
+    assert led["fees"] == pytest.approx(0.02, abs=0.001)
+    # Everything bought was sold, so nothing is still deployed.
+    assert led["cost_basis"] == pytest.approx(0.0, abs=0.01)
+
+
+def test_realized_follows_a_settled_market_that_positions_no_longer_lists():
+    """The regression: a settled ticker's P&L must still count.
+
+    `positions` has no row for it, which is exactly why the old sum went stale.
+    """
+    settlement = {
+        "ticker": "KXOLD-TEST",
+        "market_result": "yes",
+        "yes_count_fp": "10.00",
+        "yes_total_cost_dollars": "4.000000",
+        "no_count_fp": "0.00",
+        "no_total_cost_dollars": "0.000000",
+        "revenue": 1000,  # integer cents: 10 winners at 100c
+        "fee_cost": "0.020000",
+    }
+    buy = dict(FILL_BUY_YES, ticker="KXOLD-TEST")
+    led = wd._kalshi_ledger([buy], [settlement])
+    # 10.00 revenue - 4.00 cost = +6.00, and it is not zero just because the
+    # market is gone from the positions list.
+    assert led["realized"] == pytest.approx(6.00, abs=0.01)
+    assert led["settlements_counted"] == 1
+
+
+def test_a_losing_settlement_is_reported_as_a_loss():
+    settlement = {
+        "ticker": "KXOLD-TEST",
+        "market_result": "no",
+        "yes_count_fp": "10.00",
+        "yes_total_cost_dollars": "4.000000",
+        "no_count_fp": "0.00",
+        "no_total_cost_dollars": "0.000000",
+        "revenue": 0,
+        "fee_cost": "0.000000",
+    }
+    led = wd._kalshi_ledger([dict(FILL_BUY_YES, ticker="KXOLD-TEST")], [settlement])
+    assert led["realized"] == pytest.approx(-4.00, abs=0.01)
+
+
+def test_open_cost_basis_is_what_is_still_deployed():
+    """Bought 20, sold 10: 10 shares' worth of capital is still at work."""
+    bigger_buy = dict(FILL_BUY_YES, count_fp="20.00")
+    led = wd._kalshi_ledger([bigger_buy, FILL_SELL_YES], [])
+    assert led["cost_basis"] == pytest.approx(4.00, abs=0.01)
+    assert led["realized"] == pytest.approx(1.50, abs=0.01)
+
+
+def test_buying_a_no_fill_prices_off_the_no_leg():
+    """A NO fill costs `no_price_dollars`, not the YES price.
+
+    Reading the wrong leg is a ~2x error on every NO trade, and this strategy
+    takes NO clips whenever spot sits below the target.
+    """
+    no_fill = {
+        "ticker": "KXNO-TEST",
+        "outcome_side": "no",
+        "book_side": "bid",
+        "count_fp": "10.00",
+        "yes_price_dollars": "0.600000",
+        "no_price_dollars": "0.400000",
+        "fee_cost": "0.000000",
+    }
+    led = wd._kalshi_ledger([no_fill], [])
+    assert led["cost_basis"] == pytest.approx(4.00, abs=0.01)
+
+
+def test_selling_no_is_a_sale_and_reduces_cost_basis():
+    """`outcome_side: no` + `book_side: ask` is selling NO, i.e. money in.
+
+    outcome_side alone does not carry direction - the pair does. Reading it as a
+    purchase would understate cost basis and invent a loss.
+    """
+    buy = {
+        "ticker": "KXNO-TEST",
+        "outcome_side": "no",
+        "book_side": "bid",
+        "count_fp": "10.00",
+        "yes_price_dollars": "0.600000",
+        "no_price_dollars": "0.400000",
+        "fee_cost": "0.000000",
+    }
+    sell = dict(buy, book_side="ask", yes_price_dollars="0.550000", no_price_dollars="0.450000")
+    led = wd._kalshi_ledger([buy, sell], [])
+    assert led["realized"] == pytest.approx(0.50, abs=0.01)
+    assert led["cost_basis"] == pytest.approx(0.0, abs=0.01)
+
+
+def test_the_legacy_action_field_is_still_honoured():
+    """Older payloads predate book_side; action is deprecated but not absent."""
+    legacy = {
+        "ticker": "KXLEG-TEST",
+        "action": "buy",
+        "side": "yes",
+        "count_fp": "10.00",
+        "yes_price_dollars": "0.400000",
+        "fee_cost": "0.000000",
+    }
+    led = wd._kalshi_ledger([legacy], [])
+    assert led["cost_basis"] == pytest.approx(4.00, abs=0.01)
+
+
+def test_an_unusable_fill_is_skipped_rather_than_guessed():
+    """A row with no ticker or no direction must not silently become money."""
+    led = wd._kalshi_ledger(
+        [
+            {"count_fp": "10.00", "yes_price_dollars": "0.400000"},  # no ticker
+            {"ticker": "KX", "count_fp": "10.00", "yes_price_dollars": "0.4"},  # no direction
+            {"ticker": "KX", "book_side": "bid", "count_fp": "0", "yes_price_dollars": "0.4"},
+            FILL_BUY_YES,
+        ],
+        [],
+    )
+    assert led["fills_counted"] == 1
+    assert led["cost_basis"] == pytest.approx(4.00, abs=0.01)
+
+
+def test_junk_rows_do_not_crash_the_ledger():
+    led = wd._kalshi_ledger(["nope", None, {}], ["nope", None])
+    assert led["realized"] == 0.0
+    assert led["fills_counted"] == 0
+
+
+def test_realized_pnl_is_not_sourced_from_open_positions(client, auth, monkeypatch):
+    """The tile must not quote the positions-row sum as the account's P&L."""
+    _go_live(client, auth, monkeypatch)
+    monkeypatch.setitem(
+        wd.dashboard_state,
+        "ledger",
+        wd._kalshi_ledger([FILL_BUY_YES, FILL_SELL_YES], []),
+    )
+    gen = _load_kalshi(client)
+    next(gen)
+    try:
+        snap = client.get("/api/snapshot").get_json()
+    finally:
+        gen.close()
+    k = snap["kalshi"]
+    # The positions rows claim 0.30; the fills say 1.50. The fills win.
+    assert k["positions_realized"] == pytest.approx(0.30, abs=0.01)
+    assert k["realized"] == pytest.approx(1.50, abs=0.01)
+    assert k["realized_known"] is True
+
+
+def test_the_tile_says_na_rather_than_zero_when_history_is_missing(client, auth, monkeypatch):
+    """A $0.00 realized P&L would read as break-even. It must read as unknown."""
+    _go_live(client, auth, monkeypatch)
+    monkeypatch.setitem(wd.dashboard_state, "ledger", None)
+    # The monitor thread syncs Kalshi on its own interval and would repopulate the
+    # ledger between the request and the assertion.
+    monkeypatch.setattr(wd, "_refresh_kalshi", lambda: None)
+    gen = _load_kalshi(client)
+    next(gen)
+    try:
+        snap = client.get("/api/snapshot").get_json()
+        html = client.get("/").get_data(as_text=True)
+    finally:
+        gen.close()
+    assert snap["kalshi"]["realized_known"] is False
+    tile = html.split('id="tKalshiPnl"', 1)[1].split("</div>", 1)[0]
+    assert "n/a" in tile
+    assert "$0.00" not in tile
+
+
+def test_a_failed_history_fetch_keeps_the_balance_and_positions(client, monkeypatch):
+    """The history is an enhancement; losing it must not blank the account panel.
+
+    Fills and settlements are fetched after the client that served balance and
+    positions has already been closed, so a failure there has to degrade only the
+    realized-P&L tile. Taking the account panel down with it would leave the page
+    unreadable for a figure that is merely unavailable.
+    """
+    import src.clients.kalshi_client as kc
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def get_balance(self):
+            return {"balance": 5000}
+
+        async def get_positions(self):
+            return {"market_positions": [dict(KALSHI_MARKET_POSITION)], "event_positions": []}
+
+        async def get_fills(self, **kw):
+            raise RuntimeError("history exploded")
+
+        async def get_settlements(self, **kw):
+            raise RuntimeError("history exploded")
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(kc, "KalshiClient", FakeClient)
+    monkeypatch.setattr(wd, "kalshi_configured", lambda: True)
+    monkeypatch.setattr(wd, "materialize_private_key", lambda: "key.pem")
+
+    balance, positions, fills, settlements = wd._run_async(wd._fetch_kalshi_data())
+    # The account panel still has what it needs.
+    assert wd._normalise_balance(balance)["balance"] == 5000
+    assert positions["market_positions"]
+    assert (fills, settlements) == ([], [])
+    assert any("history exploded" in str(e.get("error")) for e in wd.dashboard_state["errors"])
+
+
+def test_an_unreachable_history_leaves_the_tally_unknown_not_zero(client, auth, monkeypatch):
+    """No history means the tile says so; it must never read as break-even."""
+    _go_live(client, auth, monkeypatch)
+    monkeypatch.setitem(wd.dashboard_state, "ledger", None)
+    monkeypatch.setattr(wd, "_refresh_kalshi", lambda: None)
+    gen = _load_kalshi(client)
+    next(gen)
+    try:
+        k = client.get("/api/snapshot").get_json()["kalshi"]
+    finally:
+        gen.close()
+    assert k["realized_known"] is False
+    assert k["realized"] == 0.0
+    assert k["cost_basis"] == 0.0

@@ -32,7 +32,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional, cast
+from typing import Any, Deque, Dict, List, Optional, Tuple, cast
 
 from flask import Flask, jsonify, render_template_string, request
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -93,6 +93,7 @@ dashboard_state = {
     "events": [],
     "db_positions_count": 0,
     "kalshi_position_count": 0,
+    "ledger": None,
     "market": {},
     "market_titles": {},
 }
@@ -354,17 +355,59 @@ def kalshi_configured():
     return (BASE_DIR / "kalshi_private_key.pem").exists()
 
 
+# Page cap for the fills/settlements history walk. Kalshi's fills endpoint is
+# cursor-paged and defaults to 100 rows, so a single page would silently truncate
+# a busy account's history and understate realized P&L - the same class of bug as
+# reading only open positions. Bounded so a large history cannot stall the sync.
+_LEDGER_MAX_PAGES = 20
+_LEDGER_PAGE_SIZE = 1000
+
+
+async def _fetch_all_fills(client) -> List[Dict[str, Any]]:
+    """Every fill the account has, following the cursor to the end of the history."""
+    out: List[Dict[str, Any]] = []
+    cursor = ""
+    for _ in range(_LEDGER_MAX_PAGES):
+        page = await client.get_fills(cursor=cursor or None, limit=_LEDGER_PAGE_SIZE)
+        rows = page.get("fills") or [] if isinstance(page, dict) else []
+        out.extend(r for r in rows if isinstance(r, dict))
+        cursor = str((page or {}).get("cursor") or "") if isinstance(page, dict) else ""
+        if not rows or not cursor:
+            break
+    return out
+
+
+async def _fetch_all_settlements(client) -> List[Dict[str, Any]]:
+    """Every settlement still in the live data set, following the cursor."""
+    out: List[Dict[str, Any]] = []
+    cursor = ""
+    for _ in range(_LEDGER_MAX_PAGES):
+        page = await client.get_settlements(cursor=cursor or None, limit=_LEDGER_PAGE_SIZE)
+        rows = page.get("settlements") or [] if isinstance(page, dict) else []
+        out.extend(r for r in rows if isinstance(r, dict))
+        cursor = str((page or {}).get("cursor") or "") if isinstance(page, dict) else ""
+        if not rows or not cursor:
+            break
+    return out
+
+
 async def _fetch_kalshi_data():
-    """Fetch balance and positions from the Kalshi API."""
+    """Fetch balance, positions, fills and settlements from the Kalshi API.
+
+    The history endpoints are fetched in their own try/except so a failure there
+    degrades the account panel's realized P&L to "unknown" instead of taking the
+    balance and position count down with it. Those two are what the page needs to
+    be worth reading at all.
+    """
     from src.clients.kalshi_client import KalshiClient
 
     if not kalshi_configured():
-        return None, None
+        return None, None, [], []
     try:
         key_path = materialize_private_key()
     except OSError as e:
         _push_error(f"Kalshi key material: {e}")
-        return None, None
+        return None, None, [], []
 
     # KalshiClient's constructor is eager: it loads the PEM and raises if it is
     # missing, so it must never be built when the key is unavailable. There is no
@@ -373,17 +416,33 @@ async def _fetch_kalshi_data():
         client = KalshiClient(private_key_path=key_path) if key_path else KalshiClient()
     except Exception as e:
         _push_error(f"Kalshi client init: {e}")
-        return None, None
+        return None, None, [], []
 
     try:
         balance = await client.get_balance()
         positions = await client.get_positions()
-        return balance, _normalise_positions(positions)
     except Exception as e:
         _push_error(f"Kalshi fetch: {e}")
-        return None, None
+        return None, None, [], []
     finally:
         await client.close()
+
+    fills: List[Dict[str, Any]] = []
+    settlements: List[Dict[str, Any]] = []
+    try:
+        # Rebuilt for the history walk: the client above is already closed, and
+        # constructing a second one is cheaper than holding the first open across
+        # the extra paginated requests.
+        client = KalshiClient(private_key_path=key_path) if key_path else KalshiClient()
+        try:
+            fills = await _fetch_all_fills(client)
+            settlements = await _fetch_all_settlements(client)
+        finally:
+            await client.close()
+    except Exception as e:  # noqa: BLE001 - the balance/positions result still stands
+        _push_error(f"Kalshi history: {e}")
+
+    return balance, _normalise_positions(positions), fills, settlements
 
 
 def _normalise_balance(payload: Any) -> Dict[str, Any]:
@@ -436,6 +495,168 @@ def _normalise_positions(payload: Any) -> Dict[str, Any]:
                 markets.append(row)
         return {"market_positions": markets, "event_positions": events}
     return {}
+
+
+def _fill_side_and_price(fill: Dict[str, Any]) -> Tuple[str, float]:
+    """(direction, unit price) for one fill, in dollars.
+
+    Kalshi quotes everything from the YES side, and the canonical fields are
+    `outcome_side` (which outcome you end up holding) and `book_side` (bid = buy,
+    ask = sell). The legacy `action` field is deprecated and its removal was
+    scheduled, so it is only a fallback.
+
+    Getting the sign wrong here is not cosmetic: `outcome_side` alone does not
+    say whether the fill added or removed exposure. `outcome_side: no` describes
+    both "bought NO" and "sold YES", which are opposite cash flows.
+    """
+    outcome = str(fill.get("outcome_side") or "").strip().lower()
+    book = str(fill.get("book_side") or "").strip().lower()
+    action = str(fill.get("action") or "").strip().lower()
+
+    price = _as_float(
+        fill.get("no_price_dollars") if outcome == "no" else fill.get("yes_price_dollars")
+    )
+    # `yes_price_dollars`/`no_price_dollars` are both always populated and
+    # sum to 1.0, so a zero here means the field was absent under a different
+    # name rather than a genuinely free fill. Fall back to the other side.
+    if price <= 0.0:
+        other = "yes_price_dollars" if outcome == "no" else "no_price_dollars"
+        price = _as_float(fill.get(other))
+
+    if book in ("bid", "ask"):
+        direction = "buy" if book == "bid" else "sell"
+    elif action in ("buy", "sell"):
+        direction = action
+    else:
+        direction = ""
+
+    # Defensive: if the two disagree, trust book_side (the field Kalshi says is
+    # canonical) but keep the price consistent with what was actually paid.
+    return direction, max(price, 0.0)
+
+
+def _kalshi_ledger(
+    fills: List[Dict[str, Any]], settlements: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Account totals derived from the fill and settlement history.
+
+    WHY NOT `/portfolio/positions`
+    -----------------------------
+    Positions describe only what is still held. Kalshi drops a ticker from that
+    list once its market settles, and with it goes that market's realized P&L.
+    Summing `realized_pnl_dollars` across the rows therefore reports the P&L of
+    markets still open, not the account's realized P&L - which is why the tile
+    read a fixed $11.54 that never moved while trades were being opened and
+    closed underneath it. It is not a stale cache; it is the wrong set of rows.
+
+    So the totals come from the two endpoints that are complete by construction:
+
+    - `/portfolio/fills` - every fill, so cost basis and sales proceeds are exact.
+    - `/portfolio/settlements` - every resolved market's cost basis and revenue.
+
+    Realized P&L is then an identity over cash that actually moved:
+
+        on a sale:    (sell price - average cost of the shares sold) * shares
+        on settlement: revenue - the cost basis of the contracts that settled
+
+    so it changes when a trade closes or a market resolves. Note the sale case
+    needs the average cost of the *specific* shares being sold, which is why the
+    fills are walked in time order carrying a per-ticker running position; netting
+    total sales against total buys would always give zero.
+
+    Cost basis is what those running positions still hold, so it reports capital
+    currently deployed rather than everything ever bought.
+    """
+    realized = 0.0
+    fees = 0.0
+    fill_count = 0
+    total_bought = 0.0
+    total_proceeds = 0.0
+
+    # Per-ticker running position, so a sale can be matched against what that
+    # sale actually cost rather than against the account's total buying.
+    #
+    # Proceeds alone cannot give realized P&L: `sales - sales` is always zero.
+    # The cost of the specific contracts being sold has to come from the buys that
+    # created them, which is what these two maps carry.
+    held_qty: Dict[str, float] = {}
+    held_cost: Dict[str, float] = {}
+
+    ordered = sorted(
+        (f for f in fills if isinstance(f, dict)),
+        key=lambda f: (_as_float(f.get("ts")), str(f.get("created_time") or "")),
+    )
+
+    for f in ordered:
+        ticker = str(f.get("ticker") or f.get("market_ticker") or "").strip()
+        if not ticker:
+            continue
+        direction, price = _fill_side_and_price(f)
+        qty = abs(_as_float(f.get("count_fp")))
+        if direction == "" or qty <= 0.0:
+            # An unusable row is skipped rather than guessed at, and the caller
+            # can see the shortfall through `fills_counted`.
+            continue
+        amount = qty * price
+        fees += _as_float(f.get("fee_cost"))
+        fill_count += 1
+
+        if direction == "buy":
+            held_qty[ticker] = held_qty.get(ticker, 0.0) + qty
+            held_cost[ticker] = held_cost.get(ticker, 0.0) + amount
+            total_bought += amount
+            continue
+
+        # A sale. Clamp to what is actually held: after a historical cutoff the
+        # buys behind some sales may be missing, and claiming a bigger cost basis
+        # than existed would invent a loss.
+        on_hand = held_qty.get(ticker, 0.0)
+        closing = min(qty, on_hand) if on_hand > 0.0 else 0.0
+        avg_cost = (held_cost.get(ticker, 0.0) / on_hand) if on_hand > 0.0 else 0.0
+        cost_released = avg_cost * closing
+        total_proceeds += amount
+        if closing > 0.0:
+            realized += (price - avg_cost) * closing
+            held_qty[ticker] = on_hand - closing
+            held_cost[ticker] = held_cost.get(ticker, 0.0) - cost_released
+
+    # Whatever is still held is capital at work, at the average price paid for it.
+    open_cost = sum(v for v in held_cost.values() if v > 0.0)
+
+    settle_revenue = 0.0
+    settlement_count = 0
+    for s in settlements:
+        if not isinstance(s, dict):
+            continue
+        # `revenue` is integer cents; the cost fields are fixed-point dollar
+        # strings. Mixing the two units is a 100x error, so they are converted
+        # separately and explicitly.
+        revenue = _as_float(s.get("revenue")) / 100.0
+        settled_cost = _as_float(s.get("yes_total_cost_dollars")) + _as_float(
+            s.get("no_total_cost_dollars")
+        )
+        settle_revenue += revenue
+        realized += revenue - settled_cost
+        fees += _as_float(s.get("fee_cost"))
+        settlement_count += 1
+        # The contracts are gone now, so they are no longer deployed capital.
+        ticker = str(s.get("ticker") or "").strip()
+        if ticker:
+            held_qty[ticker] = 0.0
+            held_cost[ticker] = 0.0
+
+    return {
+        "realized": round(realized, 2),
+        "fees": round(fees, 2),
+        "cost_basis": round(max(open_cost, 0.0), 2),
+        "bought": round(total_bought, 2),
+        "proceeds": round(total_proceeds, 2),
+        "settlement_revenue": round(settle_revenue, 2),
+        "fills_counted": fill_count,
+        "settlements_counted": settlement_count,
+        "open_positions_in_ledger": sum(1 for v in held_qty.values() if v > 0.0),
+        "complete": True,
+    }
 
 
 _ASYNC_LOOP: Optional[asyncio.AbstractEventLoop] = None
@@ -626,8 +847,13 @@ STRATEGY_DOCS = {
 
 
 def _refresh_kalshi():
-    """One balance/positions sync from the Kalshi API into dashboard_state."""
-    balance, positions = _run_async(_fetch_kalshi_data())
+    """One balance/positions/history sync from the Kalshi API into dashboard_state."""
+    result = _run_async(_fetch_kalshi_data())
+    # Tolerate a 2-tuple: an older or partially-patched fetch still answers
+    # (balance, positions), and the history would then be empty rather than fatal.
+    balance, positions, fills, settlements = (
+        list(result) + [[], []] if isinstance(result, (list, tuple)) and len(result) == 2 else result
+    )
     if balance:
         # Kalshi reports cents; the dashboard shows dollars.
         balance = _normalise_balance(balance)
@@ -637,6 +863,13 @@ def _refresh_kalshi():
         merged = list(positions.get("market_positions") or [])
         merged += list(positions.get("event_positions") or [])
         dashboard_state["positions"] = merged
+    # Recomputed on every sync rather than accumulated, so it is always the
+    # history as it stands now and cannot drift by double-counting a page.
+    if fills or settlements:
+        dashboard_state["ledger"] = _kalshi_ledger(
+            [f for f in fills if isinstance(f, dict)],
+            [s for s in settlements if isinstance(s, dict)],
+        )
     dashboard_state["last_update"] = _now()
     dashboard_state["kalshi_position_count"] = len(dashboard_state["positions"])
     # Titles are resolved only for the book actually being traded. Caching them
@@ -1541,17 +1774,42 @@ def _kalshi_account() -> Dict[str, Any]:
     def total(rows: List[Dict[str, Any]], key: str) -> float:
         return round(sum(float(r.get(key) or 0.0) for r in rows), 2)
 
+    # Realized P&L, fees and cost basis come from the fill/settlement ledger, not
+    # from these rows. `realized_pnl_dollars` on a position describes that market
+    # only for as long as the market is still held: Kalshi drops a settled ticker
+    # from /portfolio/positions, taking its realized P&L with it. Summing the
+    # column therefore reports "P&L on markets still open" and reads as a frozen
+    # number while trades open and close beneath it.
+    #
+    # With no ledger the tallies are reported as unknown rather than as $0.00. A
+    # zero here would be indistinguishable from a real break-even account, which is
+    # the one thing a P&L tile must never be.
+    ledger = dashboard_state.get("ledger") or {}
+    have_ledger = bool(ledger.get("complete"))
+    positions_realized = round(total(markets, "realized") + total(events, "realized"), 2)
+    positions_fees = round(total(markets, "fees") + total(events, "fees"), 2)
+
     return {
         "connected": bool(markets or events),
         "market_count": len(markets),
         "event_count": len(events),
         "markets": sorted(markets, key=lambda r: -abs(r["exposure"]))[:25],
         "events": sorted(events, key=lambda r: -abs(r["cost"]))[:25],
+        # Exposure is what the open positions are worth if sold into the current
+        # book. It is not the same quantity as cost basis, so the two are never
+        # summed or substituted for one another.
         "exposure": round(total(markets, "exposure") + total(events, "exposure"), 2),
-        "cost_basis": total(events, "cost"),
-        "realized": round(total(markets, "realized") + total(events, "realized"), 2),
-        "fees": round(total(markets, "fees") + total(events, "fees"), 2),
-        "traded": total(markets, "traded"),
+        "cost_basis": round(float(ledger.get("cost_basis", 0.0)), 2) if have_ledger else 0.0,
+        "realized": round(float(ledger.get("realized", 0.0)), 2) if have_ledger else 0.0,
+        "fees": round(float(ledger.get("fees", 0.0)), 2) if have_ledger else 0.0,
+        "realized_known": have_ledger,
+        "traded": round(total(markets, "traded"), 2),
+        # Retained for the per-position tables, where a market's own realized
+        # figure is exactly right. Only the account-wide total is wrong without
+        # the ledger.
+        "positions_realized": positions_realized,
+        "positions_fees": positions_fees,
+        "ledger": ledger,
     }
 
 
@@ -1963,6 +2221,15 @@ def api_mode_set():
     except Exception as e:
         _push_error(f"Mode switch: {e}")
         return jsonify({"error": str(e)}), 500
+
+    # Every figure in a snapshot is scoped to one book, so a payload built before
+    # the switch describes the book that is no longer being traded. Served from the
+    # memo it would put DRY positions and DRY cash on a page whose own flag reads
+    # LIVE - the exact contradiction the book-scoped queries exist to prevent, just
+    # arriving up to _SNAPSHOT_TTL seconds late. The switch is rare and explicit,
+    # so it is always worth rebuilding.
+    _SNAPSHOT_CACHE["payload"] = None
+    _SNAPSHOT_CACHE["at"] = 0.0
 
     _broadcast("mode", {"mode": mode})
     if mode == MODE_DRY:
@@ -3511,12 +3778,15 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   <div class="tile">
     <div class="k">Real exposure</div>
     <div class="v" id="tExposure">{{ '$%.2f'|format(s.kalshi.exposure) if s.kalshi else '$0.00' }}</div>
-    <div class="s">cost basis {{ '$%.2f'|format(s.kalshi.cost_basis) if s.kalshi else '$0.00' }}</div>
+    <div class="s">mark-to-market &middot; cost {{ ('$%.2f'|format(s.kalshi.cost_basis)) if s.kalshi and s.kalshi.realized_known else 'cost n/a' }}</div>
   </div>
   <div class="tile">
     <div class="k">Real realized P&amp;L</div>
-    <div class="v {{ 'up' if s.kalshi and s.kalshi.realized > 0 else ('down' if s.kalshi and s.kalshi.realized < 0 else 'flat') }}" id="tKalshiPnl">{{ '$%.2f'|format(s.kalshi.realized) if s.kalshi else '$0.00' }}</div>
-    <div class="s">fees {{ '$%.2f'|format(s.kalshi.fees) if s.kalshi else '$0.00' }}</div>
+    {#- An unavailable total reads "n/a", never "$0.00". A zero here is
+        indistinguishable from a break-even account, which is the one thing a
+        realized-P&L tile must never be. -#}
+    <div class="v {{ 'up' if s.kalshi and s.kalshi.realized_known and s.kalshi.realized > 0 else ('down' if s.kalshi and s.kalshi.realized_known and s.kalshi.realized < 0 else 'flat') }}" id="tKalshiPnl">{{ ('$%.2f'|format(s.kalshi.realized)) if s.kalshi and s.kalshi.realized_known else 'n/a' }}</div>
+    <div class="s">{% if s.kalshi and s.kalshi.realized_known %}fees {{ '$%.2f'|format(s.kalshi.fees) }}{% else %}fill history unavailable{% endif %}</div>
   </div>
   {% else %}
   <div class="tile">
