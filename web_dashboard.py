@@ -1970,6 +1970,113 @@ def api_dry_ledger():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/live/flatten")
+def api_live_flatten():
+    """Inspect what closing every real position would actually fetch.
+
+    Read-only. Placing market sells into these books without seeing the quotes
+    first is how a $925 cost basis turns into a very different number: most of
+    these are thin markets where the bid is the only realistic fill and it sits
+    well below the cost basis. This returns, per position, the live bid/ask, the
+    side held, and what selling into the bid would realise - so the decision is
+    made against prices rather than against cost basis.
+
+    Pass ?confirm=1 to actually place the sells.
+    """
+    denied = require_token()
+    if denied is not None:
+        return denied
+
+    import uuid
+
+    from src.clients.kalshi_client import KalshiClient
+    from src.utils.market_prices import get_market_prices
+
+    confirm = request.args.get("confirm") == "1"
+
+    async def _work():
+        key_path = materialize_private_key()
+        client = KalshiClient(private_key_path=key_path) if key_path else KalshiClient()
+        try:
+            balance, positions = await _fetch_kalshi_data()
+            rows: List[Dict[str, Any]] = []
+            for row in (positions or {}).get("market_positions") or []:
+                ticker = row.get("ticker") or ""
+                shares = float(row.get("position") or 0)
+                if not ticker or not shares:
+                    continue
+                try:
+                    m = await client.get_market(ticker)
+                except Exception:  # noqa: BLE001
+                    m = {}
+                yes_bid, yes_ask, no_bid, no_ask = get_market_prices(m or {})
+                # A positive position is long; which side it is long is the
+                # `position` field. Selling means hitting the bid on that side.
+                side = str(row.get("position") or "yes").lower()
+                bid = yes_bid if side == "yes" else no_bid
+                ask = yes_ask if side == "yes" else no_ask
+                entry = float(row.get("cost_basis") or 0.0) / max(abs(shares), 1)
+                proceeds = bid * abs(shares)
+                cost = entry * abs(shares)
+                placed = None
+                if confirm and abs(shares) >= 1:
+                    # Marketable limit at the bid, rounded down a cent: a
+                    # market order on a thin book can fill far below this.
+                    limit = max(int(bid * 100) - 1, 1)
+                    try:
+                        placed = await client.place_order(
+                            ticker=ticker,
+                            client_order_id=str(uuid.uuid4()),
+                            side=side,
+                            action="sell",
+                            count=int(abs(shares)),
+                            type_="limit",
+                            yes_price=limit if side == "yes" else None,
+                            no_price=limit if side == "no" else None,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        placed = {"error": f"{type(exc).__name__}: {exc}"}
+                rows.append(
+                    {
+                        "ticker": ticker,
+                        "title": _market_title(ticker),
+                        "side": side,
+                        "shares": shares,
+                        "entry": round(entry, 4),
+                        "bid": bid,
+                        "ask": ask,
+                        "cost_basis": round(cost, 2),
+                        "est_proceeds": round(proceeds, 2),
+                        "est_pnl": round(proceeds - cost, 2),
+                        "spread": round(ask - bid, 4),
+                        "status": m.get("status") if isinstance(m, dict) else None,
+                        "close_time": m.get("close_time") if isinstance(m, dict) else None,
+                        "order": placed,
+                    }
+                )
+            return {
+                "confirm": confirm,
+                "count": len(rows),
+                "cost_basis": round(sum(r["cost_basis"] for r in rows), 2),
+                "est_proceeds": round(sum(r["est_proceeds"] for r in rows), 2),
+                "est_pnl": round(sum(r["est_proceeds"] - r["cost_basis"] for r in rows), 2),
+                "cash_cents": balance.get("balance") if isinstance(balance, dict) else None,
+                "positions": rows,
+            }
+        finally:
+            await client.close()
+
+    try:
+        result = _run_async(_work())
+    except Exception as e:  # noqa: BLE001
+        _push_error(f"Live flatten: {e}")
+        return jsonify({"error": str(e)}), 500
+    _audit(
+        f"live flatten {'EXECUTED' if confirm else 'previewed'}: " f"{result['count']} positions"
+    )
+    return jsonify(result)
+
+
 @app.route("/api/dry/audit")
 def api_dry_audit():
     """Check the DRY book against its own ledger and report what disagrees.
