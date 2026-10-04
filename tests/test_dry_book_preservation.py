@@ -110,3 +110,56 @@ async def test_the_explicit_reset_is_still_destructive(tmp_path):
     assert account["cash"] == pytest.approx(300.0, abs=0.01)
     assert account["open_positions"] == 0
     assert account["closed_trades"] == 0
+
+
+async def test_switching_to_live_does_not_destroy_the_dry_book(tmp_path):
+    """The cause of the book "resetting" to \ over and over.
+
+    TradingMode.set() used to delete every DRY position, close and ledger row
+    when switching to LIVE, on the reasoning that the other book's rows "must
+    not exist". So every glance at LIVE wiped the simulated book, and coming
+    back to DRY showed \ with no history. Isolation comes from the mode
+    column, not from deleting data.
+    """
+    db = await _db(tmp_path)
+    mgr = TradingMode(db_path=db.db_path)
+
+    await mgr.record_fill(market_id="KXTEST-26", side="NO", action="buy", quantity=10, price=0.25)
+    await db.add_position(_position())
+    await db.add_trade_log(_trade())
+    before = await mgr.dry_account()
+
+    await mgr.set("live", confirmed=True)
+    await mgr.set("dry", confirmed=True)
+
+    after = await mgr.dry_account()
+    assert after["cash"] == pytest.approx(before["cash"], abs=0.01)
+    assert after["open_positions"] == before["open_positions"] == 1
+    assert after["closed_trades"] == before["closed_trades"] == 1
+    assert after["realized"] == pytest.approx(0.5, abs=0.01)
+
+
+async def test_the_two_books_can_coexist(tmp_path):
+    """A DRY position and a LIVE position are both retained and read apart."""
+    db = await _db(tmp_path)
+
+    await db.add_position(_position(strategy="ai_directional", mode="dry"))
+    await db.add_position(
+        Position(
+            market_id="KXLIVE-26",
+            side="YES",
+            entry_price=0.5,
+            quantity=2,
+            timestamp=datetime.now(),
+            rationale="live",
+            confidence=0.8,
+            live=True,
+            strategy="ai_directional",
+            mode="live",
+        )
+    )
+
+    dry_rows = await db.get_open_positions(mode="dry")
+    live_rows = await db.get_open_positions(mode="live")
+    assert [p.market_id for p in dry_rows] == ["KXTEST-26"]
+    assert [p.market_id for p in live_rows] == ["KXLIVE-26"]

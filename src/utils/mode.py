@@ -140,34 +140,25 @@ class TradingMode:
                     "requires an explicit confirmation."
                 )
 
-            # CRITICAL: Clean up the other book's rows to enforce absolute identity
-            # isolation. The other book's trade_logs and positions must not exist
-            # when we switch, or they leak across the boundary.
+            # Isolation between the books is enforced by the `mode` column on every
+            # query, by `should_trade_live()` inside each strategy process, and
+            # by the broker being chosen per book. It is NOT enforced by
+            # deleting the other book.
+            #
+            # It used to be. Switching to LIVE wiped every DRY position, close
+            # and ledger row and reset the cash to $300, on the reasoning that
+            # the other book's rows "must not exist when we switch". So every
+            # glance at LIVE destroyed the simulated book - which is why a
+            # profitable DRY account kept reappearing as $300 with no history,
+            # and why it looked like the books were leaking into each other when
+            # the books were in fact being destroyed by the switch.
+            #
+            # Two books that coexist, distinguished by a column, cannot leak:
+            # nothing reads across it.
             if mode == MODE_DRY:
-                # Going DRY: wipe all LIVE rows
-                await self._exec_optional(
-                    conn,
-                    "DELETE FROM trade_logs WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'live'",
-                )
-                await self._exec_optional(
-                    conn,
-                    "DELETE FROM positions WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'live'",
-                )
-                # Reset DRY cash to starting balance
-                starting = await self._get(conn, _START_KEY)
-                starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
-                await self._set(conn, _CASH_KEY, str(round(starting_f, 2)))
-            else:
-                # Going LIVE: wipe all DRY rows
-                await self._exec_optional(
-                    conn,
-                    "DELETE FROM trade_logs WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'",
-                )
-                await self._exec_optional(
-                    conn,
-                    "DELETE FROM positions WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'",
-                )
-                await self._exec_optional(conn, "DELETE FROM dry_ledger")
+                # Ensure a funded DRY book exists without touching an existing
+                # one. `ensure_dry_account` creates only when absent.
+                await self.ensure_dry_account()
 
             await self._set(conn, _MODE_KEY, mode)
             await conn.commit()

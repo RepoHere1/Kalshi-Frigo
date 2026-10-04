@@ -961,9 +961,17 @@ def _strategy_supervisor_loop():
                         continue  # exists and was explicitly stopped
                     if not _creds_present():
                         continue
+                    # Start into whichever book is actually in force. Hardcoding
+                    # "paper" made every auto-started strategy mismatch the book
+                    # while the switch read LIVE, which the toggle correctly
+                    # refuses - so switching to LIVE looked like the strategies
+                    # were broken.
+                    book = "live" if _current_book_mode() == "live" else "paper"
                     try:
-                        _spawn_strategy(name, "paper")
-                        _push_error(f"Started {name} (all strategies run by default).")
+                        _spawn_strategy(name, book)
+                        _push_error(
+                            f"Started {name} in {book.upper()} " f"(all strategies run by default)."
+                        )
                     except Exception as exc:  # noqa: BLE001
                         _push_error(f"Auto-start {name} failed: {exc}")
             for name, row in wanted.items():
@@ -3584,6 +3592,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
       {%- for r in s.kalshi.markets %}
         <tr>
           <td class="mono">{{ r.ticker }}</td>
+          <td>{{ _market_title(r.ticker) }}</td>
           <td class="num">{{ r.shares }}</td>
           <td class="num">{{ r.exposure }}</td>
           <td class="num">{{ r.traded }}</td>

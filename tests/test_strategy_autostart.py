@@ -65,7 +65,10 @@ def test_auto_start_does_not_resurrect_a_deliberately_stopped_strategy():
     """
     src = inspect.getsource(wd._strategy_supervisor_loop)
     assert "if name in recorded:" in src
-    assert "Started {name} (all strategies run by default)" in src
+    assert "all strategies run by default" in src
+    # ...and it must start into the book actually in force, not a hardcoded one.
+    assert '_current_book_mode() == "live"' in src
+    assert '_spawn_strategy(name, "paper")' not in src
 
 
 def test_backoff_has_a_ceiling():

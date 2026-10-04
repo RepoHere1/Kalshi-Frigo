@@ -1,3 +1,5 @@
+import os
+
 """Readable market titles, and per-strategy card attribution.
 
 Two related faults made the dashboard look broken:
@@ -99,7 +101,7 @@ def test_junk_responses_degrade_to_an_empty_dict(payload):
 
 
 def test_a_bare_list_balance_is_accepted():
-    """`/portfolio/balance` drifts shape the same way positions does."""
+    """/portfolio/balance drifts shape the same way positions does."""
     assert wd._normalise_balance([{"balance": 1234}]) == {"balance": 1234}
     assert wd._normalise_balance({"balance": 99}) == {"balance": 99}
     assert wd._normalise_balance([]) == {}
@@ -134,3 +136,65 @@ def test_the_sync_survives_either_shape(monkeypatch):
 
     assert wd.dashboard_state["balance"] == 25.0
     assert wd.dashboard_state["positions"] == [{"ticker": "KX"}]
+
+
+# ---------------------------------------------------------------------------
+# Every LIVE table must have a cell for every column it declares
+# ---------------------------------------------------------------------------
+def _table_cells(html: str, tbody_id: str):
+    import re
+
+    seg = html[html.index(tbody_id) :]
+    seg = seg[: seg.index("</tbody>")]
+    row = re.search(r"<tr>(.*?)</tr>", seg, re.S)
+    return len(re.findall(r"<td", row.group(1))) if row else 0
+
+
+def _header_cells(html: str, tbody_id: str):
+    import re
+
+    head = html[: html.index(tbody_id)]
+    tables = re.findall(r"<thead>(.*?)</thead>", head, re.S)
+    return len(re.findall(r"<th", tables[-1])) if tables else 0
+
+
+def test_live_tables_line_up_with_their_headers():
+    """A missing <td> shifts every value one column left.
+
+    The Kalshi markets table declared a Title column and emitted no cell for it,
+    so Shares rendered under Title, Exposure under Shares, and the title never
+    appeared at all - which reads as "the titles are wrong" rather than "the row
+    is short a cell".
+    """
+    import re
+    from pathlib import Path
+
+    src = Path(wd.__file__).read_text(encoding="utf-8")
+
+    for tbody_id in ("kalshiMarkets", "kalshiEvents"):
+        marker = 'id="' + tbody_id + '"'
+        assert marker in src, tbody_id
+        at = src.index(marker)
+
+        head = src[:at]
+        header = re.findall(r"<thead>(.*?)</thead>", head, re.S)[-1]
+        n_head = len(re.findall(r"<th", header))
+
+        loop = src.find("{%- for r in s.kalshi.", at)
+        row = src[loop : loop + 900]
+        n_cells = len(re.findall(r"<td", row[: row.index("</tr>")]))
+
+        assert n_cells == n_head, f"{tbody_id}: {n_cells} cells for {n_head} columns"
+
+
+def test_every_kalshi_row_renders_a_title_cell():
+    from pathlib import Path
+
+    src = Path(wd.__file__).read_text(encoding="utf-8")
+    for key in ("s.kalshi.markets", "s.kalshi.events"):
+        loop = src.find("{%- for r in " + key + " %}")
+        assert loop > 0, key
+        row = src[loop : loop + 900]
+        assert "_market_title(r.ticker)" in row[: row.index("</tr>")], (
+            key + " renders no title cell"
+        )
