@@ -438,12 +438,50 @@ def _normalise_positions(payload: Any) -> Dict[str, Any]:
     return {}
 
 
-def _run_async(coro):
-    """Run a coroutine on a throwaway event loop.
+_ASYNC_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_ASYNC_THREAD: Optional[threading.Thread] = None
 
-    Flask's request handlers are sync, so each DB call needs its own loop.
-    The loop is always closed, otherwise aiosqlite threads accumulate until
-    the worker runs out of file descriptors.
+
+def _async_loop() -> asyncio.AbstractEventLoop:
+    """One event loop for the whole process, running on its own thread.
+
+    This used to build a throwaway loop per call. Each new loop plus each
+    aiosqlite connection starts a thread, and the dashboard makes a lot of
+    database calls per page - so threads accumulated until the worker hit its
+    limit and began failing with
+
+        BlockingIOError: [Errno 11] Resource temporarily unavailable
+        can't start new thread
+
+    which is what made the page blank out (the snapshot raised, every figure fell
+    to zero), made buttons look dead, and made strategies look like they were
+    turning themselves off - the supervisor could not spawn them either, because
+    it could not start a thread to record them. Not a Railway restart, and not a
+    trading fault: thread exhaustion in the worker.
+
+    One loop, one thread, reused forever.
+    """
+    global _ASYNC_LOOP, _ASYNC_THREAD
+    if _ASYNC_LOOP is not None and not _ASYNC_LOOP.is_closed():
+        return _ASYNC_LOOP
+
+    loop = asyncio.new_event_loop()
+
+    def _run_forever():
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    thread = threading.Thread(target=_run_forever, daemon=True, name="async-loop")
+    thread.start()
+    _ASYNC_LOOP, _ASYNC_THREAD = loop, thread
+    return loop
+
+
+def _run_async(coro):
+    """Run a coroutine to completion from synchronous code.
+
+    Safe to call from any thread, including a request handler, by handing the
+    coroutine to the process-wide loop and waiting for the result.
     """
     try:
         asyncio.get_running_loop()
@@ -455,15 +493,13 @@ def _run_async(coro):
             "_run_async() cannot be called from inside a running event loop; "
             "await the coroutine directly instead."
         )
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        return loop.run_until_complete(coro)
-    finally:
-        try:
-            asyncio.set_event_loop(None)
-        finally:
-            loop.close()
+
+    loop = _async_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    # Generous, because a busy database can legitimately take seconds under
+    # six concurrent strategies - but bounded, so a wedged loop surfaces as an
+    # error instead of a hung request.
+    return future.result(timeout=120)
 
 
 def _db():
