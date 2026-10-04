@@ -303,6 +303,68 @@ def test_under_the_notional_cap_repeated_clips_pass():
 
 
 # ---------------------------------------------------------------------------
+# LIVE pays fees, so the edge bar is higher there
+# ---------------------------------------------------------------------------
+def _quoted_market(**kw):
+    return _dollars(
+        yes_bid=kw.get("yes_bid", 0.45),
+        yes_ask=kw.get("yes_ask", 0.46),
+        no_bid=kw.get("no_bid", 0.54),
+        no_ask=kw.get("no_ask", 0.55),
+        target=kw.get("target", 84609.34),
+    )
+
+
+def _scorer(spot_price=84900.0):
+    spot = SpotFeed()
+    spot.price = spot_price
+    spot.ts = time.time()
+    spot.source = "test"
+    return UpDownTrader(spot, Btc15mFeed(), UpDownConfig())
+
+
+def test_live_requires_the_fee_on_top_of_the_edge():
+    """A 6c edge clears DRY but not LIVE once the fee is taken out."""
+    trader = _scorer()
+    # Spot far above target -> fair_up ~1.0; up ask 0.92 gives up_edge ~0.08,
+    # which clears min_edge (0.06) but not min_edge + live_fee_rate (0.09).
+    trader.spot.price = 85000.0
+    market = _quoted_market(yes_ask=0.92, no_ask=0.08, target=84000.0)
+    dry = trader.evaluate(market, live=False)
+    assert dry is not None and dry.actionable, "DRY takes the 8c edge"
+    trader.book.skipped_no_edge = 0
+    live = trader.evaluate(market, live=True)
+    assert (live is None or not live.actionable), "LIVE must refuse an edge under fee+min"
+
+
+def test_live_takes_an_edge_that_clears_fee_and_minimum():
+    trader = _scorer()
+    trader.spot.price = 85000.0
+    market = _quoted_market(yes_ask=0.85, no_ask=0.15, target=84000.0)
+    live = trader.evaluate(market, live=True)
+    assert live is not None and live.actionable
+    assert live.edge >= trader.config.min_edge + trader.config.live_fee_rate
+
+
+def test_live_clip_sizes_against_the_balance_budget():
+    trader = _scorer()
+    trader.spot.price = 85000.0
+    market = _quoted_market(yes_ask=0.85, no_ask=0.15, target=84000.0)
+    # A $4 budget -> 4 contracts at 0.85, not the fixed $5 clip's 5.
+    live = trader.evaluate(market, live=True, clip_usd=4.0)
+    assert live.contracts == 4
+    assert live.notional == pytest.approx(3.40, abs=0.01)
+
+
+def test_a_zero_dollar_live_budget_produces_no_clip():
+    trader = _scorer()
+    trader.spot.price = 85000.0
+    market = _quoted_market(yes_ask=0.85, no_ask=0.15, target=84000.0)
+    live = trader.evaluate(market, live=True, clip_usd=0.0)
+    assert not live.actionable
+
+
+# ---------------------------------------------------------------------------
 # The feed must not invent a lead
 # ---------------------------------------------------------------------------
 def test_payload_reports_the_real_contract_and_no_45_second_claim():

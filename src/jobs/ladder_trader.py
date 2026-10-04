@@ -44,6 +44,18 @@ class UpDownConfig:
     notional_usd: float = 5.0
     # Required disagreement with Kalshi's own price before trading.
     min_edge: float = 0.06
+    # LIVE only: buy-side fee per fill, as a fraction of notional. Kalshi
+    # charges on every fill, so a 6c edge that clears DRY is only a ~3c edge
+    # LIVE once the fee is taken out. LIVE therefore requires
+    # edge >= min_edge + live_fee_rate; DRY keeps the raw min_edge so the two
+    # books stay comparable in decision count. Estimated from the account's own
+    # fill history (fees against notional across hundreds of fills).
+    live_fee_rate: float = 0.03
+    # LIVE only: the largest fraction of the available balance one clip may
+    # spend. A fixed $5 clip empties a small account in a trade or two and it
+    # then sits idle all night - sizing down against the balance keeps the book
+    # firing on every real edge instead of going dark after one buy.
+    live_cash_fraction: float = 0.15
     # Minimum model probability on the chosen side before any entry. The old
     # "one clip per market" guard was removed; this is what replaces it as the
     # anti-churn rule - repeated buys of the same contract are allowed, but only
@@ -150,8 +162,19 @@ class UpDownTrader:
         self._client: Any = None
         self.book = UpDownBook(max_open_notional=self.config.max_open_notional)
 
-    def evaluate(self, market: Optional[UpDownMarket]) -> Optional[UpDownSignal]:
-        """Score the next contract. Read-only: no orders here."""
+    def evaluate(
+        self,
+        market: Optional[UpDownMarket],
+        live: bool = False,
+        clip_usd: Optional[float] = None,
+    ) -> Optional[UpDownSignal]:
+        """Score the next contract. Read-only: no orders here.
+
+        `live` raises the edge bar by `live_fee_rate`: DRY pays no fee, LIVE
+        does, and an edge that clears DRY but not the fee is a losing trade with
+        real money. `clip_usd` overrides the fixed clip size (used in LIVE to
+        size down against the available balance).
+        """
         if market is None:
             self.book.skipped_unquoted += 1
             return None
@@ -214,13 +237,16 @@ class UpDownTrader:
         up_edge = (fair - up_ask) if up_ask is not None else 0.0
         down_edge = ((1.0 - fair) - down_ask) if down_ask is not None else 0.0
 
+        # LIVE pays the fee out of exactly this edge, so the bar is higher there.
+        required = self.config.min_edge + (self.config.live_fee_rate if live else 0.0)
+
         side = ""
         ask: Optional[float] = None
         kalshi: Optional[float] = None
         edge = 0.0
-        if up_edge >= self.config.min_edge and up_edge >= down_edge:
+        if up_edge >= required and up_edge >= down_edge:
             side, ask, kalshi, edge = "up", up_ask, up_ask, up_edge
-        elif down_edge >= self.config.min_edge:
+        elif down_edge >= required:
             side, ask, kalshi, edge = "down", down_ask, down_ask, down_edge
 
         if not side:
@@ -229,7 +255,9 @@ class UpDownTrader:
                 f"spot {spot:,.0f} vs target {target:,.0f} ({delta:+,.0f}): "
                 f"fair {fair:.2f}, Kalshi up "
                 f"{('%.2f' % up_ask) if up_ask is not None else '--'} / down "
-                f"{('%.2f' % down_ask) if down_ask is not None else '--'} - inside the edge"
+                f"{('%.2f' % down_ask) if down_ask is not None else '--'} - "
+                f"best edge {max(up_edge, down_edge):+.3f} under {required:.3f}"
+                + (" (fee-aware)" if live else "")
             )
         else:
             reason = (
@@ -244,7 +272,7 @@ class UpDownTrader:
         # 0.939 - a $5 clip turned into $76 of exposure. That single trade is the
         # -$73.59 that emptied the DRY account.
         fill_price = ask if side == "up" else (1.0 - ask if side else 0.0)
-        contracts = self._size(fill_price) if side else 0
+        contracts = self._size(fill_price, clip_usd=clip_usd) if side else 0
         signal = UpDownSignal(
             ticker=market.ticker,
             bucket=market.bucket,
@@ -264,15 +292,25 @@ class UpDownTrader:
         self.book.signals = [signal]
         return signal
 
-    def _size(self, ask: Optional[float]) -> int:
-        """Contracts for one $5 clip. Zero when the price cannot clear the floor."""
+    def _size(self, ask: Optional[float], clip_usd: Optional[float] = None) -> int:
+        """Contracts for one clip. Zero when the price cannot clear the floor.
+
+        `clip_usd` overrides the default clip size; LIVE passes a fraction of the
+        available balance so a small account keeps firing instead of emptying in
+        one trade.
+        """
         try:
             price = float(ask) if ask is not None else 0.0
         except (TypeError, ValueError):
             return 0
         if price <= 0 or price > 1.0:
             return 0
-        contracts = int(self.config.notional_usd / price)
+        target_notional = (
+            self.config.notional_usd if clip_usd is None else max(clip_usd, 0.0)
+        )
+        if target_notional <= 0:
+            return 0
+        contracts = int(target_notional / price)
         if contracts * price < self.config.min_order_usd:
             contracts = int(round(self.config.min_order_usd / price, 0))
         return max(contracts, 0)
@@ -452,8 +490,33 @@ class UpDownTrader:
             return self.book.summary()
 
         market = self.feed.nearest()
-        signal = self.evaluate(market)
-        self.book.last_error = ""
+
+        # LIVE sizes the clip against the real balance, so the account keeps
+        # trading on every edge instead of spending itself dark in one or two
+        # clips. A read failure must not stop the cycle - it falls back to the
+        # fixed clip and lets execute_position's own fail-closed balance check
+        # refuse if the account genuinely cannot pay.
+        live_budget: Optional[float] = None
+        if live:
+            try:
+                if self._client is None:
+                    from src.clients.kalshi_client import KalshiClient
+
+                    self._client = KalshiClient()
+                bal = await self._client.get_balance()
+                cents = float((bal or {}).get("balance") or 0.0)
+                live_budget = round(
+                    cents / 100.0 * self.config.live_cash_fraction, 2
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.book.last_error = f"LIVE balance read: {type(exc).__name__}: {exc}"
+
+        signal = self.evaluate(market, live=live, clip_usd=live_budget if live else None)
+        # Clear stale errors, but never wipe the explanation of a failed LIVE
+        # balance read - that is the difference between "no edge" and "cannot
+        # read the account".
+        if not live or live_budget is not None:
+            self.book.last_error = ""
         # Name the guard that actually refused, so the log says why. Returning a
         # bare "no quotable contract" for a contract that is quoted but inside the
         # settlement window is exactly the kind of wrong reason that makes a log
@@ -479,6 +542,20 @@ class UpDownTrader:
             )
         else:
             refusal = ""
+            # A scored but un-actionable signal in LIVE is almost always a
+            # zero-dollar budget: the account cannot buy the minimum clip. Say
+            # that instead of reporting a silent no-op.
+            if (
+                live
+                and signal is not None
+                and not signal.actionable
+                and live_budget is not None
+                and live_budget <= 0.0
+            ):
+                refusal = (
+                    "LIVE balance is $0.00 - nothing can be bought until the "
+                    "account is funded"
+                )
 
         took: Optional[Dict[str, Any]] = None
         blocked = ""
@@ -572,6 +649,10 @@ class UpDownTrader:
                 "spot_vs_target": signal.spot_vs_target if signal else None,
                 "fair_up": signal.fair if signal else None,
                 "kalshi_up": signal.kalshi_price if signal else None,
+                "live_budget": live_budget,
+                "required_edge": round(
+                    self.config.min_edge + (self.config.live_fee_rate if live else 0.0), 4
+                ),
                 "reason": (signal.reason if signal else refusal) or "no quotable contract",
             }
         )
