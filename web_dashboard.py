@@ -1309,29 +1309,19 @@ def _strategy_supervisor_loop():
             # on whatever happened to still be alive.
             if AUTO_START_ALL:
                 recorded = _run_async(store.snapshot(mode=book_mode))
-                from src.utils.strategy_runtime import INSTANCE as _CUR_INSTANCE
 
                 for name in strategy_state:
                     if _runtime_key(name) in wanted:
                         continue
                     row = recorded.get(_runtime_key(name))
                     if row is not None:
-                        # A row exists, so it has run before. Only a deliberate
-                        # operator stop keeps it down - and only a stop the
-                        # operator gave in THIS instance.
-                        #
-                        # Every deploy mints a new instance id, so a stop recorded
-                        # before the redeploy is stale intent. Treating it as
-                        # current is what left five of six strategies down and
-                        # staying down: they each carried a "stopped by operator"
-                        # row from an earlier session, that row permanently matched
-                        # the operator-stop exemption, and no restart could ever
-                        # re-arm them. The operator stops them again after the
-                        # restart if they still mean it.
-                        if (
-                            (row.get("stop_reason") or "") in _OPERATOR_STOP_REASONS
-                            and (row.get("instance") or "") == _CUR_INSTANCE
-                        ):
+                        # A row exists, so this book's button has been pushed
+                        # before. The operator's last click is PERMANENT truth:
+                        # a Stop keeps the lane down across redeploys, book
+                        # switches and any number of logins, forever, until
+                        # Start is pressed in this book again. No expiry, no
+                        # instance scoping - the button is welded to the state.
+                        if (row.get("stop_reason") or "") in _OPERATOR_STOP_REASONS:
                             continue
                     if not _creds_present():
                         continue
@@ -1726,6 +1716,21 @@ _SQL_RECENT = (
 _SQL_EQUITY = (
     "SELECT exit_timestamp, pnl FROM trade_logs WHERE {book}"
     " ORDER BY exit_timestamp DESC LIMIT 200"
+)
+# Every close, ever, for the ANALYSIS OF panel. The trade log is a forever
+# database: rows are appended and never pruned, and the file lives on the
+# Railway volume, so this query sees the account's entire history - the
+# analysis only gets deeper as more trades close.
+_SQL_ANALYSIS = (
+    "SELECT market_id, side, entry_price, exit_price, quantity, pnl, strategy,"
+    " entry_timestamp, exit_timestamp, exit_reason FROM trade_logs"
+    " WHERE {book} ORDER BY COALESCE(exit_timestamp, entry_timestamp) ASC"
+)
+_SQL_ANALYSIS_STRAT = (
+    "SELECT market_id, side, entry_price, exit_price, quantity, pnl, strategy,"
+    " entry_timestamp, exit_timestamp, exit_reason FROM trade_logs"
+    " WHERE {book} AND COALESCE(NULLIF(strategy, ''), 'unattributed') = ?"
+    " ORDER BY COALESCE(exit_timestamp, entry_timestamp) ASC"
 )
 # Every close, oldest first, so each strategy's own curve can be reconstructed.
 # This is the persistent backing for the per-strategy charts: the series is
@@ -2971,7 +2976,11 @@ def _recorded_state() -> Dict[str, Dict[str, Any]]:
                 reason = "stopped by app restart"
             else:
                 reason = "exited on its own"
-            _run_async(_runtime_store().record_stop(name, reason, _runtime_mode()))
+            _run_async(
+                _runtime_store().record_stop(
+                    name, reason, _runtime_mode(), clear_desired=False
+                )
+            )
             st["pid"] = None
             st["running"] = False
             st["stuck"] = False
@@ -3020,6 +3029,34 @@ def _running_strategies():
         for name, st in strategy_state.items()
         if st.get("running") and _pid_alive(st.get("pid"))
     ]
+
+
+@app.route("/api/analysis", methods=["GET"])
+def api_analysis():
+    """Stats and recommendations over EVERY closed trade in the current book.
+
+    Read-only and unauthenticated. The trade log is the forever database, so
+    this answers from the account's complete history, not a window.
+    """
+    from src.utils.trade_analytics import analyze_trades
+
+    book = _current_book_mode()
+    rows = _db_rows(_SQL_ANALYSIS.format(book=_book_filter(book)))
+    return jsonify(analyze_trades(rows, name=None))
+
+
+@app.route("/api/strategy/<name>/analysis", methods=["GET"])
+def api_strategy_analysis(name):
+    """Stats and recommendations over one strategy's entire closed history."""
+    from src.utils.trade_analytics import analyze_trades
+
+    if name not in strategy_state:
+        return jsonify({"error": f"Unknown strategy: {name}"}), 404
+    book = _current_book_mode()
+    rows = _db_rows(
+        _SQL_ANALYSIS_STRAT.format(book=_book_filter(book)), (name,)
+    )
+    return jsonify(analyze_trades(rows, name=name))
 
 
 @app.route("/api/strategy/<name>", methods=["GET"])
@@ -3957,6 +3994,8 @@ pre{
 .clabel{font-size:15px;font-weight:650}
 .cname{font-size:11.5px;color:var(--dim);margin-top:1px}
 .cproof{font-size:10px;color:var(--dim);margin-top:4px;min-height:12px}
+.recs{list-style:none;padding:0;margin:0}
+.recs li{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;margin:6px 0;font-size:12.5px}
 .cchart{height:54px;margin:8px 0 6px}
 /* Strategy cards get a taller curve than the compact feed cards - the per-card
    P&L line is the reason to open a card, and at 54px it was unreadable. */
@@ -4156,10 +4195,10 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   <div class="pb" style="padding-top:0">
     <p class="note" style="font-size:12px;color:var(--live)">
       Switching the mode switch never starts a strategy &mdash; that places no
-      order. Start below arms one strategy for real money. A deploy or crash
-      re-arms every lane automatically: a stop only sticks until the app
-      restarts, because a stop recorded in a previous session is treated as
-      stale intent rather than a decision that outlives the process.
+      order. Each book remembers YOUR LAST CLICK forever: a strategy you
+      stopped stays stopped across redeploys and logins until you press Start
+      here again, and a strategy you started keeps coming back from crashes
+      automatically. Start/Stop is welded to your buttons, per book, for good.
     </p>
   </div>
   {%- endif %}
@@ -4186,6 +4225,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
           <span class="mono" style="color:var(--faint)">$<span id="c-{{ c.name }}-dep">{{ '%.2f'|format(c.deployed) }}</span> deployed{% if not c.running and c.stop_reason %} &middot; {{ c.stop_reason }}{% endif %}</span>
           <span class="bar" onclick="event.stopPropagation()">
             <button id="btn-{{ c.name }}" onclick="toggleStrategy('{{ c.name }}')">{% if c.running %}Stop{% else %}Start{% endif %}</button>
+            <button onclick="showAnalysis('{{ c.name }}')">ANALYSIS OF</button>
             <button class="danger" onclick="killBot('{{ c.name }}')">Kill</button>
           </span>
         </div>
@@ -4520,10 +4560,10 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   </div>
 
   <div class="panel">
-    <div class="ph"><h2>Recent closed trades</h2><span class="note">{{ s.recent_trades|length }} most recent</span></div>
+    <div class="ph"><h2>Recent closed trades</h2><span class="note">{{ s.recent_trades|length }} most recent &middot; every close is kept forever</span><span class="bar"><button onclick="showAnalysis()">ANALYSIS OF</button></span></div>
     {%- if s.recent_trades %}
     <div class="scroll">
-    <table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Qty</th><th class="num">P&amp;L</th><th>Exited</th></tr></thead><tbody>
+    <table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Qty</th><th class="num">P&amp;L</th><th>Strategy</th><th>Exited</th></tr></thead><tbody>
     {%- for t in s.recent_trades %}
       <tr>
         <td class="mono" title="{{ t.market_id }}">{{ t.market_id[:24] }}</td>
@@ -4533,6 +4573,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
         <td class="num">{{ '%.3f'|format(t.exit_price) }}</td>
         <td class="num">{{ t.quantity }}</td>
         <td class="num {{ 'up' if t.pnl > 0 else ('down' if t.pnl < 0 else 'flat') }}">{{ t.pnl }}</td>
+        <td><span class="tag">{{ t.strategy }}</span></td>
         <td class="mono" style="color:var(--faint)">{{ (t.exit_timestamp or '')[:16] }}</td>
       </tr>
     {%- endfor %}
@@ -4542,6 +4583,16 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
     <div class="empty">No closed trades recorded yet.</div>
     {%- endif %}
   </div>
+</div>
+
+<!-- ============ trade analysis ============ -->
+<div class="panel" id="analysisPanel" style="margin-bottom:12px;display:none">
+  <div class="ph">
+    <h2 id="analysisTitle">ANALYSIS OF</h2>
+    <span class="note" id="analysisScope"></span>
+    <span class="bar"><button onclick="closeAnalysis()">Close</button></span>
+  </div>
+  <div class="pb" id="analysisBody"><div class="empty">Loading analysis&hellip;</div></div>
 </div>
 
 <!-- ============ strategy detail ============ -->
@@ -5402,6 +5453,108 @@ function closeStrategy() {
   openName = null;
   $('detailPanel').style.display = 'none';
   if (detailChart) { detailChart.destroy(); detailChart = null; }
+}
+
+// ---------------------------------------------------------------------------
+// ANALYSIS OF - stats and recommendations over the forever trade log
+// ---------------------------------------------------------------------------
+const analysisChart = { current: null };
+let analysisReq = 0;
+
+function closeAnalysis() {
+  $('analysisPanel').style.display = 'none';
+  if (analysisChart.current) { analysisChart.current.destroy(); analysisChart.current = null; }
+}
+
+function _anStat(label, value, cls) {
+  return '<div><b class="' + (cls || '') + '">' + value + '</b><span>' + label + '</span></div>';
+}
+
+function _anTable(heads, rows) {
+  if (!rows || !rows.length) return '';
+  let h = '<table><thead><tr>' + heads.map(x => '<th>' + esc(x) + '</th>').join('') + '</tr></thead><tbody>';
+  for (const r of rows) {
+    h += '<tr>' + r.map(c => '<td' + (c.num ? ' class="num"' : '') + '>' + (c.raw ? c.v : esc(c.v)) + '</td>').join('') + '</tr>';
+  }
+  return h + '</tbody></table>';
+}
+
+async function showAnalysis(name) {
+  const req = ++analysisReq;
+  const panel = $('analysisPanel');
+  panel.style.display = '';
+  $('analysisTitle').textContent = 'ANALYSIS OF';
+  $('analysisScope').textContent = name
+    ? (name + ' - every closed trade, forever')
+    : ('all strategies - every closed trade, forever');
+  $('analysisBody').innerHTML = '<div class="empty">Loading analysis&hellip;</div>';
+  panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  const url = name
+    ? '/api/strategy/' + encodeURIComponent(name) + '/analysis'
+    : '/api/analysis';
+  const r = await fetch(url);
+  const a = await r.json().catch(() => ({}));
+  if (req !== analysisReq) return; // a newer analysis replaced this one
+  if (a.error) {
+    $('analysisBody').innerHTML = '<div class="empty">' + esc(a.error) + '</div>';
+    return;
+  }
+  const pnlCls = a.total_pnl > 0 ? 'up' : (a.total_pnl < 0 ? 'down' : 'flat');
+  let html = '<div class="cstats" style="grid-template-columns:repeat(auto-fit,minmax(92px,1fr))">'
+    + _anStat('closed trades', a.trades)
+    + _anStat('win rate', a.win_rate + '%')
+    + _anStat('total P&L', money(a.total_pnl), pnlCls)
+    + _anStat('avg P&L', money(a.avg_pnl), a.avg_pnl > 0 ? 'up' : (a.avg_pnl < 0 ? 'down' : 'flat'))
+    + _anStat('best', money(a.best), 'up')
+    + _anStat('worst', money(a.worst), 'down')
+    + '</div>';
+
+  html += '<h3 style="font-size:12px;margin:14px 0 6px">Recommendations</h3><ul class="recs">'
+    + a.recommendations.map(x => '<li>' + esc(x) + '</li>').join('') + '</ul>';
+
+  html += '<h3 style="font-size:12px;margin:14px 0 6px">By strategy</h3>'
+    + _anTable(['Strategy', 'Trades', 'Win rate', 'P&L'],
+      (a.by_strategy || []).map(r => [
+        { v: r.strategy }, { v: r.trades, num: true },
+        { v: r.win_rate + '%', num: true },
+        { v: money(r.pnl), num: true, raw: '<span class="' + (r.pnl > 0 ? 'up' : (r.pnl < 0 ? 'down' : 'flat')) + '">' + money(r.pnl) + '</span>' },
+      ]));
+
+  html += '<div class="row two" style="padding:0;margin-top:8px">'
+    + '<div><h3 style="font-size:12px;margin:0 0 6px">By side</h3>'
+    + _anTable(['Side', 'Trades', 'Win rate', 'P&L'],
+      (a.by_side || []).map(r => [
+        { v: r.side }, { v: r.trades, num: true },
+        { v: r.win_rate + '%', num: true },
+        { v: money(r.pnl), num: true },
+      ])) + '</div>'
+    + '<div><h3 style="font-size:12px;margin:0 0 6px">By entry price</h3>'
+    + _anTable(['Band', 'Trades', 'Win rate', 'P&L'],
+      (a.by_price_band || []).map(r => [
+        { v: r.band }, { v: r.trades, num: true },
+        { v: r.win_rate + '%', num: true },
+        { v: money(r.pnl), num: true },
+      ])) + '</div></div>';
+
+  if (a.by_hour && a.by_hour.length) {
+    html += '<h3 style="font-size:12px;margin:14px 0 6px">By hour of exit</h3>'
+      + _anTable(['Hour', 'Trades', 'Win rate', 'P&L'],
+        a.by_hour.map(r => [
+          { v: r.hour }, { v: r.trades, num: true },
+          { v: r.win_rate + '%', num: true },
+          { v: money(r.pnl), num: true },
+        ]));
+  }
+  if (a.by_exit_reason && a.by_exit_reason.length) {
+    html += '<h3 style="font-size:12px;margin:14px 0 6px">By exit reason</h3>'
+      + _anTable(['Reason', 'Trades'], a.by_exit_reason.map(r => [{ v: r.reason }, { v: r.trades, num: true }]));
+  }
+  if (a.hold_seconds_avg_win || a.hold_seconds_avg_loss) {
+    html += '<p class="note" style="margin-top:10px;color:var(--dim)">Average hold: winners '
+      + Math.round(a.hold_seconds_avg_win / 60) + 'm, losers '
+      + Math.round(a.hold_seconds_avg_loss / 60) + 'm.</p>';
+  }
+  $('analysisBody').innerHTML = html;
 }
 
 async function startAll() {

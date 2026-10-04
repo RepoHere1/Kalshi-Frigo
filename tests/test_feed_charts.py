@@ -143,11 +143,11 @@ def test_live_lanes_are_resumed_like_any_other_lane():
     what turned the whole book off overnight: every deploy silently stopped the
     armed strategies and the account sat idle. An armed lane means the operator
     already said yes; that intent now survives the process that recorded it,
-    and only a Stop given in the current instance takes a lane down.
+    and the operator's Stop is permanent per book.
     """
     src = _supervisor_source()
     assert "was running LIVE before a restart and was not" not in src
-    assert "_CUR_INSTANCE" in src
+    assert "_OPERATOR_STOP_REASONS" in src
 
 
 def test_the_supervisor_manages_only_the_current_book():

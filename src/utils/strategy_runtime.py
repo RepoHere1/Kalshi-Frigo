@@ -287,20 +287,33 @@ class StrategyRuntime:
             await conn.commit()
         return {"name": name, "pid": int(pid), "mode": mode, "running": True}
 
-    async def record_stop(self, name: str, reason: str, mode: str) -> None:
-        # The instance is stamped on the stop as well as the start: without it a
-        # stop recorded before a redeploy is indistinguishable from one given in
-        # this instance, so a lane stopped once stayed down forever across every
-        # restart. Stamping it lets the supervisor tell "the operator just said
-        # stop" from "a stop left over from a previous deploy". The mode scopes
-        # the stop to ONE BOOK: stopping LIVE must never touch DRY.
+    async def record_stop(
+        self, name: str, reason: str, mode: str, clear_desired: bool = True
+    ) -> None:
+        # The mode scopes the stop to ONE BOOK: stopping LIVE must never touch
+        # DRY. `clear_desired` distinguishes the two kinds of stop:
+        #
+        #   clear_desired=True  - the operator pressed Stop. This is PERMANENT
+        #     intent: the lane stays down across redeploys, book switches and
+        #     any number of logins, until Start is pressed in this book again.
+        #   clear_desired=False - the process died on its own (crash, restart).
+        #     That is not a decision, so the operator's intent is kept and the
+        #     supervisor resurrects the lane.
         async with _conn(self.db_path) as conn:
-            await conn.execute(
-                "UPDATE strategy_runtime SET pid=NULL, stop_reason=?, stopped_at=?,"
-                " instance=?, desired=0"
-                " WHERE name=? AND mode=?",
-                (reason, _now(), INSTANCE, name, mode),
-            )
+            if clear_desired:
+                await conn.execute(
+                    "UPDATE strategy_runtime SET pid=NULL, stop_reason=?, stopped_at=?,"
+                    " instance=?, desired=0"
+                    " WHERE name=? AND mode=?",
+                    (reason, _now(), INSTANCE, name, mode),
+                )
+            else:
+                await conn.execute(
+                    "UPDATE strategy_runtime SET pid=NULL, stop_reason=?, stopped_at=?,"
+                    " instance=?"
+                    " WHERE name=? AND mode=?",
+                    (reason, _now(), INSTANCE, name, mode),
+                )
             await conn.commit()
 
     async def record_heartbeat(self, name: str, mode: str) -> None:

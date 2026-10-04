@@ -120,24 +120,40 @@ def test_a_restart_re_arms_every_lane_in_either_book():
     assert '_spawn_strategy(name, "paper")' not in src
 
 
-def test_an_operator_stop_only_counts_when_given_in_this_instance():
-    """A stop must not outlive the process that recorded it.
+def test_an_operator_stop_is_permanent_across_instances():
+    """The operator's Stop is welded to the state forever.
 
-    `record_stop` stamps the instance id, and the operator-stop exemption only
-    applies to a row from the current instance. Without that pairing a stop
-    recorded before a redeploy is indistinguishable from a fresh decision, so a
-    lane stopped once stayed down forever - which is precisely the "strategies
-    turned themselves off and never came back" symptom.
+    A stop must NOT expire with the process that recorded it: the button is
+    the truth. A lane stopped in one instance stays stopped across redeploys
+    and logins until Start is pressed in that book again - there is no
+    instance check, no expiry window, nothing that can quietly re-arm it.
     """
-    from src.utils.strategy_runtime import INSTANCE, StrategyRuntime
+    from src.utils.strategy_runtime import StrategyRuntime
 
     supervisor = inspect.getsource(wd._strategy_supervisor_loop)
-    assert "_CUR_INSTANCE" in supervisor
-    assert '(row.get("instance") or "") == _CUR_INSTANCE' in supervisor
+    assert "_OPERATOR_STOP_REASONS" in supervisor
+    # No instance scoping on the operator-stop exemption any more.
+    assert "_CUR_INSTANCE" not in supervisor
 
     stop_src = inspect.getsource(StrategyRuntime.record_stop)
-    assert "instance=?" in stop_src
-    assert INSTANCE is not None
+    assert "clear_desired" in stop_src
+    assert "desired=0" in stop_src
+
+
+def test_a_crash_does_not_clear_the_operators_intent():
+    """A died-on-its-own lane must be resurrected, not permanently stopped.
+
+    record_stop distinguishes the operator's Stop (clears desired forever)
+    from an incidental death (keeps desired), so a crash can never weld a
+    lane off.
+    """
+    from src.utils.strategy_runtime import StrategyRuntime
+
+    src = inspect.getsource(StrategyRuntime.record_stop)
+    assert "clear_desired: bool = True" in src
+    assert "clear_desired" in src
+    dash_src = inspect.getsource(wd._recorded_state)
+    assert "clear_desired=False" in dash_src
 
 
 def test_the_live_page_describes_the_real_arming_policy():
@@ -150,7 +166,7 @@ def test_the_live_page_describes_the_real_arming_policy():
     html = wd._TEMPLATE
     assert "armed one strategy at a time" not in html
     assert "does not place a single order" not in html
-    assert "re-arms every lane automatically" in html
+    assert "remembers YOUR LAST CLICK forever" in html
 
 
 def test_the_dry_page_offers_no_live_controls(monkeypatch, tmp_path):
