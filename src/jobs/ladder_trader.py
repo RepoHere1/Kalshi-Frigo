@@ -66,8 +66,10 @@ class UpDownConfig:
     # LIVE only: the largest fraction of the available balance one clip may
     # spend. A fixed $5 clip empties a small account in a trade or two and it
     # then sits idle all night - sizing down against the balance keeps the book
-    # firing on every real edge instead of going dark after one buy.
-    live_cash_fraction: float = 0.15
+    # firing on every real edge instead of going dark after one buy. Raised to
+    # 0.20 on the strength of the forever-log analysis (76% win rate over 283
+    # closes - the edge is real, scale up).
+    live_cash_fraction: float = 0.20
     # Minimum model probability on the chosen side before any entry. The old
     # "one clip per market" guard was removed; this is what replaces it as the
     # anti-churn rule - repeated buys of the same contract are allowed, but only
