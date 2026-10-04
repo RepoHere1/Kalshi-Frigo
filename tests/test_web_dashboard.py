@@ -991,41 +991,42 @@ def test_toggle_refuses_when_only_api_key_present(client, auth, monkeypatch):
     assert r.status_code == 400
 
 
-def test_a_strategy_running_in_the_other_book_migrates_instead_of_stopping(
-    client, auth, monkeypatch, tmp_path
-):
-    """A Start pressed from the other book migrates the lane, never stops it.
+def test_stopping_one_book_never_stops_the_other(client, auth, monkeypatch, tmp_path):
+    """DRY and LIVE are factually separate books.
 
-    The card filters nothing by book now, but the operator can still be on one
-    page while the lane runs in the other. The old behaviour - stop the
-    old-book process and report "stopped" - is what read as "nothing I start
-    in LIVE turns on": every press killed the lane instead of moving it.
-    Pressing Start on a lane running in the other book must kill the old
-    process, spawn into THIS book, and report running.
+    One runtime row per strategy meant Stop in LIVE cleared the only record,
+    so DRY stopped too - the exact complaint. Each book now has its own row,
+    its own pid and its own desired flag; a Stop scoped to the current book
+    leaves the other book's row untouched.
     """
     import asyncio
     import subprocess as sp
 
+    from src.utils.strategy_runtime import key as rt_key
+
     proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-    spawned = []
-
-    def _fake_spawn(name, mode):
-        spawned.append((name, mode))
-        return {"name": name, "pid": 4242, "running": True, "mode": mode}
-
-    monkeypatch.setattr(wd, "_spawn_strategy", _fake_spawn)
     try:
         store = wd._runtime_store()
+        # A live process on the LIVE row, and a live process on the DRY row.
         asyncio.run(
             store.record_start("btc_updown", proc.pid, "live", "cli.py run --live")
         )
-        # The book is DRY (default) and the strategy is recorded as LIVE.
+        asyncio.run(
+            store.record_start("btc_updown", proc.pid, "paper", "cli.py run --btc-updown")
+        )
+        # The book is DRY (default). Stop must hit ONLY the DRY row.
         r = client.post("/api/strategy/btc_updown/toggle", json={}, headers=auth)
         assert r.status_code == 200
         body = r.get_json()
-        assert body["running"] is True
-        assert body["migrated_from"] == "live"
-        assert spawned == [("btc_updown", "paper")]
+        assert body["running"] is False
+        assert body["was_running_in"] == "paper"
+
+        snap = asyncio.run(store.snapshot())
+        assert snap[rt_key("btc_updown", "paper")]["pid"] is None
+        assert snap[rt_key("btc_updown", "paper")]["stop_reason"] == "stopped by operator"
+        # The LIVE row is untouched: pid intact, still desired.
+        assert snap[rt_key("btc_updown", "live")]["pid"] == proc.pid
+        assert rt_key("btc_updown", "live") in asyncio.run(store.desired())
     finally:
         proc.kill()
         try:
@@ -2101,6 +2102,8 @@ def test_mode_payload_reports_both_books_separately(client):
 
 def test_strategy_state_reads_the_database_not_the_request_flag(client, monkeypatch):
     """A pid recorded by another request - or another worker - must be honoured."""
+    from src.utils.strategy_runtime import key as rt_key
+
     _db()
     from src.utils.strategy_runtime import StrategyRuntime
 
@@ -2112,7 +2115,7 @@ def test_strategy_state_reads_the_database_not_the_request_flag(client, monkeypa
     wd.strategy_state["quick_flip"].update({"running": False, "pid": None})
 
     recorded = wd._recorded_state()
-    assert recorded["quick_flip"]["pid"] == os.getpid()
+    assert recorded[rt_key("quick_flip", "paper")]["pid"] == os.getpid()
     assert wd.strategy_state["quick_flip"]["running"] is True
     assert "quick_flip" in wd._running_strategies()
     snap = client.get("/api/snapshot").get_json()

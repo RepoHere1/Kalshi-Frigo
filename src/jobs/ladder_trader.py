@@ -721,12 +721,15 @@ async def run_updown_trader(
             # Constant live proof: stamp that this process executed a pass just
             # now. The dashboard reads this stamp and refuses to call the
             # strategy "running" once it goes stale - a recycled pid cannot
-            # fake it, because only the real process can write it.
+            # fake it, because only the real process can write it. Scoped to
+            # this process's own book: a DRY heartbeat never counts as a LIVE
+            # proof of life or the other way around.
             try:
+                from src.jobs.broker import should_trade_live
                 from src.utils.strategy_runtime import StrategyRuntime
 
                 await StrategyRuntime(db_path=trader._db_path()).record_heartbeat(
-                    "btc_updown"
+                    "btc_updown", "live" if should_trade_live() else "paper"
                 )
             except Exception as exc:  # noqa: BLE001 - proof must not kill the loop
                 print(f"BTC 15m: heartbeat write failed: {type(exc).__name__}: {exc}", flush=True)

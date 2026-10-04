@@ -65,11 +65,24 @@ def test_auto_start_does_not_resurrect_a_deliberately_stopped_strategy():
     """
     src = inspect.getsource(wd._strategy_supervisor_loop)
     assert "_OPERATOR_STOP_REASONS" in src
-    assert "recorded.get(name)" in src
+    assert "recorded.get(_runtime_key(name))" in src
     assert "all strategies run by default" in src
     # ...and it must start into the book actually in force, not a hardcoded one.
-    assert '_current_book_mode() == "live"' in src
+    assert "book_mode = _runtime_mode()" in src
     assert '_spawn_strategy(name, "paper")' not in src
+
+
+def test_the_supervisor_touches_only_the_book_it_runs_in():
+    """DRY and LIVE are separate books; the supervisor manages one of them.
+
+    Every read and write is scoped with the book's mode word, so a Stop given
+    on the LIVE page can never cascade into DRY.
+    """
+    src = inspect.getsource(wd._strategy_supervisor_loop)
+    assert "book_mode = _runtime_mode()" in src
+    assert "store.desired(mode=book_mode)" in src
+    assert "store.snapshot(mode=book_mode)" in src
+    assert "store.set_desired(name, True, book_mode)" in src
 
 
 def test_only_an_operator_stop_keeps_a_lane_down():
@@ -103,7 +116,7 @@ def test_a_restart_re_arms_every_lane_in_either_book():
     assert "if AUTO_START_ALL:" in src
     assert '_current_book_mode() != "live"' not in src
     # The book in force still decides which book a lane is armed into.
-    assert '_current_book_mode() == "live"' in src
+    assert "book_mode = _runtime_mode()" in src
     assert '_spawn_strategy(name, "paper")' not in src
 
 
@@ -152,7 +165,7 @@ def test_the_dry_page_offers_no_live_controls(monkeypatch, tmp_path):
 
 def test_stopping_still_works_and_is_sticky():
     """The operator's Stop is the only way a lane goes down."""
-    from src.utils.strategy_runtime import StrategyRuntime
+    from src.utils.strategy_runtime import StrategyRuntime, key
     import tempfile
 
     async def scenario():
@@ -161,13 +174,13 @@ def test_stopping_still_works_and_is_sticky():
         path = os.path.join(tempfile.mkdtemp(), "t.db")
         store = StrategyRuntime(db_path=path)
         await store.record_start("ai_directional", 4321, "paper", "cli.py run")
-        assert "ai_directional" in await store.desired()
+        assert key("ai_directional", "paper") in await store.desired()
 
-        await store.set_desired("ai_directional", False)
-        assert "ai_directional" not in await store.desired()
+        await store.set_desired("ai_directional", False, "paper")
+        assert key("ai_directional", "paper") not in await store.desired()
 
         # The row remains, which is what stops auto-start from resurrecting it.
-        assert "ai_directional" in await store.snapshot()
+        assert key("ai_directional", "paper") in await store.snapshot()
 
     import asyncio
 

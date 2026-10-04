@@ -1295,7 +1295,12 @@ def _strategy_supervisor_loop():
             if AUTO_START_ALL and not _creds_present():
                 time.sleep(10)
                 continue
-            wanted = _run_async(store.desired())
+            # THIS BOOK ONLY. DRY and LIVE are separate books with separate
+            # runtime rows; the supervisor manages whichever book the page is
+            # in and never touches the other one. Stopping a strategy in LIVE
+            # therefore leaves DRY's own state exactly as it was.
+            book_mode = _runtime_mode()
+            wanted = _run_async(store.desired(mode=book_mode))
             # Every lane is wanted from boot. Stopping a lane clears
             # its `desired` flag and it stays down; nothing else takes
             # a strategy out of service. That inverts the old failure
@@ -1303,13 +1308,13 @@ def _strategy_supervisor_loop():
             # recorded - simply stayed down and the book quietly ran
             # on whatever happened to still be alive.
             if AUTO_START_ALL:
-                recorded = _run_async(store.snapshot())
+                recorded = _run_async(store.snapshot(mode=book_mode))
                 from src.utils.strategy_runtime import INSTANCE as _CUR_INSTANCE
 
                 for name in strategy_state:
-                    if name in wanted:
+                    if _runtime_key(name) in wanted:
                         continue
-                    row = recorded.get(name)
+                    row = recorded.get(_runtime_key(name))
                     if row is not None:
                         # A row exists, so it has run before. Only a deliberate
                         # operator stop keeps it down - and only a stop the
@@ -1330,17 +1335,11 @@ def _strategy_supervisor_loop():
                             continue
                     if not _creds_present():
                         continue
-                    # Start into whichever book is actually in force. Hardcoding
-                    # "paper" made every auto-started strategy mismatch the book
-                    # while the switch read LIVE, which the toggle correctly
-                    # refuses - so switching to LIVE looked like the strategies
-                    # were broken.
-                    book = "live" if _current_book_mode() == "live" else "paper"
                     try:
-                        _run_async(store.set_desired(name, True))
-                        _spawn_strategy(name, book)
+                        _run_async(store.set_desired(name, True, book_mode))
+                        _spawn_strategy(name, book_mode)
                         _push_error(
-                            f"Started {name} in {book.upper()} " f"(all strategies run by default)."
+                            f"Started {name} in {book_mode.upper()} " f"(all strategies run by default)."
                         )
                         # Stagger the boot storm. Six strategies starting at once
                         # all race for the SQLite write lock, and their lock
@@ -1349,27 +1348,12 @@ def _strategy_supervisor_loop():
                         time.sleep(3)
                     except Exception as exc:  # noqa: BLE001
                         _push_error(f"Auto-start {name} failed: {exc}")
-            for name, row in wanted.items():
+            for _ck, row in wanted.items():
+                name = row.get("name") or ""
                 if name not in strategy_state:
                     continue
                 row_pid = row.get("pid")
-                expected_book = "live" if _current_book_mode() == "live" else "paper"
                 if row_pid and _pid_alive(row_pid, row):
-                    # BOOK SWITCH MIGRATION. A strategy running in the other
-                    # book must follow the operator into the current one: the
-                    # page shows one book at a time, and a lane left behind in
-                    # the old book reads as "off" wherever the operator just
-                    # went - the exact "I go back to dry and every strategy is
-                    # off" complaint. Kill the old-book process and let the
-                    # respawn path below start it in the current book.
-                    row_mode = (row.get("mode") or "paper")
-                    if row_mode != expected_book:
-                        _push_error(
-                            f"{name} is running in {row_mode}; the book is now "
-                            f"{expected_book} - migrating it."
-                        )
-                        _stop_child({"pid": row_pid, "running": True})
-                        continue
                     # A pid that exists is not proof of life. A strategy that
                     # has stopped stamping heartbeats is wedged - its process is
                     # up but its loop is not running - so kill it and fall into
@@ -1430,10 +1414,7 @@ def _strategy_supervisor_loop():
                 if not _creds_present():
                     continue  # nothing to start with; wait for configuration
 
-                # Spawn into the book the operator is actually in, not the book
-                # the stale row remembers. This is what makes a book switch
-                # carry every desired lane with it.
-                mode = expected_book
+                mode = book_mode
                 backoff = failures.get(name, 0.0)
                 if attempts.get(name, 0) >= _SUPERVISOR_MAX_ATTEMPTS:
                     # Never terminal. The old behaviour gave up permanently
@@ -1559,12 +1540,12 @@ def _strategy_cards(
     on the DRY page and vice versa.
     """
     store = _runtime_store()
-    recorded = _run_async(store.snapshot())
+    recorded = _run_async(store.snapshot(mode=_runtime_mode()))
 
     cards: Dict[str, Dict[str, Any]] = {}
     for name, st in strategy_state.items():
         label, description = STRATEGY_DOCS.get(name, (name, ""))
-        db_row = recorded.get(name) or {}
+        db_row = recorded.get(_runtime_key(name)) or {}
         db_pid = db_row.get("pid")
         db_mode = db_row.get("mode")
         # The runtime store records "paper"/"live", but the book
@@ -2924,6 +2905,23 @@ def _runtime_store():
     return StrategyRuntime(db_path=str(DB_PATH))
 
 
+def _runtime_mode() -> str:
+    """The runtime store's mode word for the book currently in force.
+
+    DRY and LIVE are separate books with separate runtime rows. Every read and
+    write against strategy_runtime names ONE book: 'paper' while the page
+    reads DRY, 'live' while it reads LIVE. This is what makes Stop on the LIVE
+    page touch only the LIVE row - the DRY book keeps its own state.
+    """
+    return "live" if _current_book_mode() == "live" else "paper"
+
+
+def _runtime_key(name: str) -> str:
+    from src.utils.strategy_runtime import key as _rt_key
+
+    return _rt_key(name, _runtime_mode())
+
+
 def _recorded_state() -> Dict[str, Dict[str, Any]]:
     """Persisted strategy state, reconciled against the OS.
 
@@ -2931,6 +2929,10 @@ def _recorded_state() -> Dict[str, Dict[str, Any]]:
     `strategy_state` alone produced a page that said "stopped" for strategies
     that were running, because the flag was written by whichever request started
     the process and never learned what happened afterwards.
+
+    The state shown is THIS BOOK's state only: each (strategy, book) pair has
+    its own runtime row, so the LIVE page reports the LIVE row and never reads
+    a stop the operator gave to the DRY book.
 
     Liveness is decided by `owns_process`, not by a bare pid check. A pid recorded
     before a redeploy names some other process now, and treating that stranger as
@@ -2941,7 +2943,7 @@ def _recorded_state() -> Dict[str, Dict[str, Any]]:
 
     recorded = _run_async(_runtime_store().snapshot())
     for name, st in strategy_state.items():
-        row = recorded.get(name) or {}
+        row = recorded.get(_runtime_key(name)) or {}
         # Constant live proof: a heartbeat is stamped by the strategy process
         # itself every cycle. "running" is not a pid that exists - a recycled
         # pid, or a zombie, has a pid - it is a process whose own loop executed
@@ -2969,7 +2971,7 @@ def _recorded_state() -> Dict[str, Dict[str, Any]]:
                 reason = "stopped by app restart"
             else:
                 reason = "exited on its own"
-            _run_async(_runtime_store().record_stop(name, reason))
+            _run_async(_runtime_store().record_stop(name, reason, _runtime_mode()))
             st["pid"] = None
             st["running"] = False
             st["stuck"] = False
@@ -3168,9 +3170,11 @@ def api_strategy_toggle(name):
 
     # Check the DATABASE for the current state — not just the in-memory dict.
     # strategy_state is per-process and can be stale across gunicorn workers.
-    # The database is the shared source of truth.
+    # The database is the shared source of truth. THE LOOKUP IS BOOK-SCOPED:
+    # the LIVE page reads the LIVE row and the DRY page reads the DRY row, so
+    # Start/Stop here can never touch the other book's process or intent.
     recorded = _run_async(store.snapshot())
-    db_row = recorded.get(name) or {}
+    db_row = recorded.get(_runtime_key(name)) or {}
     db_pid = db_row.get("pid")
     db_mode = db_row.get("mode")
     # Exact check, not a bare pid: see `_pid_alive`. Without this a pid left over
@@ -3178,30 +3182,12 @@ def api_strategy_toggle(name):
     # signals an unrelated process instead of a bot.
     db_running = bool(db_pid) and _pid_alive(db_pid, db_row)
 
-    # RUNNING IN THE OTHER BOOK = the operator is asking to MIGRATE it, not to
-    # stop it. The card said "Start" because the page filters by book, the
-    # operator pressed it expecting the lane to come up HERE, and the old code
-    # stopped the other-book process and reported "stopped" - so "nothing I
-    # start in LIVE turns on". Migrate instead: kill the old-book process and
-    # spawn the lane into this book, returning the new pid as running.
-    if db_running and db_mode and db_mode != mode:
-        _stop_child({"pid": db_pid, "running": True})
-        _run_async(store.record_stop(name, f"migrated to {mode}"))
-        _run_async(store.set_desired(name, True))
-        try:
-            result = _spawn_strategy(name, mode)
-        except Exception as e:  # noqa: BLE001
-            _push_error(f"Strategy migrate ({name}): {e}")
-            return jsonify({"error": f"Failed to start: {e}"}), 500
-        _recorded_state()
-        _broadcast("strategy", {"name": name, "action": "started", "pid": result["pid"]})
-        return jsonify({**result, "migrated_from": db_mode})
-
-    # RUNNING IN THIS BOOK = a deliberate Stop.
+    # RUNNING IN THIS BOOK = a deliberate Stop, scoped to THIS BOOK. The other
+    # book's row - its pid, its desired flag - is never touched.
     if db_running:
         code = _stop_child({"pid": db_pid, "running": True})
-        _run_async(store.record_stop(name, "stopped by operator"))
-        _run_async(store.set_desired(name, False))
+        _run_async(store.record_stop(name, "stopped by operator", mode))
+        _run_async(store.set_desired(name, False, mode))
         _recorded_state()
         _broadcast("strategy", {"name": name, "action": "stopped"})
         return jsonify(
@@ -3214,31 +3200,12 @@ def api_strategy_toggle(name):
             }
         )
 
-    # Identity isolation on STARTING only: a strategy already running in the
-    # other book cannot be joined from here. (Unreachable in practice now that
-    # stop precedes it, but kept so a future reordering cannot silently reopen
-    # the deadlock.)
-    if db_running and db_mode and db_mode != mode:  # pragma: no cover
-        return (
-            jsonify(
-                {
-                    "error": f"Strategy '{name}' is already running in {db_mode} mode "
-                    f"(pid {db_pid}). Stop it in {db_mode} before starting it in {mode}."
-                }
-            ),
-            409,
-        )
-
     # Stopping is recorded as an explicit instruction, not just a cleared pid, so
     # the supervisor knows this strategy is meant to stay down.
-    _run_async(store.set_desired(name, False))
+    _run_async(store.set_desired(name, False, mode))
 
     if requested_mode is not None and requested_mode != runtime_mode:
-        # Starting is gated on the book. This check sits AFTER the stop branch
-        # deliberately: gating Stop as well made a DRY-started strategy
-        # unkillable once the switch moved to LIVE, because Kill sends the card's
-        # mode and that no longer matched. Trading processes must always be
-        # stoppable, whichever book they belong to.
+        # Starting is gated on the book: the page controls the book it shows.
         return (
             jsonify(
                 {
@@ -3850,32 +3817,16 @@ body[data-mode="dry"]  .brand .logo{border-color:rgba(77,159,255,.4);box-shadow:
 .modeflag.dry {color:var(--up);background:rgba(46,230,168,.10)}
 .modeflag.live{color:var(--live);background:var(--live-bg)}
 .modeflag .dot{width:9px;height:9px}
-/* LIVE flag: no on/off blinking. A brighter red fill, a THIN yellow border, a
-   yellow hump that travels around the border itself (never leaving it), and a
-   silver shimmer sweeping across the face. */
+/* LIVE flag: no blinking, no orbiting beacon. A brighter red fill, WHITE
+   text, a thin yellow border, and the silver shimmer sweeping across. */
 body[data-mode="live"] .modeflag.live{
   animation:none;
-  border:1px solid #ffd600;color:#ffd600;
-  background:linear-gradient(150deg,#e20707,#b00000 55%,#7a0000);
-  box-shadow:0 0 0 1px rgba(0,0,0,.5), 0 0 16px rgba(224,7,7,.6), 0 4px 16px rgba(0,0,0,.4);
+  border:1px solid #ffd600;color:#ffffff;
+  background:linear-gradient(150deg,#ff1414,#c80000 55%,#8a0000);
+  box-shadow:0 0 0 1px rgba(0,0,0,.5), 0 0 18px rgba(255,20,20,.65), 0 4px 16px rgba(0,0,0,.4);
 }
 body[data-mode="live"] .modeflag.live .dot{display:none}
-/* The hump: a bright arc in a conic gradient, masked down to the border ring,
-   rotating so the arc travels along the border continuously. */
-.orbitring{
-  position:absolute;inset:-1px;border-radius:11px;padding:1px;pointer-events:none;
-  background:conic-gradient(from 0deg,
-    transparent 0deg 295deg,
-    #ffe600 312deg 330deg,
-    #fff8d6 336deg 348deg,
-    transparent 352deg 360deg);
-  -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
-  -webkit-mask-composite:xor;
-          mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
-          mask-composite:exclude;
-  animation:spin 2.6s linear infinite;
-}
-@keyframes spin{to{transform:rotate(360deg)}}
+.orbitring{display:none}
 body[data-mode="live"] .modeflag.live::after{
   content:'';position:absolute;inset:0;border-radius:8px;pointer-events:none;overflow:hidden;
   background:linear-gradient(115deg,transparent 32%,rgba(235,240,250,.28) 47%,rgba(255,255,255,.5) 52%,transparent 68%);
@@ -4050,11 +4001,9 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
        buttons, so the mode and the control that changes it read together
        instead of the flag floating above them. -->
   <div class="moderow">
-    <!-- Unmistakable state flag. LIVE drops the blinking dot for a steady
-         blood-red fill, a bright yellow border, a yellow beacon orbiting the
-         border, and a silver shimmer sweep. -->
+    <!-- Unmistakable state flag. LIVE: brighter red fill, white text, thin
+         yellow border, silver shimmer. No blinking, no orbiting beacon. -->
     <div id="modeFlag" class="modeflag {{ 'live' if s.mode.mode == 'live' else 'dry' }}">
-      {%- if s.mode.mode == 'live' %}<span class="orbitring"></span>{% endif %}
       <span class="dot"></span>
       <span id="modeFlagText">{{ 'LIVE MODE' if s.mode.mode == 'live' else 'DRY MODE' }}</span>
     </div>

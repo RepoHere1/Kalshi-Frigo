@@ -379,6 +379,8 @@ async def test_a_cycle_crash_never_kills_the_process(tmp_path, monkeypatch):
     import src.jobs.ladder_trader as lt
     from src.utils.strategy_runtime import StrategyRuntime
 
+    rt = __import__("src.utils.strategy_runtime", fromlist=["key"])
+
     db = str(tmp_path / "t.db")
     store = StrategyRuntime(db_path=db)
     await store.record_start("btc_updown", os.getpid(), "paper", "cli.py run --btc-updown")
@@ -415,7 +417,7 @@ async def test_a_cycle_crash_never_kills_the_process(tmp_path, monkeypatch):
     await lt.run_updown_trader(lt.UpDownConfig(), loop=False)
 
     assert calls == [1], "the crashed cycle must not have been retried into an infinite loop"
-    row = (await store.snapshot())["btc_updown"]
+    row = (await store.snapshot())[rt.key("btc_updown", "paper")]
     assert row.get("heartbeat_at"), "a crashed pass must still stamp its heartbeat"
 
 

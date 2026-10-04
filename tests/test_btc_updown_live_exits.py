@@ -105,7 +105,12 @@ async def test_a_tracking_failure_does_not_stop_the_trader(tmp_path, monkeypatch
     monkeypatch.setattr("src.jobs.broker.should_trade_live", lambda: False, raising=False)
 
     summary = await trader.cycle()  # must not raise
-    assert "book" in summary or "ticker" in str(summary)
+    # The failure must not take the entry path down: the cycle completes with a
+    # full summary dict. The no-entry reason varies with the synthetic market's
+    # seconds-left, so assert the shape, not a specific skip phrase.
+    assert isinstance(summary, dict)
+    assert "reason" in summary
+    assert "signals" in summary
 
 
 @pytest.mark.live

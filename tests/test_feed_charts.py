@@ -150,18 +150,16 @@ def test_live_lanes_are_resumed_like_any_other_lane():
     assert "_CUR_INSTANCE" in src
 
 
-def test_the_supervisor_migrates_lanes_into_the_current_book():
-    """Switching DRY<->LIVE must carry every desired lane with it.
+def test_the_supervisor_manages_only_the_current_book():
+    """DRY and LIVE are separate books with separate runtime rows.
 
-    The operator flips the switch and the page shows the other book; a lane
-    left running in the old book reads as "off" wherever they just went. The
-    supervisor kills a wanted lane whose recorded book no longer matches the
-    current one, and the respawn path starts it in the current book.
+    The supervisor reads and writes one book's rows only, so a Stop on the
+    LIVE page can never clear DRY's intent or kill DRY's process.
     """
     src = _supervisor_source()
-    assert "expected_book" in src
-    assert "migrating it" in src
-    assert "Spawn into the book the operator is actually in" in src
+    assert "book_mode = _runtime_mode()" in src
+    assert "store.desired(mode=book_mode)" in src
+    assert "store.snapshot(mode=book_mode)" in src
 
 
 def test_a_recovered_strategy_resets_the_failure_budget():

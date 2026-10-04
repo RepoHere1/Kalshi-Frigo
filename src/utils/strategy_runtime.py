@@ -27,19 +27,32 @@ from src.utils.database import connect
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS strategy_runtime (
-    name TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
     pid INTEGER,
     started_at TEXT,
-    mode TEXT,
+    mode TEXT NOT NULL,
     command TEXT,
     stop_reason TEXT,
     stopped_at TEXT,
     instance TEXT,
     start_ticks INTEGER,
     desired INTEGER DEFAULT 0,
-    heartbeat_at TEXT
+    heartbeat_at TEXT,
+    PRIMARY KEY (name, mode)
 );
 """
+
+
+def key(name: str, mode: str) -> str:
+    """The composite record key: DRY and LIVE are separate books.
+
+    One row per strategy used to mean ONE process per strategy, so stopping it
+    in LIVE stopped it in DRY too - the two books shared a single runtime
+    record and therefore a single on/off switch. Each book now has its own row,
+    its own pid, its own desired flag: Stop on the LIVE page touches only the
+    LIVE row, and DRY keeps running whatever DRY was told to do.
+    """
+    return f"{name}|{mode}"
 
 # A process tree does not outlive the container. Every pid recorded by a previous
 # instance of this app therefore names something else now - at best nothing, at
@@ -48,6 +61,70 @@ CREATE TABLE IF NOT EXISTS strategy_runtime (
 # Stamping each row with the instance that created it is what makes a recorded pid
 # mean anything at all.
 INSTANCE = uuid.uuid4().hex
+
+
+async def _migrate_composite_key(conn: Any) -> None:
+    """Rebuild strategy_runtime so (name, mode) is the primary key.
+
+    The old table was keyed on `name` alone, which made DRY and LIVE share one
+    record and one on/off switch. `CREATE TABLE IF NOT EXISTS` leaves the old
+    table untouched, so the PK is detected and the table rebuilt: rows are
+    copied with their mode normalised ('dry' -> 'paper', empty -> 'paper'), and
+    a NULL/empty pid carries desired=0 forward so a lane stopped in the old
+    schema stays stopped rather than coming back armed by accident.
+    """
+    cur = await conn.execute("PRAGMA index_list(strategy_runtime)")
+    indexes = await cur.fetchall()
+    pk_cols = None
+    for idx in indexes:
+        if int(idx[2]) == 1 and idx[3] == "pk":
+            cur = await conn.execute(f"PRAGMA index_info({idx[1]})")
+            # index_info rows are (seqno, cid, name): the NAME is index 2. Reading
+            # index 1 returned column ordinals, so the composite PK was never
+            # detected and the table was rebuilt on EVERY connection - which
+            # reset desired=0 on stopped rows and made intent un-settable.
+            pk_cols = [r[2] for r in await cur.fetchall()]
+            break
+    if pk_cols is not None and "mode" in pk_cols:
+        return
+
+    await conn.execute("ALTER TABLE strategy_runtime RENAME TO strategy_runtime_legacy")
+    await conn.execute(
+        """
+        CREATE TABLE strategy_runtime (
+            name TEXT NOT NULL,
+            pid INTEGER,
+            started_at TEXT,
+            mode TEXT NOT NULL,
+            command TEXT,
+            stop_reason TEXT,
+            stopped_at TEXT,
+            instance TEXT,
+            start_ticks INTEGER,
+            desired INTEGER DEFAULT 0,
+            heartbeat_at TEXT,
+            PRIMARY KEY (name, mode)
+        )
+        """
+    )
+    await conn.execute(
+        """
+        INSERT INTO strategy_runtime
+            (name, pid, started_at, mode, command, stop_reason, stopped_at,
+             instance, start_ticks, desired, heartbeat_at)
+        SELECT name,
+               CASE WHEN pid IS NULL OR pid = 0 THEN NULL ELSE pid END,
+               started_at,
+               CASE WHEN NULLIF(mode, '') IS NULL OR mode = 'dry' THEN 'paper'
+                    ELSE mode END,
+               command, stop_reason, stopped_at, instance, start_ticks,
+               CASE WHEN pid IS NULL OR pid = 0 THEN 0 ELSE COALESCE(desired, 0) END,
+               heartbeat_at
+        FROM strategy_runtime_legacy
+        """
+    )
+    await conn.execute("DROP TABLE strategy_runtime_legacy")
+    await conn.commit()
 
 
 async def _ensure_columns(conn: Any) -> None:
@@ -156,6 +233,7 @@ async def _conn(db_path: str) -> AsyncIterator[Any]:
         conn.row_factory = aiosqlite.Row
         await conn.executescript(SCHEMA)
         await _ensure_columns(conn)
+        await _migrate_composite_key(conn)
         yield conn
 
 
@@ -190,8 +268,8 @@ class StrategyRuntime:
                 "INSERT INTO strategy_runtime (name, pid, started_at, mode, command,"
                 " stop_reason, stopped_at, instance, start_ticks, desired, heartbeat_at)"
                 " VALUES (?,?,?,?,?,NULL,NULL,?,?,?,NULL)"
-                " ON CONFLICT(name) DO UPDATE SET pid=excluded.pid,"
-                " started_at=excluded.started_at, mode=excluded.mode,"
+                " ON CONFLICT(name, mode) DO UPDATE SET pid=excluded.pid,"
+                " started_at=excluded.started_at,"
                 " command=excluded.command, stop_reason=NULL, stopped_at=NULL,"
                 " instance=excluded.instance, start_ticks=excluded.start_ticks,"
                 " desired=excluded.desired, heartbeat_at=NULL",
@@ -207,24 +285,25 @@ class StrategyRuntime:
                 ),
             )
             await conn.commit()
-        return {"name": name, "pid": int(pid), "running": True}
+        return {"name": name, "pid": int(pid), "mode": mode, "running": True}
 
-    async def record_stop(self, name: str, reason: str) -> None:
+    async def record_stop(self, name: str, reason: str, mode: str) -> None:
         # The instance is stamped on the stop as well as the start: without it a
         # stop recorded before a redeploy is indistinguishable from one given in
         # this instance, so a lane stopped once stayed down forever across every
         # restart. Stamping it lets the supervisor tell "the operator just said
-        # stop" from "a stop left over from a previous deploy".
+        # stop" from "a stop left over from a previous deploy". The mode scopes
+        # the stop to ONE BOOK: stopping LIVE must never touch DRY.
         async with _conn(self.db_path) as conn:
             await conn.execute(
                 "UPDATE strategy_runtime SET pid=NULL, stop_reason=?, stopped_at=?,"
                 " instance=?, desired=0"
-                " WHERE name=?",
-                (reason, _now(), INSTANCE, name),
+                " WHERE name=? AND mode=?",
+                (reason, _now(), INSTANCE, name, mode),
             )
             await conn.commit()
 
-    async def record_heartbeat(self, name: str) -> None:
+    async def record_heartbeat(self, name: str, mode: str) -> None:
         """Stamp that the strategy process is factually alive right now.
 
         This is the constant proof the dashboard shows: a pid can be recycled or
@@ -235,13 +314,13 @@ class StrategyRuntime:
         """
         async with _conn(self.db_path) as conn:
             await conn.execute(
-                "UPDATE strategy_runtime SET heartbeat_at=? WHERE name=?",
-                (_now(), name),
+                "UPDATE strategy_runtime SET heartbeat_at=? WHERE name=? AND mode=?",
+                (_now(), name, mode),
             )
             await conn.commit()
 
-    async def set_desired(self, name: str, desired: bool) -> None:
-        """Record the operator's intent, independent of whether a pid is alive.
+    async def set_desired(self, name: str, desired: bool, mode: str) -> None:
+        """Record the operator's intent for ONE BOOK, independent of any pid.
 
         This is what "run until I say otherwise" means concretely: the intent
         outlives the process, so a crash or a restart can be recovered from
@@ -249,26 +328,40 @@ class StrategyRuntime:
         """
         async with _conn(self.db_path) as conn:
             await conn.execute(
-                "UPDATE strategy_runtime SET desired=? WHERE name=?",
-                (1 if desired else 0, name),
+                "UPDATE strategy_runtime SET desired=? WHERE name=? AND mode=?",
+                (1 if desired else 0, name, mode),
             )
             await conn.commit()
 
-    async def desired(self) -> Dict[str, Dict[str, Any]]:
-        """Every strategy the operator asked to keep running."""
+    async def desired(self, mode: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+        """Every (strategy, book) pair the operator asked to keep running.
+
+        Keys are composite (`name|mode`). `mode` filters to one book.
+        """
         try:
             async with _conn(self.db_path) as conn:
-                cur = await conn.execute("SELECT * FROM strategy_runtime WHERE desired = 1")
-                return {r["name"]: dict(r) for r in await cur.fetchall()}
+                if mode:
+                    cur = await conn.execute(
+                        "SELECT * FROM strategy_runtime WHERE desired = 1 AND mode = ?",
+                        (mode,),
+                    )
+                else:
+                    cur = await conn.execute("SELECT * FROM strategy_runtime WHERE desired = 1")
+                return {key(r["name"], r["mode"]): dict(r) for r in await cur.fetchall()}
         except Exception:  # noqa: BLE001 - a fresh DB has no table yet
             return {}
 
-    async def snapshot(self) -> Dict[str, Dict[str, Any]]:
-        """Recorded state for every strategy that has ever been started."""
+    async def snapshot(self, mode: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+        """Recorded state for every (strategy, book) that has ever been started."""
         try:
             async with _conn(self.db_path) as conn:
-                cur = await conn.execute("SELECT * FROM strategy_runtime")
-                return {r["name"]: dict(r) for r in await cur.fetchall()}
+                if mode:
+                    cur = await conn.execute(
+                        "SELECT * FROM strategy_runtime WHERE mode = ?", (mode,)
+                    )
+                else:
+                    cur = await conn.execute("SELECT * FROM strategy_runtime")
+                return {key(r["name"], r["mode"]): dict(r) for r in await cur.fetchall()}
         except Exception:  # noqa: BLE001 - a fresh DB has no table yet
             return {}
 
