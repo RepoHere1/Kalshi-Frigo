@@ -2882,19 +2882,39 @@ body{
 }
 .wrap{max-width:1400px;margin:0 auto}
 
-/* ---------- header ---------- */
-header{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;justify-content:space-between;margin-bottom:22px}
-.brand{display:flex;align-items:center;gap:12px}
+/* ---------- header ----------
+   ONE row, left to right: logo + wordmark | mode flag + DRY/LIVE | host | stamp.
+   The stamp is pushed hard right with margin-left:auto so it stays the last
+   thing on the line even when the middle cells resize. The mode control sits
+   immediately right of the wordmark rather than in its own stacked column, so
+   the name, the current state and the control that changes it read as one
+   unit. */
+header{
+  display:flex;flex-wrap:nowrap;align-items:center;gap:18px;
+  margin-bottom:22px;min-width:0;
+}
+.brand{display:flex;align-items:center;gap:12px;min-width:0;flex:0 1 auto}
+.brandtext{min-width:0}
 .logo{
-  width:42px;height:42px;border-radius:12px;display:grid;place-items:center;font-size:20px;
+  width:42px;height:42px;border-radius:12px;display:grid;place-items:center;font-size:20px;flex:none;
   background:linear-gradient(145deg,#2b6cff,#8b5cf6);box-shadow:0 6px 20px rgba(43,108,255,.35);
 }
-h1{font-size:20px;font-weight:650;letter-spacing:-.2px}
+h1{font-size:20px;font-weight:650;letter-spacing:-.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 h1 span{color:var(--dim);font-weight:400}
-.sub{color:var(--faint);font-size:12px;margin-top:2px}
-.headright{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
-  /* Flag and switch on one row, flag to the left of the buttons. */
-  .moderow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end}
+.sub{color:var(--faint);font-size:12px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* Flag and switch on one row, flag to the left of the buttons. */
+.moderow{display:flex;align-items:center;gap:10px;flex:none}
+.hostcell{flex:none;min-width:0}
+.stamp{margin-left:auto;flex:none;font-size:11px;color:var(--faint);white-space:nowrap}
+
+/* Narrow viewports cannot hold seven things on one line without truncating the
+   mode control, which is the one element that must stay fully readable. Below
+   this width the header is allowed to wrap, but it wraps into rows rather than
+   columns so the wordmark keeps its content. */
+@media (max-width:1180px){
+  header{flex-wrap:wrap;row-gap:12px}
+  .stamp{margin-left:0}
+}
 
 /* DRY / LIVE switch - the highest-stakes control on the page, so it is the
    most prominent thing in the header and colour-coded rather than subtle. */
@@ -2954,7 +2974,10 @@ body[data-mode="live"] .modeflag.live{animation:blink 1.1s steps(1) infinite}
   padding:3px 9px;border-radius:7px;cursor:pointer;transition:.15s;
 }
 .url:hover{background:rgba(77,159,255,.18)}
-.stamp{font-size:11px;color:var(--faint)}
+/* .stamp's layout properties (margin-left:auto, flex:none, white-space) are set
+   with the rest of the header row rules further up; this block only keeps the
+   type styling so the two definitions cannot fight. */
+.stamp{color:var(--faint)}
 
 /* ---------- tiles ---------- */
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:10px;margin-bottom:18px}
@@ -3084,32 +3107,36 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 <div class="wrap">
 
 <header>
+  <!-- One row: logo + wordmark, then the mode flag + DRY/LIVE switch, then the
+       host, then the render stamp hard right. Everything used to sit in a
+       right-hand column stacked three deep, which pushed the mode control away
+       from the name and made the header two visual bands on a wide screen. -->
   <div class="brand">
     <div class="logo">&#129504;</div>
-    <div>
+    <div class="brandtext">
       <h1>Kalshi-Frigo <span>&middot; {{ 'LIVE' if s.mode.mode == 'live' else 'DRY' }} trading dashboard</span></h1>
       <div class="sub">LLM-driven Kalshi automation &middot; paper &amp; live &middot; multi-strategy</div>
     </div>
   </div>
-  <div class="headright">
-    <!-- State flag and switch share a row: the flag sits to the LEFT of the
-         buttons, so the mode and the control that changes it read together
-         instead of the flag floating above them. -->
-    <div class="moderow">
-      <!-- Unmistakable state flag: text, colour and a blinking dot. -->
-      <div id="modeFlag" class="modeflag {{ 'live' if s.mode.mode == 'live' else 'dry' }}">
-        <span class="dot"></span>
-        <span id="modeFlagText">{{ 'LIVE MODE' if s.mode.mode == 'live' else 'DRY MODE' }}</span>
-      </div>
-      <!-- DRY / LIVE switch -->
-      <div class="modeswitch">
-        <button id="modeDry"  class="modebtn {{ 'on' if s.mode.mode != 'live' else '' }}" onclick="setMode('dry')">DRY</button>
-        <button id="modeLive" class="modebtn live {{ 'on' if s.mode.mode == 'live' else '' }}" onclick="setMode('live')">LIVE</button>
-      </div>
+  <!-- State flag and switch share a row: the flag sits to the LEFT of the
+       buttons, so the mode and the control that changes it read together
+       instead of the flag floating above them. -->
+  <div class="moderow">
+    <!-- Unmistakable state flag: text, colour and a blinking dot. -->
+    <div id="modeFlag" class="modeflag {{ 'live' if s.mode.mode == 'live' else 'dry' }}">
+      <span class="dot"></span>
+      <span id="modeFlagText">{{ 'LIVE MODE' if s.mode.mode == 'live' else 'DRY MODE' }}</span>
     </div>
-    <div class="url" onclick="navigator.clipboard.writeText(location.href)" title="Click to copy this URL">{{ s.public_domain or 'localhost' }}</div>
-    <div class="stamp">Rendered {{ s.generated_at }}</div>
+    <!-- DRY / LIVE switch -->
+    <div class="modeswitch">
+      <button id="modeDry"  class="modebtn {{ 'on' if s.mode.mode != 'live' else '' }}" onclick="setMode('dry')">DRY</button>
+      <button id="modeLive" class="modebtn live {{ 'on' if s.mode.mode == 'live' else '' }}" onclick="setMode('live')">LIVE</button>
+    </div>
   </div>
+  <div class="hostcell">
+    <div class="url" onclick="navigator.clipboard.writeText(location.href)" title="Click to copy this URL">{{ s.public_domain or 'localhost' }}</div>
+  </div>
+  <div class="stamp">Rendered {{ s.generated_at }}</div>
 </header>
 
 {% if s.mode.mode == 'live' %}
