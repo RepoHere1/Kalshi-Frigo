@@ -2613,17 +2613,7 @@ def api_strategy_toggle(name):
         elif requested_mode not in ("paper", "live"):
             return jsonify({"error": "mode must be 'paper' or 'live'"}), 400
 
-    if requested_mode is not None and requested_mode != runtime_mode:
-        return (
-            jsonify(
-                {
-                    "error": f"Mode mismatch: request asked for '{requested_mode}' but the "
-                    f"current book is '{book_mode}'. Cannot start a strategy in a different book."
-                }
-            ),
-            400,
-        )
-
+    # With no mode from the caller, follow the book we are actually in.
     mode = requested_mode or runtime_mode
     if mode == "live" and not os.environ.get("KALSHI_API_KEY"):
         return jsonify({"error": "Live mode needs KALSHI_API_KEY configured"}), 400
@@ -2657,8 +2647,18 @@ def api_strategy_toggle(name):
 
     # If the strategy is already running in THIS book, stop it first.
     if db_running:
+        # STOPPING is never gated on the book.
+        #
+        # The mode check above governs *starting*: a strategy must not begin
+        # trading a book the operator is not in. Applying it to Stop as well
+        # deadlocked the dashboard - a strategy started in DRY could not be
+        # killed after switching to LIVE, because Kill sends the card's mode
+        # (paper) and that no longer matched the book. Trading processes became
+        # unkillable from the page, which is the one thing that must never
+        # happen. A process can always be stopped, whichever book it is in.
         code = _stop_child({"pid": db_pid, "running": True})
         _run_async(store.record_stop(name, "stopped by operator"))
+        _run_async(store.set_desired(name, False))
         _recorded_state()
         _broadcast("strategy", {"name": name, "action": "stopped"})
         return jsonify({"name": name, "running": False, "exit_code": code})
@@ -2666,6 +2666,25 @@ def api_strategy_toggle(name):
     # Stopping is recorded as an explicit instruction, not just a cleared pid, so
     # the supervisor knows this strategy is meant to stay down.
     _run_async(store.set_desired(name, False))
+
+    if requested_mode is not None and requested_mode != runtime_mode:
+        # Starting is gated on the book. This check sits AFTER the stop branch
+        # deliberately: gating Stop as well made a DRY-started strategy
+        # unkillable once the switch moved to LIVE, because Kill sends the card's
+        # mode and that no longer matched. Trading processes must always be
+        # stoppable, whichever book they belong to.
+        return (
+            jsonify(
+                {
+                    "error": f"Mode mismatch: request asked for '{requested_mode}' but the "
+                    f"current book is '{book_mode}'. Cannot start a strategy in a different book."
+                }
+            ),
+            400,
+        )
+
+    # With no mode supplied by the caller, follow the book we are actually in.
+    mode = requested_mode or runtime_mode
 
     # Even paper mode boots a KalshiClient, which dies immediately without
     # credentials ("Private key file not found"). Refuse up front so the button

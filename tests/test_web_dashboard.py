@@ -679,6 +679,40 @@ def test_toggle_rejects_live_without_credentials(client, auth, monkeypatch):
     assert r.status_code == 400
 
 
+def test_a_strategy_started_in_dry_can_always_be_stopped(client, auth, monkeypatch):
+    """The deadlock that blocked arming LIVE at all.
+
+    The mode check governs *starting*: a strategy must not begin trading a book
+    the operator is not in. It used to govern Stop as well, so once the switch
+    moved to LIVE the Kill button - which sends the card's mode, 'paper' - was
+    refused with a mode mismatch. A DRY-started trading process became
+    unkillable from the page, and LIVE could not be armed because the paper
+    instance could not be cleared.
+
+    Stopping is now never gated on the book.
+    """
+    monkeypatch.setenv("KALSHI_API_KEY", "kid")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nxyz\n")
+    for st in wd.strategy_state.values():
+        st.update({"running": False, "pid": None})
+
+    store = wd._runtime_store()
+
+    async def _seed():
+        await store.record_start("btc_updown", 4242, "paper", "cli.py run")
+
+    import asyncio
+
+    asyncio.run(_seed())
+    monkeypatch.setattr(wd, "_pid_alive", lambda pid, row=None: True)
+    monkeypatch.setattr(wd, "_stop_child", lambda _d: 0)
+
+    # The book is LIVE; the process belongs to paper. Stop must still work.
+    r = client.post("/api/strategy/btc_updown/toggle", json={"mode": "paper"}, headers=auth)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json()["running"] is False
+
+
 def test_toggle_rejects_invalid_mode(client, auth):
     r = client.post("/api/strategy/ai_directional/toggle", json={"mode": "yolo"}, headers=auth)
     assert r.status_code == 400
