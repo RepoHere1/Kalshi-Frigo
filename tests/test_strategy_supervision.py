@@ -49,6 +49,29 @@ async def test_intent_to_run_outlives_the_process(tmp_path):
     assert "market_making" not in await store.desired()
 
 
+async def test_a_heartbeat_is_the_living_proof_the_page_shows(tmp_path):
+    """Running must mean the strategy's own loop stamped recently.
+
+    A pid can be recycled or zombie; only a heartbeat written by the strategy
+    process itself proves it factually executed a cycle. The runtime store
+    stamps it, and a fresh start clears the old stamp so a respawned process is
+    never marked stuck by its predecessor's silence.
+    """
+    store = rt.StrategyRuntime(db_path=str(tmp_path / "t.db"))
+    await store.record_start("btc_updown", os.getpid(), "paper", "cli.py run --btc-updown")
+    row = (await store.snapshot())["btc_updown"]
+    assert row.get("heartbeat_at") is None  # no fake proof before the first cycle
+
+    await store.record_heartbeat("btc_updown")
+    row = (await store.snapshot())["btc_updown"]
+    assert row.get("heartbeat_at")
+
+    # A restart must clear the stale stamp, not inherit it.
+    await store.record_start("btc_updown", os.getpid(), "paper", "cli.py run --btc-updown")
+    row = (await store.snapshot())["btc_updown"]
+    assert row.get("heartbeat_at") is None
+
+
 async def test_columns_are_added_to_a_table_that_predates_them(tmp_path):
     import aiosqlite
 

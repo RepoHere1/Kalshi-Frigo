@@ -60,6 +60,10 @@ MAX_EVENTS = 100
 _SUPERVISOR_MAX_ATTEMPTS = 8
 # A strategy must stay up this long to count as a real recovery.
 _SUPERVISOR_STABLE_SECONDS = 120
+# A running strategy whose own process has not stamped a heartbeat this long is
+# factually dead or wedged, whatever its pid says. The supervisor kills and
+# respawns it; the page refuses to render it as "running".
+_HEARTBEAT_STALE_SECONDS = 120
 # Every strategy is wanted from boot. The operator stops lanes by hand; the app
 # does not decide that a strategy it could not start once is better off down.
 # A strategy only stays down when Stop was pressed, which clears `desired`.
@@ -682,36 +686,16 @@ _ASYNC_THREAD: Optional[threading.Thread] = None
 def _async_loop() -> asyncio.AbstractEventLoop:
     """One event loop for the whole process, running on its own thread.
 
-    This used to build a throwaway loop per call. Each new loop plus each
-    aiosqlite connection starts a thread, and the dashboard makes a lot of
-    database calls per page - so threads accumulated until the worker hit its
-    limit and began failing with
-
-        BlockingIOError: [Errno 11] Resource temporarily unavailable
-        can't start new thread
-
-    which is what made the page blank out (the snapshot raised, every figure fell
-    to zero), made buttons look dead, and made strategies look like they were
-    turning themselves off - the supervisor could not spawn them either, because
-    it could not start a thread to record them. Not a Railway restart, and not a
-    trading fault: thread exhaustion in the worker.
-
-    One loop, one thread, reused forever.
+    Delegated to src/utils.async_bridge: every module that bridges sync code
+    into async (the dashboard, mode.run, strategy_runtime.run) now shares ONE
+    loop instead of minting a throwaway loop per call. Each throwaway loop
+    leaked its aiosqlite executor threads, which is what exhausted the worker
+    with "can't start new thread" and made Railway restart the container - and
+    every strategy child died with it.
     """
-    global _ASYNC_LOOP, _ASYNC_THREAD
-    if _ASYNC_LOOP is not None and not _ASYNC_LOOP.is_closed():
-        return _ASYNC_LOOP
+    from src.utils.async_bridge import _get_loop
 
-    loop = asyncio.new_event_loop()
-
-    def _run_forever():
-        asyncio.set_event_loop(loop)
-        loop.run_forever()
-
-    thread = threading.Thread(target=_run_forever, daemon=True, name="async-loop")
-    thread.start()
-    _ASYNC_LOOP, _ASYNC_THREAD = loop, thread
-    return loop
+    return _get_loop()
 
 
 def _run_async(coro):
@@ -1354,6 +1338,27 @@ def _strategy_supervisor_loop():
                     continue
                 row_pid = row.get("pid")
                 if row_pid and _pid_alive(row_pid, row):
+                    # A pid that exists is not proof of life. A strategy that
+                    # has stopped stamping heartbeats is wedged - its process is
+                    # up but its loop is not running - so kill it and fall into
+                    # the respawn path below. Without this, a hung strategy sat
+                    # at "running" forever while trading nothing, which is
+                    # exactly the lie the page must never tell.
+                    hb = row.get("heartbeat_at")
+                    if hb:
+                        try:
+                            hb_age = (
+                                datetime.now() - datetime.fromisoformat(str(hb))
+                            ).total_seconds()
+                            if hb_age > _HEARTBEAT_STALE_SECONDS:
+                                _push_error(
+                                    f"{name} heartbeat is {hb_age:.0f}s old; "
+                                    f"killing the wedged process and respawning."
+                                )
+                                _stop_child({"pid": row_pid, "running": True})
+                                continue
+                        except Exception:  # noqa: BLE001 - malformed stamp: ignore
+                            pass
                     # A process that survives a settling period is a genuine
                     # recovery, so the failure budget starts again. Without this
                     # the budget was spent by a few rapid spawns during a brief
@@ -1533,12 +1538,28 @@ def _strategy_cards(
         if db_mode == "paper":
             db_mode = "dry"
         db_running = bool(db_pid) and _pid_alive(db_pid, db_row)
+        # Constant live proof: a heartbeat stamped by the strategy's own loop.
+        # A pid can be recycled or zombie; only a fresh heartbeat proves the
+        # strategy factually executed a cycle just now.
+        hb_age: Optional[float] = None
+        hb = db_row.get("heartbeat_at")
+        if hb:
+            try:
+                hb_age = (
+                    datetime.now() - datetime.fromisoformat(str(hb))
+                ).total_seconds()
+            except Exception:  # noqa: BLE001
+                hb_age = None
+        hb_stale = hb_age is not None and hb_age > _HEARTBEAT_STALE_SECONDS
+        db_running = db_running and not hb_stale
         running_for_this_book = db_running and db_mode == book
         cards[name] = {
             "name": name,
             "label": label,
             "description": description,
             "running": bool(running_for_this_book),
+            "stuck": bool(bool(db_pid) and _pid_alive(db_pid, db_row) and hb_stale),
+            "heartbeat_age_sec": round(hb_age, 1) if hb_age is not None else None,
             "pid": st.get("pid"),
             "mode": st.get("mode", "paper"),
             "command": " ".join(STRATEGY_COMMANDS.get(name, [])),
@@ -2827,6 +2848,25 @@ def _recorded_state() -> Dict[str, Dict[str, Any]]:
     recorded = _run_async(_runtime_store().snapshot())
     for name, st in strategy_state.items():
         row = recorded.get(name) or {}
+        # Constant live proof: a heartbeat is stamped by the strategy process
+        # itself every cycle. "running" is not a pid that exists - a recycled
+        # pid, or a zombie, has a pid - it is a process whose own loop executed
+        # recently. A strategy that stopped heartbeating while its pid still
+        # exists is stuck, and is reported as such.
+        hb = row.get("heartbeat_at")
+        heartbeat_age: Optional[float] = None
+        if hb:
+            try:
+                heartbeat_age = (
+                    datetime.now() - datetime.fromisoformat(str(hb))
+                ).total_seconds()
+            except Exception:  # noqa: BLE001 - a malformed stamp is treated as none
+                heartbeat_age = None
+        st["heartbeat_at"] = hb
+        st["heartbeat_age_sec"] = (
+            round(heartbeat_age, 1) if heartbeat_age is not None else None
+        )
+
         if row.get("pid") and not _pid_alive(row["pid"], row):
             # Died without us being told. Say what actually happened rather than
             # implying it chose to leave: a pid from a previous instance of the
@@ -2838,10 +2878,15 @@ def _recorded_state() -> Dict[str, Dict[str, Any]]:
             _run_async(_runtime_store().record_stop(name, reason))
             st["pid"] = None
             st["running"] = False
+            st["stuck"] = False
             st["stop_reason"] = reason
             continue
+        pid_ok = bool(row.get("pid"))
+        # Strategies that do not write heartbeats yet keep the plain pid test.
+        hb_stale = heartbeat_age is not None and heartbeat_age > _HEARTBEAT_STALE_SECONDS
         st["pid"] = row.get("pid") if row.get("pid") else None
-        st["running"] = bool(row.get("pid"))
+        st["running"] = pid_ok and not hb_stale
+        st["stuck"] = pid_ok and hb_stale
         st["started_at"] = row.get("started_at")
         st["command"] = row.get("command")
         st["stop_reason"] = row.get("stop_reason") or ""
@@ -3808,6 +3853,7 @@ pre{
 .ctop{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
 .clabel{font-size:15px;font-weight:650}
 .cname{font-size:11.5px;color:var(--dim);margin-top:1px}
+.cproof{font-size:10px;color:var(--dim);margin-top:4px;min-height:12px}
 .cchart{height:54px;margin:8px 0 6px}
 /* Strategy cards get a taller curve than the compact feed cards - the per-card
    P&L line is the reason to open a card, and at 54px it was unreadable. */
@@ -4010,8 +4056,9 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
             <div class="clabel">{{ c.label }}</div>
             <div class="mono cname">{{ c.name }}</div>
           </div>
-          <span class="pill {{ 'ok' if c.running else 'no' }}" id="pill-{{ c.name }}">{% if c.running %}<span class="dot pulse"></span>running{% elif c.stop_reason %}stopped{% else %}not started{% endif %}</span>
+          <span class="pill {{ 'warn' if c.stuck else ('ok' if c.running else 'no') }}" id="pill-{{ c.name }}">{% if c.stuck %}<span class="dot"></span>stuck{% elif c.running %}<span class="dot pulse"></span>running{% elif c.stop_reason %}stopped{% else %}not started{% endif %}</span>
         </div>
+        <div class="cproof mono" id="hb-{{ c.name }}">{% if c.running and c.heartbeat_age_sec is not none %}proof: cycle {{ c.heartbeat_age_sec }}s ago{% elif c.stuck %}stuck: last cycle {{ c.heartbeat_age_sec }}s ago{% endif %}</div>
         <div class="cchart"><canvas id="spark-{{ c.name }}" height="104"></canvas></div>
         <div class="cstats">
           <div><b id="c-{{ c.name }}-trades">{{ c.trades }}</b><span>trades</span></div>
@@ -4626,10 +4673,24 @@ function paintCards(cards) {
     if (card) card.classList.toggle('hot', !!c.running);
     const pill = $('pill-' + c.name);
     if (pill) {
-      pill.className = 'pill ' + (c.running ? 'ok' : 'no');
-      pill.innerHTML = c.running
-        ? '<span class="dot pulse"></span>running'
-        : (c.stop_reason ? 'stopped' : 'not started');
+      // Constant live proof: running means the strategy's own process stamped
+      // a heartbeat this cycle - not merely that a pid exists. A stuck
+      // strategy (pid alive, no recent heartbeat) is named as such.
+      if (c.stuck) {
+        pill.className = 'pill warn';
+        pill.innerHTML = '<span class="dot"></span>stuck';
+      } else {
+        pill.className = 'pill ' + (c.running ? 'ok' : 'no');
+        pill.innerHTML = c.running
+          ? '<span class="dot pulse"></span>running'
+          : (c.stop_reason ? 'stopped' : 'not started');
+      }
+    }
+    const hb = $('hb-' + c.name);
+    if (hb) {
+      hb.textContent = c.running && c.heartbeat_age_sec != null
+        ? ('proof: cycle ' + c.heartbeat_age_sec + 's ago')
+        : (c.stuck ? ('stuck: last cycle ' + c.heartbeat_age_sec + 's ago') : '');
     }
     const btn = $('btn-' + c.name);
     if (btn) btn.textContent = c.running ? 'Stop' : 'Start';

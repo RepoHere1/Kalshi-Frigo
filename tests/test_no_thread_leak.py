@@ -104,3 +104,27 @@ def test_run_async_is_bounded():
     src = inspect.getsource(wd._run_async)
     assert "timeout=" in src
     assert "future.result" in src
+
+
+def test_every_module_shares_one_bridge_loop():
+    """mode.run and strategy_runtime.run leaked loops the same way.
+
+    The dashboard's `_run_async` was fixed, but `mode.run` and
+    `strategy_runtime.run` each still built a throwaway loop per call - and the
+    mode payload calls them several times per page poll. All three now submit
+    to the one process-wide bridge loop.
+    """
+    import asyncio
+
+    from src.utils import async_bridge
+    from src.utils.mode import run as mode_run
+    from src.utils.strategy_runtime import run as rt_run
+
+    async def answer():
+        await asyncio.sleep(0)
+        return 42
+
+    assert wd._async_loop() is async_bridge._get_loop()
+    assert mode_run(answer()) == 42
+    assert rt_run(answer()) == 42
+    assert not async_bridge._get_loop().is_closed()

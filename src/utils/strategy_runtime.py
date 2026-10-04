@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS strategy_runtime (
     stopped_at TEXT,
     instance TEXT,
     start_ticks INTEGER,
-    desired INTEGER DEFAULT 0
+    desired INTEGER DEFAULT 0,
+    heartbeat_at TEXT
 );
 """
 
@@ -62,6 +63,7 @@ async def _ensure_columns(conn: Any) -> None:
         ("instance", "ALTER TABLE strategy_runtime ADD COLUMN instance TEXT"),
         ("start_ticks", "ALTER TABLE strategy_runtime ADD COLUMN start_ticks INTEGER"),
         ("desired", "ALTER TABLE strategy_runtime ADD COLUMN desired INTEGER DEFAULT 0"),
+        ("heartbeat_at", "ALTER TABLE strategy_runtime ADD COLUMN heartbeat_at TEXT"),
     ):
         if name not in existing:
             await conn.execute(ddl)
@@ -158,16 +160,15 @@ async def _conn(db_path: str) -> AsyncIterator[Any]:
 
 
 def run(coro: Any, timeout: float = 10.0) -> Any:
-    """Run a coroutine on a bounded loop (Flask handlers are synchronous)."""
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        return loop.run_until_complete(asyncio.wait_for(coro, timeout=timeout))
-    finally:
-        try:
-            asyncio.set_event_loop(None)
-        finally:
-            loop.close()
+    """Run a coroutine on the process-wide bridge loop (see async_bridge.py).
+
+    A throwaway loop per call leaked executor threads from aiosqlite until the
+    worker could not start any thread at all, which is what made strategies
+    look like they were turning themselves off.
+    """
+    from src.utils.async_bridge import run as _bridge_run
+
+    return _bridge_run(coro, timeout=timeout)
 
 
 class StrategyRuntime:
@@ -187,13 +188,13 @@ class StrategyRuntime:
         async with _conn(self.db_path) as conn:
             await conn.execute(
                 "INSERT INTO strategy_runtime (name, pid, started_at, mode, command,"
-                " stop_reason, stopped_at, instance, start_ticks, desired)"
-                " VALUES (?,?,?,?,?,NULL,NULL,?,?,?)"
+                " stop_reason, stopped_at, instance, start_ticks, desired, heartbeat_at)"
+                " VALUES (?,?,?,?,?,NULL,NULL,?,?,?,NULL)"
                 " ON CONFLICT(name) DO UPDATE SET pid=excluded.pid,"
                 " started_at=excluded.started_at, mode=excluded.mode,"
                 " command=excluded.command, stop_reason=NULL, stopped_at=NULL,"
                 " instance=excluded.instance, start_ticks=excluded.start_ticks,"
-                " desired=excluded.desired",
+                " desired=excluded.desired, heartbeat_at=NULL",
                 (
                     name,
                     int(pid),
@@ -209,19 +210,33 @@ class StrategyRuntime:
         return {"name": name, "pid": int(pid), "running": True}
 
     async def record_stop(self, name: str, reason: str) -> None:
-        # The instance is stamped on the stop as well as the start. Without it a
-        # stop recorded before a redeploy is indistinguishable from one the
-        # operator gave in this instance, so a lane stopped once stayed down
-        # forever across every subsequent restart - the exact "strategies turned
-        # themselves off and never came back" failure. Stamping it lets the
-        # supervisor tell "the operator just said stop" from "a stop left over
-        # from a previous deploy".
+        # The instance is stamped on the stop as well as the start: without it a
+        # stop recorded before a redeploy is indistinguishable from one given in
+        # this instance, so a lane stopped once stayed down forever across every
+        # restart. Stamping it lets the supervisor tell "the operator just said
+        # stop" from "a stop left over from a previous deploy".
         async with _conn(self.db_path) as conn:
             await conn.execute(
                 "UPDATE strategy_runtime SET pid=NULL, stop_reason=?, stopped_at=?,"
                 " instance=?, desired=0"
                 " WHERE name=?",
                 (reason, _now(), INSTANCE, name),
+            )
+            await conn.commit()
+
+    async def record_heartbeat(self, name: str) -> None:
+        """Stamp that the strategy process is factually alive right now.
+
+        This is the constant proof the dashboard shows: a pid can be recycled or
+        zombie without trading, but a fresh heartbeat means the strategy's own
+        loop executed a cycle since the stamp. Written by the strategy process
+        itself every cycle; read by the dashboard, which refuses to call a
+        strategy "running" once the stamp goes stale.
+        """
+        async with _conn(self.db_path) as conn:
+            await conn.execute(
+                "UPDATE strategy_runtime SET heartbeat_at=? WHERE name=?",
+                (_now(), name),
             )
             await conn.commit()
 

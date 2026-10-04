@@ -365,6 +365,61 @@ def test_a_zero_dollar_live_budget_produces_no_clip():
 
 
 # ---------------------------------------------------------------------------
+# The process must be immortal: nothing but Stop ends it
+# ---------------------------------------------------------------------------
+async def test_a_cycle_crash_never_kills_the_process(tmp_path, monkeypatch):
+    """An exception in a cycle used to exit the process and wait for a respawn.
+
+    Between the crash and the supervisor's next pass the card read "stopped",
+    which is what "it never stays on" was. The loop now swallows the failure,
+    keeps going, and still stamps the heartbeat that proves it is alive.
+    """
+    import os
+
+    import src.jobs.ladder_trader as lt
+    from src.utils.strategy_runtime import StrategyRuntime
+
+    db = str(tmp_path / "t.db")
+    store = StrategyRuntime(db_path=db)
+    await store.record_start("btc_updown", os.getpid(), "paper", "cli.py run --btc-updown")
+
+    class _Hub:
+        spot = None
+        feed = None
+
+        async def start(self):
+            return None
+
+        async def stop(self):
+            return None
+
+    calls = []
+
+    class _BoomTrader:
+        def __init__(self, *a, **k):
+            pass
+
+        def _db_path(self):
+            return db
+
+        async def cycle(self):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            return {"ok": True}
+
+    monkeypatch.setattr(lt, "UpDownTrader", _BoomTrader)
+    monkeypatch.setattr("src.jobs.market_data.MarketDataHub", _Hub)
+
+    # A single pass must survive a cycle crash and return normally.
+    await lt.run_updown_trader(lt.UpDownConfig(), loop=False)
+
+    assert calls == [1], "the crashed cycle must not have been retried into an infinite loop"
+    row = (await store.snapshot())["btc_updown"]
+    assert row.get("heartbeat_at"), "a crashed pass must still stamp its heartbeat"
+
+
+# ---------------------------------------------------------------------------
 # The feed must not invent a lead
 # ---------------------------------------------------------------------------
 def test_payload_reports_the_real_contract_and_no_45_second_claim():

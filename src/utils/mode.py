@@ -682,17 +682,15 @@ class TradingMode:
 
 
 def run(coro: Any, timeout: float = DB_TIMEOUT_SEC) -> Any:
-    """Run a coroutine on a fresh loop with a hard timeout.
+    """Run a coroutine on the process-wide bridge loop with a hard timeout.
 
-    Flask handlers are synchronous, so each needs its own loop. The timeout
-    keeps a wedged DB or socket from holding a worker thread forever.
+    This used to build a throwaway event loop per call. Each throwaway loop
+    lazily created a default executor for aiosqlite and never shut it down, so
+    every mode/DB read leaked executor threads; the dashboard worker eventually
+    hit the OS thread limit ("can't start new thread"), went blank, and Railway
+    restarted it - killing every strategy child with it. See
+    src/utils/async_bridge.py.
     """
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        return loop.run_until_complete(asyncio.wait_for(coro, timeout=timeout))
-    finally:
-        try:
-            asyncio.set_event_loop(None)
-        finally:
-            loop.close()
+    from src.utils.async_bridge import run as _bridge_run
+
+    return _bridge_run(coro, timeout=timeout)

@@ -670,19 +670,72 @@ async def run_updown_trader(
     loop: bool = False,
     interval: float = 0.0,
 ) -> None:
-    """Run the 15-minute up/down trader, optionally on a loop until interrupted."""
+    """Run the 15-minute up/down trader, optionally on a loop until interrupted.
+
+    THE PROCESS IS IMMORTAL. This used to let any exception in `cycle()` - or
+    in `hub.start()` before the try block - escape, exit the process, and wait
+    for the supervisor to notice and respawn it. Between the crash and the
+    respawn the card read "stopped", and under a crash loop it read "stopped"
+    more often than not. That is what "it never stays on" was. Nothing except
+    SIGTERM/SIGKILL (the operator's Stop, or a container kill) ends this loop
+    now: every pass is wrapped, failures are printed and retried with backoff.
+    """
     from src.jobs.market_data import MarketDataHub
 
     hub = MarketDataHub()
-    await hub.start()
     trader = UpDownTrader(hub.spot, hub.feed, config)
     sleep_for = interval or (config and config.poll_seconds) or 4.0
+    started = False
+    backoff = 1.0
     try:
         while True:
-            result = await trader.cycle()
-            print(result)
+            try:
+                if not started:
+                    try:
+                        await hub.start()
+                    except Exception as exc:  # noqa: BLE001 - start may be retried
+                        print(
+                            f"BTC 15m: market data hub failed to start "
+                            f"({type(exc).__name__}: {exc}); retrying in {backoff:.0f}s",
+                            flush=True,
+                        )
+                    else:
+                        started = True
+
+                result = await trader.cycle()
+                print(result, flush=True)
+                backoff = 1.0
+            except Exception as exc:  # noqa: BLE001 - the loop must never die
+                print(
+                    f"BTC 15m pass failed ({type(exc).__name__}: {exc}); "
+                    f"retrying in {backoff:.0f}s",
+                    flush=True,
+                )
+                try:
+                    await hub.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                started = False
+                backoff = min(backoff * 2, 30.0)
+
+            # Constant live proof: stamp that this process executed a pass just
+            # now. The dashboard reads this stamp and refuses to call the
+            # strategy "running" once it goes stale - a recycled pid cannot
+            # fake it, because only the real process can write it.
+            try:
+                from src.utils.strategy_runtime import StrategyRuntime
+
+                await StrategyRuntime(db_path=trader._db_path()).record_heartbeat(
+                    "btc_updown"
+                )
+            except Exception as exc:  # noqa: BLE001 - proof must not kill the loop
+                print(f"BTC 15m: heartbeat write failed: {type(exc).__name__}: {exc}", flush=True)
+
             if not loop:
                 return
-            await asyncio.sleep(sleep_for)
+            await asyncio.sleep(max(sleep_for, backoff))
     finally:
-        await hub.stop()
+        try:
+            await hub.stop()
+        except Exception:  # noqa: BLE001
+            pass

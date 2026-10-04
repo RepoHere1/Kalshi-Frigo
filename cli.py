@@ -82,17 +82,27 @@ def cmd_run(args: argparse.Namespace) -> None:
 
         print("📈 BTC 15-MIN UP/DOWN MODE")
         print("   KXBTC15M | live spot vs Kalshi's own quote")
-        print("   $5 per clip | 1 position at a time | no trade inside the noise band")
-        try:
-            asyncio.run(
-                run_updown_trader(
-                    UpDownConfig(),
-                    loop=getattr(args, "loop", True),
-                    interval=float(getattr(args, "interval", 0) or 0),
+        print("   $5 per clip | fee-aware in LIVE | no trade inside the noise band")
+        # The inner loop is already immortal; this outer loop is belt-and-braces
+        # so even an unexpected asyncio.run failure cannot end the process. Only
+        # SIGTERM/SIGKILL (operator Stop / container kill) takes it down.
+        import time as _time
+
+        while True:
+            try:
+                asyncio.run(
+                    run_updown_trader(
+                        UpDownConfig(),
+                        loop=getattr(args, "loop", True),
+                        interval=float(getattr(args, "interval", 0) or 0),
+                    )
                 )
-            )
-        except KeyboardInterrupt:
-            print("\nBTC up/down trader stopped by user.")
+            except KeyboardInterrupt:
+                print("\nBTC up/down trader stopped by user.")
+                raise
+            except Exception as exc:  # noqa: BLE001 - restart, never exit
+                print(f"BTC up/down trader crashed ({type(exc).__name__}: {exc}); restarting in 5s.", flush=True)
+                _time.sleep(5)
         return
 
     # --quick-flip mode: short-horizon momentum scalping
