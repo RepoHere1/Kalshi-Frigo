@@ -64,6 +64,12 @@ _SUPERVISOR_STABLE_SECONDS = 120
 # does not decide that a strategy it could not start once is better off down.
 # A strategy only stays down when Stop was pressed, which clears `desired`.
 AUTO_START_ALL = True
+# Stop reasons that mean the operator said stop. Only these keep a lane down
+# across a restart; anything else was a crash, a redeploy or a lost record and
+# the strategy comes back up.
+_OPERATOR_STOP_REASONS = frozenset(
+    {"stopped by operator", "stopped by app restart and by operator"}
+)
 # Backoff ceiling between respawns. Retries never stop, they just slow down, so
 # a prolonged outage cannot become a busy loop.
 _SUPERVISOR_MAX_BACKOFF = 60.0
@@ -950,15 +956,23 @@ def _strategy_supervisor_loop():
                 time.sleep(10)
                 continue
             wanted = _run_async(store.desired())
-            # Seed the intent on first boot only: rows that already record a
-            # deliberate Stop must not be resurrected on every pass.
+            # Everything is wanted from boot. A lane stays down only when the
+            # operator pressed Stop; a crash or a redeploy brings it back up.
             if AUTO_START_ALL:
                 recorded = _run_async(store.snapshot())
                 for name in strategy_state:
                     if name in wanted:
                         continue
-                    if name in recorded:
-                        continue  # exists and was explicitly stopped
+                    row = recorded.get(name)
+                    if row is not None:
+                        # A row exists, so it has run before. Only a deliberate
+                        # operator stop keeps it down - "exited on its own" or
+                        # "stopped by app restart" mean the operator never said
+                        # stop, so those come back up. Skping every row with a
+                        # name in it left four of six strategies down after a
+                        # deploy, because they all had stale rows.
+                        if (row.get("stop_reason") or "") in _OPERATOR_STOP_REASONS:
+                            continue
                     if not _creds_present():
                         continue
                     # Start into whichever book is actually in force. Hardcoding
@@ -968,6 +982,7 @@ def _strategy_supervisor_loop():
                     # were broken.
                     book = "live" if _current_book_mode() == "live" else "paper"
                     try:
+                        _run_async(store.set_desired(name, True))
                         _spawn_strategy(name, book)
                         _push_error(
                             f"Started {name} in {book.upper()} " f"(all strategies run by default)."

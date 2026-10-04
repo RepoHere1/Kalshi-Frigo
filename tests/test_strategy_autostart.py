@@ -64,11 +64,24 @@ def test_auto_start_does_not_resurrect_a_deliberately_stopped_strategy():
     restarted on the next pass.
     """
     src = inspect.getsource(wd._strategy_supervisor_loop)
-    assert "if name in recorded:" in src
+    assert "_OPERATOR_STOP_REASONS" in src
+    assert "recorded.get(name)" in src
     assert "all strategies run by default" in src
     # ...and it must start into the book actually in force, not a hardcoded one.
     assert '_current_book_mode() == "live"' in src
     assert '_spawn_strategy(name, "paper")' not in src
+
+
+def test_only_an_operator_stop_keeps_a_lane_down():
+    """A stale row must not read as "the operator stopped this".
+
+    Auto-start skipped every strategy that had a row, so after a deploy four of
+    six stayed down on rows left by earlier runs. The discriminator is why it
+    stopped, not whether it ever ran.
+    """
+    assert "stopped by operator" in wd._OPERATOR_STOP_REASONS
+    for incidental in ("exited on its own", "stopped by app restart"):
+        assert incidental not in wd._OPERATOR_STOP_REASONS
 
 
 def test_backoff_has_a_ceiling():
