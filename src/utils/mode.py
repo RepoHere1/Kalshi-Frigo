@@ -375,6 +375,30 @@ class TradingMode:
             await self._set(conn, _CASH_KEY, str(round(float(amount), 2)))
             await conn.commit()
 
+    async def ensure_dry_account(self) -> Dict[str, Any]:
+        """Make sure a funded DRY book exists - without destroying an existing one.
+
+        This is what "switch to DRY" needs. `reset_dry_account` is a deliberate
+        wipe: it clears the ledger, the positions and the closes, and puts the
+        balance back to the starting figure. Calling that on every mode-set meant
+        any trip through the DRY switch - or a retried request - silently threw
+        away the whole simulated book, which is what kept resetting a profitable
+        account back to $300.
+
+        So this only ever *creates*: if there is no ledger and no balance, it
+        seeds the starting figure. An existing book is returned untouched.
+        """
+        async with self._conn() as conn:
+            starting = await self._get(conn, _START_KEY)
+            starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
+            cash = await self._get(conn, _CASH_KEY)
+            rows = int(await self._scalar(conn, "SELECT COUNT(*) FROM dry_ledger") or 0)
+            if cash is None and rows == 0:
+                await self._set(conn, _START_KEY, str(round(starting_f, 2)))
+                await self._set(conn, _CASH_KEY, str(round(starting_f, 2)))
+                await conn.commit()
+        return await self.dry_account()
+
     async def reset_dry_account(self) -> Dict[str, Any]:
         """Restore the DRY book to a clean starting state.
 

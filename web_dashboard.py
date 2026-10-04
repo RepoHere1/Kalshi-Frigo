@@ -1869,10 +1869,13 @@ def api_mode_set():
 
     _broadcast("mode", {"mode": mode})
     if mode == MODE_DRY:
-        # Back to simulated: make sure a DRY book exists and is funded. This must
-        # be awaited - calling the coroutine bare leaves the DRY account at $0
-        # and emits a RuntimeWarning.
-        run(mgr.reset_dry_account())
+        # Back to simulated: make sure a DRY book exists and is funded. This
+        # CREATES the book if it is missing; it must never wipe one that already
+        # has history. Calling reset_dry_account() here meant every pass through
+        # the DRY switch erased the ledger, the open positions and the closes, so
+        # a profitable book kept snapping back to $300 with nothing to show for
+        # the difference. Only the explicit reset endpoint wipes.
+        run(mgr.ensure_dry_account())
     _audit(f"trading mode set to {mode.upper()}")
     return jsonify({"ok": True, **_mode_payload()})
 
@@ -2863,7 +2866,7 @@ _TEMPLATE = r"""<!doctype html>
 :root{
   --bg:#080b12; --panel:#0f1420; --panel2:#141b2a; --line:#1f2937; --line2:#2b3648;
   --fg:#e6edf6; --dim:#8494ab; --faint:#5b6a80;
-  --up:#2ee6a8; --down:#ff2d20; --blue:#4d9fff; --amber:#ffb454; --violet:#a78bfa;
+  --up:#2ee6a8; --down:#ff2d20; --live:#e11d2e; --live-bg:rgba(225,29,46,.18); --blue:#4d9fff; --amber:#ffb454; --violet:#a78bfa;
   --r:14px; --shadow:0 1px 0 rgba(255,255,255,.03) inset, 0 8px 30px rgba(0,0,0,.45);
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -2890,6 +2893,8 @@ h1{font-size:20px;font-weight:650;letter-spacing:-.2px}
 h1 span{color:var(--dim);font-weight:400}
 .sub{color:var(--faint);font-size:12px;margin-top:2px}
 .headright{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+  /* Flag and switch on one row, flag to the left of the buttons. */
+  .moderow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end}
 
 /* DRY / LIVE switch - the highest-stakes control on the page, so it is the
    most prominent thing in the header and colour-coded rather than subtle. */
@@ -2930,12 +2935,16 @@ body[data-mode="live"] .brand .logo{background:linear-gradient(145deg,#ff2d55,#f
 body[data-mode="dry"]  .brand .logo{background:linear-gradient(145deg,#2b6cff,#8b5cf6)}
 
 .modeflag{
-  display:inline-flex;align-items:center;gap:8px;
-  font-size:13px;font-weight:800;letter-spacing:.14em;
-  padding:5px 14px;border-radius:9px;border:2px solid currentColor;
+  display:inline-flex;align-items:center;gap:9px;
+  /* A darker red than the P&L red needs heavier lettering to hold its own
+     against the panel: heavier weight, more size, slightly tighter tracking. */
+  font-size:14px;font-weight:900;letter-spacing:.10em;
+  padding:6px 15px;border-radius:10px;border:2px solid currentColor;
+  box-shadow:0 0 0 1px rgba(0,0,0,.35), 0 4px 14px rgba(0,0,0,.35);
 }
+.modeflag.dry{color:var(--up);background:rgba(46,230,168,.12)}
 .modeflag.dry {color:var(--up);background:rgba(46,230,168,.10)}
-.modeflag.live{color:var(--down);background:rgba(255,92,122,.14)}
+.modeflag.live{color:var(--live);background:var(--live-bg)}
 .modeflag .dot{width:9px;height:9px}
 body[data-mode="live"] .modeflag.live{animation:blink 1.1s steps(1) infinite}
 @keyframes blink{0%,60%{opacity:1}61%,100%{opacity:.25}}
@@ -3083,15 +3092,20 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
     </div>
   </div>
   <div class="headright">
-    <!-- Unmistakable state flag: text, colour and a blinking dot. -->
-    <div id="modeFlag" class="modeflag {{ 'live' if s.mode.mode == 'live' else 'dry' }}">
-      <span class="dot"></span>
-      <span id="modeFlagText">{{ 'LIVE MODE' if s.mode.mode == 'live' else 'DRY MODE' }}</span>
-    </div>
-    <!-- DRY / LIVE switch -->
-    <div class="modeswitch">
-      <button id="modeDry"  class="modebtn {{ 'on' if s.mode.mode != 'live' else '' }}" onclick="setMode('dry')">DRY</button>
-      <button id="modeLive" class="modebtn live {{ 'on' if s.mode.mode == 'live' else '' }}" onclick="setMode('live')">LIVE</button>
+    <!-- State flag and switch share a row: the flag sits to the LEFT of the
+         buttons, so the mode and the control that changes it read together
+         instead of the flag floating above them. -->
+    <div class="moderow">
+      <!-- Unmistakable state flag: text, colour and a blinking dot. -->
+      <div id="modeFlag" class="modeflag {{ 'live' if s.mode.mode == 'live' else 'dry' }}">
+        <span class="dot"></span>
+        <span id="modeFlagText">{{ 'LIVE MODE' if s.mode.mode == 'live' else 'DRY MODE' }}</span>
+      </div>
+      <!-- DRY / LIVE switch -->
+      <div class="modeswitch">
+        <button id="modeDry"  class="modebtn {{ 'on' if s.mode.mode != 'live' else '' }}" onclick="setMode('dry')">DRY</button>
+        <button id="modeLive" class="modebtn live {{ 'on' if s.mode.mode == 'live' else '' }}" onclick="setMode('live')">LIVE</button>
+      </div>
     </div>
     <div class="url" onclick="navigator.clipboard.writeText(location.href)" title="Click to copy this URL">{{ s.public_domain or 'localhost' }}</div>
     <div class="stamp">Rendered {{ s.generated_at }}</div>
