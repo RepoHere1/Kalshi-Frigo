@@ -956,9 +956,12 @@ def _strategy_supervisor_loop():
                 time.sleep(10)
                 continue
             wanted = _run_async(store.desired())
-            # Everything is wanted from boot. A lane stays down only when the
-            # operator pressed Stop; a crash or a redeploy brings it back up.
-            if AUTO_START_ALL:
+            # DRY runs itself: every lane is wanted from boot, because simulated
+            # money cannot be lost. LIVE never does. Switching to LIVE must not
+            # be the thing that starts six strategies placing real orders - each
+            # one is armed by hand, from its own button, so the act of arming is
+            # deliberate and attributable.
+            if AUTO_START_ALL and _current_book_mode() != "live":
                 recorded = _run_async(store.snapshot())
                 for name in strategy_state:
                     if name in wanted:
@@ -3344,8 +3347,23 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   <div class="ph">
     <h2>Strategies</h2>
     <span class="note">click a card for everything about that strategy</span>
-    <span class="bar"><button id="startAllBtn" onclick="startAll()">Start all in DRY</button><button onclick="stopAll()">Stop all</button></span>
+    <span class="bar">
+      <button id="startAllBtn" onclick="startAll()">{{ 'Start all in LIVE' if s.mode.mode == 'live' else 'Start all in DRY' }}</button>
+      <button onclick="stopAll()">Stop all</button>
+      {%- if s.mode.mode == 'live' %}
+      <button class="danger" onclick="stopAll()">Kill all LIVE</button>
+      {%- endif %}
+    </span>
   </div>
+  {%- if s.mode.mode == 'live' %}
+  <div class="pb" style="padding-top:0">
+    <p class="note" style="font-size:12px;color:var(--live)">
+      LIVE is armed one strategy at a time. Nothing here starts by itself &mdash;
+      switching the mode switch does not place a single order. Each Start below
+      begins real-money trading for that strategy only.
+    </p>
+  </div>
+  {%- endif %}
   <div class="pb">
     <div class="cards">
       {%- for c in s.strategy_cards %}
@@ -4560,6 +4578,15 @@ function closeStrategy() {
 
 async function startAll() {
   const names = (SNAPSHOT.strategy_cards || []).map(c => c.name);
+  if ((SNAPSHOT.mode && SNAPSHOT.mode.mode) === 'live') {
+    // Arming six real-money strategies is not a thing to do by muscle memory.
+    if (!confirm('LIVE MODE\n\nThis starts REAL-MONEY trading in all '
+      + names.length + ' strategies against your Kalshi account.\n\n'
+      + 'Prefer arming them one at a time. Continue?')) {
+      note('live bulk start cancelled');
+      return;
+    }
+  }
   for (const n of names) await toggleStrategy(n, true);
   note('started: ' + names.join(', '));
 }

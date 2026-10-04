@@ -73,12 +73,6 @@ def test_auto_start_does_not_resurrect_a_deliberately_stopped_strategy():
 
 
 def test_only_an_operator_stop_keeps_a_lane_down():
-    """A stale row must not read as "the operator stopped this".
-
-    Auto-start skipped every strategy that had a row, so after a deploy four of
-    six stayed down on rows left by earlier runs. The discriminator is why it
-    stopped, not whether it ever ran.
-    """
     assert "stopped by operator" in wd._OPERATOR_STOP_REASONS
     for incidental in ("exited on its own", "stopped by app restart"):
         assert incidental not in wd._OPERATOR_STOP_REASONS
@@ -87,6 +81,31 @@ def test_only_an_operator_stop_keeps_a_lane_down():
 def test_backoff_has_a_ceiling():
     """Retries forever, but never as a busy loop."""
     assert 0 < wd._SUPERVISOR_MAX_BACKOFF <= 300
+
+
+# ---------------------------------------------------------------------------
+# LIVE must never arm itself
+# ---------------------------------------------------------------------------
+def test_dry_auto_starts_but_live_never_does():
+    """Switching to LIVE must not place a single order.
+
+    AUTO_START_ALL means every DRY lane comes up on boot, because simulated money
+    cannot be lost. Applied to LIVE it would start six real-money strategies the
+    moment the switch moved, so the seed is gated on the book being DRY and LIVE
+    is armed one strategy at a time by hand.
+    """
+    src = inspect.getsource(wd._strategy_supervisor_loop)
+    assert 'AUTO_START_ALL and _current_book_mode() != "live"' in src
+
+
+def test_the_dry_page_offers_no_live_controls(monkeypatch, tmp_path):
+    monkeypatch.setattr(wd, "DB_PATH", str(tmp_path / "dry.db"))
+    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
+    wd.app.config["TESTING"] = True
+    html = wd.app.test_client().get("/").get_data(as_text=True)
+    assert "Start all in DRY" in html
+    assert "Kill all LIVE" not in html
+    assert "armed one strategy at a time" not in html
 
 
 def test_stopping_still_works_and_is_sticky():
