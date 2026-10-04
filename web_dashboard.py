@@ -897,11 +897,17 @@ def _refresh_kalshi():
 
 _title_client: Any = None
 _TITLE_CACHE_MAX = 400
-# Kalshi rate-limits the markets endpoint; the dashboard was calling it for every
-# unresolved ticker on every sync until the API answered 429.
-_TITLE_MIN_INTERVAL_SECONDS = 120
+# One request per interval now resolves the whole batch, so the floor is a
+# politeness gap rather than a rate-limit workaround. It used to be 120s because
+# a batch cost 25 sequential requests; at one request the same politeness is 30s
+# and the panel converges in a couple of syncs instead of a couple of hours.
+_TITLE_MIN_INTERVAL_SECONDS = 30
 _title_last_attempt = 0.0
 _title_backoff_until = 0.0
+# Tickers whose last lookup did not yield a title. Kept separately from the cache
+# because the cached value may be a perfectly good decoded fallback, and "value
+# equals ticker" is not a reliable test of whether the API was ever asked.
+_title_unresolved: set = set()
 
 
 def _current_book_tickers() -> List[Dict[str, Any]]:
@@ -913,7 +919,25 @@ def _current_book_tickers() -> List[Dict[str, Any]]:
     the DRY page's title cache.
     """
     if _current_book_mode() == "live":
-        return list(dashboard_state.get("positions") or [])
+        rows = list(dashboard_state.get("positions") or [])
+        # Only rows that still hold contracts are shown, so only those need a
+        # title. Resolving all 31 rows spent the whole lookup budget on tickers
+        # the page never renders - the zero-share rows Kalshi keeps for every
+        # market the account ever touched.
+        held = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            if r.get("ticker"):
+                # A market row: contracts currently held.
+                if _as_float(r.get("position_fp")) != 0.0:
+                    held.append(r)
+            elif r.get("event_ticker"):
+                # An event row: `total_cost_shares_fp` is cumulative history, so
+                # exposure is the only signal that something is still open.
+                if _as_float(r.get("event_exposure_dollars")) != 0.0:
+                    held.append(r)
+        return held or rows
     try:
         where = _book_filter("dry")
         rows = _db_many([(_SQL_POSITIONS.format(book=where), ())])
@@ -941,22 +965,44 @@ def _refresh_market_titles(positions):
     returns a human-readable title per market, and we cache the mapping so the
     dashboard can show "BTC 15-minute" instead of the raw ticker.
 
-    This is rate-limited deliberately. An unbounded lookup per unresolved ticker
-    on every sync drove the markets endpoint into HTTP 429, so every title
-    silently degraded to the ticker and the panel displayed the error. Calls are
-    floored to one small batch per interval, and a 429 pushes the next attempt
-    out instead of hammering a host that has already said no.
+    ONE REQUEST PER BATCH, NOT ONE PER TICKER
+    ------------------------------------------
+    This used to call `get_market(ticker)` inside a loop - 25 separate HTTP
+    requests every interval, for 25 tickers. That is what drove the markets
+    endpoint into HTTP 429, and the 429 handler then abandoned the whole batch,
+    so the panel never resolved anything at all. Kalshi's `get_markets` accepts
+    a `tickers` list and answers all of them in one call, so the batch now costs
+    one request and the rate limit stops being the bottleneck.
+
+    A FAILED LOOKUP IS NOT CACHED AS THE TITLE
+    --------------------------------------------
+    The old code wrote `cached[ticker] = ticker` when a lookup failed. Because
+    the "already cached?" test is `ticker not in cached`, that one-off failure
+    was permanent: the ticker was stored as its own title, every later pass saw
+    it as resolved, and it was never retried. A transient 404 or timeout
+    therefore locked the raw ticker into the page for the life of the process.
+
+    Now a failure caches the prettified fallback instead - still a readable
+    label, but recorded in a separate `_title_unresolved` set so the next pass
+    retries the API and replaces it with the real title when one is available.
+
+    The retry test has to be that set, not "is the cached value still equal to
+    the ticker". Inferring it from the value fails the moment the fallback is
+    decodable: `_prettify_ticker("KXMYSTERY-26")` returns "MYSTERY", which
+    differs from the ticker, so the value looks resolved and the lookup is never
+    attempted again.
     """
     global _title_client, _title_last_attempt, _title_backoff_until
 
     cached = dashboard_state["market_titles"]
     if len(cached) > _TITLE_CACHE_MAX:
         cached.clear()
+        _title_unresolved.clear()
 
     missing = set()
     for p in positions:
         t = p.get("ticker") or p.get("event_ticker") or ""
-        if t and t not in cached:
+        if t and (t not in cached or t in _title_unresolved):
             missing.add(t)
     if not missing or not os.environ.get("KALSHI_API_KEY"):
         return
@@ -965,8 +1011,7 @@ def _refresh_market_titles(positions):
     if now < _title_backoff_until or now - _title_last_attempt < _TITLE_MIN_INTERVAL_SECONDS:
         return
 
-    # A bounded batch, so one sync cannot burst the endpoint.
-    batch = sorted(missing)[:25]
+    batch = sorted(missing)[:50]
     _title_last_attempt = now
     try:
         if _title_client is None:
@@ -974,17 +1019,32 @@ def _refresh_market_titles(positions):
             from src.clients.kalshi_client import KalshiClient
 
             _title_client = KalshiClient(private_key_path=key_path) if key_path else KalshiClient()
+        resp = _run_async(_title_client.get_markets(tickers=batch, limit=len(batch)))
+        rows = (resp or {}).get("markets") or []
+        resolved = set()
+        for m in rows:
+            if not isinstance(m, dict):
+                continue
+            t = str(m.get("ticker") or "")
+            title = str(m.get("title") or m.get("subtitle") or "").strip()
+            if t and title:
+                cached[t] = title
+                resolved.add(t)
+        _title_unresolved.difference_update(resolved)
+
+        # Anything the batch did not return (delisted, or a stale reference) gets
+        # the decoded ticker, and is remembered as unresolved so the next pass
+        # tries again instead of treating this as settled.
         for ticker in batch:
-            try:
-                m = _run_async(_title_client.get_market(ticker))
-                cached[ticker] = (m or {}).get("title") or ticker
-            except Exception as exc:  # noqa: BLE001
-                if "429" in str(exc) or "Too Many Requests" in str(exc):
-                    _title_backoff_until = now + _TITLE_MIN_INTERVAL_SECONDS * 4
-                    _push_error("Kalshi rate-limited title lookup; backing off.")
-                    return
-                cached[ticker] = ticker
-    except Exception:
+            if ticker in resolved:
+                continue
+            cached[ticker] = _prettify_ticker(ticker) or ticker
+            _title_unresolved.add(ticker)
+    except Exception as exc:  # noqa: BLE001 - titles are cosmetic
+        if "429" in str(exc) or "Too Many Requests" in str(exc):
+            _title_backoff_until = now + _TITLE_MIN_INTERVAL_SECONDS * 4
+            _push_error("Kalshi rate-limited title lookup; backing off.")
+            return
         return
 
 
@@ -1249,18 +1309,29 @@ def _strategy_supervisor_loop():
             # on whatever happened to still be alive.
             if AUTO_START_ALL:
                 recorded = _run_async(store.snapshot())
+                from src.utils.strategy_runtime import INSTANCE as _CUR_INSTANCE
+
                 for name in strategy_state:
                     if name in wanted:
                         continue
                     row = recorded.get(name)
                     if row is not None:
                         # A row exists, so it has run before. Only a deliberate
-                        # operator stop keeps it down - "exited on its own" or
-                        # "stopped by app restart" mean the operator never said
-                        # stop, so those come back up. Skping every row with a
-                        # name in it left four of six strategies down after a
-                        # deploy, because they all had stale rows.
-                        if (row.get("stop_reason") or "") in _OPERATOR_STOP_REASONS:
+                        # operator stop keeps it down - and only a stop the
+                        # operator gave in THIS instance.
+                        #
+                        # Every deploy mints a new instance id, so a stop recorded
+                        # before the redeploy is stale intent. Treating it as
+                        # current is what left five of six strategies down and
+                        # staying down: they each carried a "stopped by operator"
+                        # row from an earlier session, that row permanently matched
+                        # the operator-stop exemption, and no restart could ever
+                        # re-arm them. The operator stops them again after the
+                        # restart if they still mean it.
+                        if (
+                            (row.get("stop_reason") or "") in _OPERATOR_STOP_REASONS
+                            and (row.get("instance") or "") == _CUR_INSTANCE
+                        ):
                             continue
                     if not _creds_present():
                         continue
@@ -1791,16 +1862,64 @@ def _kalshi_account() -> Dict[str, Any]:
     positions_realized = round(total(markets, "realized") + total(events, "realized"), 2)
     positions_fees = round(total(markets, "fees") + total(events, "fees"), 2)
 
+# ZERO-SHARE ROWS ARE NOT POSITIONS, AND EVENT ROWS ARE NOT SEPARATE ONES
+    # ---------------------------------------------------------------------
+    # /portfolio/positions answers with two views of the same book:
+    #
+    #   market_positions - one row per market, `position_fp` = contracts held now.
+    #   event_positions  - one row per EVENT, aggregating every market in it.
+    #     `total_cost_shares_fp` / `total_cost_dollars` are CUMULATIVE history,
+    #     not current holdings, so they stay large long after nothing is open.
+    #
+    # Two separate mistakes lived here. The first was counting rows: Kalshi keeps
+    # a row per ticker the account ever touched, so 15 markets at exactly 0 shares
+    # were being reported as open positions, and event rows carrying $925.84 of
+    # historical cost behind 0 exposure were counted too - 33 "live positions"
+    # for an account holding 3.
+    #
+    # The second was summing them. An event row and its market rows describe the
+    # SAME contracts, so adding both double-counts: the live account reported
+    # $3.84 of exposure against a true $1.92, because KXDJIA-26DEC31 and
+    # KXDJIA-26DEC31-54000 each carried $0.94 of the same position.
+    #
+    # So: a market row is held when `position_fp != 0`; an event row is held when
+    # it has exposure, and it is reported for context only. Every money total and
+    # the open-position count come from market rows alone, which are the atomic
+    # positions. The zero-share rows are still reported as a count, because
+    # "18 rows, 3 held" is honest and hiding them just invites the same question.
+    held_markets = [r for r in markets if float(r.get("shares") or 0.0) != 0.0]
+    held_events = [
+        r for r in events if float(r.get("exposure") or 0.0) != 0.0
+    ]
+    # The event panel is a per-event view of where money went, so it keeps rows
+    # with historical cost even when nothing is open - that is the useful part of
+    # it. Those rows are listed but never counted as open positions.
+    listed_events = [
+        r
+        for r in events
+        if float(r.get("exposure") or 0.0) != 0.0 or float(r.get("cost") or 0.0) != 0.0
+    ]
+    ghost_count = (len(markets) - len(held_markets)) + (len(events) - len(held_events))
+
     return {
         "connected": bool(markets or events),
-        "market_count": len(markets),
-        "event_count": len(events),
-        "markets": sorted(markets, key=lambda r: -abs(r["exposure"]))[:25],
-        "events": sorted(events, key=lambda r: -abs(r["cost"]))[:25],
+        # Held counts drive every headline. `*_rows` is what the endpoint returned,
+        # so the difference between the two is visible rather than mysterious.
+        "market_count": len(held_markets),
+        "event_count": len(held_events),
+        # Atomic truth: event rows are rollups of market rows, so counting both
+        # would report one position twice.
+        "held_count": len(held_markets),
+        "market_rows": len(markets),
+        "event_rows": len(events),
+        "ghost_count": ghost_count,
+        "markets": sorted(held_markets, key=lambda r: -abs(r["exposure"]))[:25],
+        "events": sorted(listed_events, key=lambda r: -abs(r["cost"]))[:25],
         # Exposure is what the open positions are worth if sold into the current
-        # book. It is not the same quantity as cost basis, so the two are never
-        # summed or substituted for one another.
-        "exposure": round(total(markets, "exposure") + total(events, "exposure"), 2),
+        # book. Market rows only - see the double-count note above. It is also not
+        # the same quantity as cost basis, so the two are never substituted.
+        "exposure": round(total(held_markets, "exposure"), 2),
+        "event_exposure": round(total(held_events, "exposure"), 2),
         "cost_basis": round(float(ledger.get("cost_basis", 0.0)), 2) if have_ledger else 0.0,
         "realized": round(float(ledger.get("realized", 0.0)), 2) if have_ledger else 0.0,
         "fees": round(float(ledger.get("fees", 0.0)), 2) if have_ledger else 0.0,
@@ -2901,36 +3020,51 @@ def api_strategy_toggle(name):
     # signals an unrelated process instead of a bot.
     db_running = bool(db_pid) and _pid_alive(db_pid, db_row)
 
-    # Identity isolation: a strategy running in the OTHER book must not be
-    # touched from this book. Refuse cross-book starts.
-    if db_running and db_mode and db_mode != mode:
-        return (
-            jsonify(
-                {
-                    "error": f"Strategy '{name}' is already running in {db_mode} mode (pid {db_pid}). "
-                    f"Stop it in {db_mode} before starting it in {mode}."
-                }
-            ),
-            409,
-        )
-
-    # If the strategy is already running in THIS book, stop it first.
+    # STOP FIRST, ALWAYS, BEFORE ANY MODE CHECK.
+    #
+    # This refusal used to sit above the stop branch, which made a strategy
+    # running in the other book impossible to stop from this book's page: the
+    # card's Stop button sends no mode, so it resolved to the current book, and
+    # `db_mode != mode` returned 409. The operator switched the book, then found
+    # the lane could neither be started (409, wrong book) nor stopped (409, wrong
+    # book) - a deadlock with a trading process on the far side of it. That is
+    # what "can't turn btc 15 on" was: not a refusal to trade, but a button that
+    # refused to do anything at all.
+    #
+    # Its own comment claimed stopping was never gated on the book, and a
+    # strategy "can always be stopped, whichever book it is in". Ordering is what
+    # made that true. A process that cannot be killed from the page is the one
+    # failure mode that must not exist, so stop wins over every mode check below.
     if db_running:
-        # STOPPING is never gated on the book.
-        #
-        # The mode check above governs *starting*: a strategy must not begin
-        # trading a book the operator is not in. Applying it to Stop as well
-        # deadlocked the dashboard - a strategy started in DRY could not be
-        # killed after switching to LIVE, because Kill sends the card's mode
-        # (paper) and that no longer matched the book. Trading processes became
-        # unkillable from the page, which is the one thing that must never
-        # happen. A process can always be stopped, whichever book it is in.
         code = _stop_child({"pid": db_pid, "running": True})
         _run_async(store.record_stop(name, "stopped by operator"))
         _run_async(store.set_desired(name, False))
         _recorded_state()
         _broadcast("strategy", {"name": name, "action": "stopped"})
-        return jsonify({"name": name, "running": False, "exit_code": code})
+        return jsonify(
+            {
+                "name": name,
+                "running": False,
+                "exit_code": code,
+                "stopped_from_book": book_mode,
+                "was_running_in": db_mode,
+            }
+        )
+
+    # Identity isolation on STARTING only: a strategy already running in the
+    # other book cannot be joined from here. (Unreachable in practice now that
+    # stop precedes it, but kept so a future reordering cannot silently reopen
+    # the deadlock.)
+    if db_running and db_mode and db_mode != mode:  # pragma: no cover
+        return (
+            jsonify(
+                {
+                    "error": f"Strategy '{name}' is already running in {db_mode} mode "
+                    f"(pid {db_pid}). Stop it in {db_mode} before starting it in {mode}."
+                }
+            ),
+            409,
+        )
 
     # Stopping is recorded as an explicit instruction, not just a cleared pid, so
     # the supervisor knows this strategy is meant to stay down.
@@ -3774,8 +3908,12 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   </div>
   <div class="tile">
     <div class="k">Live positions</div>
-    <div class="v" id="tLivePos">{{ (s.kalshi.market_count + s.kalshi.event_count) if s.kalshi else 0 }}</div>
-    <div class="s">{{ s.kalshi.market_count if s.kalshi else 0 }} market &middot; {{ s.kalshi.event_count if s.kalshi else 0 }} event</div>
+    {#- Counts rows that actually hold contracts. Kalshi keeps a zero-share row
+        per ticker the account ever touched, so the raw row count (31) is not a
+        position count and reporting it as one made the account look like it had
+        31 open bets when 3 were held. The zero-share rows are named below. -#}
+    <div class="v" id="tLivePos">{{ s.kalshi.held_count if s.kalshi else 0 }}</div>
+    <div class="s" id="tLivePosNote">{% if s.kalshi %}{{ s.kalshi.market_count }} market &middot; {{ s.kalshi.event_count }} event{% if s.kalshi.ghost_count %} &middot; {{ s.kalshi.ghost_count }} zero-share rows{% endif %}{% else %}&mdash;{% endif %}</div>
   </div>
   <div class="tile">
     <div class="k">Real exposure</div>
@@ -3788,7 +3926,11 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
         indistinguishable from a break-even account, which is the one thing a
         realized-P&L tile must never be. -#}
     <div class="v {{ 'up' if s.kalshi and s.kalshi.realized_known and s.kalshi.realized > 0 else ('down' if s.kalshi and s.kalshi.realized_known and s.kalshi.realized < 0 else 'flat') }}" id="tKalshiPnl">{{ ('$%.2f'|format(s.kalshi.realized)) if s.kalshi and s.kalshi.realized_known else 'n/a' }}</div>
-    <div class="s">{% if s.kalshi and s.kalshi.realized_known %}fees {{ '$%.2f'|format(s.kalshi.fees) }}{% else %}fill history unavailable{% endif %}</div>
+    {#- The breakdown is on the tile, not behind a click. A single -$329.58 with
+        "fees $50.01" underneath invites the obvious suspicion that the number is
+        wrong; showing that it is +$162.71 of sales against -$492.29 of
+        settlements over Aug 1 - Oct 4 is what makes it checkable. -#}
+    <div class="s" id="tKalshiPnlNote">{% if s.kalshi and s.kalshi.realized_known %}sales {{ '$%.2f'|format(s.kalshi.ledger.get('sales_realized', 0.0)) }} &middot; settled {{ '$%.2f'|format(s.kalshi.ledger.get('settlement_realized', 0.0)) }} &middot; fees {{ '$%.2f'|format(s.kalshi.fees) }}{% if s.kalshi.ledger.get('window_start') %} &middot; since {{ s.kalshi.ledger.get('window_start')[:10] }}{% endif %}{% else %}fill history unavailable{% endif %}</div>
   </div>
   {% else %}
   <div class="tile">
@@ -3851,9 +3993,11 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   {%- if s.mode.mode == 'live' %}
   <div class="pb" style="padding-top:0">
     <p class="note" style="font-size:12px;color:var(--live)">
-      LIVE is armed one strategy at a time. Nothing here starts by itself &mdash;
-      switching the mode switch does not place a single order. Each Start below
-      begins real-money trading for that strategy only.
+      Switching the mode switch never starts a strategy &mdash; that places no
+      order. Start below arms one strategy for real money. A deploy or crash
+      re-arms every lane automatically: a stop only sticks until the app
+      restarts, because a stop recorded in a previous session is treated as
+      stale intent rather than a decision that outlives the process.
     </p>
   </div>
   {%- endif %}
@@ -4414,11 +4558,25 @@ function paint(s) {
   // versa, so each write is a no-op in the other mode rather than a leak.
   if (s.mode && s.mode.mode === 'live') {
     set('tBalance', s.balance == null ? '-' : money(s.balance));
-    set('tLivePos', (k.market_count || 0) + (k.event_count || 0));
+    // Held contracts, not raw rows: Kalshi keeps a zero-share row per ticker the
+    // account ever touched, and summing those reported 31 "positions" when 3
+    // were held.
+    const held = k.held_count != null
+      ? k.held_count : (k.market_count || 0) + (k.event_count || 0);
+    set('tLivePos', held);
+    set('tLivePosNote',
+      (k.market_count || 0) + ' market · ' + (k.event_count || 0) + ' event' +
+      (k.ghost_count ? ' · ' + k.ghost_count + ' zero-share rows' : ''));
     set('tExposure', money(k.exposure));
     set('tKalshiPnl', money(k.realized));
     const kr = document.getElementById('tKalshiPnl');
     if (kr) kr.className = 'v ' + sgn(k.realized || 0);
+    const led = k.ledger || {};
+    set('tKalshiPnlNote',
+      'sales ' + money(led.sales_realized) +
+      ' · settled ' + money(led.settlement_realized) +
+      ' · fees ' + money(k.fees) +
+      (led.window_start ? ' · since ' + String(led.window_start).slice(0, 10) : ''));
   } else {
     const dry = (s.mode && s.mode.dry) || {}, od = s.open_dry || {};
     set('dCashTile', money(dry.cash));

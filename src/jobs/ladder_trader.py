@@ -42,9 +42,18 @@ class UpDownConfig:
     """Hard limits. Sized so a single bad call cannot damage the account."""
 
     notional_usd: float = 5.0
-    max_open_positions: int = 1
     # Required disagreement with Kalshi's own price before trading.
     min_edge: float = 0.06
+    # Minimum model probability on the chosen side before any entry. The old
+    # "one clip per market" guard was removed; this is what replaces it as the
+    # anti-churn rule - repeated buys of the same contract are allowed, but only
+    # while the contract is still more likely than not to pay.
+    min_win_prob: float = 0.60
+    # Total simulated/live notional the book may hold open across ALL clips,
+    # including multiple clips of the same contract. This replaces the old
+    # max_open_positions position COUNT, which forbade a second clip of the same
+    # market even when the odds justified it.
+    max_open_notional: float = 25.0
     # Deadband around the target, in dollars. Settlement is a 60-second average
     # of a composite index, so sub-noise moves are not information.
     noise_usd: float = 15.0
@@ -83,12 +92,13 @@ class UpDownSignal:
 class UpDownBook:
     signals: List[UpDownSignal] = field(default_factory=list)
     open_positions: List[Dict[str, Any]] = field(default_factory=list)
-    max_open: int = 1
+    max_open_notional: float = 25.0
     trades_today: int = 0
     skipped_no_edge: int = 0
     skipped_stale: int = 0
     skipped_too_close: int = 0
     skipped_unquoted: int = 0
+    skipped_low_prob: int = 0
     last_error: str = ""
     dry: bool = True
 
@@ -97,12 +107,14 @@ class UpDownBook:
             "signals": len(self.signals),
             "actionable": sum(1 for s in self.signals if s.actionable),
             "open_positions": len(self.open_positions),
-            "max_open_positions": self.max_open,
+            "open_notional": round(sum(float(p.get("notional") or 0.0) for p in self.open_positions), 2),
+            "max_open_notional": self.max_open_notional,
             "trades_today": self.trades_today,
             "skipped_no_edge": self.skipped_no_edge,
             "skipped_stale": self.skipped_stale,
             "skipped_too_close": self.skipped_too_close,
             "skipped_unquoted": self.skipped_unquoted,
+            "skipped_low_prob": self.skipped_low_prob,
             "last_error": self.last_error,
             "dry": self.dry,
         }
@@ -136,7 +148,7 @@ class UpDownTrader:
         self.config = config or UpDownConfig()
         self.db_manager = db_manager
         self._client: Any = None
-        self.book = UpDownBook(max_open=self.config.max_open_positions)
+        self.book = UpDownBook(max_open_notional=self.config.max_open_notional)
 
     def evaluate(self, market: Optional[UpDownMarket]) -> Optional[UpDownSignal]:
         """Score the next contract. Read-only: no orders here."""
@@ -273,6 +285,49 @@ class UpDownTrader:
 
         return os.environ.get("DB_PATH", "").strip() or "trading_system.db"
 
+    def _entry_block(
+        self, signal: UpDownSignal, held: List[Dict[str, Any]]
+    ) -> str:
+        """Why this clip may not be taken - or "" when it may.
+
+        Repeated clips of the same contract are allowed by design; the old guard
+        refused a second clip of a market the book already held and thereby
+        treated every re-entry as an error even while the contract was still
+        mispriced. What replaced it is money rules, not count rules:
+
+          - never hold both sides of one contract (the payouts sum to $1.00, so
+            the pair is a certain loss of the spread)
+          - the model's probability on the chosen side must clear
+            `min_win_prob`, so repeated clips only accumulate while the contract
+            is still more likely than not to pay
+          - total open notional across all clips stays under
+            `max_open_notional`
+        """
+        opposite = {"up": "NO", "down": "YES"}
+        for p in held:
+            if p["ticker"] == signal.ticker and p["side"] == opposite.get(signal.side):
+                return (
+                    f"already hold the opposite side of {signal.ticker}; "
+                    "closing first (never both sides of one contract)"
+                )
+
+        win_prob = signal.fair if signal.side == "up" else 1.0 - signal.fair
+        if win_prob < self.config.min_win_prob:
+            self.book.skipped_low_prob += 1
+            return (
+                f"win probability {win_prob:.2f} below "
+                f"{self.config.min_win_prob:.2f} on {signal.side.upper()}"
+            )
+
+        open_notional = sum(float(p.get("notional") or 0.0) for p in held)
+        if open_notional + signal.notional > self.config.max_open_notional:
+            return (
+                f"${open_notional:.2f} already deployed; adding "
+                f"${signal.notional:.2f} would exceed the "
+                f"${self.config.max_open_notional:.2f} cap"
+            )
+        return ""
+
     async def _place(self, signal: UpDownSignal, live: bool) -> bool:
         """Submit one clip through the canonical order path.
 
@@ -322,13 +377,18 @@ class UpDownTrader:
         # max-open guard never tripped, and the next cycle bought the same
         # contract again a few seconds later - draining the DRY account at ~$5 a
         # pass with nothing on the board to show for it.
+        #
+        # `allow_duplicate=True` is what lets this strategy pyramid: buying
+        # additional clips of the same contract is deliberate, gated by
+        # min_win_prob and max_open_notional in `cycle`, not an accident to
+        # prevent.
         try:
-            position_id = await self.db_manager.add_position(position)
+            position_id = await self.db_manager.add_position(position, allow_duplicate=True)
         except Exception as exc:  # noqa: BLE001
             self.book.last_error = f"position insert failed: {type(exc).__name__}: {exc}"
             return False
         if position_id is None:
-            self.book.blocked = f"already holding {signal.ticker}"
+            self.book.last_error = f"position insert refused for {signal.ticker}"
             return False
         position.id = position_id
 
@@ -458,26 +518,21 @@ class UpDownTrader:
         if stale_count:
             self.book.blocked = f"{stale_count} position(s) on settled contracts awaiting close-out"
 
-        # One position at a time. No pyramiding, no doubling in.
+        # Repeated clips of the same contract are allowed - deliberately. The old
+        # guard refused a second clip of a market the book already held, which
+        # treated every re-entry as an error even when the contract was still
+        # mispriced. What it actually produced was one $5 bet on a 15-minute
+        # window, decided once, at whatever noise the quote happened to carry.
+        #
+        # The replacement rules are money rules, not count rules:
+        #   - never hold both sides of one contract (certain loss of the spread)
+        #   - only enter when the model's probability on this side clears
+        #     min_win_prob, so repeated clips only accumulate while the contract
+        #     is still genuinely more likely than not to pay
+        #   - total open notional across ALL clips stays under max_open_notional
         if signal is not None and signal.actionable:
-            # Never hold both sides of one contract: the two payouts sum to $1.00
-            # while the combined cost is whatever was paid, so the pair is a
-            # certain loss of the spread.
-            opposite = {"up": "NO", "down": "YES"}
-            for p in held:
-                if p["ticker"] == signal.ticker and p["side"] == opposite.get(signal.side):
-                    blocked = (
-                        f"already hold the opposite side of {signal.ticker}; "
-                        "closing first (never both sides of one contract)"
-                    )
-                    break
-                if p["ticker"] == signal.ticker:
-                    blocked = f"already holding {signal.ticker}"
-                    break
-
-            if not blocked and len(held) >= self.config.max_open_positions:
-                blocked = f"already holding {len(held)} open position(s); " "max is one at a time"
-            elif not blocked and await self._place(signal, live):
+            blocked = self._entry_block(signal, held)
+            if not blocked and await self._place(signal, live):
                 self.book.open_positions.append(
                     {
                         "ticker": signal.ticker,

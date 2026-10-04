@@ -239,15 +239,67 @@ def test_size_never_returns_a_fractional_or_negative_count():
 def test_limits_are_hard_defaults():
     c = UpDownConfig()
     assert c.notional_usd == 5.0
-    assert c.max_open_positions == 1
+    # The one-clip-per-market COUNT guard is gone: repeated clips of the same
+    # contract are allowed while the model still favours it. What caps risk now
+    # is money (total open notional) and probability (min_win_prob).
+    assert not hasattr(c, "max_open_positions")
+    assert c.max_open_notional == 25.0
+    assert c.min_win_prob == 0.60
 
 
 def test_book_summary_reports_the_limits_it_enforces():
     trader = UpDownTrader(SpotFeed(), Btc15mFeed())
-    trader.book.open_positions = [{}]
+    trader.book.open_positions = [{"notional": 5.0}, {"notional": 5.0}]
     s = trader.book.summary()
-    assert s["open_positions"] == 1
-    assert s["max_open_positions"] == 1
+    assert s["open_positions"] == 2
+    assert s["open_notional"] == 10.0
+    assert s["max_open_notional"] == 25.0
+    assert "max_open_positions" not in s
+
+
+# ---------------------------------------------------------------------------
+# Entry gating: probability and money, not clip counts
+# ---------------------------------------------------------------------------
+def test_a_second_clip_of_the_same_contract_is_not_blocked():
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed())
+    held = [{"ticker": "KXBTC15M-26OCT011715-15", "side": "YES", "notional": 5.0}]
+    second = _signal("KXBTC15M-26OCT011715-15", side="up", ask=0.5, contracts=8)
+    assert trader._entry_block(second, held) == ""
+
+
+def test_the_opposite_side_of_the_same_contract_is_still_blocked():
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed())
+    held = [{"ticker": "KXBTC15M-26OCT011715-15", "side": "YES", "notional": 5.0}]
+    down = _signal("KXBTC15M-26OCT011715-15", side="down", ask=0.5, contracts=8)
+    assert "opposite side" in trader._entry_block(down, held)
+
+
+def test_an_entry_under_min_win_prob_is_refused():
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed())
+    # fair=0.89 for up -> win_prob 0.89 passes; a DOWN clip on fair 0.89 has
+    # win_prob 0.11, which is below min_win_prob 0.60.
+    down = _signal("KXBTC15M-26OCT011715-15", side="down", ask=0.5, contracts=8)
+    blocked = trader._entry_block(down, [])
+    assert "win probability" in blocked
+    assert trader.book.skipped_low_prob == 1
+
+
+def test_the_notional_cap_stops_accumulation():
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed())
+    held = [
+        {"ticker": "KXBTC15M-26OCT011715-15", "side": "YES", "notional": 12.0},
+        {"ticker": "KXBTC15M-26OCT011715-15", "side": "YES", "notional": 12.0},
+    ]
+    clip = _signal("KXBTC15M-26OCT011715-15", side="up", ask=0.5, contracts=8)
+    blocked = trader._entry_block(clip, held)
+    assert "exceed" in blocked and "$25.00" in blocked
+
+
+def test_under_the_notional_cap_repeated_clips_pass():
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed())
+    held = [{"ticker": "KXBTC15M-26OCT011715-15", "side": "YES", "notional": 5.0}]
+    clip = _signal("KXBTC15M-26OCT011715-15", side="up", ask=0.5, contracts=8)
+    assert trader._entry_block(clip, held) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -317,8 +369,16 @@ async def test_clip_is_persisted_before_the_fill_is_sought(tmp_path, monkeypatch
     assert stored[0].strategy == "btc_updown"
 
 
-async def test_a_second_clip_into_the_same_contract_is_refused(tmp_path, monkeypatch):
-    """`add_position` is the only guard against re-buying a held contract."""
+async def test_more_clips_of_the_same_contract_are_allowed_by_design(tmp_path, monkeypatch):
+    """The one-clip-per-market guard is gone, at every layer.
+
+    btc_updown is meant to pyramid: buy additional clips of the same contract
+    while the model still gives it better than min_win_prob odds. That used to
+    be impossible three different ways - the in-cycle `already holding` refusal,
+    the `add_position` duplicate check, and a UNIQUE(market_id, side) constraint
+    in the schema. All three are removed; what caps the book now is the win
+    probability gate and the total-notional cap in `cycle`.
+    """
     from src.utils.database import DatabaseManager
 
     db = DatabaseManager(db_path=str(tmp_path / "t.db"))
@@ -340,8 +400,12 @@ async def test_a_second_clip_into_the_same_contract_is_refused(tmp_path, monkeyp
     assert await trader._place(first, live=False) is True
 
     second = _signal("KXBTC15M-26OCT011715-15", side="up", ask=0.5, contracts=8)
-    assert await trader._place(second, live=False) is False
-    assert len(fills) == 1, "the held contract was bought a second time"
+    assert await trader._place(second, live=False) is True
+    assert len(fills) == 2, "the second clip of the same contract was refused"
+
+    stored = await db.get_open_positions(mode="dry")
+    assert len(stored) == 2
+    assert [p.market_id for p in stored] == ["KXBTC15M-26OCT011715-15"] * 2
 
 
 async def test_execute_refuses_a_position_that_was_never_saved():

@@ -521,6 +521,14 @@ class DatabaseManager(TradingLoggerMixin):
             # available for them: live=1 meant a real order was sent.
             lambda: self._backfill_position_mode(db),
             lambda: self._migrate_existing_strategy_data(db),
+            # Drop the UNIQUE(market_id, side) constraint on positions. It was the
+            # deepest layer of the "one clip per market" guard: even with every
+            # caller-side check removed, a second row for the same market and side
+            # was impossible because the schema rejected it. Strategies that need
+            # to pyramid - btc_updown buying more of the same contract while the
+            # model still favours it - were structurally unable to. Their own
+            # in-code guards still prevent duplicate entry everywhere else.
+            lambda: self._drop_positions_market_side_unique(db),
         ]
 
         for step in steps:
@@ -535,6 +543,57 @@ class DatabaseManager(TradingLoggerMixin):
         """Give pre-mode positions a book, derived from `live`."""
         await db.execute("UPDATE positions SET mode = 'live' WHERE mode IS NULL AND live = 1")
         await db.execute("UPDATE positions SET mode = 'dry' WHERE mode IS NULL AND live = 0")
+
+    async def _drop_positions_market_side_unique(self, db: aiosqlite.Connection) -> None:
+        """Rebuild `positions` without the UNIQUE(market_id, side) constraint.
+
+        SQLite cannot drop a UNIQUE constraint in place, so the table is rebuilt:
+        rename the old one, create the new shape, copy the rows, drop the old.
+        The column list is taken from PRAGMA so a database from any point in the
+        migration history copies correctly; the new table then has exactly the
+        current schema, minus the constraint.
+        """
+        cur = await db.execute("PRAGMA index_list(positions)")
+        indexes = await cur.fetchall()
+        # rows: seq, name, unique, origin, partial
+        has_unique_constraint = any(
+            int(r[2]) == 1 and r[3] == "u" for r in indexes
+        )
+        if not has_unique_constraint:
+            return
+
+        cur = await db.execute("PRAGMA table_info(positions)")
+        columns = [c[1] for c in await cur.fetchall()]
+        col_list = ", ".join(columns)
+
+        await db.execute("ALTER TABLE positions RENAME TO positions_legacy")
+        await db.execute(
+            """
+            CREATE TABLE positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                quantity INTEGER NOT NULL,
+                timestamp TEXT NOT NULL,
+                rationale TEXT,
+                confidence REAL,
+                live BOOLEAN NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'open',
+                strategy TEXT,
+                stop_loss_price REAL,
+                take_profit_price REAL,
+                max_hold_hours INTEGER,
+                target_confidence_change REAL,
+                mode TEXT
+            )
+            """
+        )
+        await db.execute(
+            f"INSERT INTO positions ({col_list}) SELECT {col_list} FROM positions_legacy"
+        )
+        await db.execute("DROP TABLE positions_legacy")
+        self.logger.info("Rebuilt positions without UNIQUE(market_id, side)")
 
     async def upsert_markets(self, markets: List[Market]):
         """
@@ -1210,24 +1269,31 @@ class DatabaseManager(TradingLoggerMixin):
             await db.commit()
         self.logger.info(f"Updated position {position_id} to live.")
 
-    async def add_position(self, position: Position) -> Optional[int]:
+    async def add_position(
+        self, position: Position, allow_duplicate: bool = False
+    ) -> Optional[int]:
         """
         Adds a new position to the database, if one doesn't already exist for the same market and side.
 
         Args:
             position: The position to add.
+            allow_duplicate: Permit a second open row for the same market and
+                side. This is for strategies that deliberately pyramid (e.g.
+                btc_updown buying more of the same contract while the model
+                still favours it). Every other caller keeps the guard.
 
         Returns:
             The ID of the newly inserted position, or None if a position already exists.
         """
-        existing_position = await self.get_position_by_market_and_side(
-            position.market_id, position.side
-        )
-        if existing_position:
-            self.logger.warning(
-                f"Position already exists for market {position.market_id} and side {position.side}."
+        if not allow_duplicate:
+            existing_position = await self.get_position_by_market_and_side(
+                position.market_id, position.side
             )
-            return None
+            if existing_position:
+                self.logger.warning(
+                    f"Position already exists for market {position.market_id} and side {position.side}."
+                )
+                return None
 
         async with connect(self.db_path) as db:
             position_dict = asdict(position)

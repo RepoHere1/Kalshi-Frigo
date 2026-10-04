@@ -34,6 +34,63 @@ def _position(ticker="KXTEST-26", side="NO", price=0.25, qty=10, strategy="ai_di
     )
 
 
+async def test_total_pnl_is_equity_minus_starting_not_a_double_count(tmp_path, monkeypatch):
+    """The headline P&L must agree with the tiles beside it.
+
+    `total_pnl` was computed as `cash - starting + realized`. But cash is the
+    running ledger that was already debited on every buy and credited on every
+    close, so `cash - starting` already contains the realized P&L; adding the
+    trade_logs `realized` again summed every close twice. The production DRY
+    page showed "realized P&L $4,261.81" beside an equity of $3,011.89 on a
+    $300 start - an arithmetic contradiction inside one row of tiles.
+
+    The only derivation that cannot contradict its own row is equity minus
+    starting, so that is what total_pnl is now.
+    """
+    from src.utils.database import TradeLog
+
+    db = await _db(tmp_path)
+    mgr = TradingMode(db_path=db.db_path)
+    monkeypatch.setenv("DB_PATH", db.db_path)
+
+    # A buy: $10 of cash becomes a position.
+    await mgr.record_fill(market_id="KXTEST-26", side="NO", action="buy", quantity=10, price=1.0)
+    await db.add_position(_position(ticker="KXTEST-26", price=1.0, qty=10))
+    # A winning close: +$2.50 into the ledger cash via record_fill sell,
+    # and a matching +$2.50 trade log row.
+    await mgr.record_fill(market_id="KXTEST-26", side="NO", action="sell", quantity=10, price=1.25)
+    await db.add_trade_log(
+        TradeLog(
+            market_id="KXTEST-26",
+            side="NO",
+            entry_price=1.0,
+            exit_price=1.25,
+            quantity=10,
+            pnl=2.5,
+            entry_timestamp=datetime.now(),
+            exit_timestamp=datetime.now(),
+            rationale="x",
+            strategy="ai_directional",
+            exit_reason="take_profit",
+            mode="dry",
+        )
+    )
+
+    account = await mgr.book_account(MODE_DRY)
+    # cash: 300 - 10 + 12.50 = 302.50. realized (trade_logs): 2.50.
+    assert account["cash"] == pytest.approx(302.50, abs=0.01)
+    assert account["realized"] == pytest.approx(2.50, abs=0.01)
+    # equity = cash + deployed (position row still open) - but for the identity
+    # test what matters is that total_pnl is equity - starting, never
+    # cash - starting + realized (which would be 5.00).
+    expected_total = round(account["equity"] - account["starting_balance"], 2)
+    assert account["total_pnl"] == pytest.approx(expected_total, abs=0.01)
+    assert account["total_pnl"] != pytest.approx(5.00, abs=0.01)
+    assert account["return_pct"] == pytest.approx(
+        round(expected_total / account["starting_balance"] * 100, 2), abs=0.01
+    )
+
+
 async def test_a_clean_book_audits_ok(tmp_path, monkeypatch):
     mgr = TradingMode(db_path=str(tmp_path / "a.db"))
     db = await _db(tmp_path)

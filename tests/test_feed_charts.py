@@ -124,18 +124,30 @@ def _supervisor_source() -> str:
 def test_the_supervisor_accepts_both_spellings_of_paper():
     """Resuming after a deploy dropped five of six strategies.
 
-    The runtime store records `paper`; the book says `dry`. Requiring one exact
-    spelling treated every row carrying the other as if it were LIVE, cleared the
-    operator's intent, and left the strategy down after every deploy.
+    The runtime store records `paper`; the book says `dry`. The old supervisor
+    matched one exact spelling, treated every row carrying the other as LIVE,
+    cleared the operator's intent, and left the strategy down after every
+    deploy. That whole vocabulary check is gone now: the supervisor no longer
+    inspects the recorded mode spelling at all, so there is no string it can
+    get wrong.
     """
     src = _supervisor_source()
-    assert 'not in ("paper", "dry")' in src
-    assert '!= "paper"' not in src
+    assert 'not in ("paper", "dry")' not in src
+    assert "row.get('mode')" not in src
 
 
-def test_live_is_still_never_resumed_automatically():
-    """The safety half of that rule must survive the fix."""
-    assert "was running LIVE before a restart and was not" in _supervisor_source()
+def test_live_lanes_are_resumed_like_any_other_lane():
+    """A LIVE strategy is resumed across a restart, exactly like a paper one.
+
+    The old rule dropped LIVE intent on every redeploy "for safety", which is
+    what turned the whole book off overnight: every deploy silently stopped the
+    armed strategies and the account sat idle. An armed lane means the operator
+    already said yes; that intent now survives the process that recorded it,
+    and only a Stop given in the current instance takes a lane down.
+    """
+    src = _supervisor_source()
+    assert "was running LIVE before a restart and was not" not in src
+    assert "_CUR_INSTANCE" in src
 
 
 def test_a_recovered_strategy_resets_the_failure_budget():

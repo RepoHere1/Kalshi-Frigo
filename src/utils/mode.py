@@ -336,18 +336,31 @@ class TradingMode:
                 else 0
             )
 
+        equity = round(cash_f + deployed, 2)
+        # total_pnl = cash - starting + realized counted every closed trade twice.
+        #
+        # `cash_f` is the running cash counter: it was debited on every simulated
+        # fill and credited on every close, so `cash - starting` already IS the
+        # realized P&L. Adding the trade_logs `realized` on top of it summed the
+        # same closes a second time - the DRY page showed "realized P&L $4,261.81"
+        # while the equity tile beside it said $3,011.89 on a $300 start, an
+        # arithmetic contradiction on the same row of tiles.
+        #
+        # Total P&L is therefore derived from the two numbers displayed next to
+        # it: equity minus starting. That cannot disagree with its own row.
+        total_pnl = round(equity - starting_f, 2)
         return {
             "book": mode,
             "starting_balance": round(starting_f, 2),
             "cash": round(cash_f, 2),
             "deployed": round(deployed, 2),
             "open_positions": open_count,
-            "equity": round(cash_f + deployed, 2),
+            "equity": round(equity, 2),
             "realized": round(realized, 2),
-            "total_pnl": round(cash_f - starting_f + realized, 2),
+            "total_pnl": total_pnl,
             "closed_trades": closed,
             "ledger_entries": ledger_rows,
-            "return_pct": round((cash_f - starting_f + realized) / starting_f * 100, 2)
+            "return_pct": round(total_pnl / starting_f * 100, 2)
             if starting_f
             else 0.0,
         }

@@ -209,11 +209,19 @@ class StrategyRuntime:
         return {"name": name, "pid": int(pid), "running": True}
 
     async def record_stop(self, name: str, reason: str) -> None:
+        # The instance is stamped on the stop as well as the start. Without it a
+        # stop recorded before a redeploy is indistinguishable from one the
+        # operator gave in this instance, so a lane stopped once stayed down
+        # forever across every subsequent restart - the exact "strategies turned
+        # themselves off and never came back" failure. Stamping it lets the
+        # supervisor tell "the operator just said stop" from "a stop left over
+        # from a previous deploy".
         async with _conn(self.db_path) as conn:
             await conn.execute(
-                "UPDATE strategy_runtime SET pid=NULL, stop_reason=?, stopped_at=?, desired=0"
+                "UPDATE strategy_runtime SET pid=NULL, stop_reason=?, stopped_at=?,"
+                " instance=?, desired=0"
                 " WHERE name=?",
-                (reason, _now(), name),
+                (reason, _now(), INSTANCE, name),
             )
             await conn.commit()
 

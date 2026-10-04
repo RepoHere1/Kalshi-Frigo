@@ -84,18 +84,60 @@ def test_backoff_has_a_ceiling():
 
 
 # ---------------------------------------------------------------------------
-# LIVE must never arm itself
+# Arming policy
 # ---------------------------------------------------------------------------
-def test_dry_auto_starts_but_live_never_does():
-    """Switching to LIVE must not place a single order.
+def test_a_restart_re_arms_every_lane_in_either_book():
+    """A redeploy must not silently stop the book.
 
-    AUTO_START_ALL means every DRY lane comes up on boot, because simulated money
-    cannot be lost. Applied to LIVE it would start six real-money strategies the
-    moment the switch moved, so the seed is gated on the book being DRY and LIVE
-    is armed one strategy at a time by hand.
+    The seed used to be gated on `AUTO_START_ALL and _current_book_mode() !=
+    "live"`, so every LIVE lane stayed down across a restart and the account
+    quietly stopped trading until somebody noticed and pressed Start on six
+    buttons. Gating it that way made the DRY/LIVE distinction a reason to stop
+    working rather than a reason to be careful about money.
+
+    Arming is now the same in both books. The mode switch itself still starts
+    nothing - that is a separate endpoint - so switching to LIVE does not place
+    an order; the seed only runs on the supervisor's boot pass.
     """
     src = inspect.getsource(wd._strategy_supervisor_loop)
-    assert 'AUTO_START_ALL and _current_book_mode() != "live"' in src
+    assert "if AUTO_START_ALL:" in src
+    assert '_current_book_mode() != "live"' not in src
+    # The book in force still decides which book a lane is armed into.
+    assert '_current_book_mode() == "live"' in src
+    assert '_spawn_strategy(name, "paper")' not in src
+
+
+def test_an_operator_stop_only_counts_when_given_in_this_instance():
+    """A stop must not outlive the process that recorded it.
+
+    `record_stop` stamps the instance id, and the operator-stop exemption only
+    applies to a row from the current instance. Without that pairing a stop
+    recorded before a redeploy is indistinguishable from a fresh decision, so a
+    lane stopped once stayed down forever - which is precisely the "strategies
+    turned themselves off and never came back" symptom.
+    """
+    from src.utils.strategy_runtime import INSTANCE, StrategyRuntime
+
+    supervisor = inspect.getsource(wd._strategy_supervisor_loop)
+    assert "_CUR_INSTANCE" in supervisor
+    assert '(row.get("instance") or "") == _CUR_INSTANCE' in supervisor
+
+    stop_src = inspect.getsource(StrategyRuntime.record_stop)
+    assert "instance=?" in stop_src
+    assert INSTANCE is not None
+
+
+def test_the_live_page_describes_the_real_arming_policy():
+    """The page must not promise "nothing here starts by itself".
+
+    That sentence described the old gate. Leaving it in place after the gate was
+    removed is the same class of bug this whole file is about: the UI asserting
+    something the code no longer does.
+    """
+    html = wd._TEMPLATE
+    assert "armed one strategy at a time" not in html
+    assert "does not place a single order" not in html
+    assert "re-arms every lane automatically" in html
 
 
 def test_the_dry_page_offers_no_live_controls(monkeypatch, tmp_path):
@@ -105,7 +147,7 @@ def test_the_dry_page_offers_no_live_controls(monkeypatch, tmp_path):
     html = wd.app.test_client().get("/").get_data(as_text=True)
     assert "Start all in DRY" in html
     assert "Kill all LIVE" not in html
-    assert "armed one strategy at a time" not in html
+    assert "re-arms every lane automatically" not in html
 
 
 def test_stopping_still_works_and_is_sticky():

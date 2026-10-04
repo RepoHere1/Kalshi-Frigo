@@ -237,7 +237,12 @@ def test_kalshi_account_normalises_both_shapes(client, auth, monkeypatch):
     k = snap["kalshi"]
     assert k["connected"] is True
     assert k["market_count"] == 1
-    assert k["event_count"] == 1
+    # The event fixture has zero exposure, so it is historical context, not a
+    # held position - but its row must still be normalised and listed so the
+    # event panel can show where the money went.
+    assert k["event_count"] == 0
+    assert k["event_rows"] == 1
+    assert any(r["ticker"] == "KXMLB-26" for r in k["events"])
     # Decimal strings must become floats, not stay as text.
     assert k["exposure"] == 1.85
     assert k["traded"] == 9.4
@@ -250,6 +255,164 @@ def test_kalshi_account_normalises_both_shapes(client, auth, monkeypatch):
     # The per-market figures are still correct and kept for the position tables.
     assert k["positions_realized"] == 0.30  # 0.33 - 0.026
     assert k["positions_fees"] == 0.06  # 0.005 + 0.0506
+
+
+def test_zero_share_rows_are_not_counted_as_positions(client, auth, monkeypatch):
+    """Kalshi keeps a row per ticker ever touched; a 0-share row is not a position.
+
+    The production account answered with 31 rows - 15 markets at exactly zero
+    shares and zero exposure, plus event rollups carrying historical cost behind
+    no open contracts. Counting them reported "33 live positions" for an account
+    holding three, which is the number that sent the operator looking for 31
+    positions that did not exist.
+    """
+    _go_live(client, auth, monkeypatch)
+    wd.dashboard_state["positions"] = [
+        # Held.
+        dict(KALSHI_MARKET_POSITION),
+        dict(KALSHI_EVENT_POSITION),
+        # Touched and closed: Kalshi keeps these forever.
+        {"ticker": "KXSB-27-LV", "position_fp": "0.00", "market_exposure_dollars": "0.00",
+         "total_traded_dollars": "120.00", "realized_pnl_dollars": "-40.00",
+         "fees_paid_dollars": "2.00"},
+        {"ticker": "KXMLB-26-NYY", "position_fp": "0.00", "market_exposure_dollars": "0.00",
+         "total_traded_dollars": "60.00", "realized_pnl_dollars": "-10.00",
+         "fees_paid_dollars": "1.00"},
+        # An event rollup whose cost is all historical, with nothing open.
+        {"event_ticker": "KXNBAGREAT-26", "total_cost_shares_fp": "100.00",
+         "total_cost_dollars": "925.84", "event_exposure_dollars": "0.00",
+         "realized_pnl_dollars": "0.00", "fees_paid_dollars": "0.00"},
+    ]
+    try:
+        snap = client.get("/api/snapshot").get_json()
+    finally:
+        wd.dashboard_state["positions"] = []
+    k = snap["kalshi"]
+
+    assert k["market_count"] == 1
+    # Neither event row holds anything (both have zero exposure), so they are
+    # historical context, not open positions - the held count is the market row
+    # only, and event rows are never added to it (they are rollups of the same
+    # contracts, and counting both would report one position twice).
+    assert k["event_count"] == 0
+    assert k["held_count"] == 1
+    # The raw row counts are still reported, so the difference is visible.
+    assert k["market_rows"] == 3
+    assert k["event_rows"] == 2
+    assert k["ghost_count"] == 4
+    # Exposure sums held MARKET rows only. The $925.84 event cost is not
+    # exposure, and neither is the other event rollup.
+    assert k["exposure"] == 1.85
+    # Closed tickers must not be listed as open positions; the event rows are
+    # still listed as history (cost > 0).
+    assert [r["ticker"] for r in k["markets"]] == [KALSHI_MARKET_POSITION["ticker"]]
+    listed_events = sorted(r["ticker"] for r in k["events"])
+    assert listed_events == ["KXMLB-26", "KXNBAGREAT-26"]
+
+
+def test_the_live_position_tile_counts_held_rows_not_raw_rows(client, auth, monkeypatch):
+    _go_live(client, auth, monkeypatch)
+    wd.dashboard_state["positions"] = [
+        dict(KALSHI_MARKET_POSITION),
+        {"ticker": "KXSB-27-LV", "position_fp": "0.00", "market_exposure_dollars": "0.00",
+         "total_traded_dollars": "0.00", "realized_pnl_dollars": "0.00",
+         "fees_paid_dollars": "0.00"},
+    ]
+    try:
+        html = client.get("/").get_data(as_text=True)
+    finally:
+        wd.dashboard_state["positions"] = []
+    # "1" held, with the zero-share rows named rather than silently added in.
+    assert "zero-share rows" in html
+
+
+def test_a_zero_share_row_is_not_spent_a_title_lookup(client, auth, monkeypatch):
+    """Only rows the page actually renders are worth a title request."""
+    _go_live(client, auth, monkeypatch)
+    wd.dashboard_state["positions"] = [
+        dict(KALSHI_MARKET_POSITION),
+        {"ticker": "KXSB-27-LV", "position_fp": "0.00"},
+        {"ticker": "KXMLB-26-NYY", "position_fp": "0.00"},
+    ]
+    try:
+        tickers = wd._current_book_tickers()
+    finally:
+        wd.dashboard_state["positions"] = []
+    got = {r.get("ticker") or r.get("event_ticker") for r in tickers}
+    assert "KXSB-27-LV" not in got
+    assert "KXMLB-26-NYY" not in got
+    assert KALSHI_MARKET_POSITION["ticker"] in got
+
+
+def test_titles_are_resolved_in_one_batched_request(monkeypatch):
+    """One request per batch, not one per ticker.
+
+    The loop of `get_market(ticker)` calls was 25 sequential HTTP requests every
+    interval, which is what drove the markets endpoint into 429 - and the 429
+    handler abandoned the entire batch, so titles never resolved at all.
+    """
+    calls = []
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def get_markets(self, tickers=None, limit=None, **k):
+            calls.append(list(tickers or []))
+            return {"markets": [{"ticker": t, "title": f"Title for {t}"} for t in tickers or []]}
+
+        async def get_market(self, ticker):  # pragma: no cover - must not be called
+            raise AssertionError("per-ticker lookup must not be used for a batch")
+
+    monkeypatch.setattr(wd, "_title_client", FakeClient())
+    monkeypatch.setenv("KALSHI_API_KEY", "x")
+    monkeypatch.setattr(wd, "_title_last_attempt", 0.0)
+    monkeypatch.setattr(wd, "_title_backoff_until", 0.0)
+    wd.dashboard_state["market_titles"] = {}
+
+    rows = [{"ticker": f"KXT{i}"} for i in range(40)]
+    wd._refresh_market_titles(rows)
+
+    assert len(calls) == 1, "a 40-ticker batch must not cost 40 requests"
+    assert len(calls[0]) == 40
+    assert wd.dashboard_state["market_titles"]["KXT7"] == "Title for KXT7"
+
+
+def test_a_failed_title_lookup_is_retried_rather_than_cached_as_the_ticker(monkeypatch):
+    """A transient failure must not permanently pin the raw ticker to the page.
+
+    The old code wrote `cached[ticker] = ticker` on failure, and "already
+    resolved?" is `ticker not in cached` - so one 404 locked the raw ticker in
+    for the life of the process with no path back to the real title.
+    """
+    attempts = []
+
+    class FlakyClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def get_markets(self, tickers=None, limit=None, **k):
+            attempts.append(list(tickers or []))
+            if len(attempts) == 1:
+                return {"markets": []}  # nothing resolved this pass
+            return {"markets": [{"ticker": t, "title": "Recovered"} for t in tickers or []]}
+
+    monkeypatch.setattr(wd, "_title_client", FlakyClient())
+    monkeypatch.setenv("KALSHI_API_KEY", "x")
+    monkeypatch.setattr(wd, "_title_last_attempt", 0.0)
+    monkeypatch.setattr(wd, "_title_backoff_until", 0.0)
+    wd.dashboard_state["market_titles"] = {}
+
+    rows = [{"ticker": "KXMYSTERY-26"}]
+    wd._refresh_market_titles(rows)
+    # A readable fallback is shown rather than an empty cell...
+    assert wd.dashboard_state["market_titles"]["KXMYSTERY-26"]
+    # ...and it is not the ticker, so the next pass tries again.
+    assert wd.dashboard_state["market_titles"]["KXMYSTERY-26"] != "KXMYSTERY-26"
+
+    wd._title_last_attempt = 0.0
+    wd._refresh_market_titles(rows)
+    assert wd.dashboard_state["market_titles"]["KXMYSTERY-26"] == "Recovered"
 
 
 def test_a_dry_snapshot_carries_no_real_account_data(client):
@@ -754,6 +917,42 @@ def test_toggle_refuses_when_only_api_key_present(client, auth, monkeypatch):
     monkeypatch.delenv("KALSHI_PRIVATE_KEY_PATH", raising=False)
     r = client.post("/api/strategy/safe_compounder/toggle", json={"mode": "paper"}, headers=auth)
     assert r.status_code == 400
+
+
+def test_a_strategy_running_in_the_other_book_can_always_be_stopped(
+    client, auth, monkeypatch, tmp_path
+):
+    """Stop must never be refused on a book mismatch.
+
+    The cross-book 409 used to sit ABOVE the stop branch, so a strategy recorded
+    as running in LIVE could not be stopped from the DRY page (and vice versa):
+    the card's Stop button sends no mode, resolves to the current book, and got
+    "already running in live mode" back. That is the deadlock behind "can't turn
+    btc 15 on" - not a refusal to trade, but a button that could neither start
+    nor stop. Stopping now wins over every mode check.
+    """
+    import asyncio
+    import subprocess as sp
+
+    proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        store = wd._runtime_store()
+        asyncio.run(
+            store.record_start("btc_updown", proc.pid, "live", "cli.py run --live")
+        )
+        # The book is DRY (default) and the strategy is recorded as LIVE.
+        r = client.post("/api/strategy/btc_updown/toggle", json={}, headers=auth)
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["running"] is False
+        assert body["was_running_in"] == "live"
+        assert body["stopped_from_book"] == "dry"
+    finally:
+        proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------
