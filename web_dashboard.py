@@ -1107,6 +1107,9 @@ def _prettify_ticker(ticker: str) -> str:
         "NFLAFCCHAMP": "NFL AFC Championship",
         "NFLAFC": "NFL AFC",
         "NFLCONFCHAMP": "NFL Conference Championship",
+        "NFLMVP": "NFL MVP",
+        "BOXING": "Boxing",
+        "CABILLIONAIRETAX": "CA Billionaire Tax",
         "DJIA": "Dow Jones Industrial Average",
         "NASDAQ": "Nasdaq 100",
         "SPX": "S&P 500",
@@ -1854,6 +1857,43 @@ def _row_positions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _truth_positions_for_live(
+    positions: List[Dict[str, Any]], account: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """The LIVE open-position list, reconciled against Kalshi.
+
+    Local rows whose market is not among Kalshi's held markets are settled or
+    phantom and must not render as open. Kalshi-held markets the local book
+    never recorded are added from the account payload so nothing real is
+    missing. Returns only what Kalshi says is actually open.
+    """
+    held = {r["ticker"] for r in account.get("markets", [])}
+    out = [p for p in positions if p.get("market_id") in held]
+    seen = {p.get("market_id") for p in out}
+    for r in account.get("markets", []):
+        if r["ticker"] in seen:
+            continue
+        out.append(
+            {
+                "market_id": r["ticker"],
+                "side": "long" if r["shares"] > 0 else "short",
+                "entry_price": None,
+                "quantity": r["shares"],
+                "strategy": "kalshi_api",
+                "stop_loss": None,
+                "take_profit": None,
+                "status": "open",
+                "timestamp": "",
+                "mode": "live",
+                "source": "kalshi",
+            }
+        )
+    dashboard_state["stale_live_rows"] = sum(
+        1 for p in positions if p.get("market_id") not in held
+    )
+    return out
+
+
 def _as_float(value: Any, default: float = 0.0) -> float:
     """Kalshi returns money as decimal *strings* (e.g. "-0.012000")."""
     try:
@@ -2045,25 +2085,15 @@ def build_snapshot() -> Dict[str, Any]:
 
     positions = _row_positions(pos_r)
     account = _kalshi_account()
-    if not positions and account["connected"] and book == "live":
-        # Kalshi is the source of truth for the LIVE book's own rows. Falling
-        # back to it in DRY put the real account's positions on the DRY screen
-        # whenever the simulated book happened to be empty.
-        positions = [
-            {
-                "market_id": r["ticker"],
-                "side": "event" if not r["shares"] else ("long" if r["shares"] > 0 else "short"),
-                "entry_price": None,
-                "quantity": r["shares"],
-                "strategy": "kalshi_api",
-                "stop_loss": None,
-                "take_profit": None,
-                "status": "open",
-                "timestamp": r.get("updated", ""),
-                "source": "kalshi",
-            }
-            for r in (account["markets"] + account["events"])
-        ]
+    if book == "live" and account["connected"]:
+        # LIVE truth: Kalshi is the only authority on what the real account
+        # holds. Local rows for markets Kalshi has settled are stale - the
+        # contracts are gone and the money already moved - and rendering them
+        # as open positions is a lie. The 29 "open" BTC15M rows came from here:
+        # their contracts settled on Kalshi hours ago while the local book kept
+        # them open. Only rows Kalshi still holds are shown, and Kalshi rows
+        # the local book never saw are added so the list is complete.
+        positions = _truth_positions_for_live(positions, account)
     dashboard_state["db_positions_count"] = len(positions)
 
     running = _running_strategies()
@@ -2106,6 +2136,7 @@ def build_snapshot() -> Dict[str, Any]:
         "open_dry": _row_open_dry(dry_open_r),
         "data": _row_data(counts, ai_r, llm_r),
         "positions": positions,
+        "stale_live_rows": dashboard_state.get("stale_live_rows", 0),
         "recent_trades": recent,
         "by_strategy": _row_breakdown(strat_r),
         "equity": {"labels": labels, "pnl": values},
@@ -2137,7 +2168,10 @@ def build_snapshot() -> Dict[str, Any]:
         # positions table while the cache was empty or mid-resolution. Sourced
         # from THIS BOOK's position rows only: a DRY snapshot must not carry the
         # real account's tickers in its title map.
-        "market_titles": _complete_title_map(positions),
+        "market_titles": _complete_title_map(
+            positions
+            + (account["markets"] + account["events"] if book == "live" else [])
+        ),
         "errors": errors[-10:],
         "events": events[-8:],
     }
@@ -3035,6 +3069,25 @@ def api_strategy_detail(name):
         r["pnl"] = round(float(r.get("pnl") or 0.0), 2)
         r["exit_timestamp"] = str(r.get("exit_timestamp") or "")[:19]
 
+    # Same LIVE truth rule as the main page: only rows Kalshi still holds.
+    detail_positions = _in_book(_mine(pos_r))
+    if book == "live":
+        detail_positions = _truth_positions_for_live(
+            [
+                {
+                    "market_id": r.get("market_id"),
+                    "side": r.get("side"),
+                    "entry_price": r.get("entry_price"),
+                    "quantity": r.get("quantity"),
+                    "stop_loss": r.get("stop_loss_price"),
+                    "take_profit": r.get("take_profit_price"),
+                    "timestamp": r.get("timestamp"),
+                }
+                for r in detail_positions
+            ],
+            _kalshi_account(),
+        )
+
     return jsonify(
         {
             "strategy": card,
@@ -3045,11 +3098,11 @@ def api_strategy_detail(name):
                     "side": r.get("side"),
                     "entry_price": r.get("entry_price"),
                     "quantity": r.get("quantity"),
-                    "stop_loss": r.get("stop_loss_price"),
-                    "take_profit": r.get("take_profit_price"),
+                    "stop_loss": r.get("stop_loss"),
+                    "take_profit": r.get("take_profit"),
                     "opened": str(r.get("timestamp") or "")[:19],
                 }
-                for r in _in_book(_mine(pos_r))
+                for r in detail_positions
             ],
             "trades": closed,
             "logs": _strategy_log_tail(name),
@@ -3797,22 +3850,30 @@ body[data-mode="dry"]  .brand .logo{border-color:rgba(77,159,255,.4);box-shadow:
 .modeflag.dry {color:var(--up);background:rgba(46,230,168,.10)}
 .modeflag.live{color:var(--live);background:var(--live-bg)}
 .modeflag .dot{width:9px;height:9px}
-/* LIVE flag: no on/off blinking. Steady blood-red fill, bright yellow border,
-   a yellow beacon orbiting the border, and a silver shimmer sweeping across. */
+/* LIVE flag: no on/off blinking. A brighter red fill, a THIN yellow border, a
+   yellow hump that travels around the border itself (never leaving it), and a
+   silver shimmer sweeping across the face. */
 body[data-mode="live"] .modeflag.live{
   animation:none;
-  border-color:#ffd600;color:#ffd600;
-  background:linear-gradient(150deg,rgba(138,3,3,.72),rgba(92,0,0,.82));
-  box-shadow:0 0 0 1px rgba(0,0,0,.5), 0 0 16px rgba(255,214,0,.28), 0 4px 16px rgba(0,0,0,.4);
+  border:1px solid #ffd600;color:#ffd600;
+  background:linear-gradient(150deg,#e20707,#b00000 55%,#7a0000);
+  box-shadow:0 0 0 1px rgba(0,0,0,.5), 0 0 16px rgba(224,7,7,.6), 0 4px 16px rgba(0,0,0,.4);
 }
 body[data-mode="live"] .modeflag.live .dot{display:none}
+/* The hump: a bright arc in a conic gradient, masked down to the border ring,
+   rotating so the arc travels along the border continuously. */
 .orbitring{
-  position:absolute;inset:-9px;border-radius:14px;pointer-events:none;
-  animation:spin 3.2s linear infinite;
-}
-.orbitring::before{
-  content:'';position:absolute;top:-5px;left:50%;width:11px;height:11px;margin-left:-5.5px;
-  border-radius:50%;background:#ffd600;box-shadow:0 0 12px 3px rgba(255,214,0,.75);
+  position:absolute;inset:-1px;border-radius:11px;padding:1px;pointer-events:none;
+  background:conic-gradient(from 0deg,
+    transparent 0deg 295deg,
+    #ffe600 312deg 330deg,
+    #fff8d6 336deg 348deg,
+    transparent 352deg 360deg);
+  -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+  -webkit-mask-composite:xor;
+          mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+          mask-composite:exclude;
+  animation:spin 2.6s linear infinite;
 }
 @keyframes spin{to{transform:rotate(360deg)}}
 body[data-mode="live"] .modeflag.live::after{
@@ -4458,7 +4519,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 <!-- ============ positions + equity ============ -->
 <div class="row two">
   <div class="panel">
-    <div class="ph"><h2>Open positions</h2><span class="note">{{ s.positions|length }} row{{ '' if s.positions|length == 1 else 's' }}</span></div>
+    <div class="ph"><h2>Open positions</h2><span class="note">{{ s.positions|length }} row{{ '' if s.positions|length == 1 else 's' }}{% if live and s.stale_live_rows %} &middot; {{ s.stale_live_rows }} stale local row{{ '' if s.stale_live_rows == 1 else 's' }} settled on Kalshi, not shown{% endif %}</span></div>
     <div class="scroll">
       {%- if s.positions %}
       <table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th class="num">Entry</th><th class="num">Qty</th><th>Strategy</th><th class="num">SL</th><th class="num">TP</th></tr></thead><tbody id="posBody">

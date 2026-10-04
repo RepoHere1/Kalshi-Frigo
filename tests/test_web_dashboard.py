@@ -344,6 +344,77 @@ def test_a_zero_share_row_is_not_spent_a_title_lookup(client, auth, monkeypatch)
     assert KALSHI_MARKET_POSITION["ticker"] in got
 
 
+def test_live_positions_show_only_what_kalshi_still_holds(client, auth, monkeypatch):
+    """Settled local rows must never render as open LIVE positions.
+
+    The 29 BTC15M rows that showed as LIVE "open" were contracts Kalshi had
+    settled hours earlier - the local book kept them open and the page printed
+    them as real positions, which is a lie with money attached. The LIVE list
+    is now reconciled against Kalshi: only markets Kalshi still holds appear,
+    stale local rows are excluded and counted, and Kalshi-held markets the
+    local book never saw are added.
+    """
+    import asyncio
+    from datetime import datetime
+
+    from src.utils.database import DatabaseManager, Position
+
+    _go_live(client, auth, monkeypatch)
+    db = DatabaseManager(db_path=str(wd.DB_PATH))
+    asyncio.run(db.initialize())
+    asyncio.run(
+        db.add_position(
+            Position(
+                market_id="KXHELD-26",
+                side="YES",
+                entry_price=0.5,
+                quantity=2,
+                timestamp=datetime.now(),
+                rationale="t",
+                confidence=0.9,
+                live=True,
+                strategy="btc_updown",
+                mode="live",
+            )
+        )
+    )
+    asyncio.run(
+        db.add_position(
+            Position(
+                market_id="KXSETTLED-26",
+                side="YES",
+                entry_price=0.8,
+                quantity=1,
+                timestamp=datetime.now(),
+                rationale="t",
+                confidence=0.9,
+                live=True,
+                strategy="btc_updown",
+                mode="live",
+            )
+        )
+    )
+    # Kalshi says only KXHELD-26 is still held.
+    wd.dashboard_state["positions"] = [
+        {
+            "ticker": "KXHELD-26",
+            "position_fp": "2.00",
+            "market_exposure_dollars": "1.00",
+            "total_traded_dollars": "2.00",
+            "realized_pnl_dollars": "0.00",
+            "fees_paid_dollars": "0.00",
+        }
+    ]
+    try:
+        snap = client.get("/api/snapshot").get_json()
+    finally:
+        wd.dashboard_state["positions"] = []
+
+    ids = [p["market_id"] for p in snap["positions"]]
+    assert ids == ["KXHELD-26"], "a settled market must not render as an open LIVE position"
+    assert snap["stale_live_rows"] == 1
+
+
 def test_titles_are_resolved_in_one_batched_request(monkeypatch):
     """One request per batch, not one per ticker.
 
@@ -634,8 +705,9 @@ def test_kalshi_positions_stand_in_for_empty_db_only_in_live(client, auth, monke
         snap = client.get("/api/snapshot").get_json()
     finally:
         gen2.close()
-    assert len(snap["positions"]) == 2
+    assert len(snap["positions"]) == 1, "only the market Kalshi still holds is an open LIVE position"
     assert all(p["strategy"] == "kalshi_api" for p in snap["positions"])
+    assert snap["positions"][0]["market_id"] == "KXPRES-26-BIDEN"
     # Back to DRY for any test that follows.
     client.post("/api/mode", json={"mode": "dry", "confirm": True}, headers=auth)
 
