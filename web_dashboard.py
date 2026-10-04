@@ -2107,7 +2107,7 @@ def dashboard():
     the real position, trade and P&L data instead of "--" placeholders.
     """
     try:
-        snap = build_snapshot()
+        snap = build_snapshot_cached()
     except Exception as e:
         _push_error(f"Snapshot build: {e}")
         snap = {
@@ -2141,10 +2141,69 @@ def dashboard():
     )
 
 
+_SNAPSHOT_CACHE: Dict[str, Any] = {"at": 0.0, "payload": None}
+_SNAPSHOT_TTL = 2.0
+
+
+def build_snapshot_cached() -> Dict[str, Any]:
+    """build_snapshot, memoised for a couple of seconds and never allowed to raise.
+
+    Two failure modes made the page look broken rather than busy:
+
+    - `/api/snapshot` returned **500 with an empty body** when a query lost its
+      race for the database lock. The client had nothing to render, so every
+      figure on the page went to zero - the "blanked to zero" report. A page
+      showing slightly stale numbers is worth far more than a blank one.
+    - `/api/strategies` took **27 seconds**, which is the 30s busy timeout
+      nearly expiring on a blocked read. Buttons looked dead and clicks looked
+      ignored, so strategies appeared to "not turn on".
+
+    So: a short TTL so a burst of polls costs one query rather than six, a read
+    timeout short enough that a blocked read fails in seconds instead of hanging
+    the page, and a last-known-good payload if the rebuild fails outright.
+    """
+    now = time.time()
+    cached = _SNAPSHOT_CACHE.get("payload")
+    ttl = 0.0 if app.config.get("TESTING") else _SNAPSHOT_TTL
+    if cached is not None and now - float(_SNAPSHOT_CACHE.get("at") or 0) < ttl:
+        return cached
+    try:
+        payload = build_snapshot()
+    except Exception as exc:  # noqa: BLE001 - never blank the page
+        _push_error(f"Snapshot rebuild failed, serving last known: {exc}")
+        if cached is not None:
+            return cached
+        return {
+            "mode": _safe_mode_payload(),
+            "error": str(exc),
+            "positions": [],
+            "strategy_cards": [],
+            "by_strategy": [],
+            "trades": {
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "realized_pnl": 0.0,
+                "win_rate": 0.0,
+                "best_trade": 0.0,
+                "worst_trade": 0.0,
+                "avg_pnl": 0.0,
+            },
+            "open": {"positions": 0, "capital": 0.0, "paper": 0, "live": 0},
+            "kalshi": None,
+            "market_titles": {},
+            "errors": [],
+            "funding": {"connected": False, "balance": 0.0, "can_fund": False, "reason": ""},
+        }
+    _SNAPSHOT_CACHE["at"] = now
+    _SNAPSHOT_CACHE["payload"] = payload
+    return payload
+
+
 @app.route("/api/snapshot")
 def api_snapshot():
     """The same payload the page was rendered from, for client-side refreshes."""
-    return jsonify(build_snapshot())
+    return jsonify(build_snapshot_cached())
 
 
 @app.route("/health")

@@ -156,6 +156,18 @@ class LLMQuery:
 # default is 5s, which six strategy processes plus the dashboard exhaust
 # routinely: the crash was "database is locked" during startup, twice.
 BUSY_TIMEOUT_SECONDS = 30
+# A blocked *reader* must fail fast. Every dashboard poll opens connections, and
+# with six strategies writing to one file a reader that waits the full write
+# timeout turns the page into a 27-second hang - long enough that buttons look
+# dead and the figures look blank. Writes still get the long timeout, because a
+# write that gives up loses work.
+READ_BUSY_TIMEOUT_SECONDS = 4
+
+
+def connect_readonly(path: str, **kwargs):
+    """A connection for reads: short busy timeout, so a page never hangs."""
+    kwargs.setdefault("timeout", READ_BUSY_TIMEOUT_SECONDS)
+    return aiosqlite.connect(path, **kwargs)
 
 
 async def _apply_pragmas(conn):
