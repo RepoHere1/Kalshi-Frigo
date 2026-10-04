@@ -34,7 +34,7 @@ def test_the_two_charts_have_their_own_windows(html):
 
 def test_spot_is_coloured_by_direction_not_a_fixed_amber(html):
     assert "'#2ee6a8'" in html  # green, closing higher
-    assert "'#ff2d20'" in html  # true red, closing lower
+    assert "'#a10000'" in html  # blood red, closing lower
     assert "label: 'BTC-USD spot'," not in html, "the fixed-amber series is gone"
 
 
@@ -65,8 +65,8 @@ def test_chart_text_is_legible(html):
 
 
 def test_negative_figures_use_true_red(html):
-    """#ff5c7a is pink. Losses should look like losses."""
-    assert "--down:#ff2d20" in html
+    """#ff5c7a is pink. Losses must read as the blood red they are."""
+    assert "--down:#a10000" in html
     assert "--down:#ff5c7a" not in html
 
 
@@ -148,6 +148,20 @@ def test_live_lanes_are_resumed_like_any_other_lane():
     src = _supervisor_source()
     assert "was running LIVE before a restart and was not" not in src
     assert "_CUR_INSTANCE" in src
+
+
+def test_the_supervisor_migrates_lanes_into_the_current_book():
+    """Switching DRY<->LIVE must carry every desired lane with it.
+
+    The operator flips the switch and the page shows the other book; a lane
+    left running in the old book reads as "off" wherever they just went. The
+    supervisor kills a wanted lane whose recorded book no longer matches the
+    current one, and the respawn path starts it in the current book.
+    """
+    src = _supervisor_source()
+    assert "expected_book" in src
+    assert "migrating it" in src
+    assert "Spawn into the book the operator is actually in" in src
 
 
 def test_a_recovered_strategy_resets_the_failure_budget():

@@ -919,22 +919,29 @@ def test_toggle_refuses_when_only_api_key_present(client, auth, monkeypatch):
     assert r.status_code == 400
 
 
-def test_a_strategy_running_in_the_other_book_can_always_be_stopped(
+def test_a_strategy_running_in_the_other_book_migrates_instead_of_stopping(
     client, auth, monkeypatch, tmp_path
 ):
-    """Stop must never be refused on a book mismatch.
+    """A Start pressed from the other book migrates the lane, never stops it.
 
-    The cross-book 409 used to sit ABOVE the stop branch, so a strategy recorded
-    as running in LIVE could not be stopped from the DRY page (and vice versa):
-    the card's Stop button sends no mode, resolves to the current book, and got
-    "already running in live mode" back. That is the deadlock behind "can't turn
-    btc 15 on" - not a refusal to trade, but a button that could neither start
-    nor stop. Stopping now wins over every mode check.
+    The card filters nothing by book now, but the operator can still be on one
+    page while the lane runs in the other. The old behaviour - stop the
+    old-book process and report "stopped" - is what read as "nothing I start
+    in LIVE turns on": every press killed the lane instead of moving it.
+    Pressing Start on a lane running in the other book must kill the old
+    process, spawn into THIS book, and report running.
     """
     import asyncio
     import subprocess as sp
 
     proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    spawned = []
+
+    def _fake_spawn(name, mode):
+        spawned.append((name, mode))
+        return {"name": name, "pid": 4242, "running": True, "mode": mode}
+
+    monkeypatch.setattr(wd, "_spawn_strategy", _fake_spawn)
     try:
         store = wd._runtime_store()
         asyncio.run(
@@ -944,9 +951,9 @@ def test_a_strategy_running_in_the_other_book_can_always_be_stopped(
         r = client.post("/api/strategy/btc_updown/toggle", json={}, headers=auth)
         assert r.status_code == 200
         body = r.get_json()
-        assert body["running"] is False
-        assert body["was_running_in"] == "live"
-        assert body["stopped_from_book"] == "dry"
+        assert body["running"] is True
+        assert body["migrated_from"] == "live"
+        assert spawned == [("btc_updown", "paper")]
     finally:
         proc.kill()
         try:
@@ -1403,7 +1410,7 @@ def test_page_title_and_favicon_track_mode(client):
     assert "DRY Trading Dashboard" in html
     assert 'id="favicon"' in html
     # Both colours are present: the template picks per mode.
-    assert "%232ee6a8" in html and "%23ff5c7a" in html
+    assert "%232ee6a8" in html and "%23a30808" in html
 
 
 def test_page_embeds_write_token_so_controls_do_not_prompt(client):

@@ -25,6 +25,14 @@ _LOOP: Optional[asyncio.AbstractEventLoop] = None
 _THREAD: Optional[threading.Thread] = None
 _LOCK = threading.Lock()
 
+# Bound concurrent bridge tasks. Each DB-backed task opens an aiosqlite
+# connection, and every connection is a thread. Under a boot storm - six
+# strategies respawning while the page and its tabs all poll at once - the
+# worker could otherwise mint connections faster than dead ones are reaped and
+# hit the OS thread limit ("can't start new thread"), which crashed the worker
+# and made Railway restart the container. This cap queues the excess instead.
+_SEM = threading.BoundedSemaphore(16)
+
 
 def _get_loop() -> asyncio.AbstractEventLoop:
     """The one process-wide loop, created lazily and never closed."""
@@ -67,9 +75,19 @@ def run(coro: Any, timeout: float = 30.0) -> Any:
             "await the coroutine directly instead."
         )
 
-    loop = _get_loop()
-    future = asyncio.run_coroutine_threadsafe(
-        asyncio.wait_for(coro, timeout=timeout), loop
-    )
-    # Slack over the coroutine's own timeout for the cross-thread dispatch.
-    return future.result(timeout=timeout + 5)
+    # Queue behind the concurrency cap instead of minting an unbounded number
+    # of connection threads.
+    if not _SEM.acquire(timeout=timeout + 5):
+        coro.close()
+        raise RuntimeError(
+            f"async_bridge.run() timed out waiting for a slot after {timeout}s"
+        )
+    try:
+        loop = _get_loop()
+        future = asyncio.run_coroutine_threadsafe(
+            asyncio.wait_for(coro, timeout=timeout), loop
+        )
+        # Slack over the coroutine's own timeout for the cross-thread dispatch.
+        return future.result(timeout=timeout + 5)
+    finally:
+        _SEM.release()

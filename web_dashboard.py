@@ -1004,7 +1004,15 @@ def _refresh_market_titles(positions):
 
             _title_client = KalshiClient(private_key_path=key_path) if key_path else KalshiClient()
         resp = _run_async(_title_client.get_markets(tickers=batch, limit=len(batch)))
-        rows = (resp or {}).get("markets") or []
+        # Same shape drift as every other Kalshi endpoint: /markets has answered
+        # as {"markets": [...]} and as a bare list. Reading it only as a dict
+        # raised AttributeError, the whole batch was abandoned, and titles
+        # silently stayed as raw tickers forever.
+        rows: List[Dict[str, Any]] = []
+        if isinstance(resp, dict):
+            rows = [r for r in (resp.get("markets") or []) if isinstance(r, dict)]
+        elif isinstance(resp, list):
+            rows = [r for r in resp if isinstance(r, dict)]
         resolved = set()
         for m in rows:
             if not isinstance(m, dict):
@@ -1331,13 +1339,34 @@ def _strategy_supervisor_loop():
                         _push_error(
                             f"Started {name} in {book.upper()} " f"(all strategies run by default)."
                         )
+                        # Stagger the boot storm. Six strategies starting at once
+                        # all race for the SQLite write lock, and their lock
+                        # contention is what turned the dashboard's DB reads into
+                        # timed-out, thread-leaking calls on boot.
+                        time.sleep(3)
                     except Exception as exc:  # noqa: BLE001
                         _push_error(f"Auto-start {name} failed: {exc}")
             for name, row in wanted.items():
                 if name not in strategy_state:
                     continue
                 row_pid = row.get("pid")
+                expected_book = "live" if _current_book_mode() == "live" else "paper"
                 if row_pid and _pid_alive(row_pid, row):
+                    # BOOK SWITCH MIGRATION. A strategy running in the other
+                    # book must follow the operator into the current one: the
+                    # page shows one book at a time, and a lane left behind in
+                    # the old book reads as "off" wherever the operator just
+                    # went - the exact "I go back to dry and every strategy is
+                    # off" complaint. Kill the old-book process and let the
+                    # respawn path below start it in the current book.
+                    row_mode = (row.get("mode") or "paper")
+                    if row_mode != expected_book:
+                        _push_error(
+                            f"{name} is running in {row_mode}; the book is now "
+                            f"{expected_book} - migrating it."
+                        )
+                        _stop_child({"pid": row_pid, "running": True})
+                        continue
                     # A pid that exists is not proof of life. A strategy that
                     # has stopped stamping heartbeats is wedged - its process is
                     # up but its loop is not running - so kill it and fall into
@@ -1398,7 +1427,10 @@ def _strategy_supervisor_loop():
                 if not _creds_present():
                     continue  # nothing to start with; wait for configuration
 
-                mode = row.get("mode") or "paper"
+                # Spawn into the book the operator is actually in, not the book
+                # the stale row remembers. This is what makes a book switch
+                # carry every desired lane with it.
+                mode = expected_book
                 backoff = failures.get(name, 0.0)
                 if attempts.get(name, 0) >= _SUPERVISOR_MAX_ATTEMPTS:
                     # Never terminal. The old behaviour gave up permanently
@@ -1552,12 +1584,19 @@ def _strategy_cards(
                 hb_age = None
         hb_stale = hb_age is not None and hb_age > _HEARTBEAT_STALE_SECONDS
         db_running = db_running and not hb_stale
-        running_for_this_book = db_running and db_mode == book
+        # NO BOOK FILTER. Filtering by book made every strategy read "off" the
+        # moment the operator switched books, even though the process was still
+        # running in the other book - and the supervisor migration then had a
+        # page full of "off" cards to contradict. Running means running, period;
+        # the book it runs in is shown next to it, and the supervisor migrates
+        # desired lanes into the current book within one pass.
+        running_for_this_book = bool(db_running)
         cards[name] = {
             "name": name,
             "label": label,
             "description": description,
             "running": bool(running_for_this_book),
+            "running_book": db_mode or None,
             "stuck": bool(bool(db_pid) and _pid_alive(db_pid, db_row) and hb_stale),
             "heartbeat_age_sec": round(hb_age, 1) if hb_age is not None else None,
             "pid": st.get("pid"),
@@ -2091,10 +2130,31 @@ def build_snapshot() -> Dict[str, Any]:
             _current_book_mode(): _account_payload(_current_book_mode()),
         },
         "logs": _read_log_tail(100) or list(log_buffer)[-100:],
-        "market_titles": dict(dashboard_state.get("market_titles", {})),
+        # Every position ticker gets an entry here, real title when available and
+        # a decoded human label otherwise - NEVER the raw ticker. The client-side
+        # mktTitle() reads this map and falls back to the bare ticker when a key
+        # is missing, which is what printed KXBTC15M-26OCT041545-45 in the
+        # positions table while the cache was empty or mid-resolution. Sourced
+        # from THIS BOOK's position rows only: a DRY snapshot must not carry the
+        # real account's tickers in its title map.
+        "market_titles": _complete_title_map(positions),
         "errors": errors[-10:],
         "events": events[-8:],
     }
+
+
+def _complete_title_map(book_positions: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Cached titles plus a decoded fallback for every position ticker."""
+    out = dict(dashboard_state.get("market_titles", {}))
+    for p in book_positions or []:
+        if not isinstance(p, dict):
+            continue
+        t = p.get("ticker") or p.get("event_ticker") or p.get("market_id") or ""
+        if not t:
+            continue
+        if t not in out or out[t] == t:
+            out[t] = _prettify_ticker(t) or t
+    return out
 
 
 def _safe_mode_payload() -> Dict[str, Any]:
@@ -3065,21 +3125,26 @@ def api_strategy_toggle(name):
     # signals an unrelated process instead of a bot.
     db_running = bool(db_pid) and _pid_alive(db_pid, db_row)
 
-    # STOP FIRST, ALWAYS, BEFORE ANY MODE CHECK.
-    #
-    # This refusal used to sit above the stop branch, which made a strategy
-    # running in the other book impossible to stop from this book's page: the
-    # card's Stop button sends no mode, so it resolved to the current book, and
-    # `db_mode != mode` returned 409. The operator switched the book, then found
-    # the lane could neither be started (409, wrong book) nor stopped (409, wrong
-    # book) - a deadlock with a trading process on the far side of it. That is
-    # what "can't turn btc 15 on" was: not a refusal to trade, but a button that
-    # refused to do anything at all.
-    #
-    # Its own comment claimed stopping was never gated on the book, and a
-    # strategy "can always be stopped, whichever book it is in". Ordering is what
-    # made that true. A process that cannot be killed from the page is the one
-    # failure mode that must not exist, so stop wins over every mode check below.
+    # RUNNING IN THE OTHER BOOK = the operator is asking to MIGRATE it, not to
+    # stop it. The card said "Start" because the page filters by book, the
+    # operator pressed it expecting the lane to come up HERE, and the old code
+    # stopped the other-book process and reported "stopped" - so "nothing I
+    # start in LIVE turns on". Migrate instead: kill the old-book process and
+    # spawn the lane into this book, returning the new pid as running.
+    if db_running and db_mode and db_mode != mode:
+        _stop_child({"pid": db_pid, "running": True})
+        _run_async(store.record_stop(name, f"migrated to {mode}"))
+        _run_async(store.set_desired(name, True))
+        try:
+            result = _spawn_strategy(name, mode)
+        except Exception as e:  # noqa: BLE001
+            _push_error(f"Strategy migrate ({name}): {e}")
+            return jsonify({"error": f"Failed to start: {e}"}), 500
+        _recorded_state()
+        _broadcast("strategy", {"name": name, "action": "started", "pid": result["pid"]})
+        return jsonify({**result, "migrated_from": db_mode})
+
+    # RUNNING IN THIS BOOK = a deliberate Stop.
     if db_running:
         code = _stop_child({"pid": db_pid, "running": True})
         _run_async(store.record_stop(name, "stopped by operator"))
@@ -3624,12 +3689,12 @@ _TEMPLATE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kalshi-Frigo — {{ 'LIVE' if s.mode.mode == 'live' else 'DRY' }} Trading Dashboard</title>
 <!-- Favicon colour tracks the mode, so the tab itself shows which one is active. -->
-<link rel="icon" id="favicon" href="data:image/svg+xml,{{ '<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><rect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%23ff5c7a%22/><text x=%2216%22 y=%2223%22 font-size=%2219%22 font-weight=%22bold%22 text-anchor=%22middle%22 fill=%22%23000%22>L</text></svg>' if s.mode.mode == 'live' else '<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><rect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%232ee6a8%22/><text x=%2216%22 y=%2223%22 font-size=%2219%22 font-weight=%22bold%22 text-anchor=%22middle%22 fill=%22%23000%22>D</text></svg>' }}">
+<link rel="icon" id="favicon" href="data:image/svg+xml,{{ '<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><rect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%23a30808%22/><text x=%2216%22 y=%2223%22 font-size=%2219%22 font-weight=%22bold%22 text-anchor=%22middle%22 fill=%22%23000%22>L</text></svg>' if s.mode.mode == 'live' else '<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><rect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%232ee6a8%22/><text x=%2216%22 y=%2223%22 font-size=%2219%22 font-weight=%22bold%22 text-anchor=%22middle%22 fill=%22%23000%22>D</text></svg>' }}">
 <style>
 :root{
   --bg:#080b12; --panel:#0f1420; --panel2:#141b2a; --line:#1f2937; --line2:#2b3648;
   --fg:#e6edf6; --dim:#8494ab; --faint:#5b6a80;
-  --up:#2ee6a8; --down:#ff2d20; --live:#e11d2e; --live-bg:rgba(225,29,46,.18); --blue:#4d9fff; --amber:#ffb454; --violet:#a78bfa;
+  --up:#2ee6a8; --down:#a10000; --live:#8a0303; --live-bg:rgba(138,3,3,.20); --blue:#4d9fff; --amber:#ffb454; --violet:#a78bfa;
   --r:14px; --shadow:0 1px 0 rgba(255,255,255,.03) inset, 0 8px 30px rgba(0,0,0,.45);
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -3659,8 +3724,10 @@ header{
 .brand{display:flex;align-items:center;gap:12px;min-width:0;flex:0 1 auto}
 .brandtext{min-width:0}
 .logo{
-  width:42px;height:42px;border-radius:12px;display:grid;place-items:center;font-size:20px;flex:none;
-  background:linear-gradient(145deg,#2b6cff,#8b5cf6);box-shadow:0 6px 20px rgba(43,108,255,.35);
+  width:42px;height:42px;border-radius:12px;display:grid;place-items:center;flex:none;
+  background:linear-gradient(160deg,#1c0707,#0c0303 70%);
+  border:1px solid rgba(255,59,31,.35);
+  box-shadow:0 0 0 1px rgba(0,0,0,.55), 0 6px 20px rgba(161,0,0,.35), inset 0 0 14px rgba(161,0,0,.22);
 }
 h1{font-size:20px;font-weight:650;letter-spacing:-.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 h1 span{color:var(--dim);font-weight:400}
@@ -3688,9 +3755,9 @@ h1 span{color:var(--dim);font-weight:400}
 }
 .modebtn:hover{background:rgba(255,255,255,.07)}
 .modebtn.on{background:rgba(46,230,168,.16);color:var(--up);box-shadow:inset 0 -2px 0 var(--up)}
-.modebtn.live.on{background:rgba(255,92,122,.18);color:var(--down);box-shadow:inset 0 -2px 0 var(--down)}
+.modebtn.live.on{background:rgba(168,10,10,.18);color:var(--down);box-shadow:inset 0 -2px 0 var(--down)}
 .modebtn:disabled{opacity:.5;cursor:not-allowed}
-.note-box.live{background:rgba(255,92,122,.08);border-color:rgba(255,92,122,.28)}
+.note-box.live{background:rgba(168,10,10,.08);border-color:rgba(168,10,10,.28)}
 .note-box.live b{color:var(--down)}
 
 /* ---------- Mode is a whole-page state, not a badge you have to find ----------
@@ -3706,18 +3773,19 @@ body::before{
 }
 body[data-mode="dry"]{--mode-color:var(--up);--mode-glow:rgba(46,230,168,.32)}
 body[data-mode="live"]{
-  --mode-color:var(--down);--mode-glow:rgba(255,92,122,.55);
+  --mode-color:var(--down);--mode-glow:rgba(168,10,10,.55);
   animation:livepulse 1.4s ease-in-out infinite;
 }
 @keyframes livepulse{
-  0%,100%{box-shadow:inset 0 0 22px rgba(255,92,122,.55)}
-  50%    {box-shadow:inset 0 0 46px rgba(255,92,122,1)}
+  0%,100%{box-shadow:inset 0 0 22px rgba(168,10,10,.55)}
+  50%    {box-shadow:inset 0 0 46px rgba(168,10,10,1)}
 }
 /* Redundant, non-colour signal so the state survives colour-blindness. */
-body[data-mode="live"] .brand .logo{background:linear-gradient(145deg,#ff2d55,#ff5c7a)}
-body[data-mode="dry"]  .brand .logo{background:linear-gradient(145deg,#2b6cff,#8b5cf6)}
+body[data-mode="live"] .brand .logo{border-color:rgba(255,214,0,.45);box-shadow:0 0 0 1px rgba(0,0,0,.55), 0 6px 20px rgba(161,0,0,.45), 0 0 18px rgba(255,214,0,.15), inset 0 0 14px rgba(161,0,0,.28)}
+body[data-mode="dry"]  .brand .logo{border-color:rgba(77,159,255,.4);box-shadow:0 0 0 1px rgba(0,0,0,.55), 0 6px 20px rgba(43,108,255,.35)}
 
 .modeflag{
+  position:relative;
   display:inline-flex;align-items:center;gap:9px;
   /* A darker red than the P&L red needs heavier lettering to hold its own
      against the panel: heavier weight, more size, slightly tighter tracking. */
@@ -3729,8 +3797,31 @@ body[data-mode="dry"]  .brand .logo{background:linear-gradient(145deg,#2b6cff,#8
 .modeflag.dry {color:var(--up);background:rgba(46,230,168,.10)}
 .modeflag.live{color:var(--live);background:var(--live-bg)}
 .modeflag .dot{width:9px;height:9px}
-body[data-mode="live"] .modeflag.live{animation:blink 1.1s steps(1) infinite}
-@keyframes blink{0%,60%{opacity:1}61%,100%{opacity:.25}}
+/* LIVE flag: no on/off blinking. Steady blood-red fill, bright yellow border,
+   a yellow beacon orbiting the border, and a silver shimmer sweeping across. */
+body[data-mode="live"] .modeflag.live{
+  animation:none;
+  border-color:#ffd600;color:#ffd600;
+  background:linear-gradient(150deg,rgba(138,3,3,.72),rgba(92,0,0,.82));
+  box-shadow:0 0 0 1px rgba(0,0,0,.5), 0 0 16px rgba(255,214,0,.28), 0 4px 16px rgba(0,0,0,.4);
+}
+body[data-mode="live"] .modeflag.live .dot{display:none}
+.orbitring{
+  position:absolute;inset:-9px;border-radius:14px;pointer-events:none;
+  animation:spin 3.2s linear infinite;
+}
+.orbitring::before{
+  content:'';position:absolute;top:-5px;left:50%;width:11px;height:11px;margin-left:-5.5px;
+  border-radius:50%;background:#ffd600;box-shadow:0 0 12px 3px rgba(255,214,0,.75);
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+body[data-mode="live"] .modeflag.live::after{
+  content:'';position:absolute;inset:0;border-radius:8px;pointer-events:none;overflow:hidden;
+  background:linear-gradient(115deg,transparent 32%,rgba(235,240,250,.28) 47%,rgba(255,255,255,.5) 52%,transparent 68%);
+  background-size:230% 100%;
+  animation:shimmer 3s linear infinite;
+}
+@keyframes shimmer{0%{background-position:190% 0}100%{background-position:-40% 0}}
 .url{
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:var(--blue);
   background:rgba(77,159,255,.09);border:1px solid rgba(77,159,255,.25);
@@ -3775,7 +3866,7 @@ body[data-mode="live"] .modeflag.live{animation:blink 1.1s steps(1) infinite}
 /* ---------- bits ---------- */
 .pill{display:inline-flex;align-items:center;gap:5px;padding:2.5px 9px;border-radius:999px;font-size:10.5px;font-weight:620;letter-spacing:.02em}
 .pill.ok{background:rgba(46,230,168,.13);color:var(--up)}
-.pill.no{background:rgba(255,92,122,.13);color:var(--down)}
+.pill.no{background:rgba(168,10,10,.13);color:var(--down)}
 .pill.warn{background:rgba(255,180,84,.14);color:var(--amber)}
 .pill.info{background:rgba(77,159,255,.13);color:var(--blue)}
 .dot{width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 0 3px rgba(255,255,255,.05)}
@@ -3815,8 +3906,8 @@ button{
   font-family:inherit;transition:.14s;white-space:nowrap;
 }
 button:hover{background:rgba(77,159,255,.26)}
-button.danger{background:rgba(255,92,122,.12);color:var(--down);border-color:rgba(255,92,122,.28)}
-button.danger:hover{background:rgba(255,92,122,.24)}
+button.danger{background:rgba(168,10,10,.12);color:var(--down);border-color:rgba(168,10,10,.28)}
+button.danger:hover{background:rgba(168,10,10,.24)}
 button:disabled{opacity:.45;cursor:not-allowed}
 input[type=text],input[type=number]{
   background:var(--bg);color:var(--fg);border:1px solid var(--line2);border-radius:8px;
@@ -3876,7 +3967,19 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
        right-hand column stacked three deep, which pushed the mode control away
        from the name and made the header two visual bands on a wide screen. -->
   <div class="brand">
-    <div class="logo">&#129504;</div>
+    <div class="logo" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="24" height="24">
+        <defs>
+          <linearGradient id="lgred" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#ff3b1f"/>
+            <stop offset=".55" stop-color="#a10000"/>
+            <stop offset="1" stop-color="#5c0000"/>
+          </linearGradient>
+        </defs>
+        <path d="M13.2 2 4.6 13.6h5.6L9.4 22l8.6-11.6h-5.6L13.2 2z"
+              fill="url(#lgred)" stroke="#ffe600" stroke-width=".5" stroke-linejoin="round"/>
+      </svg>
+    </div>
     <div class="brandtext">
       <h1>Kalshi-Frigo <span>&middot; {{ 'LIVE' if s.mode.mode == 'live' else 'DRY' }} trading dashboard</span></h1>
       <div class="sub">LLM-driven Kalshi automation &middot; paper &amp; live &middot; multi-strategy</div>
@@ -3886,8 +3989,11 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
        buttons, so the mode and the control that changes it read together
        instead of the flag floating above them. -->
   <div class="moderow">
-    <!-- Unmistakable state flag: text, colour and a blinking dot. -->
+    <!-- Unmistakable state flag. LIVE drops the blinking dot for a steady
+         blood-red fill, a bright yellow border, a yellow beacon orbiting the
+         border, and a silver shimmer sweep. -->
     <div id="modeFlag" class="modeflag {{ 'live' if s.mode.mode == 'live' else 'dry' }}">
+      {%- if s.mode.mode == 'live' %}<span class="orbitring"></span>{% endif %}
       <span class="dot"></span>
       <span id="modeFlagText">{{ 'LIVE MODE' if s.mode.mode == 'live' else 'DRY MODE' }}</span>
     </div>
@@ -4801,7 +4907,7 @@ function flashBanner(text, isLive) {
     document.body.appendChild(el);
   }
   el.textContent = text;
-  el.style.background = isLive ? '#ff5c7a' : '#2ee6a8';
+  el.style.background = isLive ? '#a30808' : '#2ee6a8';
   el.style.color = '#000';
   clearTimeout(bannerTimer);
   bannerTimer = setTimeout(() => { el.remove(); }, 6000);
@@ -4836,7 +4942,7 @@ function paintMode(d) {
   document.title = 'Kalshi-Frigo — ' + (live ? 'LIVE' : 'DRY') + ' Trading Dashboard';
   const f = $('favicon');
   if (f) {
-    const bg = live ? '%23ff5c7a' : '%232ee6a8';
+    const bg = live ? '%23a30808' : '%232ee6a8';
     const ch = live ? 'L' : 'D';
     f.href = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">' +
       '<rect width="32" height="32" rx="8" fill="' + bg + '"/>' +
@@ -5021,7 +5127,7 @@ function paintMarket(md) {
     const rising = clean[clean.length - 1] >= clean[0];
     return rising
       ? { line: '#2ee6a8', fill: 'rgba(46,230,168,.12)' }
-      : { line: '#ff2d20', fill: 'rgba(255,45,32,.12)' };
+      : { line: '#a10000', fill: 'rgba(255,45,32,.12)' };
   };
 
   const pts = within(spot.points, SPOT_WINDOW);
@@ -5130,7 +5236,7 @@ function paintAccount(a) {
   const curve = a.curve || { labels: [], pnl: [] };
   drawFeed('accountChart', curve.labels, [{
     label: "Today's P&L ($)", data: curve.pnl,
-    borderColor: (a.today && a.today.pnl > 0) ? '#2ee6a8' : ((a.today && a.today.pnl < 0) ? '#ff5c7a' : '#4d9fff'),
+    borderColor: (a.today && a.today.pnl > 0) ? '#2ee6a8' : ((a.today && a.today.pnl < 0) ? '#a30808' : '#4d9fff'),
     backgroundColor: 'rgba(46,230,168,.10)', tension: 0.3, fill: true, pointRadius: 2,
   }]);
 }
@@ -5164,7 +5270,7 @@ function drawSparks(cards) {
         datasets: [{
           label: 'Cumulative P&L ($)',
           data: flat ? [0] : c.equity.pnl,
-          borderColor: c.realized > 0 ? '#2ee6a8' : (c.realized < 0 ? '#ff5c7a' : '#4d9fff'),
+          borderColor: c.realized > 0 ? '#2ee6a8' : (c.realized < 0 ? '#a30808' : '#4d9fff'),
           backgroundColor: 'rgba(46,230,168,.08)',
           tension: 0.3, fill: true, pointRadius: 0, borderWidth: 1.5,
         }],
@@ -5265,7 +5371,7 @@ async function openStrategy(name, keepScroll) {
         datasets: [{
           label: 'Cumulative P&L ($)',
           data: empty ? [0] : eq.pnl,
-          borderColor: s.realized > 0 ? '#2ee6a8' : (s.realized < 0 ? '#ff5c7a' : '#4d9fff'),
+          borderColor: s.realized > 0 ? '#2ee6a8' : (s.realized < 0 ? '#a30808' : '#4d9fff'),
           backgroundColor: 'rgba(46,230,168,.10)',
           tension: 0.3, fill: true, pointRadius: 2, borderWidth: 2,
         }],

@@ -25,8 +25,12 @@ VALID_MODES = (MODE_DRY, MODE_LIVE)
 DEFAULT_DRY_STARTING_BALANCE = 300.0
 
 # Every DB call is bounded. A hung read must surface as an error the dashboard
-# can render, not as a request that never returns.
-DB_TIMEOUT_SEC = 10
+# can render, not as a request that never returns. This must be LONGER than the
+# SQLite busy timeout (database.BUSY_TIMEOUT_SECONDS): a wait_for that fires
+# while the driver is waiting out a write lock cancels the coroutine mid-
+# connection and leaks its thread, which is how a busy database turned into a
+# worker that could not start new threads.
+DB_TIMEOUT_SEC = 60
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runtime_config (
