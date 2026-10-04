@@ -365,6 +365,26 @@ class UpDownTrader:
         # from inside this coroutine.
         mode = await TradingMode(db_path=self._db_path()).current()
 
+        # This trader used to only ever OPEN positions. Closing them was someone
+        # else's job: `run_tracking` lives inside BeastModeBot, so in DRY the
+        # ai_directional process quietly closed btc_updown's positions for it.
+        #
+        # Arming btc_updown on its own in LIVE - exactly the plan for a small
+        # first run - therefore had nothing tracking it at all: no take-profit,
+        # no stop-loss, nothing but Kalshi's own settlement at the 15-minute
+        # boundary, and no close ever written to trade_logs. A strategy that
+        # cannot exit is not a strategy.
+        #
+        # So it tracks its own book now. Running tracking from more than one
+        # process is safe because claim_position_for_close() admits exactly one
+        # closer per position - that is what stopped the double-counted closes.
+        try:
+            from src.jobs.track import run_tracking
+
+            await run_tracking(self.db_manager)
+        except Exception as exc:  # noqa: BLE001 - tracking must not block entry
+            self.book.last_error = f"position tracking: {type(exc).__name__}: {exc}"
+
         try:
             await self.feed.fetch()
         except Exception as exc:  # noqa: BLE001
