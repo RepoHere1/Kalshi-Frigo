@@ -225,10 +225,13 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
         from src.jobs.execute import place_profit_taking_orders, place_stop_loss_orders
 
         logger.info("🎯 Checking for profit-taking opportunities...")
+        mode = await _current_mode()
+        is_live = mode == MODE_LIVE
         profit_results = await place_profit_taking_orders(
             db_manager=db_manager,
             kalshi_client=kalshi_client,
             profit_threshold=0.20,  # 20% profit target
+            live_mode=is_live,
         )
 
         logger.info("🛡️ Checking for stop-loss protection...")
@@ -236,6 +239,7 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
             db_manager=db_manager,
             kalshi_client=kalshi_client,
             stop_loss_threshold=-0.15,  # 15% stop loss
+            live_mode=is_live,
         )
 
         total_sell_orders = profit_results["orders_placed"] + stop_loss_results["orders_placed"]

@@ -572,6 +572,11 @@ def _kalshi_ledger(
     fill_count = 0
     total_bought = 0.0
     total_proceeds = 0.0
+    sales_realized = 0.0
+    settlement_cost = 0.0
+    settlement_realized = 0.0
+    window_start: Optional[str] = None
+    window_end: Optional[str] = None
 
     # Per-ticker running position, so a sale can be matched against what that
     # sale actually cost rather than against the account's total buying.
@@ -591,11 +596,14 @@ def _kalshi_ledger(
         ticker = str(f.get("ticker") or f.get("market_ticker") or "").strip()
         if not ticker:
             continue
+        ts = str(f.get("created_time") or f.get("ts") or "")
+        if window_start is None or ts < window_start:
+            window_start = ts
+        if window_end is None or ts > window_end:
+            window_end = ts
         direction, price = _fill_side_and_price(f)
         qty = abs(_as_float(f.get("count_fp")))
         if direction == "" or qty <= 0.0:
-            # An unusable row is skipped rather than guessed at, and the caller
-            # can see the shortfall through `fills_counted`.
             continue
         amount = qty * price
         fees += _as_float(f.get("fee_cost"))
@@ -617,6 +625,7 @@ def _kalshi_ledger(
         total_proceeds += amount
         if closing > 0.0:
             realized += (price - avg_cost) * closing
+            sales_realized += (price - avg_cost) * closing
             held_qty[ticker] = on_hand - closing
             held_cost[ticker] = held_cost.get(ticker, 0.0) - cost_released
 
@@ -636,7 +645,9 @@ def _kalshi_ledger(
             s.get("no_total_cost_dollars")
         )
         settle_revenue += revenue
+        settlement_cost += settled_cost
         realized += revenue - settled_cost
+        settlement_realized += revenue - settled_cost
         fees += _as_float(s.get("fee_cost"))
         settlement_count += 1
         # The contracts are gone now, so they are no longer deployed capital.
@@ -652,9 +663,14 @@ def _kalshi_ledger(
         "bought": round(total_bought, 2),
         "proceeds": round(total_proceeds, 2),
         "settlement_revenue": round(settle_revenue, 2),
+        "sales_realized": round(sales_realized, 2),
+        "settlement_cost": round(settlement_cost, 2),
+        "settlement_realized": round(settlement_realized, 2),
         "fills_counted": fill_count,
         "settlements_counted": settlement_count,
         "open_positions_in_ledger": sum(1 for v in held_qty.values() if v > 0.0),
+        "window_start": window_start,
+        "window_end": window_end,
         "complete": True,
     }
 
@@ -1225,12 +1241,13 @@ def _strategy_supervisor_loop():
                 time.sleep(10)
                 continue
             wanted = _run_async(store.desired())
-            # DRY runs itself: every lane is wanted from boot, because simulated
-            # money cannot be lost. LIVE never does. Switching to LIVE must not
-            # be the thing that starts six strategies placing real orders - each
-            # one is armed by hand, from its own button, so the act of arming is
-            # deliberate and attributable.
-            if AUTO_START_ALL and _current_book_mode() != "live":
+            # Every lane is wanted from boot. Stopping a lane clears
+            # its `desired` flag and it stays down; nothing else takes
+            # a strategy out of service. That inverts the old failure
+            # mode, where a strategy that died once - or was never
+            # recorded - simply stayed down and the book quietly ran
+            # on whatever happened to still be alive.
+            if AUTO_START_ALL:
                 recorded = _run_async(store.snapshot())
                 for name in strategy_state:
                     if name in wanted:
@@ -1294,26 +1311,11 @@ def _strategy_supervisor_loop():
 
                 stale_instance = bool(row_pid) and (row.get("instance") or "") != INSTANCE
                 if stale_instance:
-                    # "Run until I say otherwise" has to survive a redeploy, or
-                    # every push silently stops the book. Resume it - but only in
-                    # paper. A LIVE strategy places real orders, and nothing may
-                    # start one without the operator asking in this instance, so
-                    # that intent is dropped and must be re-given by hand.
-                    if row.get("mode") not in ("paper", "dry"):
-                        # Only a genuinely LIVE strategy is dropped. The two
-                        # vocabularies meet here - the runtime store writes
-                        # "paper", the book says "dry" - and requiring one exact
-                        # spelling silently discarded the operator's intent for
-                        # every row carrying the other. That is how five of six
-                        # strategies came back as "stopped by app restart" after a
-                        # deploy and stayed down.
-                        _run_async(store.record_stop(name, "stopped by app restart"))
-                        _run_async(store.set_desired(name, False))
-                        _push_error(
-                            f"{name} was running LIVE before a restart and was not "
-                            f"resumed. Press Start to trade real money again."
-                        )
-                        continue
+                    # "Run until I say otherwise" has to survive a
+                    # redeploy, or every push silently stops the book.
+                    # Resume it regardless of mode - the operator
+                    # armed it before the restart, and that intent
+                    # must survive.
                     failures[name] = 0.0
                     attempts[name] = 0
 
