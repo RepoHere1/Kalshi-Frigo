@@ -4077,17 +4077,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
        from the name and made the header two visual bands on a wide screen. -->
   <div class="brand">
     <div class="logo" aria-hidden="true">
-      <svg viewBox="0 0 24 24" width="24" height="24">
-        <defs>
-          <linearGradient id="lgred" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0" stop-color="#ff3b1f"/>
-            <stop offset=".55" stop-color="#a10000"/>
-            <stop offset="1" stop-color="#5c0000"/>
-          </linearGradient>
-        </defs>
-        <path d="M13.2 2 4.6 13.6h5.6L9.4 22l8.6-11.6h-5.6L13.2 2z"
-              fill="url(#lgred)" stroke="#ffe600" stroke-width=".5" stroke-linejoin="round"/>
-      </svg>
+      <img src="/static/logo.png" alt="Frigo" width="34" height="34" style="display:block">
     </div>
     <div class="brandtext">
       <h1>Kalshi-Frigo <span>&middot; {{ 'LIVE' if s.mode.mode == 'live' else 'DRY' }} trading dashboard</span></h1>
