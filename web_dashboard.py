@@ -60,6 +60,13 @@ MAX_EVENTS = 100
 _SUPERVISOR_MAX_ATTEMPTS = 8
 # A strategy must stay up this long to count as a real recovery.
 _SUPERVISOR_STABLE_SECONDS = 120
+# Every strategy is wanted from boot. The operator stops lanes by hand; the app
+# does not decide that a strategy it could not start once is better off down.
+# A strategy only stays down when Stop was pressed, which clears `desired`.
+AUTO_START_ALL = True
+# Backoff ceiling between respawns. Retries never stop, they just slow down, so
+# a prolonged outage cannot become a busy loop.
+_SUPERVISOR_MAX_BACKOFF = 60.0
 
 # ---------------------------------------------------------------------------
 # State
@@ -918,16 +925,17 @@ def _market_data_loop():
 def _strategy_supervisor_loop():
     """Keep every strategy the operator asked for actually running.
 
-    A strategy process is a child, and children die: an unhandled exception in a
-    trading cycle, an OOM kill, a transient API failure during boot. Until now
-    that was terminal - the card flipped to "exited on its own" and stayed there
-    until somebody noticed and pressed Start again. The intent to run is recorded
-    separately from the pid (`desired`), so a crash can be recovered from without
-    the operator being present.
+    On boot, every strategy is wanted (AUTO_START_ALL). Stopping a lane clears
+    its `desired` flag and it stays down; nothing else takes a strategy out of
+    service. That inverts the old failure mode, where a strategy that died once
+    - or was never recorded - simply stayed down and the book quietly ran on
+    whatever happened to still be alive.
 
-    This only ever restarts strategies the operator explicitly started. Nothing is
-    started on boot that was not asked for, and Stop clears `desired`, so pressing
-    Stop means stopped.
+    A strategy process is a child, and children die: an unhandled exception in a
+    trading cycle, an OOM kill, a transient API failure during boot, a locked
+    database. Retries never stop - they slow to a ceiling and keep going - so a
+    bad stretch cannot leave a lane down. Stopping is the only way down, and that
+    is the operator pressing Stop.
     """
     # Backoff per strategy, and a hard cap on consecutive respawns. Without the
     # cap a strategy that cannot start (bad credentials, a syntax error) becomes
@@ -938,7 +946,27 @@ def _strategy_supervisor_loop():
     while True:
         try:
             store = _runtime_store()
-            for name, row in _run_async(store.desired()).items():
+            if AUTO_START_ALL and not _creds_present():
+                time.sleep(10)
+                continue
+            wanted = _run_async(store.desired())
+            # Seed the intent on first boot only: rows that already record a
+            # deliberate Stop must not be resurrected on every pass.
+            if AUTO_START_ALL:
+                recorded = _run_async(store.snapshot())
+                for name in strategy_state:
+                    if name in wanted:
+                        continue
+                    if name in recorded:
+                        continue  # exists and was explicitly stopped
+                    if not _creds_present():
+                        continue
+                    try:
+                        _spawn_strategy(name, "paper")
+                        _push_error(f"Started {name} (all strategies run by default).")
+                    except Exception as exc:  # noqa: BLE001
+                        _push_error(f"Auto-start {name} failed: {exc}")
+            for name, row in wanted.items():
                 if name not in strategy_state:
                     continue
                 row_pid = row.get("pid")
@@ -1000,16 +1028,23 @@ def _strategy_supervisor_loop():
                 mode = row.get("mode") or "paper"
                 backoff = failures.get(name, 0.0)
                 if attempts.get(name, 0) >= _SUPERVISOR_MAX_ATTEMPTS:
+                    # Never terminal. The old behaviour gave up permanently
+                    # after 8 attempts, so one bad stretch - a locked database,
+                    # a deploy mid-write - left strategies down until somebody
+                    # noticed and pressed Start. It now keeps trying forever and
+                    # simply slows down, reporting that it is still trying. Only
+                    # pressing Stop clears `desired`, and only that leaves a
+                    # strategy down.
                     if backoff == 0.0:
                         _push_error(
-                            f"Supervisor gave up on {name} after "
-                            f"{_SUPERVISOR_MAX_ATTEMPTS} failed starts — it will not "
-                            f"be restarted again until you press Start."
+                            f"Supervisor has retried {name} {_SUPERVISOR_MAX_ATTEMPTS}"
+                            f"+ times without a stable start; still retrying every"
+                            f" {_SUPERVISOR_MAX_BACKOFF:.0f}s until you press Stop."
                         )
-                        failures[name] = -1.0
+                        failures[name] = _SUPERVISOR_MAX_BACKOFF
                     continue
                 if backoff > 0:
-                    time.sleep(min(backoff, 30.0))
+                    time.sleep(min(backoff, _SUPERVISOR_MAX_BACKOFF))
 
                 try:
                     started = _spawn_strategy(name, mode)
@@ -2484,7 +2519,40 @@ def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
     # Persist before answering: the next request may be served by a different
     # process, and a button that reports "started" for a process nobody can see
     # is exactly the lie this store exists to remove.
-    _run_async(store.record_start(name, proc.pid, mode, " ".join(cmd[1:])))
+    #
+    # This used to be fire-and-forget. If the write failed - and under WAL with
+    # six strategies plus the dashboard writing, "database is locked" was
+    # routine - the exception escaped with the child already running and
+    # unrecorded. The dashboard then read the *previous* row, saw a pid from a
+    # previous instance, and reported "stopped by app restart" for a strategy
+    # that was very much alive and trading. Pressing Start again would then
+    # spawn a second copy of the same strategy.
+    #
+    # So: retry briefly, and if it still cannot be recorded, kill the child. An
+    # untracked trading process is worse than no process.
+    last_error: Optional[Exception] = None
+    for attempt in range(4):
+        try:
+            _run_async(store.record_start(name, proc.pid, mode, " ".join(cmd[1:]), desired=True))
+            last_error = None
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            time.sleep(0.4 * (attempt + 1))
+    if last_error is not None:
+        _child_procs.pop(proc.pid, None)
+        try:
+            proc.terminate()
+            proc.wait(timeout=10)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        raise RuntimeError(
+            f"started {name} but could not record it ({last_error}); "
+            f"the process was stopped rather than left untracked"
+        ) from last_error
     return {"name": name, "running": True, "pid": proc.pid}
 
 
