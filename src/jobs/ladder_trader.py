@@ -44,6 +44,18 @@ class UpDownConfig:
     notional_usd: float = 5.0
     # Required disagreement with Kalshi's own price before trading.
     min_edge: float = 0.06
+    # STANDARD TUNING, learned from the forever trade log (283 closes):
+    #   - entries at $0.90 and up win 4% of the time ($-110.82): hard-blocked
+    #   - the $0.25-$0.50 band wins 100% ($363.34): entries outside it need
+    #     EXTRA edge before they are worth taking
+    #   - NO trades win 83% vs YES at 67%: the NO side is preferred unless YES
+    #     is clearly better
+    max_entry_price: float = 0.90
+    sweet_band_low: float = 0.25
+    sweet_band_high: float = 0.50
+    out_of_band_extra_edge: float = 0.02
+    prefer_side: str = "down"
+    up_override_margin: float = 0.02
     # LIVE only: buy-side fee per fill, as a fraction of notional. Kalshi
     # charges on every fill, so a 6c edge that clears DRY is only a ~3c edge
     # LIVE once the fee is taken out. LIVE therefore requires
@@ -240,14 +252,45 @@ class UpDownTrader:
         # LIVE pays the fee out of exactly this edge, so the bar is higher there.
         required = self.config.min_edge + (self.config.live_fee_rate if live else 0.0)
 
+        up_fill = up_ask if up_ask is not None else None
+        down_fill = (1.0 - down_ask) if down_ask is not None else None
+
+        def _side_ok(edge: float, fill_price: Optional[float]) -> bool:
+            if fill_price is None or fill_price <= 0.0:
+                return False
+            # Hard block from the log: $0.90+ entries won 4% of the time.
+            if fill_price >= self.config.max_entry_price:
+                return False
+            r = required
+            # The sweet band wins 100%; outside it, demand more edge.
+            if not (
+                self.config.sweet_band_low
+                <= fill_price
+                <= self.config.sweet_band_high
+            ):
+                r += self.config.out_of_band_extra_edge
+            return edge >= r
+
+        up_ok = _side_ok(up_edge, up_fill)
+        down_ok = _side_ok(down_edge, down_fill)
+
         side = ""
         ask: Optional[float] = None
         kalshi: Optional[float] = None
         edge = 0.0
-        if up_edge >= required and up_edge >= down_edge:
-            side, ask, kalshi, edge = "up", up_ask, up_ask, up_edge
-        elif down_edge >= required:
-            side, ask, kalshi, edge = "down", down_ask, down_ask, down_edge
+        if self.config.prefer_side == "down":
+            # NO wins 83% vs YES at 67%: prefer NO unless YES is clearly better.
+            if down_ok and (
+                not up_ok or down_edge >= up_edge - self.config.up_override_margin
+            ):
+                side, ask, kalshi, edge = "down", down_ask, down_ask, down_edge
+            elif up_ok:
+                side, ask, kalshi, edge = "up", up_ask, up_ask, up_edge
+        else:
+            if up_ok and up_edge >= down_edge:
+                side, ask, kalshi, edge = "up", up_ask, up_ask, up_edge
+            elif down_ok:
+                side, ask, kalshi, edge = "down", down_ask, down_ask, down_edge
 
         if not side:
             self.book.skipped_no_edge += 1
@@ -259,6 +302,10 @@ class UpDownTrader:
                 f"best edge {max(up_edge, down_edge):+.3f} under {required:.3f}"
                 + (" (fee-aware)" if live else "")
             )
+            if (up_fill is not None and up_fill >= self.config.max_entry_price) or (
+                down_fill is not None and down_fill >= self.config.max_entry_price
+            ):
+                reason += " - entry price in the blocked $0.90+ band"
         else:
             reason = (
                 f"spot {spot:,.0f} vs target {target:,.0f} ({delta:+,.0f}): "

@@ -323,15 +323,15 @@ def _scorer(spot_price=84900.0):
     return UpDownTrader(spot, Btc15mFeed(), UpDownConfig())
 
 
-def test_live_requires_the_fee_on_top_of_the_edge():
+def test_live_requires_the_fee_on_top_of_the_edge(monkeypatch):
     """A 6c edge clears DRY but not LIVE once the fee is taken out."""
+    import src.jobs.ladder_trader as lt
+
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.53)
     trader = _scorer()
-    # Spot far above target -> fair_up ~1.0; up ask 0.92 gives up_edge ~0.08,
-    # which clears min_edge (0.06) but not min_edge + live_fee_rate (0.09).
-    trader.spot.price = 85000.0
-    market = _quoted_market(yes_ask=0.92, no_ask=0.08, target=84000.0)
+    market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0)
     dry = trader.evaluate(market, live=False)
-    assert dry is not None and dry.actionable, "DRY takes the 8c edge"
+    assert dry is not None and dry.actionable, "DRY takes the 8c in-band edge"
     trader.book.skipped_no_edge = 0
     live = trader.evaluate(market, live=True)
     assert (live is None or not live.actionable), "LIVE must refuse an edge under fee+min"
@@ -344,6 +344,57 @@ def test_live_takes_an_edge_that_clears_fee_and_minimum():
     live = trader.evaluate(market, live=True)
     assert live is not None and live.actionable
     assert live.edge >= trader.config.min_edge + trader.config.live_fee_rate
+
+
+# ---------------------------------------------------------------------------
+# Standard tuning: the recommendations from the forever log, wired in
+# ---------------------------------------------------------------------------
+def test_entries_at_or_above_ninety_cents_are_hard_blocked():
+    """The log: $0.90+ entries won 4% of the time. Never take them."""
+    trader = _scorer()
+    trader.spot.price = 85000.0
+    market = _quoted_market(yes_ask=0.92, no_ask=0.08, target=84000.0)
+    out = trader.evaluate(market, live=False)
+    assert out is None or not out.actionable
+    if out is not None:
+        assert "blocked $0.90+" in (out.reason or "")
+
+
+def test_out_of_band_entries_need_extra_edge(monkeypatch):
+    """The sweet band is $0.25-$0.50; outside it the bar is higher."""
+    import src.jobs.ladder_trader as lt
+
+    # 6c of edge at a 0.55 fill: clears the base bar but not the band penalty.
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.61)
+    trader = _scorer()
+    market = _quoted_market(yes_ask=0.55, no_ask=0.45, target=84000.0)
+    out = trader.evaluate(market, live=False)
+    assert out is None or not out.actionable
+
+    # 9c of edge at the same fill: clears base + band penalty.
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.64)
+    trader.book.skipped_no_edge = 0
+    out2 = trader.evaluate(market, live=False)
+    assert out2 is not None and out2.actionable
+
+
+def test_the_no_side_is_preferred_when_edges_are_close(monkeypatch):
+    """NO wins 83% vs YES at 67% - prefer NO unless YES is clearly better."""
+    import src.jobs.ladder_trader as lt
+
+    # Tied edges: NO is chosen.
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.44)
+    trader = _scorer()
+    market = _quoted_market(yes_ask=0.38, no_ask=0.50, target=84000.0)
+    out = trader.evaluate(market, live=False)
+    assert out is not None and out.side == "down"
+
+    # YES clearly better (by more than the override margin): YES is chosen.
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.44)
+    trader.book.skipped_no_edge = 0
+    market2 = _quoted_market(yes_ask=0.35, no_ask=0.50, target=84000.0)
+    out2 = trader.evaluate(market2, live=False)
+    assert out2 is not None and out2.side == "up"
 
 
 def test_live_clip_sizes_against_the_balance_budget():

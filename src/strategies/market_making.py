@@ -553,6 +553,7 @@ class AdvancedMarketMaker:
                 prompt,
                 max_tokens=3000,  # Higher for reasoning models like grok-4
                 temperature=0.1,  # Lower for consistency
+                strategy="market_making",
             )
 
             # Check if AI response is None (API exhausted or failed)

@@ -424,6 +424,7 @@ Be concise and actionable. Focus on the top 3 priorities.
                 prompt=analysis_prompt,
                 max_tokens=3000,
                 temperature=0.3,
+                strategy="automated_performance_analyzer",
                 strategy="performance_analysis",
                 query_type="analysis",
             )

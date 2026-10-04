@@ -64,6 +64,17 @@ _SUPERVISOR_STABLE_SECONDS = 120
 # factually dead or wedged, whatever its pid says. The supervisor kills and
 # respawns it; the page refuses to render it as "running".
 _HEARTBEAT_STALE_SECONDS = 120
+# Strategies that burn the OpenRouter key out of proportion to their value.
+# quick_flip is the #1 spender (3,079 calls, $14.61 tracked, half the lifetime
+# burn) - the Start button on its card is blocked with a popup so it stays off,
+# in BOTH books. The block lives in the client, so the operator is reminded,
+# not secretly overridden.
+HEAVY_API_ABUSERS = {
+    "quick_flip": (
+        "quick_flip is the #1 OpenRouter spender - 3,079 LLM calls and over "
+        "half of the tracked API cost. It is left OFF on purpose."
+    )
+}
 # Every strategy is wanted from boot. The operator stops lanes by hand; the app
 # does not decide that a strategy it could not start once is better off down.
 # A strategy only stays down when Stop was pressed, which clears `desired`.
@@ -1571,6 +1582,8 @@ def _strategy_cards(
             "description": description,
             "running": bool(running_for_this_book),
             "running_book": db_mode or None,
+            "heavy_api_abuser": name in HEAVY_API_ABUSERS,
+            "heavy_api_abuser_reason": HEAVY_API_ABUSERS.get(name, ""),
             "stuck": bool(bool(db_pid) and _pid_alive(db_pid, db_row) and hb_stale),
             "heartbeat_age_sec": round(hb_age, 1) if hb_age is not None else None,
             "pid": st.get("pid"),
@@ -4225,11 +4238,11 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
 
 <!-- ============ openrouter usage ============ -->
 <div class="panel" style="margin-bottom:12px">
-  <div class="ph">
+  <div class="ph" style="cursor:pointer" onclick="toggleLlmUsage()">
     <h2>OpenRouter key usage &mdash; what is actually consuming it</h2>
-    <span class="note">every LLM call is logged with its strategy and query type &middot; lifetime, never reset</span>
+    <span class="note"><span id="llmToggle" style="cursor:pointer;font-weight:600">show</span> &middot; lifetime, never reset</span>
   </div>
-  <div class="pb">
+  <div class="pb" id="llmUsageBodyWrap" style="display:none">
     <div class="cstats" style="grid-template-columns:repeat(auto-fit,minmax(100px,1fr));margin:0 0 12px">
       <div><b id="llmCalls">&hellip;</b><span>calls</span></div>
       <div><b id="llmTokens">&hellip;</b><span>tokens</span></div>
@@ -4279,7 +4292,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
       <div class="card{{ ' hot' if c.running else '' }}" id="card-{{ c.name }}" onclick="openStrategy('{{ c.name }}')">
         <div class="ctop">
           <div>
-            <div class="clabel">{{ c.label }}</div>
+            <div class="clabel">{{ c.label }}{% if c.heavy_api_abuser %} <span class="pill no" title="{{ c.heavy_api_abuser_reason }}">HEAVY API ABUSER</span>{% endif %}</div>
             <div class="mono cname">{{ c.name }}</div>
           </div>
           <span class="pill {{ 'warn' if c.stuck else ('ok' if c.running else 'no') }}" id="pill-{{ c.name }}">{% if c.stuck %}<span class="dot"></span>stuck{% elif c.running %}<span class="dot pulse"></span>running{% elif c.stop_reason %}stopped{% else %}not started{% endif %}</span>
@@ -4953,7 +4966,24 @@ async function refresh() {
 // OpenRouter usage - who is eating the key, itemised from the lifetime log
 // ---------------------------------------------------------------------------
 let llmUsageReq = 0;
+
+function toggleLlmUsage() {
+  const wrap = $('llmUsageBodyWrap');
+  const t = $('llmToggle');
+  if (!wrap || !t) return;
+  if (wrap.style.display === 'none') {
+    wrap.style.display = '';
+    t.textContent = 'hide';
+    refreshLlmUsage();
+  } else {
+    wrap.style.display = 'none';
+    t.textContent = 'show';
+  }
+}
+
 async function refreshLlmUsage() {
+  const wrap = $('llmUsageBodyWrap');
+  if (wrap && wrap.style.display === 'none') return;
   const req = ++llmUsageReq;
   const r = await fetch('/api/llm/usage');
   const d = await r.json().catch(() => null);
@@ -5158,6 +5188,17 @@ async function toggleStrategy(name, quiet) {
     });
     if (!quiet) note(name + ': stopped');
   } else {
+    // HEAVY API ABUSER gate: quick_flip's Start is blocked with a popup so the
+    // #1 OpenRouter spender stays off, in both books. The popup is the
+    // reminder - it says exactly why the button does nothing.
+    if (card && card.heavy_api_abuser) {
+      if (!quiet) {
+        alert('HEAVY API ABUSER\n\n' + (card.heavy_api_abuser_reason || '') +
+          '\n\nThis strategy stays OFF. Not started.');
+      }
+      note(name + ': left off (HEAVY API ABUSER)');
+      return;
+    }
     const r = await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
       method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
     });

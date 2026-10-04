@@ -259,7 +259,8 @@ Focus on actionable insights that can immediately improve performance.
         try:
             # Use XAI client's get_completion method - just return the text response
             response = await self.xai_client.get_completion(
-                prompt=analysis_prompt, max_tokens=3000, temperature=0.3
+                prompt=analysis_prompt, max_tokens=3000, temperature=0.3,
+                strategy="performance_analyzer"
             )
 
             # Extract text from response
