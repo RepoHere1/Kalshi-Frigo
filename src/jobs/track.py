@@ -225,7 +225,7 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
         from src.jobs.execute import place_profit_taking_orders, place_stop_loss_orders
 
         logger.info("🎯 Checking for profit-taking opportunities...")
-        mode = await _current_mode()
+        mode = _current_mode()
         is_live = mode == MODE_LIVE
         profit_results = await place_profit_taking_orders(
             db_manager=db_manager,
