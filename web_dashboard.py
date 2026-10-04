@@ -1732,6 +1732,17 @@ _SQL_ANALYSIS_STRAT = (
     " WHERE {book} AND COALESCE(NULLIF(strategy, ''), 'unattributed') = ?"
     " ORDER BY COALESCE(exit_timestamp, entry_timestamp) ASC"
 )
+# Who is actually consuming the OpenRouter key. Every LLM call is logged with
+# its strategy and query type, so the burn is attributable to a named consumer
+# - which strategy, doing what - instead of a single mystery total.
+_SQL_LLM_USAGE = (
+    "SELECT strategy, query_type, COUNT(*) AS n,"
+    " COALESCE(SUM(tokens_used), 0) AS tokens,"
+    " COALESCE(SUM(cost_usd), 0) AS cost,"
+    " MIN(timestamp) AS first_at, MAX(timestamp) AS last_at"
+    " FROM llm_queries GROUP BY strategy, query_type"
+    " ORDER BY cost DESC"
+)
 # Every close, oldest first, so each strategy's own curve can be reconstructed.
 # This is the persistent backing for the per-strategy charts: the series is
 # rebuilt from the trade log rather than accumulated in memory, so it survives a
@@ -3031,6 +3042,40 @@ def _running_strategies():
     ]
 
 
+@app.route("/api/llm/usage", methods=["GET"])
+def api_llm_usage():
+    """Which consumers are eating the OpenRouter key, itemised.
+
+    Read-only. Answers from llm_queries - the forever log of every LLM call -
+    grouped by (strategy, query_type) with counts, tokens and tracked cost, so
+    the burn is attributable instead of one mystery number.
+    """
+    rows = _db_rows(_SQL_LLM_USAGE)
+    total_cost = round(sum(_as_float(r.get("cost")) for r in rows), 4)
+    total_tokens = int(sum(int(r.get("tokens") or 0) for r in rows))
+    total_calls = int(sum(int(r.get("n") or 0) for r in rows))
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "strategy": r.get("strategy") or "unknown",
+                "query_type": r.get("query_type") or "unknown",
+                "calls": int(r.get("n") or 0),
+                "tokens": int(r.get("tokens") or 0),
+                "cost": round(_as_float(r.get("cost")), 4),
+                "last_at": str(r.get("last_at") or "")[:19],
+            }
+        )
+    return jsonify(
+        {
+            "total_calls": total_calls,
+            "total_tokens": total_tokens,
+            "total_cost": total_cost,
+            "consumers": out,
+        }
+    )
+
+
 @app.route("/api/analysis", methods=["GET"])
 def api_analysis():
     """Stats and recommendations over EVERY closed trade in the current book.
@@ -4178,6 +4223,32 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   </div>
 </div>
 
+<!-- ============ openrouter usage ============ -->
+<div class="panel" style="margin-bottom:12px">
+  <div class="ph">
+    <h2>OpenRouter key usage &mdash; what is actually consuming it</h2>
+    <span class="note">every LLM call is logged with its strategy and query type &middot; lifetime, never reset</span>
+  </div>
+  <div class="pb">
+    <div class="cstats" style="grid-template-columns:repeat(auto-fit,minmax(100px,1fr));margin:0 0 12px">
+      <div><b id="llmCalls">&hellip;</b><span>calls</span></div>
+      <div><b id="llmTokens">&hellip;</b><span>tokens</span></div>
+      <div><b id="llmCost" class="down">&hellip;</b><span>tracked cost</span></div>
+      <div><b id="llmConsumers">&hellip;</b><span>consumers</span></div>
+    </div>
+    <div class="scroll">
+    <table><thead><tr><th>Strategy</th><th>Query type</th><th class="num">Calls</th><th class="num">Tokens</th><th class="num">Tracked cost</th><th>Last call</th></tr></thead><tbody id="llmUsageBody">
+      <tr><td colspan="6" class="empty">Loading&hellip;</td></tr>
+    </tbody></table>
+    </div>
+    <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
+      "Tracked cost" is the cost the client computes per call; the "AI spend
+      today" tile above resets every deploy and under-reports. This table is
+      the lifetime log and does not reset.
+    </p>
+  </div>
+</div>
+
 <!-- ============ strategy cards ============ -->
 <div class="panel" style="margin-bottom:12px">
   <div class="ph">
@@ -4875,6 +4946,38 @@ async function refresh() {
   } catch (e) {
     note('snapshot refresh failed: ' + e.message);
   }
+  try { refreshLlmUsage(); } catch (_) {}
+}
+
+// ---------------------------------------------------------------------------
+// OpenRouter usage - who is eating the key, itemised from the lifetime log
+// ---------------------------------------------------------------------------
+let llmUsageReq = 0;
+async function refreshLlmUsage() {
+  const req = ++llmUsageReq;
+  const r = await fetch('/api/llm/usage');
+  const d = await r.json().catch(() => null);
+  if (!d || req !== llmUsageReq) return;
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  set('llmCalls', d.total_calls.toLocaleString());
+  set('llmTokens', d.total_tokens.toLocaleString());
+  const c = $('llmCost');
+  if (c) c.textContent = '$' + d.total_cost.toFixed(2);
+  set('llmConsumers', (d.consumers || []).length);
+  const body = $('llmUsageBody');
+  if (!body) return;
+  if (!d.consumers || !d.consumers.length) {
+    body.innerHTML = '<tr><td colspan="6" class="empty">No LLM calls logged yet.</td></tr>';
+    return;
+  }
+  body.innerHTML = d.consumers.map(x =>
+    '<tr><td><span class="tag">' + esc(x.strategy) + '</span></td>'
+    + '<td class="mono" style="color:var(--dim)">' + esc(x.query_type) + '</td>'
+    + '<td class="num">' + x.calls.toLocaleString() + '</td>'
+    + '<td class="num">' + x.tokens.toLocaleString() + '</td>'
+    + '<td class="num down">$' + x.cost.toFixed(2) + '</td>'
+    + '<td class="mono" style="color:var(--faint)">' + esc(x.last_at) + '</td></tr>'
+  ).join('');
 }
 
 // --- DRY / LIVE mode -----------------------------------------------------
