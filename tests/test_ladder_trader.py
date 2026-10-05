@@ -362,18 +362,18 @@ def test_entries_at_or_above_ninety_cents_are_hard_blocked():
 
 
 def test_out_of_band_entries_need_extra_edge(monkeypatch):
-    """The sweet band is $0.25-$0.50; outside it the bar is higher."""
+    """The sweet band is $0.20-$0.50; outside it (up to $0.60) the bar is higher."""
     import src.jobs.ladder_trader as lt
 
-    # 6c of edge at a 0.55 fill: clears the base bar but not the band penalty.
-    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.61)
+    # 9c of edge at a 0.55 fill (out-of-band, 0.50-0.60): not enough, needs 0.04 extra.
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.64)
     trader = _scorer()
     market = _quoted_market(yes_ask=0.55, no_ask=0.45, target=84000.0)
     out = trader.evaluate(market, live=False)
     assert out is None or not out.actionable
 
-    # 9c of edge at the same fill: clears base + band penalty.
-    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.64)
+    # 13c of edge at 0.55 (0.09 base + 0.04 out-of-band penalty): now it works.
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.68)
     trader.book.skipped_no_edge = 0
     out2 = trader.evaluate(market, live=False)
     assert out2 is not None and out2.actionable

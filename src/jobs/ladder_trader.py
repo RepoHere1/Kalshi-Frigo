@@ -61,10 +61,10 @@ class UpDownConfig:
     #     EXTRA edge before they are worth taking
     #   - NO trades win 83% vs YES at 67%: the NO side is preferred unless YES
     #     is clearly better
-    max_entry_price: float = 0.90
-    sweet_band_low: float = 0.25
+    max_entry_price: float = 0.60  # REDUCED: 11% win above 0.65, stop the bleeding
+    sweet_band_low: float = 0.20
     sweet_band_high: float = 0.50
-    out_of_band_extra_edge: float = 0.02
+    out_of_band_extra_edge: float = 0.04  # RAISED: Now out-of-band is 0.50-0.60, needs +4c edge
     prefer_side: str = "down"
     up_override_margin: float = 0.02
     # LIVE only: buy-side fee per fill, as a fraction of notional. Kalshi
