@@ -3996,7 +3996,7 @@ _TEMPLATE = r"""<!doctype html>
 <style>
 :root{
   --bg:#080b12; --panel:#0f1420; --panel2:#141b2a; --line:#1f2937; --line2:#2b3648;
-  --fg:#e6edf6; --dim:#8494ab; --faint:#5b6a80;
+  --fg:#e6edf6; --dim:#b8cce0; --faint:#5b6a80;
   --up:#2ee6a8; --down:#a10000; --live:#8a0303; --live-bg:rgba(138,3,3,.20); --blue:#4d9fff; --amber:#ffb454; --violet:#a78bfa;
   --r:14px; --shadow:0 1px 0 rgba(255,255,255,.03) inset, 0 8px 30px rgba(0,0,0,.45);
 }
@@ -4138,7 +4138,7 @@ body[data-mode="live"] .modeflag.live::after{
 .tile::after{content:"";position:absolute;inset:0 0 auto 0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,.09),transparent)}
 .tile .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);margin-bottom:7px}
 .tile .v{font-size:25px;font-weight:660;letter-spacing:-.6px;font-variant-numeric:tabular-nums;line-height:1.05}
-.tile .s{font-size:11px;color:var(--dim);margin-top:4px}
+.tile .s{font-size:12px;color:var(--dim);margin-top:4px}
 .up{color:var(--up)} .down{color:var(--down)} .flat{color:var(--fg)}
 
 /* ---------- layout ---------- */
@@ -4367,7 +4367,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
         "fees $50.01" underneath invites the obvious suspicion that the number is
         wrong; showing that it is +$162.71 of sales against -$492.29 of
         settlements over Aug 1 - Oct 4 is what makes it checkable. -#}
-    <div class="s" id="tKalshiPnlNote">{% if s.kalshi and s.kalshi.realized_known %}sales {{ '$%.2f'|format(s.kalshi.ledger.get('sales_realized', 0.0)) }} &middot; settled {{ '$%.2f'|format(s.kalshi.ledger.get('settlement_realized', 0.0)) }} &middot; fees {{ '$%.2f'|format(s.kalshi.fees) }}{% if s.kalshi.ledger.get('window_start') %} &middot; since {{ s.kalshi.ledger.get('window_start')[:10] }}{% endif %}{% else %}fill history unavailable{% endif %}</div>
+    <div class="s" id="tKalshiPnlNote">{% if s.kalshi and s.kalshi.realized_known %}sales {{ '$%.2f'|format(s.kalshi.ledger.get('sales_realized', 0.0)) }} &middot; settled {{ '$%.2f'|format(s.kalshi.ledger.get('settlement_realized', 0.0)) }} &middot; fees {{ '$%.2f'|format(s.kalshi.fees) }}{% if s.kalshi.ledger.get('window_start') %} &middot; since {{ s.kalshi.ledger.get('window_start')[:10]|strptime('%Y-%m-%d')|strftime('%b %d, %Y') }}{% endif %}{% else %}fill history unavailable{% endif %}</div>
   </div>
   {% else %}
   <div class="tile">
