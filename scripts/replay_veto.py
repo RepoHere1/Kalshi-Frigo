@@ -180,7 +180,16 @@ def main() -> int:
             {"side": "DOWN", "entry": 0.50, "qty": 1, "pnl": -0.20, "at": "2026-10-05 12:45", "ticker": "KXBTC15M-26OCT012000-15"},
             {"side": "UP", "entry": 0.38, "qty": 1, "pnl": -0.15, "at": "2026-10-05 13:00", "ticker": "KXBTC15M-26OCT012015-15"},
             {"side": "UP", "entry": 0.42, "qty": 1, "pnl": 0.35, "at": "2026-10-05 13:15", "ticker": "KXBTC15M-26OCT012030-15"},
+            {"side": "DOWN", "entry": 0.43, "qty": 1, "pnl": 0.25, "at": "2026-10-05 13:30", "ticker": "KXBTC15M-26OCT012045-15"},
+            {"side": "DOWN", "entry": 0.46, "qty": 1, "pnl": -0.25, "at": "2026-10-05 13:45", "ticker": "KXBTC15M-26OCT013000-15"},
+            {"side": "UP", "entry": 0.37, "qty": 1, "pnl": -0.10, "at": "2026-10-05 14:00", "ticker": "KXBTC15M-26OCT013015-15"},
+            {"side": "UP", "entry": 0.44, "qty": 1, "pnl": 0.45, "at": "2026-10-05 14:15", "ticker": "KXBTC15M-26OCT013030-15"},
+            {"side": "DOWN", "entry": 0.48, "qty": 1, "pnl": -0.05, "at": "2026-10-05 14:30", "ticker": "KXBTC15M-26OCT013045-15"},
+            {"side": "DOWN", "entry": 0.41, "qty": 1, "pnl": 0.30, "at": "2026-10-05 14:45", "ticker": "KXBTC15M-26OCT014000-15"},
         ]
+        # Force canned mode for --test.
+        if not args.canned:
+            args.canned = "approve"
     else:
         closes = load_closes(args.db, args.limit)
         if not closes:
