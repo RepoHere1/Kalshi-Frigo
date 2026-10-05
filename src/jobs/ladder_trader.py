@@ -266,7 +266,7 @@ class UpDownTrader:
                 pass
 
         up_fill = up_ask if up_ask is not None else None
-        down_fill = (1.0 - down_ask) if down_ask is not None else None
+        down_fill = down_ask if down_ask is not None else None
 
         def _side_ok(edge: float, fill_price: Optional[float]) -> bool:
             if fill_price is None or fill_price <= 0.0:
@@ -326,12 +326,13 @@ class UpDownTrader:
                 f"{float(kalshi or 0.0):.2f} on {side.upper()} - edge {edge:+.3f}"
             )
 
-        # Size on the price the order will actually fill at, not on the raw ask.
-        # A DOWN clip buys NO, so it fills at (1 - ask). Sizing off `ask` alone
-        # meant a 6c NO ask produced 5/0.06 = 83 contracts, which then filled at
-        # 0.939 - a $5 clip turned into $76 of exposure. That single trade is the
-        # -$73.59 that emptied the DRY account.
-        fill_price = ask if side == "up" else (1.0 - ask if side else 0.0)
+        # Size on the price the order will actually fill at: the side's own ask.
+        # UP fills at yes_ask, DOWN fills at no_ask. An earlier revision filled
+        # DOWN at (1 - ask) -- the UP price for a DOWN bet -- which booked $48
+        # of exposure as a $4.93 clip and credited exits at the real price: ~$43
+        # of phantom profit per trade. That inversion is what flattered the DRY
+        # NO line. Both sides fill at their own ask now.
+        fill_price = ask if side else 0.0
         contracts = self._size(fill_price, clip_usd=clip_usd) if side else 0
         signal = UpDownSignal(
             ticker=market.ticker,
@@ -448,7 +449,9 @@ class UpDownTrader:
                 return False
 
         ask = float(signal.ask or 0.0)
-        price = ask if signal.side == "up" else 1.0 - ask
+        # Both sides fill at their own ask (UP at yes_ask, DOWN at no_ask).
+        # See the note at sizing: (1 - ask) here once booked $48 as $4.93.
+        price = ask
         position = Position(
             market_id=signal.ticker,
             side="YES" if signal.side == "up" else "NO",
