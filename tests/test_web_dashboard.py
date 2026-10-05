@@ -2714,6 +2714,34 @@ def test_realized_follows_a_settled_market_that_positions_no_longer_lists():
     assert led["settlements_counted"] == 1
 
 
+def test_settled_cost_is_not_reported_as_capital_still_deployed():
+    """The phantom-basis regression: settled contracts have no cost basis.
+
+    open_cost was captured BEFORE settlements zeroed their tickers, so every
+    buy-then-settled contract kept reporting its cost as capital at work:
+    the tile read "exposure $1.92 - cost $485.82" for an account holding $2.
+    """
+    settlement = {
+        "ticker": "KXOLD-TEST",
+        "market_result": "yes",
+        "yes_count_fp": "10.00",
+        "yes_total_cost_dollars": "4.000000",
+        "no_count_fp": "0.00",
+        "no_total_cost_dollars": "0.000000",
+        "revenue": 1000,
+        "fee_cost": "0.020000",
+    }
+    buy = dict(FILL_BUY_YES, ticker="KXOLD-TEST")
+    led = wd._kalshi_ledger([buy], [settlement])
+    assert led["cost_basis"] == pytest.approx(0.0, abs=0.01)
+    assert led["basis_by_ticker"] == {}
+    # And a genuinely still-held ticker keeps its basis alongside.
+    other = dict(FILL_BUY_YES, ticker="KXHELD-TEST")
+    led2 = wd._kalshi_ledger([buy, other], [settlement])
+    assert led2["cost_basis"] == pytest.approx(4.00, abs=0.01)
+    assert led2["basis_by_ticker"] == {"KXHELD-TEST": pytest.approx(4.00, abs=0.01)}
+
+
 def test_a_losing_settlement_is_reported_as_a_loss():
     settlement = {
         "ticker": "KXOLD-TEST",

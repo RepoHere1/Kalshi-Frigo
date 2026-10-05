@@ -644,9 +644,13 @@ def _kalshi_ledger(
             held_qty[ticker] = on_hand - closing
             held_cost[ticker] = held_cost.get(ticker, 0.0) - cost_released
 
-    # Whatever is still held is capital at work, at the average price paid for it.
-    open_cost = sum(v for v in held_cost.values() if v > 0.0)
-
+    # Whatever is still held is capital at work, at the average price paid for
+    # it -- but only AFTER settlements zero their tickers below. Settled
+    # contracts are consumed without a sale fill, so capturing the total before
+    # that loop reported the cost of the dead as "capital currently deployed":
+    # the account showed cost $485.82 next to a $1.92 mark-to-market, and both
+    # were "true" only under two different definitions. The map is therefore
+    # built at the end, from what actually still has shares.
     settle_revenue = 0.0
     settlement_count = 0
     for s in settlements:
@@ -671,6 +675,14 @@ def _kalshi_ledger(
             held_qty[ticker] = 0.0
             held_cost[ticker] = 0.0
 
+    # Cost basis of what is held RIGHT NOW: tickers with shares left. Cost
+    # residue on a zero-qty row is rounding dust from avg-cost release and
+    # counts as nothing.
+    basis_by_ticker = {
+        t: c for t, c in held_cost.items() if held_qty.get(t, 0.0) > 0.0 and c > 0.0
+    }
+    open_cost = sum(basis_by_ticker.values())
+
     return {
         "realized": round(realized, 2),
         "fees": round(fees, 2),
@@ -684,6 +696,11 @@ def _kalshi_ledger(
         "fills_counted": fill_count,
         "settlements_counted": settlement_count,
         "open_positions_in_ledger": sum(1 for v in held_qty.values() if v > 0.0),
+        # Per-ticker cost of what is still held, after settlements. The
+        # account tile sums this over the tickers Kalshi says are held; a held
+        # ticker missing from this map means its buys predate the retained
+        # fill history and its cost is unknown, not zero.
+        "basis_by_ticker": {t: round(c, 4) for t, c in basis_by_ticker.items()},
         "window_start": window_start,
         "window_end": window_end,
         "complete": True,
@@ -2019,6 +2036,27 @@ def _kalshi_account() -> Dict[str, Any]:
     ]
     ghost_count = (len(markets) - len(held_markets)) + (len(events) - len(held_events))
 
+    # Cost basis answers "what did what I hold RIGHT NOW cost", so it is
+    # summed over the tickers Kalshi says are still held, from the ledger's
+    # post-settlement basis map. A held ticker missing from the map means its
+    # buys predate Kalshi's retained fill history; a negative share count is a
+    # short whose "cost" is proceeds received, not basis paid. Either makes
+    # the account total unknowable -- the tile then says unknown instead of
+    # quoting a confident wrong number (a $485.82 phantom was worse than n/a).
+    _basis_map = ledger.get("basis_by_ticker", {}) if have_ledger else {}
+    _held_cost_basis = 0.0
+    _cost_basis_missing = 0
+    for _r in held_markets:
+        if float(_r.get("shares") or 0.0) < 0.0:
+            _cost_basis_missing += 1
+            continue
+        _b = _basis_map.get(_r["ticker"])
+        if _b is None:
+            _cost_basis_missing += 1
+        else:
+            _held_cost_basis += float(_b)
+    _cost_basis_known = have_ledger and _cost_basis_missing == 0
+
     return {
         "connected": bool(markets or events),
         # Held counts drive every headline. `*_rows` is what the endpoint returned,
@@ -2038,7 +2076,9 @@ def _kalshi_account() -> Dict[str, Any]:
         # the same quantity as cost basis, so the two are never substituted.
         "exposure": round(total(held_markets, "exposure"), 2),
         "event_exposure": round(total(held_events, "exposure"), 2),
-        "cost_basis": round(float(ledger.get("cost_basis", 0.0)), 2) if have_ledger else 0.0,
+        "cost_basis": round(_held_cost_basis, 2) if _cost_basis_known else 0.0,
+        "cost_basis_known": _cost_basis_known,
+        "cost_basis_missing": _cost_basis_missing,
         "realized": round(float(ledger.get("realized", 0.0)), 2) if have_ledger else 0.0,
         "fees": round(float(ledger.get("fees", 0.0)), 2) if have_ledger else 0.0,
         "realized_known": have_ledger,
@@ -4279,7 +4319,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   <div class="tile">
     <div class="k">Real exposure</div>
     <div class="v" id="tExposure">{{ '$%.2f'|format(s.kalshi.exposure) if s.kalshi else '$0.00' }}</div>
-    <div class="s">mark-to-market &middot; cost {{ ('$%.2f'|format(s.kalshi.cost_basis)) if s.kalshi and s.kalshi.realized_known else 'cost n/a' }}</div>
+    <div class="s" id="tExposureNote">{% if s.kalshi and s.kalshi.realized_known and s.kalshi.cost_basis_known %}mark-to-market &middot; cost {{ '$%.2f'|format(s.kalshi.cost_basis) }}{% elif s.kalshi and s.kalshi.realized_known %}mark-to-market &middot; cost unknown ({{ s.kalshi.cost_basis_missing }} holding{{ '' if s.kalshi.cost_basis_missing == 1 else 's' }} predate fill history){% else %}mark-to-market &middot; cost n/a{% endif %}</div>
   </div>
   <div class="tile">
     <div class="k">Real realized P&amp;L</div>
@@ -4319,7 +4359,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   <div class="tile">
     <div class="k">Bot realized P&amp;L</div>
     <div class="v {{ 'up' if s.trades and s.trades.realized_pnl > 0 else ('down' if s.trades and s.trades.realized_pnl < 0 else 'flat') }}" id="tBotPnl">{{ '$%.2f'|format(s.trades.realized_pnl) if s.trades else '$0.00' }}</div>
-    <div class="s">{{ s.trades.trades if s.trades else 0 }} closed trades</div>
+    <div class="s">{{ s.trades.trades if s.trades else 0 }} closed trades &middot; bot log only, not account history</div>
   </div>
   <div class="tile">
     <div class="k">Win rate</div>
@@ -4968,6 +5008,13 @@ function paint(s) {
       (k.market_count || 0) + ' market · ' + (k.event_count || 0) + ' event' +
       (k.ghost_count ? ' · ' + k.ghost_count + ' zero-share rows' : ''));
     set('tExposure', money(k.exposure));
+    set('tExposureNote',
+      'mark-to-market · ' + (k.cost_basis_known
+        ? 'cost ' + money(k.cost_basis)
+        : (k.realized_known
+          ? 'cost unknown (' + (k.cost_basis_missing || 0) + ' holding' +
+            (k.cost_basis_missing === 1 ? '' : 's') + ' predate fill history)'
+          : 'cost n/a')));
     set('tKalshiPnl', money(k.realized));
     const kr = document.getElementById('tKalshiPnl');
     if (kr) kr.className = 'v ' + sgn(k.realized || 0);
