@@ -4147,7 +4147,7 @@ body[data-mode="live"] .modeflag.live::after{
   position:relative;overflow:hidden;
 }
 .tile::after{content:"";position:absolute;inset:0 0 auto 0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,.09),transparent)}
-.tile .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);margin-bottom:7px}
+.tile .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:#ffdd00;margin-bottom:7px}
 .tile .v{font-size:25px;font-weight:660;letter-spacing:-.6px;font-variant-numeric:tabular-nums;line-height:1.05}
 .tile .s{font-size:12px;color:var(--dim);margin-top:4px}
 .up{color:var(--up)} .down{color:var(--down)} .flat{color:var(--fg)}
@@ -4166,7 +4166,7 @@ body[data-mode="live"] .modeflag.live::after{
   padding:13px 16px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.012);
 }
 .ph h2{font-size:12.5px;font-weight:620;letter-spacing:.04em;text-transform:uppercase;color:var(--fg)}
-.ph .note{font-size:11px;color:var(--faint);font-weight:400;text-transform:none;letter-spacing:0}
+.ph .note{font-size:11px;color:#ffdd00;font-weight:400;text-transform:none;letter-spacing:0}
 .pb{padding:14px 16px;flex:1}
 
 /* ---------- bits ---------- */
