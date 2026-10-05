@@ -2956,9 +2956,20 @@ def api_live_journal():
             r["exit_timestamp"] = str(r.get("exit_timestamp") or "")[:19]
         # The reaper's latest pass: what it killed and what Kalshi still holds.
         try:
-            from src.jobs.live_reaper import last_summary
+            from src.jobs.live_reaper import _summary_path, last_summary
 
-            reaper = last_summary()
+            # Anchored to the DB this process already reads, not to an env
+            # default: the trader writes the summary beside its own db_path and
+            # the two processes do not necessarily share DB_PATH.
+            import os as _os
+            import json as _json
+
+            _sp = _summary_path(db.db_path)
+            try:
+                with open(_sp, "r", encoding="utf-8") as _fh:
+                    reaper = _json.load(_fh)
+            except Exception:  # noqa: BLE001 - no pass yet
+                reaper = last_summary()
         except Exception:  # noqa: BLE001 - visibility only
             reaper = {}
         return jsonify(
