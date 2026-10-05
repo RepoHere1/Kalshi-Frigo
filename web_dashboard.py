@@ -459,9 +459,7 @@ async def _fetch_kalshi_data():
             # Bounded: balance + positions above already stand on their own, so
             # a hung history walk degrades realized P&L to "unknown" instead
             # of holding a gthread for the full 120s _run_async timeout.
-            fills = await asyncio.wait_for(
-                _fetch_all_fills(client), _KALSHI_HISTORY_BUDGET_SEC
-            )
+            fills = await asyncio.wait_for(_fetch_all_fills(client), _KALSHI_HISTORY_BUDGET_SEC)
             settlements = await asyncio.wait_for(
                 _fetch_all_settlements(client), _KALSHI_HISTORY_BUDGET_SEC
             )
@@ -691,9 +689,7 @@ def _kalshi_ledger(
     # Cost basis of what is held RIGHT NOW: tickers with shares left. Cost
     # residue on a zero-qty row is rounding dust from avg-cost release and
     # counts as nothing.
-    basis_by_ticker = {
-        t: c for t, c in held_cost.items() if held_qty.get(t, 0.0) > 0.0 and c > 0.0
-    }
+    basis_by_ticker = {t: c for t, c in held_cost.items() if held_qty.get(t, 0.0) > 0.0 and c > 0.0}
     open_cost = sum(basis_by_ticker.values())
 
     return {
@@ -893,7 +889,9 @@ def _refresh_kalshi():
     # Tolerate a 2-tuple: an older or partially-patched fetch still answers
     # (balance, positions), and the history would then be empty rather than fatal.
     balance, positions, fills, settlements = (
-        list(result) + [[], []] if isinstance(result, (list, tuple)) and len(result) == 2 else result
+        list(result) + [[], []]
+        if isinstance(result, (list, tuple)) and len(result) == 2
+        else result
     )
     if balance:
         # Kalshi reports cents; the dashboard shows dollars.
@@ -1288,9 +1286,7 @@ def _publish_if_changed() -> bool:
 def _monitor_once(interval: int, flags: Dict[str, Any]) -> bool:
     """One monitor pass. Split out so tests can drive it without the sleep."""
     dashboard_state["status"] = "online"
-    dashboard_state["has_openrouter_creds"] = bool(
-        os.environ.get("OPENROUTER_API_KEY", "").strip()
-    )
+    dashboard_state["has_openrouter_creds"] = bool(os.environ.get("OPENROUTER_API_KEY", "").strip())
     dashboard_state["has_kalshi_creds"] = kalshi_configured()
 
     # Make sure the schema exists so the dashboard shows real numbers even
@@ -1443,7 +1439,8 @@ def _strategy_supervisor_loop():
                         _run_async(store.set_desired(name, True, book_mode))
                         _spawn_strategy(name, book_mode)
                         _push_error(
-                            f"Started {name} in {book_mode.upper()} " f"(all strategies run by default)."
+                            f"Started {name} in {book_mode.upper()} "
+                            f"(all strategies run by default)."
                         )
                         # Stagger the boot storm. Six strategies starting at once
                         # all race for the SQLite write lock, and their lock
@@ -1665,9 +1662,7 @@ def _strategy_cards(
         hb = db_row.get("heartbeat_at")
         if hb:
             try:
-                hb_age = (
-                    datetime.now() - datetime.fromisoformat(str(hb))
-                ).total_seconds()
+                hb_age = (datetime.now() - datetime.fromisoformat(str(hb))).total_seconds()
             except Exception:  # noqa: BLE001
                 hb_age = None
         hb_stale = hb_age is not None and hb_age > _HEARTBEAT_STALE_SECONDS
@@ -2001,9 +1996,7 @@ def _truth_positions_for_live(
                 "source": "kalshi",
             }
         )
-    dashboard_state["stale_live_rows"] = sum(
-        1 for p in positions if p.get("market_id") not in held
-    )
+    dashboard_state["stale_live_rows"] = sum(1 for p in positions if p.get("market_id") not in held)
     return out
 
 
@@ -2075,7 +2068,7 @@ def _kalshi_account() -> Dict[str, Any]:
     positions_realized = round(total(markets, "realized") + total(events, "realized"), 2)
     positions_fees = round(total(markets, "fees") + total(events, "fees"), 2)
 
-# ZERO-SHARE ROWS ARE NOT POSITIONS, AND EVENT ROWS ARE NOT SEPARATE ONES
+    # ZERO-SHARE ROWS ARE NOT POSITIONS, AND EVENT ROWS ARE NOT SEPARATE ONES
     # ---------------------------------------------------------------------
     # /portfolio/positions answers with two views of the same book:
     #
@@ -2101,9 +2094,7 @@ def _kalshi_account() -> Dict[str, Any]:
     # positions. The zero-share rows are still reported as a count, because
     # "18 rows, 3 held" is honest and hiding them just invites the same question.
     held_markets = [r for r in markets if float(r.get("shares") or 0.0) != 0.0]
-    held_events = [
-        r for r in events if float(r.get("exposure") or 0.0) != 0.0
-    ]
+    held_events = [r for r in events if float(r.get("exposure") or 0.0) != 0.0]
     # The event panel is a per-event view of where money went, so it keeps rows
     # with historical cost even when nothing is open - that is the useful part of
     # it. Those rows are listed but never counted as open positions.
@@ -2311,8 +2302,7 @@ def build_snapshot() -> Dict[str, Any]:
         # from THIS BOOK's position rows only: a DRY snapshot must not carry the
         # real account's tickers in its title map.
         "market_titles": _complete_title_map(
-            positions
-            + (account["markets"] + account["events"] if book == "live" else [])
+            positions + (account["markets"] + account["events"] if book == "live" else [])
         ),
         "errors": errors[-10:],
         "events": events[-8:],
@@ -2822,16 +2812,17 @@ def dashboard():
     # connected yet must still render a page, with its own honest empty state.
     context = _market_context()
     acct = _account_payload(_current_book_mode())
-    
+
     def _format_date(date_str: str) -> str:
         """Convert YYYY-MM-DD to MON DD, YYYY."""
         try:
             from datetime import datetime
+
             dt = datetime.strptime(date_str, "%Y-%m-%d")
             return dt.strftime("%b %d, %Y").upper()
         except:
             return date_str
-    
+
     return render_template_string(
         _TEMPLATE,
         s=snap,
@@ -2901,10 +2892,7 @@ def build_snapshot_cached() -> Dict[str, Any]:
         # Re-check: the builder may have finished while waiting on the lock.
         now = time.time()
         cached = _SNAPSHOT_CACHE.get("payload")
-        if (
-            cached is not None
-            and now - float(_SNAPSHOT_CACHE.get("at") or 0) < ttl
-        ):
+        if cached is not None and now - float(_SNAPSHOT_CACHE.get("at") or 0) < ttl:
             return cached
         try:
             payload = build_snapshot()
@@ -2913,27 +2901,27 @@ def build_snapshot_cached() -> Dict[str, Any]:
             if cached is not None:
                 return cached
             return {
-            "mode": _safe_mode_payload(),
-            "error": str(exc),
-            "positions": [],
-            "strategy_cards": [],
-            "by_strategy": [],
-            "trades": {
-                "trades": 0,
-                "wins": 0,
-                "losses": 0,
-                "realized_pnl": 0.0,
-                "win_rate": 0.0,
-                "best_trade": 0.0,
-                "worst_trade": 0.0,
-                "avg_pnl": 0.0,
-            },
-            "open": {"positions": 0, "capital": 0.0, "paper": 0, "live": 0},
-            "kalshi": None,
-            "market_titles": {},
-            "errors": [],
-            "funding": {"connected": False, "balance": 0.0, "can_fund": False, "reason": ""},
-        }
+                "mode": _safe_mode_payload(),
+                "error": str(exc),
+                "positions": [],
+                "strategy_cards": [],
+                "by_strategy": [],
+                "trades": {
+                    "trades": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "realized_pnl": 0.0,
+                    "win_rate": 0.0,
+                    "best_trade": 0.0,
+                    "worst_trade": 0.0,
+                    "avg_pnl": 0.0,
+                },
+                "open": {"positions": 0, "capital": 0.0, "paper": 0, "live": 0},
+                "kalshi": None,
+                "market_titles": {},
+                "errors": [],
+                "funding": {"connected": False, "balance": 0.0, "can_fund": False, "reason": ""},
+            }
     finally:
         _SNAPSHOT_LOCK.release()
     _SNAPSHOT_CACHE["at"] = now
@@ -3085,13 +3073,14 @@ def api_live_journal():
             r["exit_timestamp"] = str(r.get("exit_timestamp") or "")[:19]
         # The reaper's latest pass: what it killed and what Kalshi still holds.
         try:
-            from src.jobs.live_reaper import _summary_path, last_summary
+            import json as _json
 
             # Anchored to the DB this process already reads, not to an env
             # default: the trader writes the summary beside its own db_path and
             # the two processes do not necessarily share DB_PATH.
             import os as _os
-            import json as _json
+
+            from src.jobs.live_reaper import _summary_path, last_summary
 
             _sp = _summary_path(db.db_path)
             try:
@@ -3275,15 +3264,11 @@ def _recorded_state() -> Dict[str, Dict[str, Any]]:
         heartbeat_age: Optional[float] = None
         if hb:
             try:
-                heartbeat_age = (
-                    datetime.now() - datetime.fromisoformat(str(hb))
-                ).total_seconds()
+                heartbeat_age = (datetime.now() - datetime.fromisoformat(str(hb))).total_seconds()
             except Exception:  # noqa: BLE001 - a malformed stamp is treated as none
                 heartbeat_age = None
         st["heartbeat_at"] = hb
-        st["heartbeat_age_sec"] = (
-            round(heartbeat_age, 1) if heartbeat_age is not None else None
-        )
+        st["heartbeat_age_sec"] = round(heartbeat_age, 1) if heartbeat_age is not None else None
 
         if row.get("pid") and not _pid_alive(row["pid"], row):
             # Died without us being told. Say what actually happened rather than
@@ -3294,9 +3279,7 @@ def _recorded_state() -> Dict[str, Dict[str, Any]]:
             else:
                 reason = "exited on its own"
             _run_async(
-                _runtime_store().record_stop(
-                    name, reason, _runtime_mode(), clear_desired=False
-                )
+                _runtime_store().record_stop(name, reason, _runtime_mode(), clear_desired=False)
             )
             st["pid"] = None
             st["running"] = False
@@ -3404,9 +3387,7 @@ def api_strategy_analysis(name):
     if name not in strategy_state:
         return jsonify({"error": f"Unknown strategy: {name}"}), 404
     book = _current_book_mode()
-    rows = _db_rows(
-        _SQL_ANALYSIS_STRAT.format(book=_book_filter(book)), (name,)
-    )
+    rows = _db_rows(_SQL_ANALYSIS_STRAT.format(book=_book_filter(book)), (name,))
     return jsonify(analyze_trades(rows, name=name))
 
 

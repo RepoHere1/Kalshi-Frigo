@@ -17,10 +17,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from json_repair import repair_json
 from openai import AsyncOpenAI
 
-from src.clients.xai_client import TradingDecision, DailyUsageTracker
+from src.clients.xai_client import DailyUsageTracker, TradingDecision
 from src.config.settings import settings
 from src.utils.logging_setup import TradingLoggerMixin, log_error_with_context
-
 
 # ---------------------------------------------------------------------------
 # Model registry: pricing per 1K tokens (USD)
@@ -63,6 +62,31 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
         "input_per_1k": 0.00014,
         "output_per_1k": 0.00028,
     },
+    # AI advisory stack (OpenRouter standard listings, late Sep 2026).
+    "deepseek/deepseek-v4.1-flash": {
+        "input_per_1k": 0.000035,
+        "output_per_1k": 0.00029,
+    },
+    "openai/gpt-5-nano": {
+        "input_per_1k": 0.00005,
+        "output_per_1k": 0.0004,
+    },
+    "mistralai/mistral-nemo": {
+        "input_per_1k": 0.000019,
+        "output_per_1k": 0.00003,
+    },
+    "qwen/qwen3.7-flash": {
+        "input_per_1k": 0.00003,
+        "output_per_1k": 0.00013,
+    },
+    "x-ai/grok-4.7": {
+        "input_per_1k": 0.0016,
+        "output_per_1k": 0.0048,
+    },
+    "deepseek/deepseek-v4-pro": {
+        "input_per_1k": 0.00095526,
+        "output_per_1k": 0.00191052,
+    },
 }
 
 # Ordered fallback chain -- if the requested model fails, try the next one.
@@ -81,9 +105,11 @@ DEFAULT_FALLBACK_ORDER: List[str] = [
 # Per-model cost accumulator
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ModelCostTracker:
     """Accumulated cost data for a single model."""
+
     model: str
     input_tokens: int = 0
     output_tokens: int = 0
@@ -96,6 +122,7 @@ class ModelCostTracker:
 # ---------------------------------------------------------------------------
 # OpenRouterClient
 # ---------------------------------------------------------------------------
+
 
 class OpenRouterClient(TradingLoggerMixin):
     """
@@ -295,9 +322,7 @@ class OpenRouterClient(TradingLoggerMixin):
     # Cost calculation
     # ------------------------------------------------------------------
 
-    def _calculate_cost(
-        self, model: str, input_tokens: int, output_tokens: int
-    ) -> float:
+    def _calculate_cost(self, model: str, input_tokens: int, output_tokens: int) -> float:
         """Return the USD cost for the given token counts."""
         pricing = MODEL_PRICING.get(model)
         if pricing is None:
@@ -356,7 +381,7 @@ class OpenRouterClient(TradingLoggerMixin):
 
     def _backoff_delay(self, attempt: int) -> float:
         """Compute exponential backoff delay for *attempt* (0-based)."""
-        delay = self.BASE_BACKOFF * (2 ** attempt)
+        delay = self.BASE_BACKOFF * (2**attempt)
         return min(delay, self.MAX_BACKOFF)
 
     # ------------------------------------------------------------------
@@ -418,9 +443,7 @@ class OpenRouterClient(TradingLoggerMixin):
                     or not response.choices[0].message
                     or not response.choices[0].message.content
                 ):
-                    raise ValueError(
-                        f"Empty response from {model} on attempt {attempt + 1}"
-                    )
+                    raise ValueError(f"Empty response from {model} on attempt {attempt + 1}")
 
                 content = response.choices[0].message.content
 
@@ -629,8 +652,14 @@ class OpenRouterClient(TradingLoggerMixin):
         title = market_data.get("title", "Unknown Market")
         # Support both new dollar-denominated and legacy cent-based API fields
         if "yes_bid_dollars" in market_data:
-            yes_price = (float(market_data.get("yes_bid_dollars", 0) or 0) + float(market_data.get("yes_ask_dollars", 0) or 0)) / 2
-            no_price = (float(market_data.get("no_bid_dollars", 0) or 0) + float(market_data.get("no_ask_dollars", 0) or 0)) / 2
+            yes_price = (
+                float(market_data.get("yes_bid_dollars", 0) or 0)
+                + float(market_data.get("yes_ask_dollars", 0) or 0)
+            ) / 2
+            no_price = (
+                float(market_data.get("no_bid_dollars", 0) or 0)
+                + float(market_data.get("no_ask_dollars", 0) or 0)
+            ) / 2
         else:
             yes_price = (market_data.get("yes_bid", 0) + market_data.get("yes_ask", 100)) / 2
             no_price = (market_data.get("no_bid", 0) + market_data.get("no_ask", 100)) / 2
@@ -644,9 +673,7 @@ class OpenRouterClient(TradingLoggerMixin):
             cash * settings.trading.max_position_size_pct / 100,
         )
 
-        truncated_news = (
-            news_summary[:800] + "..." if len(news_summary) > 800 else news_summary
-        )
+        truncated_news = news_summary[:800] + "..." if len(news_summary) > 800 else news_summary
 
         return f"""Analyze this prediction market and provide a trading decision.
 
@@ -723,7 +750,9 @@ If you do not recommend trading, use action "SKIP":
 
             side = data.get("side", "YES").upper()
             confidence = float(data.get("confidence", 0.5))
-            limit_price = int(data.get("limit_price", 50)) if data.get("limit_price") is not None else None
+            limit_price = (
+                int(data.get("limit_price", 50)) if data.get("limit_price") is not None else None
+            )
 
             return TradingDecision(
                 action=action,

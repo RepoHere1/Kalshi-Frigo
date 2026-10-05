@@ -51,16 +51,15 @@ async def _confirm_maker_fill(
 
     async def _resting() -> bool:
         try:
-            resp = await kalshi_client.get_orders(
-                ticker=position.market_id, status="resting"
-            )
+            resp = await kalshi_client.get_orders(ticker=position.market_id, status="resting")
             rows = resp.get("orders") or [] if isinstance(resp, dict) else []
             for o in rows:
                 if not isinstance(o, dict):
                     continue
-                if str(o.get("client_order_id") or "") == str(
-                    request.client_order_id
-                ) or str(o.get("order_id") or "") == order_id:
+                if (
+                    str(o.get("client_order_id") or "") == str(request.client_order_id)
+                    or str(o.get("order_id") or "") == order_id
+                ):
                     return True
         except Exception:  # noqa: BLE001 - a failed read retries on the next poll
             pass
@@ -93,13 +92,9 @@ async def _confirm_maker_fill(
     if await _resting():
         # Never filled: cancel so nothing can execute behind the local book.
         try:
-            await kalshi_client.cancel_order(
-                order_id, market_ticker=position.market_id
-            )
+            await kalshi_client.cancel_order(order_id, market_ticker=position.market_id)
         except Exception as exc:  # noqa: BLE001 - cancel is best-effort
-            logger.warning(
-                f"Maker entry cancel failed for {position.market_id}: {exc}"
-            )
+            logger.warning(f"Maker entry cancel failed for {position.market_id}: {exc}")
 
     held = await _held_qty()
     if held != 0.0:
@@ -119,7 +114,10 @@ async def _confirm_maker_fill(
 
 
 async def execute_position(
-    position: Position, live_mode: bool, db_manager: DatabaseManager, kalshi_client: KalshiClient,
+    position: Position,
+    live_mode: bool,
+    db_manager: DatabaseManager,
+    kalshi_client: KalshiClient,
     maker_wait_seconds: float = 0.0,
 ) -> bool:
     """
@@ -257,9 +255,7 @@ async def execute_position(
                 )
                 return False
             await db_manager.update_position_to_live(position.id, fill_price)
-            logger.info(
-                f"✅ LIVE MAKER ENTRY FILLED for {position.market_id} @ {fill_price:.3f}"
-            )
+            logger.info(f"✅ LIVE MAKER ENTRY FILLED for {position.market_id} @ {fill_price:.3f}")
             return True
 
         if live_mode:
@@ -389,8 +385,7 @@ async def place_sell_limit_order(
                     int(p.quantity or 0)
                     for p in _live_open
                     if str(p.market_id) == str(position.market_id)
-                    and str(p.side or "").upper()
-                    == str(position.side or "").upper()
+                    and str(p.side or "").upper() == str(position.side or "").upper()
                 )
                 if _held <= 0:
                     logger.warning(
@@ -485,17 +480,13 @@ async def place_sell_limit_order(
             )
             if not filled:
                 try:
-                    await kalshi_client.cancel_order(
-                        order_id, market_ticker=position.market_id
-                    )
+                    await kalshi_client.cancel_order(order_id, market_ticker=position.market_id)
                     logger.warning(
                         f"⏳ LIVE sell of {position.market_id} did not fill in 8s; "
                         f"cancelled, position stays open"
                     )
                 except Exception as exc2:  # noqa: BLE001 - best effort cancel
-                    logger.warning(
-                        f"LIVE sell cancel failed for {position.market_id}: {exc2}"
-                    )
+                    logger.warning(f"LIVE sell cancel failed for {position.market_id}: {exc2}")
                 return False
             logger.info(f"✅ LIVE SELL CONFIRMED FILLED for {position.market_id}")
         return True
@@ -603,9 +594,7 @@ async def place_profit_taking_orders(
                                         )
                                         if _ct.tzinfo is None:
                                             _ct = _ct.replace(tzinfo=timezone.utc)
-                                        _secs = (
-                                            _ct - datetime.now(timezone.utc)
-                                        ).total_seconds()
+                                        _secs = (_ct - datetime.now(timezone.utc)).total_seconds()
                                 except Exception:  # noqa: BLE001
                                     _secs = None
                                 # Item 4b: a winning position inside the

@@ -2363,7 +2363,8 @@ def test_reconcile_reports_realized_without_restating_cash(client):
             await conn.commit()
 
     asyncio.run(seed())
-    from src.utils.mode import TradingMode, run as mode_run
+    from src.utils.mode import TradingMode
+    from src.utils.mode import run as mode_run
 
     ledger_cash = mode_run(TradingMode(db_path=str(wd.DB_PATH)).dry_account())["cash"]
     mode = client.get("/api/mode").get_json()

@@ -87,6 +87,28 @@ class UpDownConfig:
     # a coin flip, so LIVE sits the hour out. DRY never reads this flag and
     # still trades the hour.
     live_skip_losing_hour: bool = True
+    # AI advisory stack. All default OFF: with every flag off the ladder is
+    # byte-identical math, and the ai_* modules are never even imported on
+    # the trading path. Env overrides let Railway enable one lane at a time
+    # without a code change (AI_VETO_ENABLED=1, SENTINEL_ENABLED=1).
+    ai_veto_enabled: bool = False
+    sentinel_enabled: bool = False
+    sentinel_state_path: str = "sentinel_state.json"
+    # Extra edge demanded while the sentinel reads caution (event risk in
+    # the air but unconfirmed). Halt blocks outright; see _ai_guards.
+    sentinel_caution_extra_edge: float = 0.03
+
+    def __post_init__(self) -> None:
+        import os as _os
+
+        if _os.environ.get("AI_VETO_ENABLED", "") == "1":
+            self.ai_veto_enabled = True
+        if _os.environ.get("SENTINEL_ENABLED", "") == "1":
+            self.sentinel_enabled = True
+        _sp = _os.environ.get("SENTINEL_STATE_PATH", "")
+        if _sp:
+            self.sentinel_state_path = _sp
+
     # Minimum model probability on the chosen side before any entry. The old
     # "one clip per market" guard was removed; this is what replaces it as the
     # anti-churn rule - repeated buys of the same contract are allowed, but only
@@ -146,6 +168,8 @@ class UpDownBook:
     skipped_unquoted: int = 0
     skipped_low_prob: int = 0
     skipped_session: int = 0
+    skipped_ai_veto: int = 0
+    skipped_sentinel: int = 0
     last_error: str = ""
     dry: bool = True
 
@@ -154,7 +178,9 @@ class UpDownBook:
             "signals": len(self.signals),
             "actionable": sum(1 for s in self.signals if s.actionable),
             "open_positions": len(self.open_positions),
-            "open_notional": round(sum(float(p.get("notional") or 0.0) for p in self.open_positions), 2),
+            "open_notional": round(
+                sum(float(p.get("notional") or 0.0) for p in self.open_positions), 2
+            ),
             "max_open_notional": self.max_open_notional,
             "trades_today": self.trades_today,
             "skipped_no_edge": self.skipped_no_edge,
@@ -163,6 +189,8 @@ class UpDownBook:
             "skipped_unquoted": self.skipped_unquoted,
             "skipped_low_prob": self.skipped_low_prob,
             "skipped_session": self.skipped_session,
+            "skipped_ai_veto": self.skipped_ai_veto,
+            "skipped_sentinel": self.skipped_sentinel,
             "last_error": self.last_error,
             "dry": self.dry,
         }
@@ -200,6 +228,9 @@ class UpDownTrader:
         # Coinbase spot only -- every existing caller keeps working.
         self.brti = brti
         self._client: Any = None
+        # Lazy OpenRouter client for the veto judge. Built only when
+        # ai_veto_enabled, so DRY never pays for it.
+        self._ai_client: Any = None
         self.book = UpDownBook(max_open_notional=self.config.max_open_notional)
 
     def evaluate(
@@ -282,10 +313,10 @@ class UpDownTrader:
         # window is the final 60 seconds, and a fill in there is a coin toss
         # whether the truth is spot or the windowed average.
         if (market.seconds_left or 0) < self.config.min_seconds_left:
-                # The settlement window is the final 60 seconds. Inside it,
-                # spot is no longer leading anything.
-                self.book.skipped_too_close += 1
-                return None
+            # The settlement window is the final 60 seconds. Inside it,
+            # spot is no longer leading anything.
+            self.book.skipped_too_close += 1
+            return None
 
         target = float(market.target)
         delta = round(spot - target, 2)
@@ -352,11 +383,7 @@ class UpDownTrader:
                 return False
             r = required
             # The sweet band wins 100%; outside it, demand more edge.
-            if not (
-                self.config.sweet_band_low
-                <= fill_price
-                <= self.config.sweet_band_high
-            ):
+            if not (self.config.sweet_band_low <= fill_price <= self.config.sweet_band_high):
                 r += self.config.out_of_band_extra_edge
             return edge >= r
 
@@ -369,9 +396,7 @@ class UpDownTrader:
         edge = 0.0
         if self.config.prefer_side == "down":
             # NO wins 83% vs YES at 67%: prefer NO unless YES is clearly better.
-            if down_ok and (
-                not up_ok or down_edge >= up_edge - self.config.up_override_margin
-            ):
+            if down_ok and (not up_ok or down_edge >= up_edge - self.config.up_override_margin):
                 side, ask, kalshi, edge = "down", down_ask, down_ask, down_edge
             elif up_ok:
                 side, ask, kalshi, edge = "up", up_ask, up_ask, up_edge
@@ -443,9 +468,7 @@ class UpDownTrader:
             return 0
         if price <= 0 or price > 1.0:
             return 0
-        target_notional = (
-            self.config.notional_usd if clip_usd is None else max(clip_usd, 0.0)
-        )
+        target_notional = self.config.notional_usd if clip_usd is None else max(clip_usd, 0.0)
         if target_notional <= 0:
             return 0
         contracts = int(target_notional / price)
@@ -515,6 +538,102 @@ class UpDownTrader:
                 f"${self.config.max_open_notional:.2f} cap"
             )
         return ""
+
+    async def _ai_guards(self, signal: UpDownSignal, live: bool) -> str:
+        """Sentinel flag + AI veto, both fail-open. Returns '' or the block.
+
+        With both flags off (the default) this is one branch and no imports:
+        the ladder is byte-identical math. Enabled lanes degrade to math on
+        any error -- an advisor that cannot be read is permission, never a
+        halt (except an explicit sentinel halt, which is the point of it).
+        """
+        if self.config.sentinel_enabled:
+            try:
+                from src.jobs import sentinel as _sentinel
+
+                _state, _reason = _sentinel.read_flag(self.config.sentinel_state_path)
+                if _state == "halt":
+                    self.book.skipped_sentinel += 1
+                    return f"sentinel halt: {_reason}"[:200]
+                if _state == "caution":
+                    _r = (
+                        self.config.min_edge
+                        + (self.config.live_fee_rate if live else 0.0)
+                        + self.config.sentinel_caution_extra_edge
+                    )
+                    _fill = float(signal.ask or 0.0)
+                    if not (self.config.sweet_band_low <= _fill <= self.config.sweet_band_high):
+                        _r += self.config.out_of_band_extra_edge
+                    if float(signal.edge or 0.0) < _r:
+                        self.book.skipped_sentinel += 1
+                        return (f"sentinel caution demands {_r:.2f} edge" f" ({_reason})")[:200]
+            except Exception:  # noqa: BLE001 - sentinel errors never block
+                pass
+        if self.config.ai_veto_enabled:
+            try:
+                from src.jobs import ai_veto as _ai_veto
+
+                if self._ai_client is None:
+                    from src.clients.openrouter_client import OpenRouterClient
+
+                    self._ai_client = OpenRouterClient()
+                _streak = "unknown"
+                try:
+                    _recent = await self._recent_side_outcomes(signal.side)
+                    _streak = _recent
+                except Exception:  # noqa: BLE001
+                    _streak = "unknown"
+                _clip = {
+                    "ticker": signal.ticker,
+                    "side": signal.side,
+                    "ask": signal.ask,
+                    "edge": signal.edge,
+                    "fair": signal.fair,
+                    "seconds_left": signal.seconds_left,
+                    "streak": _streak,
+                    "vol_pct": 0.0,
+                    "headlines": "none",
+                    "required": self.config.min_edge + (self.config.live_fee_rate if live else 0.0),
+                }
+                _veto = await _ai_veto.check_veto(self._ai_client, _clip)
+                if _veto:
+                    self.book.skipped_ai_veto += 1
+                    return f"AI veto: {_veto}"[:200]
+            except Exception:  # noqa: BLE001 - veto errors never block
+                pass
+        return ""
+
+    async def _recent_side_outcomes(self, side: str, limit: int = 6) -> str:
+        """Same-side streak context for the veto prompt, from trade_logs."""
+        if self.db_manager is None:
+            return "unknown"
+        try:
+            import aiosqlite
+
+            db_path = getattr(self.db_manager, "db_path", None) or self._db_path()
+            async with aiosqlite.connect(db_path) as conn:
+                cur = await conn.execute(
+                    "SELECT side, pnl FROM trade_logs WHERE strategy='btc_updown'"
+                    " ORDER BY rowid DESC LIMIT ?",
+                    (limit,),
+                )
+                rows = await cur.fetchall()
+        except Exception:  # noqa: BLE001
+            return "unknown"
+        losses = 0
+        for _s, _pnl in rows:
+            if str(_s or "").lower() != str(side or "").lower():
+                break
+            try:
+                if float(_pnl or 0.0) <= 0:
+                    losses += 1
+                else:
+                    break
+            except Exception:  # noqa: BLE001
+                break
+        if losses == 0:
+            return "no streak"
+        return f"{losses} same-side losses in a row"
 
     async def _place(self, signal: UpDownSignal, live: bool) -> bool:
         """Submit one clip through the canonical order path.
@@ -694,9 +813,9 @@ class UpDownTrader:
             _is_429 = "429" in _msg or "Too Many Requests" in _msg
             if live and _is_429 and getattr(self.feed, "markets", None):
                 try:
-                    from src.jobs import live_fees as _live_fees
-
                     import asyncio as _asyncio
+
+                    from src.jobs import live_fees as _live_fees
 
                     await _asyncio.sleep(_live_fees.backoff_delay_seconds(1))
                 except Exception:  # noqa: BLE001
@@ -723,9 +842,7 @@ class UpDownTrader:
                     self._client = KalshiClient()
                 bal = await self._client.get_balance()
                 cents = float((bal or {}).get("balance") or 0.0)
-                live_budget = round(
-                    cents / 100.0 * self.config.live_cash_fraction, 2
-                )
+                live_budget = round(cents / 100.0 * self.config.live_cash_fraction, 2)
             except Exception as exc:  # noqa: BLE001
                 self.book.last_error = f"LIVE balance read: {type(exc).__name__}: {exc}"
             # LIVE-ONLY variance-commensurate sizing: the bigger Kalshi's lie
@@ -800,8 +917,7 @@ class UpDownTrader:
                 and live_budget <= 0.0
             ):
                 refusal = (
-                    "LIVE balance is $0.00 - nothing can be bought until the "
-                    "account is funded"
+                    "LIVE balance is $0.00 - nothing can be bought until the " "account is funded"
                 )
 
         took: Optional[Dict[str, Any]] = None
@@ -856,6 +972,8 @@ class UpDownTrader:
         #   - total open notional across ALL clips stays under max_open_notional
         if signal is not None and signal.actionable:
             blocked = self._entry_block(signal, held, live=live)
+            if not blocked:
+                blocked = await self._ai_guards(signal, live)
             if not blocked and await self._place(signal, live):
                 self.book.open_positions.append(
                     {

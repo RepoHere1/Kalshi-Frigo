@@ -319,11 +319,7 @@ def test_live_entry_block_caps_clips_per_ticker():
     """LIVE takes at most 3 clips of one ticker; DRY is uncapped."""
     import time as _time
 
-    from src.jobs.ladder_trader import (
-        LIVE_MAX_CLIPS_PER_TICKER,
-        UpDownSignal,
-        UpDownTrader,
-    )
+    from src.jobs.ladder_trader import LIVE_MAX_CLIPS_PER_TICKER, UpDownSignal, UpDownTrader
     from src.jobs.market_data import Btc15mFeed, SpotFeed
 
     def trader():
