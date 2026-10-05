@@ -285,6 +285,49 @@ def test_stale_quote_is_refused_even_with_fresh_truth():
     assert trader.evaluate(market, live=False) is None
 
 
+def test_live_entry_block_caps_clips_per_ticker():
+    """LIVE takes at most 3 clips of one ticker; DRY is uncapped."""
+    import time as _time
+
+    from src.jobs.ladder_trader import (
+        LIVE_MAX_CLIPS_PER_TICKER,
+        UpDownSignal,
+        UpDownTrader,
+    )
+    from src.jobs.market_data import Btc15mFeed, SpotFeed
+
+    def trader():
+        spot = SpotFeed()
+        spot.price = 85000.0
+        spot.ts = _time.time()
+        return UpDownTrader(spot, Btc15mFeed(), UpDownConfig())
+
+    sig = UpDownSignal(
+        ticker="T",
+        bucket="B",
+        side="up",
+        target=84609.0,
+        spot=84900.0,
+        spot_vs_target=291.0,
+        fair=0.89,
+        kalshi_price=0.40,
+        edge=0.28,
+        ask=0.40,
+        contracts=12,
+        notional=4.80,
+        seconds_left=300.0,
+        reason="test",
+    )
+    held = [
+        {"ticker": "T", "side": "YES", "notional": 5.0, "contracts": 12}
+        for _ in range(LIVE_MAX_CLIPS_PER_TICKER)
+    ]
+    assert trader()._entry_block(sig, held, live=True) != ""
+    assert trader()._entry_block(sig, held[:2], live=True) == ""
+    assert trader()._entry_block(sig, held, live=False) == ""
+    assert trader()._entry_block(sig, [], live=True) == ""
+
+
 # ---------------------------------------------------------------------------
 # DB migration: fee_paid is additive, DRY rows read back unaffected
 # ---------------------------------------------------------------------------

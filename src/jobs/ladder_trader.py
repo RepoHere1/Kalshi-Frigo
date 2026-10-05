@@ -40,6 +40,9 @@ from src.jobs.market_data import Btc15mFeed, SpotFeed, UpDownMarket
 # A Kalshi quote older than this is not traded against: the book simply has
 # not repriced yet, so any "edge" versus fresh truth is fiction.
 QUOTE_MAX_AGE_SEC = 30.0
+# LIVE-ONLY: max open clips of one ticker. One 15-minute bucket is one bet;
+# DRY is uncapped so its historic pyramiding pattern is untouched.
+LIVE_MAX_CLIPS_PER_TICKER = 3
 
 
 @dataclass
@@ -431,7 +434,7 @@ class UpDownTrader:
         return os.environ.get("DB_PATH", "").strip() or "trading_system.db"
 
     def _entry_block(
-        self, signal: UpDownSignal, held: List[Dict[str, Any]]
+        self, signal: UpDownSignal, held: List[Dict[str, Any]], live: bool = False
     ) -> str:
         """Why this clip may not be taken - or "" when it may.
 
@@ -447,6 +450,11 @@ class UpDownTrader:
             is still more likely than not to pay
           - total open notional across all clips stays under
             `max_open_notional`
+
+        LIVE-ONLY: at most LIVE_MAX_CLIPS_PER_TICKER clips of one ticker. One
+        15-minute bucket is one coin flip -- the 26-clip pyramid of 2026-10-04
+        put $21.50 of real exposure on a single flip. DRY keeps unlimited
+        pyramiding so its historic pattern is untouched.
         """
         opposite = {"up": "NO", "down": "YES"}
         for p in held:
@@ -455,6 +463,13 @@ class UpDownTrader:
                     f"already hold the opposite side of {signal.ticker}; "
                     "closing first (never both sides of one contract)"
                 )
+        if live and sum(1 for p in held if p["ticker"] == signal.ticker) >= (
+            LIVE_MAX_CLIPS_PER_TICKER
+        ):
+            return (
+                f"already hold {LIVE_MAX_CLIPS_PER_TICKER} LIVE clips of"
+                f" {signal.ticker}; one bucket is one bet, no more pyramiding"
+            )
 
         win_prob = signal.fair if signal.side == "up" else 1.0 - signal.fair
         if win_prob < self.config.min_win_prob:
@@ -784,7 +799,7 @@ class UpDownTrader:
         #     is still genuinely more likely than not to pay
         #   - total open notional across ALL clips stays under max_open_notional
         if signal is not None and signal.actionable:
-            blocked = self._entry_block(signal, held)
+            blocked = self._entry_block(signal, held, live=live)
             if not blocked and await self._place(signal, live):
                 self.book.open_positions.append(
                     {

@@ -275,6 +275,62 @@ async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
                 continue
             receipt = _live_fees.parse_settlement_result(payload, position.market_id)
             if receipt is None:
+                # Last resort for ancient rows: older than 6h, no receipt,
+                # AND the market itself unresolvable (expired off the API).
+                # Kalshi auto-settled these long ago; the cash truth already
+                # reflects the outcome, so the local pin is closed at 0.0 and
+                # the cap is freed. Anything resolvable or younger stays open.
+                if age_hours >= 6.0:
+                    try:
+                        _m = await kalshi_client.get_market(position.market_id)
+                        _resolvable = bool((_m or {}).get("market"))
+                    except Exception:  # noqa: BLE001 - gone from the API
+                        _resolvable = False
+                    if not _resolvable:
+                        try:
+                            _entry = float(position.entry_price or 0.0)
+                            _qty = int(position.quantity or 0)
+                            _fee = float(
+                                _live_fees.taker_fee_dollars(_entry, _qty)
+                            )
+                            _log = TradeLog(
+                                market_id=position.market_id,
+                                side=position.side,
+                                entry_price=position.entry_price,
+                                exit_price=0.0,
+                                quantity=position.quantity,
+                                pnl=round(-_entry * _qty - _fee, 2),
+                                entry_timestamp=position.timestamp,
+                                exit_timestamp=datetime.now(),
+                                rationale=(
+                                    f"{position.rationale} | EXIT:"
+                                    f" expired-unresolved (no receipt, market"
+                                    f" gone >6h) | LIVE entry fee"
+                                    f" ${_fee:.2f}"
+                                ),
+                                strategy=position.strategy
+                                or _infer_strategy(position),
+                                exit_reason="expired-unresolved",
+                                mode="live",
+                                fee_paid=round(_fee, 2),
+                            )
+                            await db_manager.add_trade_log(_log)
+                            if position.id is not None:
+                                await db_manager.update_position_status(
+                                    position.id, "closed"
+                                )
+                            result["reconciled"] += 1
+                            logger.info(
+                                f"LIVE expired {position.market_id} closed at"
+                                f" 0.0 (no receipt, market gone;"
+                                f" net ${_log.pnl:.2f})"
+                            )
+                            continue
+                        except Exception as exc:  # noqa: BLE001
+                            logger.error(
+                                f"LIVE expiry close failed for"
+                                f" {position.market_id}: {exc}"
+                            )
                 if claimed:
                     await db_manager.release_position_claim(position.id)
                 try:
