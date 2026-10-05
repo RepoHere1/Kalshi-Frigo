@@ -31,10 +31,15 @@ Both are hard limits in `UpDownConfig`. Orders route through the canonical
 """
 import asyncio
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from src.jobs.market_data import Btc15mFeed, SpotFeed, UpDownMarket
+
+# A Kalshi quote older than this is not traded against: the book simply has
+# not repriced yet, so any "edge" versus fresh truth is fiction.
+QUOTE_MAX_AGE_SEC = 30.0
 
 
 @dataclass
@@ -108,6 +113,9 @@ class UpDownSignal:
     notional: float
     seconds_left: Optional[float]
     reason: str
+    # Which truth the score used: kalshi-brti (windowed/avg60/value) or
+    # coinbase-spot. Added for the BRTI feed; defaults keep old rows valid.
+    truth: str = ""
 
     @property
     def actionable(self) -> bool:
@@ -168,11 +176,15 @@ class UpDownTrader:
         feed: Btc15mFeed,
         config: Optional[UpDownConfig] = None,
         db_manager: Any = None,
+        brti: Any = None,
     ):
         self.spot = spot
         self.feed = feed
         self.config = config or UpDownConfig()
         self.db_manager = db_manager
+        # BRTI truth feed (Kalshi's own CF Benchmarks index). None means
+        # Coinbase spot only -- every existing caller keeps working.
+        self.brti = brti
         self._client: Any = None
         self.book = UpDownBook(max_open_notional=self.config.max_open_notional)
 
@@ -195,16 +207,48 @@ class UpDownTrader:
         if not market.tradable or market.target is None:
             self.book.skipped_unquoted += 1
             return None
-        if self.spot.price <= 0 or self.spot.age > self.config.max_spot_age:
-            self.book.skipped_stale += 1
-            return None
+        # A stale Kalshi quote plus a fresh truth is a fake edge: the book
+        # simply hasn't repriced yet. Refuse when the quote itself is old.
+        # Feeds that never fetched (ts == 0, the unit-test shape) skip this:
+        # in production cycle() always fetches before scoring.
+        try:
+            _feed_ts = float(getattr(self.feed, "ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            _feed_ts = 0.0
+        if _feed_ts > 0:
+            try:
+                _quote_age = max(0.0, time.time() - _feed_ts)
+            except (TypeError, ValueError):
+                _quote_age = float("inf")
+            if not getattr(self.feed, "markets", None) or _quote_age > QUOTE_MAX_AGE_SEC:
+                self.book.skipped_stale += 1
+                return None
+        # Truth selection: Kalshi's own BRTI index first (it is the settlement
+        # family -- windowed final-minute average, else trailing avg60, else
+        # live value), Coinbase spot as fallback. Either stale means no trade.
+        truth_price = 0.0
+        truth_kind = ""
+        try:
+            _brti = self.brti
+            if _brti is not None and bool(getattr(_brti, "fresh", False)):
+                truth_price = float(_brti.estimate() or 0.0)
+                if truth_price > 0:
+                    truth_kind = f"kalshi-brti-{_brti.estimate_kind()}"
+        except Exception:  # noqa: BLE001 - truth selection never blocks, falls back
+            truth_price, truth_kind = 0.0, ""
+        if truth_price <= 0:
+            if self.spot.price <= 0 or self.spot.age > self.config.max_spot_age:
+                self.book.skipped_stale += 1
+                return None
+            truth_price = self.spot.price
+            truth_kind = f"coinbase-{self.spot.source or 'spot'}"
+        spot = truth_price
         if (market.seconds_left or 0) < self.config.min_seconds_left:
             # The settlement window is the final 60 seconds. Inside it, spot is
             # no longer leading anything.
             self.book.skipped_too_close += 1
             return None
 
-        spot = self.spot.price
         target = float(market.target)
         delta = round(spot - target, 2)
         # Hard deadband. Settlement is the 60-second average of a composite
@@ -228,9 +272,10 @@ class UpDownTrader:
                 notional=0.0,
                 seconds_left=round(market.seconds_left or 0.0, 1),
                 reason=(
-                    f"spot {spot:,.0f} is {delta:+,.0f} from target {target:,.0f} - "
+                    f"{truth_kind} {spot:,.0f} is {delta:+,.0f} from target {target:,.0f} - "
                     f"inside the ${self.config.noise_usd:,.0f} noise band, no trade"
                 ),
+                truth=truth_kind,
             )
             self.book.signals = [signal]
             return signal
@@ -308,7 +353,7 @@ class UpDownTrader:
         if not side:
             self.book.skipped_no_edge += 1
             reason = (
-                f"spot {spot:,.0f} vs target {target:,.0f} ({delta:+,.0f}): "
+                f"{truth_kind} {spot:,.0f} vs target {target:,.0f} ({delta:+,.0f}): "
                 f"fair {fair:.2f}, Kalshi up "
                 f"{('%.2f' % up_ask) if up_ask is not None else '--'} / down "
                 f"{('%.2f' % down_ask) if down_ask is not None else '--'} - "
@@ -321,7 +366,7 @@ class UpDownTrader:
                 reason += " - entry price in the blocked $0.90+ band"
         else:
             reason = (
-                f"spot {spot:,.0f} vs target {target:,.0f} ({delta:+,.0f}): "
+                f"{truth_kind} {spot:,.0f} vs target {target:,.0f} ({delta:+,.0f}): "
                 f"fair {('%.2f' % (fair if side == 'up' else 1.0 - fair))} vs Kalshi "
                 f"{float(kalshi or 0.0):.2f} on {side.upper()} - edge {edge:+.3f}"
             )
@@ -349,6 +394,7 @@ class UpDownTrader:
             notional=round(float(fill_price or 0.0) * contracts, 2),
             seconds_left=round(market.seconds_left or 0.0, 1),
             reason=reason,
+            truth=truth_kind,
         )
         self.book.signals = [signal]
         return signal
@@ -621,9 +667,20 @@ class UpDownTrader:
                     from src.jobs import live_fees as _live_fees_var
 
                     _tgt = market.target
-                    if _tgt is not None and self.spot.price > 0:
+                    # Variance is measured on the same truth the score uses:
+                    # BRTI estimate when fresh, else retail spot.
+                    _ref = 0.0
+                    try:
+                        _b = getattr(self, "brti", None)
+                        if _b is not None and bool(getattr(_b, "fresh", False)):
+                            _ref = float(_b.estimate() or 0.0)
+                    except Exception:  # noqa: BLE001
+                        _ref = 0.0
+                    if _ref <= 0:
+                        _ref = self.spot.price
+                    if _tgt is not None and _ref > 0:
                         variance_mult = _live_fees_var.variance_clip_multiplier(
-                            self.spot.price - float(_tgt),
+                            _ref - float(_tgt),
                             self.config.noise_usd,
                         )
                         live_budget = round(live_budget * variance_mult, 2)
@@ -779,6 +836,7 @@ class UpDownTrader:
                 "kalshi_up": signal.kalshi_price if signal else None,
                 "live_budget": live_budget,
                 "variance_mult": variance_mult if live else 1.0,
+                "truth_source": (signal.truth if signal else "") or "none",
                 "required_edge": round(
                     self.config.min_edge
                     + (self.config.live_fee_rate if live else 0.0)
@@ -815,7 +873,17 @@ async def run_updown_trader(
     from src.jobs.market_data import MarketDataHub
 
     hub = MarketDataHub()
-    trader = UpDownTrader(hub.spot, hub.feed, config)
+    # BRTI truth: Kalshi's own settlement index over its own socket. Starts
+    # degraded without keys and the trader falls back to Coinbase; never fatal.
+    brti = None
+    try:
+        from src.jobs.brti_feed import BrtiFeed
+
+        brti = BrtiFeed()
+    except Exception as exc:  # noqa: BLE001
+        print(f"BTC 15m: BRTI feed unavailable ({exc}); coinbase-spot only", flush=True)
+        brti = None
+    trader = UpDownTrader(hub.spot, hub.feed, config, brti=brti)
     sleep_for = interval or (config and config.poll_seconds) or 4.0
     started = False
     backoff = 1.0
@@ -825,6 +893,15 @@ async def run_updown_trader(
                 if not started:
                     try:
                         await hub.start()
+                        if brti is not None:
+                            try:
+                                await brti.start()
+                            except Exception as exc2:  # noqa: BLE001 - degraded ok
+                                print(
+                                    f"BTC 15m: BRTI start failed "
+                                    f"({type(exc2).__name__}); coinbase-spot only",
+                                    flush=True,
+                                )
                     except Exception as exc:  # noqa: BLE001 - start may be retried
                         print(
                             f"BTC 15m: market data hub failed to start "
@@ -872,5 +949,10 @@ async def run_updown_trader(
     finally:
         try:
             await hub.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if brti is not None:
+                await brti.stop()
         except Exception:  # noqa: BLE001
             pass

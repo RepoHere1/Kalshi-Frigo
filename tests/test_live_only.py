@@ -183,6 +183,109 @@ def test_settlement_parser_never_invents_a_close():
         is None
     )
 # ---------------------------------------------------------------------------
+# BRTI truth: Kalshi's own settlement index beats retail spot when fresh
+# ---------------------------------------------------------------------------
+def test_brti_parser_reads_flat_and_nested_shapes():
+    from src.jobs.brti_feed import parse_brti_message
+
+    flat = {"value": 86500.5, "avg_60s_data": 86490.0, "source_ts_ms": 1791157700000}
+    out = parse_brti_message(flat)
+    assert out["value"] == 86500.5
+    assert out["avg60"] == 86490.0
+    assert out["source_ts"] == 1791157700.0
+
+    nested = {
+        "data": {
+            "value": "86501.25",
+            "avg_60s_data": {"average": 86491.5},
+            "last_60s_windowed_average_15min": 86495.0,
+        }
+    }
+    out2 = parse_brti_message(nested)
+    assert out2["value"] == 86501.25
+    assert out2["avg60"] == 86491.5
+    assert out2["win_avg"] == 86495.0
+
+    assert parse_brti_message({})["value"] is None
+    assert parse_brti_message("garbage")["value"] is None
+
+
+def test_brti_estimate_prefers_windowed_then_avg60_then_value():
+    from src.jobs.brti_feed import BrtiFeed
+
+    b = BrtiFeed()
+    b.value, b.avg60, b.win_avg = 86500.0, 86490.0, 86495.0
+    assert b.estimate() == 86495.0
+    assert b.estimate_kind() == "windowed-settlement-avg"
+    b.win_avg = 0.0
+    assert b.estimate() == 86490.0
+    assert b.estimate_kind() == "trailing-avg60"
+    b.avg60 = 0.0
+    assert b.estimate() == 86500.0
+
+
+def _brti_fake(price, fresh=True, kind="trailing-avg60"):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        fresh=fresh, estimate=lambda: price, estimate_kind=lambda: kind
+    )
+
+
+def test_evaluate_uses_brti_when_fresh():
+    import time as _time
+
+    from src.jobs.market_data import Btc15mFeed, SpotFeed
+
+    spot = SpotFeed()
+    spot.price = 84000.0  # stale-side decoy: would refuse or flip the side
+    spot.ts = _time.time()
+    feed = Btc15mFeed()
+    feed.ts = _time.time()
+    trader = UpDownTrader(spot, feed, UpDownConfig(), brti=_brti_fake(85000.0))
+    market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0)
+    feed.markets = [market]
+    out = trader.evaluate(market, live=False)
+    assert out is not None and out.truth.startswith("kalshi-brti")
+    assert out.spot == 85000.0
+
+
+def test_evaluate_falls_back_to_coinbase_when_brti_stale():
+    import time as _time
+
+    from src.jobs.market_data import Btc15mFeed, SpotFeed
+
+    spot = SpotFeed()
+    spot.price = 85000.0
+    spot.ts = _time.time()
+    feed = Btc15mFeed()
+    feed.ts = _time.time()
+    trader = UpDownTrader(
+        spot, feed, UpDownConfig(), brti=_brti_fake(85000.0, fresh=False)
+    )
+    market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0)
+    feed.markets = [market]
+    out = trader.evaluate(market, live=False)
+    assert out is not None and out.truth.startswith("coinbase-")
+
+
+def test_stale_quote_is_refused_even_with_fresh_truth():
+    import time as _time
+
+    from src.jobs.market_data import Btc15mFeed, SpotFeed
+
+    spot = SpotFeed()
+    spot.price = 85000.0
+    spot.ts = _time.time()
+    feed = Btc15mFeed()
+    feed.ts = _time.time() - 120.0  # quote 2 minutes old
+    trader = UpDownTrader(spot, feed, UpDownConfig(), brti=_brti_fake(85000.0))
+    market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0)
+    feed.markets = [market]
+    assert trader.evaluate(market, live=False) is None
+
+
+# ---------------------------------------------------------------------------
 # DB migration: fee_paid is additive, DRY rows read back unaffected
 # ---------------------------------------------------------------------------
 def test_fee_column_migrates_and_defaults_to_zero(tmp_path):

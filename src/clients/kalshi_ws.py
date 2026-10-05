@@ -42,7 +42,11 @@ CHANNEL_ORDERBOOK_DELTA = "orderbook_delta"
 CHANNEL_TICKER = "ticker"
 CHANNEL_TRADE = "trade"
 CHANNEL_FILL = "fill"
-ALL_CHANNELS = {CHANNEL_ORDERBOOK_DELTA, CHANNEL_TICKER, CHANNEL_TRADE, CHANNEL_FILL}
+# CF Benchmarks index values (e.g. BRTI): ~1s ticks with trailing 60s and
+# final-minute windowed averages. Subscribed by index_ids, not tickers.
+CHANNEL_CF_BENCHMARKS = "cfbenchmarks_value"
+ALL_CHANNELS = {CHANNEL_ORDERBOOK_DELTA, CHANNEL_TICKER, CHANNEL_TRADE, CHANNEL_FILL,
+                CHANNEL_CF_BENCHMARKS}
 
 # Reconnect parameters
 _INITIAL_BACKOFF_S = 1.0
@@ -71,6 +75,8 @@ class _SubscriptionState:
     """Tracks which tickers/channels are actively subscribed."""
     tickers: Set[str] = field(default_factory=set)
     channels: Set[str] = field(default_factory=set)
+    # CF Benchmarks index subscriptions survive reconnects too.
+    index_ids: Set[str] = field(default_factory=set)
 
 
 class KalshiWebSocket(TradingLoggerMixin):
@@ -133,6 +139,7 @@ class KalshiWebSocket(TradingLoggerMixin):
             CHANNEL_ORDERBOOK_DELTA: [],
             CHANNEL_TRADE: [],
             CHANNEL_FILL: [],
+            CHANNEL_CF_BENCHMARKS: [],
         }
 
         # Load RSA private key on init
@@ -251,6 +258,8 @@ class KalshiWebSocket(TradingLoggerMixin):
                         list(self._sub_state.tickers),
                         list(self._sub_state.channels),
                     )
+                if self._sub_state.index_ids:
+                    await self.subscribe_indices(list(self._sub_state.index_ids))
                 self.logger.info("Reconnected and resubscribed successfully")
                 return
             except Exception as exc:
@@ -309,7 +318,27 @@ class KalshiWebSocket(TradingLoggerMixin):
             channels=channels,
         )
 
-    async def unsubscribe(self, tickers: List[str]) -> None:
+    async def subscribe_indices(self, index_ids: List[str]) -> None:
+        """Subscribe to CF Benchmarks index values (e.g. ["BRTI"]).
+
+        Unlike market channels these are keyed by index_ids, not tickers.
+        """
+        if not self.is_connected:
+            raise RuntimeError("Cannot subscribe: WebSocket is not connected")
+        msg = {
+            "id": self._next_msg_id(),
+            "cmd": "subscribe",
+            "params": {
+                "channels": [CHANNEL_CF_BENCHMARKS],
+                "index_ids": list(index_ids),
+            },
+        }
+        await self._ws.send(json.dumps(msg))
+        self._sub_state.index_ids.update(index_ids)
+        self._sub_state.channels.add(CHANNEL_CF_BENCHMARKS)
+        self.logger.info("Subscribed to CF Benchmarks indices", index_ids=index_ids)
+
+    async def unsubscribe(self, tickers: List[str]):
         """
         Unsubscribe from all channels for the given tickers.
 
@@ -357,6 +386,11 @@ class KalshiWebSocket(TradingLoggerMixin):
         self._callbacks[CHANNEL_FILL].append(callback)
         return callback
 
+    def on_cf_benchmarks(self, callback: MessageCallback) -> MessageCallback:
+        """Register a callback for CF Benchmarks index value messages."""
+        self._callbacks[CHANNEL_CF_BENCHMARKS].append(callback)
+        return callback
+
     # ------------------------------------------------------------------
     # Message dispatch
     # ------------------------------------------------------------------
@@ -378,6 +412,8 @@ class KalshiWebSocket(TradingLoggerMixin):
             "orderbook_snapshot": CHANNEL_ORDERBOOK_DELTA,
             "trade": CHANNEL_TRADE,
             "fill": CHANNEL_FILL,
+            "cfbenchmarks_value": CHANNEL_CF_BENCHMARKS,
+            "cfbenchmarks_value_indexlist": CHANNEL_CF_BENCHMARKS,
         }
 
         event_bus_map: Dict[str, str] = {
@@ -386,6 +422,7 @@ class KalshiWebSocket(TradingLoggerMixin):
             "orderbook_snapshot": EVENT_ORDERBOOK_UPDATE,
             "trade": EVENT_TRADE_EXECUTED,
             "fill": EVENT_FILL_RECEIVED,
+            "cfbenchmarks_value": EVENT_PRICE_UPDATE,
         }
 
         channel = channel_map.get(msg_type)
