@@ -153,12 +153,37 @@ def test_orphan_holding_is_sold_at_the_bid(db):
     assert client.placed[0]["count"] == 9
 
 
-def test_short_is_flagged_not_covered_by_default(db):
+def test_a_negative_position_with_a_no_buy_is_a_long_no_and_is_sold(db):
+    """Kalshi reports position_fp in YES terms: negative = long NO.
+
+    This is the real 04:30 case - a NO fill bought 9.47 NO, Kalshi showed
+    -9.47, and it must be flattened by SELLING NO at the NO bid.
+    """
+    client = _FakeClient(
+        {"KX04BUCKET-30": -9.47},
+        fills={
+            "KX04BUCKET-30": [
+                {"ticker": "KX04BUCKET-30", "side": "no", "action": "buy", "created_time": "2026-10-05T08:16:16Z"}
+            ]
+        },
+    )
+    summary = asyncio.run(live_reaper.reap_live_book(db, client))
+    assert summary["shorts_flagged"] == []
+    assert len(summary["liquidated"]) == 1
+    sold = summary["liquidated"][0]
+    assert sold["side"] == "no"
+    assert sold["contracts"] == 9
+    assert client.placed[0]["action"] == "sell"
+    assert client.placed[0]["side"] == "no"
+
+
+def test_a_naked_short_is_flagged_not_covered_by_default(db):
+    """Last fill sold YES against a negative position: that IS a naked short."""
     client = _FakeClient(
         {"KXDJIA-SHORT": -4.0},
         fills={
             "KXDJIA-SHORT": [
-                {"ticker": "KXDJIA-SHORT", "side": "no", "action": "sell", "created_time": "2026-10-04T10:00:00Z"}
+                {"ticker": "KXDJIA-SHORT", "side": "yes", "action": "sell", "created_time": "2026-10-04T10:00:00Z"}
             ]
         },
     )
@@ -169,12 +194,12 @@ def test_short_is_flagged_not_covered_by_default(db):
     assert client.placed == [], "covering a short spends real cash and is an operator call"
 
 
-def test_short_is_covered_when_the_operator_opts_in(db):
+def test_naked_short_is_covered_when_the_operator_opts_in(db):
     client = _FakeClient(
         {"KXDJIA-SHORT": -4.0},
         fills={
             "KXDJIA-SHORT": [
-                {"ticker": "KXDJIA-SHORT", "side": "no", "action": "sell", "created_time": "2026-10-04T10:00:00Z"}
+                {"ticker": "KXDJIA-SHORT", "side": "yes", "action": "sell", "created_time": "2026-10-04T10:00:00Z"}
             ]
         },
     )
@@ -185,12 +210,22 @@ def test_short_is_covered_when_the_operator_opts_in(db):
     assert client.placed[0]["count"] == 4
 
 
-def test_unknown_side_is_left_alone(db):
-    client = _FakeClient({"KXMYSTERY-1": 5.0}, fills={})
+def test_dust_under_one_contract_is_reported_not_sold(db):
+    client = _FakeClient({"KXDUST-1": 0.80}, fills={})
     summary = asyncio.run(live_reaper.reap_live_book(db, client))
     assert summary["liquidated"] == []
-    assert any("KXMYSTERY-1" in e for e in summary["errors"])
+    assert summary["dust"] == 1
+    assert summary["dust_tickers"][0]["ticker"] == "KXDUST-1"
     assert client.placed == []
+
+
+def test_a_long_yes_holding_is_sold_without_needing_fills(db):
+    """The position itself names the side; fills are only the short tiebreak."""
+    client = _FakeClient({"KXORPHAN-YES": 9.40}, fills={})
+    summary = asyncio.run(live_reaper.reap_live_book(db, client))
+    assert len(summary["liquidated"]) == 1
+    assert summary["liquidated"][0]["side"] == "yes"
+    assert client.placed[0]["side"] == "yes"
 
 
 def test_liquidation_is_bounded_per_pass(db):

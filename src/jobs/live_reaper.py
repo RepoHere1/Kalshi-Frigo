@@ -61,17 +61,49 @@ ALLOW_SHORTS = str(os.environ.get("LIVE_REAP_SHORTS", "0")).lower() in (
 _LAST_SUMMARY: Dict[str, Any] = {}
 
 
+def _summary_path() -> str:
+    """Where the pass is written so the dashboard process can read it.
+
+    The reaper runs in the trader process and the journal endpoint runs in the
+    web process; in-memory state is invisible across them even on one box.
+    """
+    import os
+
+    db_path = os.environ.get("DB_PATH", "trading_system.db")
+    return os.path.join(os.path.dirname(os.path.abspath(db_path)), "live_reaper_summary.json")
+
+
+def _persist(summary: Dict[str, Any]) -> None:
+    try:
+        import json
+
+        with open(_summary_path(), "w", encoding="utf-8") as fh:
+            json.dump(summary, fh, default=str)
+    except Exception as exc:  # noqa: BLE001 - visibility never blocks a pass
+        logger.warning(f"Reaper summary not persisted: {type(exc).__name__}: {exc}")
+
+
 def last_summary() -> Dict[str, Any]:
-    """The most recent pass, for /api/live/journal."""
-    return dict(_LAST_SUMMARY)
+    """The most recent pass, for /api/live/journal. File first: the reaper and
+    the endpoint are different processes."""
+    try:
+        import json
+
+        with open(_summary_path(), "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:  # noqa: BLE001 - no pass yet, or unreadable
+        return dict(_LAST_SUMMARY)
 
 
 async def _holdings(client: Any) -> tuple[Dict[str, float], int]:
-    """Ticker -> shares actually held (nonzero only), plus the flat-row count.
+    """Ticker -> net YES shares held (nonzero only), plus the flat-row count.
 
-    Kalshi returns a row per market the account ever touched; `position_fp`
-    of 0.00 is not a position and is deliberately dropped from the map so it
-    can never be mistaken for something to sell.
+    Kalshi reports `position_fp` in YES contracts: positive is long YES,
+    negative is long NO. Both are holdings to flatten by SELLING that side -
+    a negative number is not a naked short. Kalshi also returns a row per
+    market the account ever touched; `position_fp` of 0.00 is not a position,
+    is dropped from the map so it can never be mistaken for something to sell,
+    and is only counted.
     """
     payload = await client.get_positions()
     held: Dict[str, float] = {}
@@ -94,30 +126,20 @@ async def _holdings(client: Any) -> tuple[Dict[str, float], int]:
     return held, flat
 
 
-async def _held_side(client: Any, ticker: str) -> Optional[str]:
-    """Which side is actually held, from the newest fill on that ticker.
-
-    /portfolio/positions reports a signed share count but not the side, and
-    selling the side you do not hold is rejected by Kalshi. The fill history
-    is the only authority, so it is asked rather than guessed.
+async def _newest_fill(client: Any, ticker: str) -> Optional[Dict[str, Any]]:
+    """The newest fill on a ticker, or None. The side/action pair is how a
+    genuinely naked short is told apart from an ordinary long NO holding:
+    a long NO's last fill is a BUY of no, a naked short's is a SELL of yes.
     """
     try:
         payload = await client.get_fills(ticker=ticker, limit=50)
-    except Exception as exc:  # noqa: BLE001 - unknown side means no trade
+    except Exception as exc:  # noqa: BLE001 - unknown history, not a short
         logger.warning(f"Reaper cannot read fills for {ticker}: {exc}")
         return None
-    rows = payload.get("fills") or []
+    rows = [r for r in (payload.get("fills") or []) if isinstance(r, dict)]
     if not rows:
         return None
-
-    def _sort_key(f: Dict[str, Any]) -> str:
-        return str(f.get("created_time") or "")
-
-    for fill in sorted(rows, key=_sort_key, reverse=True):
-        side = str(fill.get("side") or "").strip().lower()
-        if side in ("yes", "no"):
-            return side
-    return None
+    return max(rows, key=lambda r: str(r.get("created_time") or ""))
 
 
 async def _orphan_sell(client: Any, ticker: str, side: str, contracts: int) -> Dict[str, Any]:
@@ -206,6 +228,8 @@ async def reap_live_book(
         "phantom_tickers": [],
         "liquidated": [],
         "shorts_flagged": [],
+        "dust": 0,
+        "dust_tickers": [],
         "protected": [],
         "errors": [],
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -278,30 +302,51 @@ async def reap_live_book(
 
     # Pass 2: Kalshi holdings with no local row protecting them. Real money,
     # unmanaged, invisible to every exit path.
+    #
+    # Kalshi expresses position_fp in YES contracts, so a negative number is a
+    # long NO holding, not a naked short: it is flattened by SELLING NO. A
+    # genuine naked short (YES sold without ever holding it) leaves the same
+    # negative number, so the newest fill is the tiebreak - a last fill of
+    # "sell yes" against a negative position is the short, and covering it
+    # spends real cash, so it is reported unless the operator opted in.
     orphans = {t: q for t, q in held.items() if t not in protected}
-    for ticker, qty in sorted(orphans.items())[:max_liquidations]:
-        side = await _held_side(client, ticker)
-        if side is None:
-            summary["errors"].append(f"{ticker}: held side unknown, left alone")
+    for ticker, net_yes in sorted(orphans.items())[:max_liquidations]:
+        held_side = "yes" if net_yes > 0 else "no"
+        contracts = int(abs(net_yes))
+        if contracts < 1:
+            # Under one whole contract (a dust position from rounding): there
+            # is nothing to sell, so say so instead of pretending to act.
+            summary["dust"] += 1
+            summary["dust_tickers"].append(
+                {"ticker": ticker, "shares": net_yes, "side": held_side}
+            )
+            logger.info(
+                f"REAPER left dust on {ticker}: {net_yes:.2f} net {held_side.upper()} "
+                f"(< 1 contract, unsellable)"
+            )
             continue
-        if qty < 0:
-            contracts = int(round(abs(qty)))
+        fill = await _newest_fill(client, ticker)
+        fill_action = str((fill or {}).get("action") or "").strip().lower()
+        fill_side = str((fill or {}).get("side") or "").strip().lower()
+        naked_short = net_yes < 0 and fill_action == "sell" and fill_side == "yes"
+        if naked_short:
             if not allow_shorts:
                 summary["shorts_flagged"].append(
-                    {"ticker": ticker, "shares": qty, "side": side}
+                    {
+                        "ticker": ticker,
+                        "net_yes": net_yes,
+                        "detail": "last fill was a SELL of yes against a negative position",
+                    }
                 )
                 logger.warning(
-                    f"REAPER flagged SHORT {ticker}: {qty:.2f} {side.upper()} "
-                    f"({contracts} contracts) held on Kalshi with no local row. "
-                    f"Set LIVE_REAP_SHORTS=1 to cover it automatically."
+                    f"REAPER flagged NAKED SHORT {ticker}: {net_yes:.2f} net YES "
+                    f"with no local row (last fill: sold YES we did not hold). "
+                    f"Set LIVE_REAP_SHORTS=1 to buy it back automatically."
                 )
                 continue
-            result = await _short_cover(client, ticker, side, contracts)
+            result = await _short_cover(client, ticker, "yes", contracts)
         else:
-            contracts = int(qty)
-            if contracts < 1:
-                continue
-            result = await _orphan_sell(client, ticker, side, contracts)
+            result = await _orphan_sell(client, ticker, held_side, contracts)
         if result.get("ok"):
             summary["liquidated"].append(
                 {
@@ -335,6 +380,7 @@ async def reap_live_book(
 
     global _LAST_SUMMARY
     _LAST_SUMMARY = summary
+    _persist(summary)
     logger.info(
         f"LIVE reaper pass: {summary['phantom_closed']} phantom rows closed, "
         f"{len(summary['liquidated'])} orphan holdings liquidated, "

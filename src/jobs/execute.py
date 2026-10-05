@@ -287,6 +287,62 @@ async def execute_position(
         return False
 
 
+async def _live_holding_yes(kalshi_client, ticker: str):
+    """Kalshi's net YES shares for a ticker, or None when it cannot be read.
+
+    Kalshi expresses position_fp in YES contracts: positive is long YES,
+    negative is long NO.
+    """
+    try:
+        raw = await kalshi_client.get_positions(ticker=ticker)
+    except Exception:  # noqa: BLE001 - unknown, treated as "cannot prove"
+        return None
+    for bucket in ("market_positions", "event_positions"):
+        for entry in (raw or {}).get(bucket) or []:
+            if (entry.get("ticker") or entry.get("event_ticker")) != ticker:
+                continue
+            try:
+                return float(entry.get("position_fp") or 0.0)
+            except (TypeError, ValueError):
+                return None
+    return 0.0
+
+
+async def _confirm_live_sell(kalshi_client, position, before, wait_seconds=8.0, logger=None):
+    """LIVE-only: did the sell actually leave the account?
+
+    A resting limit sell is not a sale. Closing the local row on submission
+    claimed P&L and freed the slot for a trade Kalshi had not made, which is
+    how a real holding ended up with no local row tracking it at all. The
+    holding is the only authority: it must shrink toward zero before the
+    caller is told the exit happened. An unreadable holding is NOT a fill.
+    """
+    import asyncio as _asyncio
+
+    deadline = float(wait_seconds)
+    while True:
+        held = await _live_holding_yes(kalshi_client, position.market_id)
+        if held is None:
+            if logger:
+                logger.warning(
+                    f"LIVE sell of {position.market_id}: holding unreadable, "
+                    f"treated as NOT filled so the row stays open"
+                )
+            return False
+        moved = (
+            abs(held) < abs(before) - 1e-9
+            if before is not None
+            else abs(held) < int(position.quantity or 0) - 1e-9
+        )
+        if moved:
+            return True
+        if deadline <= 0:
+            return False
+        step = min(2.5, deadline)
+        await _asyncio.sleep(step)
+        deadline -= step
+
+
 async def place_sell_limit_order(
     position: Position,
     limit_price: float,
@@ -366,6 +422,31 @@ async def place_sell_limit_order(
             logger.warning(f"⚠️  Skipping sell for {position.market_id}: {reason}")
             return False
 
+        # LIVE-ONLY: Kalshi accepts a sell of contracts the account does not
+        # hold and turns it into a negative position - a real short created by
+        # a local row that no longer has anything behind it. The holding is
+        # read first and the sell refused unless it can cover the quantity.
+        held_before = None
+        if live_mode:
+            held_before = await _live_holding_yes(kalshi_client, position.market_id)
+            want = int(position.quantity or 0)
+            if held_before is None:
+                logger.warning(
+                    f"⚠️  Refusing LIVE sell for {position.market_id}: Kalshi holding "
+                    f"unreadable, so the sell cannot be proven safe"
+                )
+                return False
+            held_side = "YES" if held_before > 0 else "NO"
+            covered = held_before if side == "yes" else -held_before
+            if covered < want:
+                logger.warning(
+                    f"⚠️  Refusing LIVE sell for {position.market_id}: local row says "
+                    f"{want} {side.upper()} but Kalshi holds {abs(held_before):.2f} net "
+                    f"{held_side}. Selling anyway would open a real short; the local "
+                    f"row is stale and the reaper will close it."
+                )
+                return False
+
         verb = "LIVE SELL LIMIT ORDER" if live_mode else "DRY SELL LIMIT ORDER"
         logger.info(
             f"🎯 Placing {verb}: {position.quantity} {side.upper()} at "
@@ -387,6 +468,29 @@ async def place_sell_limit_order(
         logger.info(f"   Side: {side.upper()} (selling {position.quantity} shares)")
         logger.info(f"   Limit Price: {request.no_price or request.yes_price}¢")
         logger.info(f"   Proceeds: ${request.notional:.2f}")
+
+        if live_mode:
+            # LIVE-only: a resting limit sell is not a sale. Callers credit
+            # P&L and close the local row on a True return, so True now means
+            # the holding actually shrank at Kalshi. Unfilled -> cancel the
+            # resting order and report False, leaving the row open for the
+            # next cycle to retry. DRY is untouched: its broker fills at once.
+            filled = await _confirm_live_sell(
+                kalshi_client, position, held_before, wait_seconds=8.0, logger=logger
+            )
+            if not filled:
+                try:
+                    await kalshi_client.cancel_order(order_id)
+                    logger.warning(
+                        f"⏳ LIVE sell of {position.market_id} did not fill in 8s; "
+                        f"cancelled, position stays open"
+                    )
+                except Exception as exc2:  # noqa: BLE001 - best effort cancel
+                    logger.warning(
+                        f"LIVE sell cancel failed for {position.market_id}: {exc2}"
+                    )
+                return False
+            logger.info(f"✅ LIVE SELL CONFIRMED FILLED for {position.market_id}")
         return True
 
     except Exception as e:
