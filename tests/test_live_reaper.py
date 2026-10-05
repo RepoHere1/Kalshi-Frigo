@@ -57,7 +57,7 @@ class _FakeClient:
     async def get_market(self, ticker):
         return {"market": self._market}
 
-    async def cancel_order(self, order_id):
+    async def cancel_order(self, order_id, market_ticker=None):
         self.cancelled.append(order_id)
         return {}
 

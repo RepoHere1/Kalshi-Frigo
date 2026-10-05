@@ -217,11 +217,11 @@ async def _orphan_sell(client: Any, ticker: str, side: str, contracts: int) -> D
     }
 
 
-async def _cancel(client: Any, order_id: str) -> None:
+async def _cancel(client: Any, order_id: str, ticker: str) -> None:
     if not order_id:
         return
     try:
-        await client.cancel_order(order_id)
+        await client.cancel_order(order_id, market_ticker=ticker)
     except Exception as exc:  # noqa: BLE001 - best effort; the cooldown stops the loop
         logger.warning(f"Reaper cancel of {order_id} failed: {exc}")
 
@@ -419,7 +419,7 @@ async def reap_live_book(
                             "reason": "order did not fill; holding left as is",
                         }
                     )
-                    await _cancel(client, str(result.get("order_id") or ""))
+                    await _cancel(client, str(result.get("order_id") or ""), ticker)
                     logger.warning(
                         f"REAPER could not sell orphan {ticker} "
                         f"({abs(net_yes):.2f} net {held_side.upper()}): the order did "

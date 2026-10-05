@@ -401,78 +401,65 @@ def test_fee_column_migrates_and_defaults_to_zero(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Item 5: 18 UTC is a hard skip in LIVE, never in DRY
+# DRY parity: LIVE runs DRY's decision rule, plus the one cost DRY does not
+# have (the exchange fee). No LIVE-only bands, no hour bans, no extra refusals.
 # ---------------------------------------------------------------------------
-def test_live_session_skip_only_hits_18_utc():
-    assert live_fees.live_session_skip(datetime(2026, 10, 4, 18, 59, tzinfo=timezone.utc))
-    assert not live_fees.live_session_skip(datetime(2026, 10, 4, 17, 59, tzinfo=timezone.utc))
-    assert not live_fees.live_session_skip(datetime(2026, 10, 4, 19, 0, tzinfo=timezone.utc))
+def test_live_takes_everything_dry_takes_except_at_the_fee_bar(monkeypatch):
+    """Same market, both books: DRY acts, and LIVE acts whenever the fee bar
+    is cleared. The only difference permitted is the fee."""
+    import src.jobs.ladder_trader as lt
 
-
-def test_hard_skip_refuses_live_entries_and_never_touches_dry(monkeypatch):
-    monkeypatch.setattr(live_fees, "live_session_skip", lambda now=None: True)
+    # In-band price (no surcharge), 15c of modelled edge: both books act.
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.60)
+    market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0)
     trader = _scorer()
+    trader.feed.markets = [market]
+    dry = trader.evaluate(market, live=False)
+    live = trader.evaluate(market, live=True)
+    assert dry is not None and dry.actionable
+    assert live is not None and live.actionable
+    assert dry.side == live.side
+
+
+def test_live_refuses_only_what_the_fee_makes_unprofitable(monkeypatch):
+    """6c of edge: DRY takes it, LIVE does not, and the only reason is cost."""
+    import src.jobs.ladder_trader as lt
+
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.53)
+    market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0)
+    trader = _scorer()
+    trader.feed.markets = [market]
+    dry = trader.evaluate(market, live=False)
+    live = trader.evaluate(market, live=True)
+    assert dry is not None and dry.actionable, "DRY takes the in-band edge"
+    assert (live is None or not live.actionable), "the fee is what refuses it"
+
+
+def test_live_trades_the_18_utc_hour_dry_does():
+    """The losing-hour ban is gone: DRY trades it, LIVE trades it."""
     market = _quoted_market(yes_ask=0.40, no_ask=0.60, target=84000.0)
+    trader = _scorer()
     trader.feed.markets = [market]
     out = trader.evaluate(market, live=True)
-    assert out is not None and not out.actionable
-    assert "hard skip" in out.reason
-    out_dry = trader.evaluate(market, live=False)
-    assert out_dry is not None and out_dry.actionable
-
-
-# ---------------------------------------------------------------------------
-# Item 3: LIVE entries only at $0.10-$0.50; DRY keeps its old bands
-# ---------------------------------------------------------------------------
-def test_live_refuses_entries_above_the_band_but_dry_takes_them():
-    market = _quoted_market(yes_ask=0.60, no_ask=0.40, target=84000.0)
-    trader = _scorer()
-    trader.feed.markets = [market]
-    out_live = trader.evaluate(market, live=True)
-    assert out_live is not None and not out_live.actionable
-    out_dry = trader.evaluate(market, live=False)
-    assert out_dry is not None and out_dry.actionable
-    assert out_dry.side == "up"
-
-
-def test_live_refuses_entries_below_the_band():
-    market = _quoted_market(yes_ask=0.06, no_ask=0.94, target=84000.0)
-    trader = _scorer()
-    trader.feed.markets = [market]
-    out_live = trader.evaluate(market, live=True)
-    assert out_live is not None and not out_live.actionable
-
-
-# ---------------------------------------------------------------------------
-# Item 4a: the final 60s opens only for a fresh windowed settlement average
-# ---------------------------------------------------------------------------
-def test_final_minute_entry_needs_windowed_brti_in_live():
-    market = _quoted_market(yes_ask=0.40, no_ask=0.60, target=84000.0, seconds_left=30)
-    # Coinbase-only truth inside the window: refused, as always.
-    trader = _scorer()
-    trader.feed.markets = [market]
-    assert trader.evaluate(market, live=True) is None
-    # A stale/avg60 BRTI is not the settlement number: still refused.
-    trader2 = _scorer()
-    trader2.feed.markets = [market]
-    trader2.brti = _brti_fake(85100.0, kind="trailing-avg60")
-    assert trader2.evaluate(market, live=True) is None
-    # A fresh windowed-settlement average IS the settlement, accumulating:
-    # the one reading strong enough to trade the last minute on.
-    trader3 = _scorer()
-    trader3.feed.markets = [market]
-    trader3.brti = _brti_fake(85100.0, kind="windowed-settlement-avg")
-    out = trader3.evaluate(market, live=True)
     assert out is not None and out.actionable
-    assert out.truth.startswith("kalshi-brti")
 
 
-def test_final_minute_window_never_opens_for_dry():
+def test_both_books_refuse_the_final_minute_alike():
     market = _quoted_market(yes_ask=0.40, no_ask=0.60, target=84000.0, seconds_left=30)
     trader = _scorer()
     trader.feed.markets = [market]
     trader.brti = _brti_fake(85100.0, kind="windowed-settlement-avg")
+    assert trader.evaluate(market, live=True) is None
     assert trader.evaluate(market, live=False) is None
+
+
+def test_both_books_use_the_same_entry_ceiling():
+    market = _quoted_market(yes_ask=0.92, no_ask=0.08, target=84000.0)
+    trader = _scorer()
+    trader.feed.markets = [market]
+    for live in (False, True):
+        out = trader.evaluate(market, live=live)
+        assert out is None or not out.actionable, f"live={live} took a 92c entry"
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +475,7 @@ class _FakeMakerClient:
     async def get_orders(self, ticker=None, status=None):
         return {"orders": list(self._resting)}
 
-    async def cancel_order(self, order_id):
+    async def cancel_order(self, order_id, market_ticker=None):
         self.cancelled.append(str(order_id))
         self._resting = []
         return {}

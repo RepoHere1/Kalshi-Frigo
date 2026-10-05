@@ -62,7 +62,7 @@ class _Client:
         self.orders.append(kw)
         return {"order": {"order_id": "oid-sell", "status": "resting"}}
 
-    async def cancel_order(self, order_id):
+    async def cancel_order(self, order_id, market_ticker=None):
         self.cancelled.append(order_id)
         return {}
 

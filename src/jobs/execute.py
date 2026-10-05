@@ -93,7 +93,9 @@ async def _confirm_maker_fill(
     if await _resting():
         # Never filled: cancel so nothing can execute behind the local book.
         try:
-            await kalshi_client.cancel_order(order_id)
+            await kalshi_client.cancel_order(
+                order_id, market_ticker=position.market_id
+            )
         except Exception as exc:  # noqa: BLE001 - cancel is best-effort
             logger.warning(
                 f"Maker entry cancel failed for {position.market_id}: {exc}"
@@ -480,7 +482,9 @@ async def place_sell_limit_order(
             )
             if not filled:
                 try:
-                    await kalshi_client.cancel_order(order_id)
+                    await kalshi_client.cancel_order(
+                        order_id, market_ticker=position.market_id
+                    )
                     logger.warning(
                         f"⏳ LIVE sell of {position.market_id} did not fill in 8s; "
                         f"cancelled, position stays open"

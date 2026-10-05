@@ -28,6 +28,16 @@ class KalshiAPIError(Exception):
     pass
 
 
+
+
+def _as_float_safe(value: Any) -> float:
+    """Fixed-point strings ("9.40") and numbers both become a float."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class KalshiClient(TradingLoggerMixin):
     """
     Kalshi API client for automated trading.
@@ -399,28 +409,122 @@ class KalshiClient(TradingLoggerMixin):
         Returns:
             Order response
         """
-        order_data = {
+        # Kalshi's legacy write endpoint is gone: POST /portfolio/orders
+        # answers HTTP 410 deprecated_v1_order_endpoint on every order. This
+        # legacy-shaped call is therefore translated into the V2 request and
+        # the answer translated back, so every caller - entries, maker waits,
+        # sells, the reaper - reaches the exchange without touching its own
+        # code.
+        leg_price = yes_price if yes_price is not None else no_price
+        if leg_price is None:
+            raise ValueError("a V2 order needs an explicit price")
+        leg_price_dollars = int(leg_price) / 100.0
+        # (action, side) -> the direction the order is actually long:
+        # buy yes and sell no are long yes; buy no and sell yes are long no.
+        outcome_side = (
+            "yes" if (action == "buy") == (str(side).lower() == "yes") else "no"
+        )
+        # A resting limit wants good_till_canceled, with post_only so it can
+        # never cross silently; a market-style order wants an immediate fill.
+        resting = str(type_).lower() == "limit"
+        response = await self.place_order_v2(
+            ticker=ticker,
+            client_order_id=client_order_id,
+            outcome_side=outcome_side,
+            price_dollars=leg_price_dollars,
+            count=int(count),
+            post_only=resting,
+            time_in_force="good_till_canceled" if resting else "fill_or_kill",
+        )
+        filled = _as_float_safe(response.get("fill_count"))
+        return {
+            "order": {
+                "order_id": response.get("order_id", ""),
+                "client_order_id": response.get("client_order_id", client_order_id),
+                "ticker": ticker,
+                "side": str(side).lower(),
+                "action": action,
+                "count": count,
+                "type": type_,
+                "status": "filled" if filled > 0 else "resting",
+                "yes_price": yes_price,
+                "no_price": no_price,
+                "create_time": response.get("ts_ms"),
+            },
+            "fill_count": filled,
+            "remaining_count": _as_float_safe(response.get("remaining_count")),
+            "average_fill_price": _as_float_safe(response.get("average_fill_price")),
+            "average_fee_paid": _as_float_safe(response.get("average_fee_paid")),
+        }
+    
+    # ------------------------------------------------------------------
+    # V2 order endpoints. Writes moved to /portfolio/events/orders; the
+    # legacy write path is gone (HTTP 410). Reads (/portfolio/orders/*) are
+    # unchanged.
+    #
+    # V2 has no (action, side) pair: one book side and one YES-leg price.
+    #   buy  yes -> bid @ p      sell yes -> ask @ p
+    #   sell no  -> bid @ (1-p)  buy  no  -> ask @ (1-p)
+    # (Kalshi "Order direction": bid == long yes, ask == long no, and a no-leg
+    # price p is the yes-leg price 1-p.)
+    # ------------------------------------------------------------------
+    async def place_order_v2(
+        self,
+        *,
+        ticker: str,
+        client_order_id: str,
+        outcome_side: str,
+        price_dollars: float,
+        count: int,
+        post_only: bool = False,
+        time_in_force: str = "fill_or_kill",
+        reduce_only: bool = False,
+    ) -> Dict[str, Any]:
+        """Place one order on the V2 event-order endpoint.
+
+        `price_dollars` is the price of `outcome_side` in dollars (a no at
+        30c is passed as 0.30 and converted internally to the 0.70 yes-leg
+        price). `post_only` rejects the order if it would cross, which is
+        what makes an entry a maker order instead of a hidden taker.
+        """
+        outcome = str(outcome_side or "yes").strip().lower()
+        if outcome not in ("yes", "no"):
+            raise ValueError(f"outcome_side must be yes or no, got {outcome_side!r}")
+        price = float(price_dollars)
+        if outcome == "no":
+            price = 1.0 - price
+        payload = {
             "ticker": ticker,
             "client_order_id": client_order_id,
-            "side": side,
-            "action": action,
-            "count": count,
-            "type": type_
+            "side": "bid" if outcome == "yes" else "ask",
+            "count": f"{int(count)}.00",
+            "price": f"{price:.4f}",
+            "time_in_force": time_in_force,
+            "self_trade_prevention_type": "taker_at_cross",
+            "post_only": bool(post_only),
         }
-        
-        if yes_price is not None:
-            order_data["yes_price"] = yes_price
-        if no_price is not None:
-            order_data["no_price"] = no_price
-        if expiration_ts:
-            order_data["expiration_ts"] = expiration_ts
-        
+        if reduce_only:
+            payload["reduce_only"] = True
         return await self._make_authenticated_request(
-            "POST", "/trade-api/v2/portfolio/orders", json_data=order_data
+            "POST", "/trade-api/v2/portfolio/events/orders", json_data=payload
         )
-    
-    async def cancel_order(self, order_id: str) -> Dict[str, Any]:
-        """Cancel an order."""
+
+    async def cancel_order(
+        self, order_id: str, market_ticker: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Cancel a resting order.
+
+        V2 lives at /portfolio/events/orders/{id} and auto-routes only when
+        `market_ticker` is supplied - an order_id alone cannot identify the
+        exchange shard. Without a ticker the legacy path is used, which is
+        what every pre-V2 caller did.
+        """
+        if market_ticker:
+            return await self._make_authenticated_request(
+                "DELETE",
+                f"/trade-api/v2/portfolio/events/orders/{order_id}",
+                params={"market_ticker": market_ticker},
+            )
         return await self._make_authenticated_request(
             "DELETE", f"/trade-api/v2/portfolio/orders/{order_id}"
         )

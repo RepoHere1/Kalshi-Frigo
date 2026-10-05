@@ -259,58 +259,10 @@ class UpDownTrader:
         # strongest signal this strategy gets -- allowed in LIVE only. DRY
         # keeps the historic 45s window, and any non-windowed truth stays out.
         if (market.seconds_left or 0) < self.config.min_seconds_left:
-            _late_ok = False
-            if live:
-                try:
-                    _b = getattr(self, "brti", None)
-                    _late_ok = bool(
-                        _b is not None
-                        and getattr(_b, "fresh", False)
-                        and _b.estimate_kind() == "windowed-settlement-avg"
-                        and float(market.seconds_left or 0.0) >= 15.0
-                    )
-                except Exception:  # noqa: BLE001 - no exception buys an entry
-                    _late_ok = False
-            if not _late_ok:
                 # The settlement window is the final 60 seconds. Inside it,
                 # spot is no longer leading anything.
                 self.book.skipped_too_close += 1
                 return None
-
-        # LIVE-ONLY hard session skip (item 5): the 18 UTC hour lost money in
-        # the forever log (17 trades, 41.2%, -$2.70). Extra edge still paid
-        # the fee on a coin flip, so LIVE sits the hour out entirely. DRY
-        # never takes this branch and still trades it.
-        if live:
-            try:
-                from src.jobs import live_fees as _live_fees_skip
-
-                if _live_fees_skip.live_session_skip():
-                    self.book.skipped_no_edge += 1
-                    signal = UpDownSignal(
-                        ticker=market.ticker,
-                        bucket=market.bucket,
-                        side="",
-                        target=float(market.target or 0.0),
-                        spot=spot,
-                        spot_vs_target=0.0,
-                        fair=0.5,
-                        kalshi_price=market.up_price,
-                        edge=0.0,
-                        ask=None,
-                        contracts=0,
-                        notional=0.0,
-                        seconds_left=round(market.seconds_left or 0.0, 1),
-                        reason=(
-                            "18 UTC hard skip (LIVE): the hour lost money in "
-                            "the forever log; DRY still trades it"
-                        ),
-                        truth=truth_kind,
-                    )
-                    self.book.signals = [signal]
-                    return signal
-            except Exception:  # noqa: BLE001 - a clock error never buys an entry
-                pass
 
         target = float(market.target)
         delta = round(spot - target, 2)
@@ -359,19 +311,12 @@ class UpDownTrader:
         up_edge = (fair - up_ask) if up_ask is not None else 0.0
         down_edge = ((1.0 - fair) - down_ask) if down_ask is not None else 0.0
 
-        # LIVE pays the fee out of exactly this edge, so the bar is higher there.
-        # DRY keeps the raw min_edge so the two books stay comparable.
+        # ONE decision rule for both books: DRY's min_edge. LIVE adds exactly
+        # what costs real money - the exchange fee - and nothing else. No hour
+        # bans, no LIVE-only bands, no refusal DRY does not also have: if DRY
+        # would take the trade, LIVE takes it. The edge that built DRY's ledger
+        # is the edge LIVE trades on now.
         required = self.config.min_edge + (self.config.live_fee_rate if live else 0.0)
-        if live:
-            # LIVE-ONLY session filter: the 18 UTC hour lost money in the
-            # forever log (17 trades, 41.2%, -$2.70). LIVE demands extra edge
-            # there. DRY never takes this branch and still trades the hour.
-            try:
-                from src.jobs import live_fees as _live_fees
-
-                required += _live_fees.live_session_extra_edge()
-            except Exception:  # noqa: BLE001 - session filter must not block entry
-                pass
 
         up_fill = up_ask if up_ask is not None else None
         down_fill = down_ask if down_ask is not None else None
@@ -381,12 +326,6 @@ class UpDownTrader:
                 return False
             # Hard block from the log: $0.90+ entries won 4% of the time.
             if fill_price >= self.config.max_entry_price:
-                return False
-            # LIVE-ONLY band (item 3): entries only at $0.10-$0.50. The
-            # forever log won 85-100% there and the fee curve P(1-P) is
-            # cheapest per dollar of edge; 0.50-0.75 went flat and 0.75+
-            # lost even fee-free. DRY keeps the old ceiling and surcharge.
-            if live and not (LIVE_ENTRY_BAND_LOW <= fill_price <= LIVE_ENTRY_BAND_HIGH):
                 return False
             r = required
             # The sweet band wins 100%; outside it, demand more edge.
