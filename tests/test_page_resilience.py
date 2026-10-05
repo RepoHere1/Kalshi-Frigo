@@ -31,7 +31,10 @@ def test_writes_keep_the_long_timeout():
 
 def test_the_snapshot_caches_for_a_short_window():
     """A burst of polls should cost one query, not six."""
-    assert 0 < wd._SNAPSHOT_TTL <= 5
+    # 15s: one rebuild walks up to 42 serial Kalshi calls, so the memo must
+    # cover a full poll burst. Single-flight (tested in
+    # test_web_dashboard.py) keeps concurrent misses at one build.
+    assert 0 < wd._SNAPSHOT_TTL <= 30
 
 
 def test_the_snapshot_is_memoised(monkeypatch, tmp_path):

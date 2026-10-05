@@ -2983,3 +2983,139 @@ def test_live_journal_shows_mode_live_rows_only(client):
     assert body["open"][0]["market_id"] == "LIVE-1"
     assert body["open"][0]["notional"] == 1.28
     assert body["open_notional"] == 1.28
+
+
+# ---------------------------------------------------------------------------
+# Snapshot single-flight: one rebuild serves a burst, never a pileup
+# ---------------------------------------------------------------------------
+def test_snapshot_burst_triggers_a_single_rebuild(client, monkeypatch):
+    """Five concurrent misses must cost one build, not five Kalshi walks."""
+    import threading
+    import time as _time
+
+    calls = []
+
+    def _slow_build():
+        calls.append(1)
+        _time.sleep(0.5)
+        return {"marker": len(calls)}
+
+    monkeypatch.setattr(wd, "build_snapshot", _slow_build)
+    stale = {"marker": "stale"}
+    # Present but long expired: every thread misses the cache, but only the
+    # first may rebuild while the rest serve this stale payload.
+    monkeypatch.setitem(wd._SNAPSHOT_CACHE, "payload", stale)
+    monkeypatch.setitem(wd._SNAPSHOT_CACHE, "at", 0.0)
+
+    results = []
+
+    def _call():
+        results.append(wd.build_snapshot_cached())
+
+    threads = [threading.Thread(target=_call) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert len(calls) == 1
+    fresh = [r for r in results if r is not stale]
+    assert len(results) == 5
+    assert len(fresh) == 1 and fresh[0] == {"marker": 1}
+    assert sum(1 for r in results if r is stale) == 4
+
+
+# ---------------------------------------------------------------------------
+# Kalshi freshness truth: numbers carry their age, changes push an event
+# ---------------------------------------------------------------------------
+def _fresh_state(monkeypatch):
+    monkeypatch.setitem(wd.dashboard_state, "balance", None)
+    monkeypatch.setitem(wd.dashboard_state, "positions", [])
+    monkeypatch.setitem(wd.dashboard_state, "ledger", None)
+    monkeypatch.setitem(wd.dashboard_state, "kalshi_at", None)
+    monkeypatch.setitem(wd.dashboard_state, "kalshi_at_ts", 0.0)
+    monkeypatch.setattr(wd, "_LAST_SNAPSHOT_DIGEST", None)
+    monkeypatch.setitem(wd._SNAPSHOT_CACHE, "payload", None)
+    monkeypatch.setitem(wd._SNAPSHOT_CACHE, "at", 0.0)
+
+
+def test_successful_sync_stamps_kalshi_time(monkeypatch, tmp_path):
+    """Only a sync that delivers a balance moves the stamp (the $0.29 rule)."""
+    import time as _time
+
+    _fresh_state(monkeypatch)
+    monkeypatch.setattr(wd, "DB_PATH", str(tmp_path / "c.db"))
+    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(wd, "_refresh_market_titles", lambda *a, **k: None)
+
+    async def _fake_fetch():
+        return (
+            {"balance": 29},
+            {"market_positions": [], "event_positions": []},
+            [],
+            [],
+        )
+
+    monkeypatch.setattr(wd, "_fetch_kalshi_data", _fake_fetch)
+    wd._refresh_kalshi()
+    assert wd.dashboard_state["balance"] == pytest.approx(0.29)
+    assert wd.dashboard_state["kalshi_at"] is not None
+    assert wd.dashboard_state["kalshi_at_ts"] > _time.time() - 60
+
+
+def test_failed_sync_keeps_the_old_stamp(monkeypatch, tmp_path):
+    """A dead sync must age the numbers, never freeze them silently."""
+    _fresh_state(monkeypatch)
+    monkeypatch.setattr(wd, "DB_PATH", str(tmp_path / "c.db"))
+    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setitem(wd.dashboard_state, "balance", 0.29)
+    monkeypatch.setitem(wd.dashboard_state, "kalshi_at", "2026-10-05 12:00:00")
+    monkeypatch.setitem(wd.dashboard_state, "kalshi_at_ts", 1000.0)
+
+    async def _boom():
+        raise RuntimeError("Kalshi down")
+
+    monkeypatch.setattr(wd, "_fetch_kalshi_data", _boom)
+    with pytest.raises(RuntimeError):
+        wd._refresh_kalshi()
+    assert wd.dashboard_state["balance"] == pytest.approx(0.29)
+    assert wd.dashboard_state["kalshi_at_ts"] == 1000.0
+    assert wd._kalshi_age_sec() > 3600
+
+
+def test_publish_fires_once_per_change(monkeypatch):
+    """The monitor busts the memo and pushes SSE exactly when Kalshi moves."""
+    _fresh_state(monkeypatch)
+    events = []
+    monkeypatch.setattr(wd, "_broadcast", lambda e, d: events.append((e, d)))
+    monkeypatch.setitem(wd.dashboard_state, "balance", 1.0)
+
+    assert wd._publish_if_changed() is True
+    assert [e for e, _ in events] == ["snapshot"]
+    assert wd._SNAPSHOT_CACHE["payload"] is None
+    # Same numbers again: quiet, no rebuild, no event.
+    assert wd._publish_if_changed() is False
+    assert len(events) == 1
+    # A fill moves the balance: fires again.
+    monkeypatch.setitem(wd.dashboard_state, "balance", 2.0)
+    assert wd._publish_if_changed() is True
+    assert len(events) == 2
+
+
+def test_snapshot_carries_kalshi_age(monkeypatch, tmp_path):
+    """The tally tiles render from these two fields."""
+    import time as _time
+
+    _fresh_state(monkeypatch)
+    monkeypatch.setattr(wd, "DB_PATH", str(tmp_path / "c.db"))
+    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
+    wd.app.config["TESTING"] = False
+    try:
+        monkeypatch.setitem(wd.dashboard_state, "balance", 5.0)
+        monkeypatch.setitem(wd.dashboard_state, "kalshi_at", "2026-10-05 13:00:00")
+        monkeypatch.setitem(wd.dashboard_state, "kalshi_at_ts", _time.time())
+        payload = wd.build_snapshot_cached()
+    finally:
+        wd.app.config["TESTING"] = True
+    assert payload["kalshi_at"] == "2026-10-05 13:00:00"
+    assert 0 <= payload["kalshi_age_sec"] <= 30

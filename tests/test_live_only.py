@@ -490,7 +490,7 @@ class _Req:
     client_order_id = "cid-1"
 
 
-def _pos(ticker="KXBTC15M-T", qty=12):
+def _pos(ticker="KXTEST-T", qty=12):
     from src.utils.database import Position
 
     return Position(
@@ -610,6 +610,117 @@ def test_winning_position_with_time_left_still_takes_profit(monkeypatch):
     monkeypatch.setattr(ex, "place_sell_limit_order", _fake_sell)
     res = asyncio.run(
         ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=True)
+    )
+    assert res["orders_placed"] == 1
+    assert len(sells) == 1
+
+
+# ---------------------------------------------------------------------------
+# Session skip is enforced in LIVE evaluate(), never in DRY
+# ---------------------------------------------------------------------------
+def test_live_skips_losing_hour_and_dry_trades_it(monkeypatch):
+    monkeypatch.setattr(live_fees, "live_session_skip", lambda now=None: True)
+    trader = _scorer()
+    assert trader.evaluate(_quoted_market(), live=True) is None
+    assert trader.book.skipped_session == 1
+    # DRY never reads the flag.
+    signal = trader.evaluate(_quoted_market(), live=False)
+    assert signal is not None and signal.actionable
+
+
+def test_live_trades_outside_losing_hour(monkeypatch):
+    monkeypatch.setattr(live_fees, "live_session_skip", lambda now=None: False)
+    trader = _scorer()
+    signal = trader.evaluate(_quoted_market(), live=True)
+    assert signal is not None and signal.actionable
+
+
+def test_losing_hour_skip_is_configurable(monkeypatch):
+    monkeypatch.setattr(live_fees, "live_session_skip", lambda now=None: True)
+    trader = _scorer(live_skip_losing_hour=False)
+    signal = trader.evaluate(_quoted_market(), live=True)
+    assert signal is not None and signal.actionable
+
+
+# ---------------------------------------------------------------------------
+# Ride-to-settlement: LIVE never scalps 15-minute binaries mid-bucket
+# ---------------------------------------------------------------------------
+def _btc_pos():
+    from src.utils.database import Position
+
+    return Position(
+        market_id="KXBTC15M-26OCT011715-15",
+        side="NO",
+        entry_price=0.44,
+        quantity=10,
+        timestamp=datetime.now(timezone.utc),
+        strategy="btc_updown",
+    )
+
+
+class _ExplodingClient:
+    async def get_market(self, ticker):
+        raise AssertionError("ride-to-settlement must not read the book")
+
+
+def test_live_profit_take_skips_btc15m():
+    from src.jobs import execute as ex
+
+    class _FakeDB:
+        async def get_open_live_positions(self):
+            return [_btc_pos()]
+
+    res = asyncio.run(
+        ex.place_profit_taking_orders(
+            _FakeDB(), _ExplodingClient(), 0.20, live_mode=True
+        )
+    )
+    assert res == {"orders_placed": 0, "positions_processed": 0}
+
+
+def test_live_stop_loss_skips_btc15m():
+    from src.jobs import execute as ex
+
+    class _FakeDB:
+        async def get_open_live_positions(self):
+            return [_btc_pos()]
+
+    res = asyncio.run(
+        ex.place_stop_loss_orders(_FakeDB(), _ExplodingClient(), -0.15, live_mode=True)
+    )
+    assert res == {"orders_placed": 0, "positions_processed": 0}
+
+
+def test_dry_still_exits_btc15m_mid_bucket(monkeypatch):
+    from src.jobs import execute as ex
+
+    close_later = (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat()
+    market = {
+        "status": "open",
+        "yes_bid_dollars": "0.55",
+        "yes_ask_dollars": "0.57",
+        "no_bid_dollars": "0.70",
+        "no_ask_dollars": "0.72",
+        "close_time": close_later,
+    }
+
+    class _FakeDB:
+        async def get_open_live_positions(self):
+            return [_btc_pos()]
+
+    class _FakeClient:
+        async def get_market(self, ticker):
+            return {"market": market}
+
+    sells = []
+
+    async def _fake_sell(**kw):
+        sells.append(kw)
+        return True
+
+    monkeypatch.setattr(ex, "place_sell_limit_order", _fake_sell)
+    res = asyncio.run(
+        ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=False)
     )
     assert res["orders_placed"] == 1
     assert len(sells) == 1

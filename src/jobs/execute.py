@@ -537,6 +537,19 @@ async def place_profit_taking_orders(
         logger.info(f"📊 Checking {len(positions)} positions for profit-taking opportunities")
 
         for position in positions:
+            # LIVE-ONLY ride-to-settlement: 15-minute binaries ride to the
+            # $1.00/$0.00 settlement. A 20% profit-take exits mid-bucket and
+            # pays the spread plus a second fee for nothing; tracking closes
+            # these at resolution instead. DRY keeps the exits untouched.
+            if live_mode and (
+                str(getattr(position, "strategy", "") or "") == "btc_updown"
+                or str(position.market_id or "").startswith("KXBTC15M")
+            ):
+                logger.debug(
+                    f"Skipping mid-bucket profit-take for {position.market_id}: "
+                    "BTC 15m rides to settlement in LIVE"
+                )
+                continue
             try:
                 results["positions_processed"] += 1
 
@@ -691,6 +704,19 @@ async def place_stop_loss_orders(
         logger.info(f"🛡️ Checking {len(positions)} positions for stop-loss protection")
 
         for position in positions:
+            # LIVE-ONLY ride-to-settlement: 15-minute binaries ride to the
+            # $1.00/$0.00 settlement. A 15% stop exits mid-bucket and pays
+            # the spread plus a second fee for nothing; tracking closes
+            # these at resolution instead. DRY keeps the exits untouched.
+            if live_mode and (
+                str(getattr(position, "strategy", "") or "") == "btc_updown"
+                or str(position.market_id or "").startswith("KXBTC15M")
+            ):
+                logger.debug(
+                    f"Skipping mid-bucket stop-loss for {position.market_id}: "
+                    "BTC 15m rides to settlement in LIVE"
+                )
+                continue
             try:
                 results["positions_processed"] += 1
 

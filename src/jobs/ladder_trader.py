@@ -43,12 +43,9 @@ QUOTE_MAX_AGE_SEC = 30.0
 # LIVE-ONLY: max open clips of one ticker. One 15-minute bucket is one bet;
 # DRY is uncapped so its historic pyramiding pattern is untouched.
 LIVE_MAX_CLIPS_PER_TICKER = 3
-# LIVE-ONLY entry price band. The forever log: 0.10-0.50 won 85-100% and the
-# fee formula P(1-P) is cheapest per dollar of edge there; 0.50-0.75 went
-# flat and 0.75+ lost even fee-free. DRY keeps the 0.90 ceiling and the
-# sweet-band surcharge so its historic decision pattern is untouched.
-LIVE_ENTRY_BAND_LOW = 0.10
-LIVE_ENTRY_BAND_HIGH = 0.50
+# NOTE: a LIVE-only 0.10-0.50 entry band lived here and was removed: it cut
+# LIVE to 52 skips and 0 trades an hour. Both books now share the sweet-band
+# surcharge in UpDownConfig; LIVE adds only the real fee.
 
 
 @dataclass
@@ -84,6 +81,12 @@ class UpDownConfig:
     # 0.20 on the strength of the forever-log analysis (76% win rate over 283
     # closes - the edge is real, scale up).
     live_cash_fraction: float = 0.20
+    # LIVE only: skip the historically losing 18 UTC hour entirely. The
+    # forever log went 17 trades at 41.2% for -$2.70 there while every
+    # neighbouring hour printed; demanding extra edge still paid the fee on
+    # a coin flip, so LIVE sits the hour out. DRY never reads this flag and
+    # still trades the hour.
+    live_skip_losing_hour: bool = True
     # Minimum model probability on the chosen side before any entry. The old
     # "one clip per market" guard was removed; this is what replaces it as the
     # anti-churn rule - repeated buys of the same contract are allowed, but only
@@ -142,6 +145,7 @@ class UpDownBook:
     skipped_too_close: int = 0
     skipped_unquoted: int = 0
     skipped_low_prob: int = 0
+    skipped_session: int = 0
     last_error: str = ""
     dry: bool = True
 
@@ -158,6 +162,7 @@ class UpDownBook:
             "skipped_too_close": self.skipped_too_close,
             "skipped_unquoted": self.skipped_unquoted,
             "skipped_low_prob": self.skipped_low_prob,
+            "skipped_session": self.skipped_session,
             "last_error": self.last_error,
             "dry": self.dry,
         }
@@ -210,6 +215,18 @@ class UpDownTrader:
         real money. `clip_usd` overrides the fixed clip size (used in LIVE to
         size down against the available balance).
         """
+        # LIVE-ONLY losing-hour skip: the 18 UTC hour lost money in the
+        # forever log, so LIVE sits it out. A losing hour is cheaper to skip
+        # than to re-learn with real money. DRY never enters this branch.
+        if live and self.config.live_skip_losing_hour:
+            try:
+                from src.jobs import live_fees as _live_fees_hr
+
+                if _live_fees_hr.live_session_skip():
+                    self.book.skipped_session += 1
+                    return None
+            except Exception:  # noqa: BLE001 - a clock error never buys an entry
+                pass
         if market is None:
             self.book.skipped_unquoted += 1
             return None
@@ -261,12 +278,9 @@ class UpDownTrader:
                 truth_price = self.spot.price
                 truth_kind = f"coinbase-{self.spot.source or 'spot'}"
         spot = truth_price
-        # LIVE-ONLY settlement-window exception (item 4): the final 60s is a
-        # no-entry coin toss for a spot proxy, but a FRESH windowed-settlement
-        # average IS the number the contract settles on, still accumulating.
-        # When BRTI carries that and the book still disagrees, it is the
-        # strongest signal this strategy gets -- allowed in LIVE only. DRY
-        # keeps the historic 45s window, and any non-windowed truth stays out.
+        # No entries inside the no-entry window (both books): the settlement
+        # window is the final 60 seconds, and a fill in there is a coin toss
+        # whether the truth is spot or the windowed average.
         if (market.seconds_left or 0) < self.config.min_seconds_left:
                 # The settlement window is the final 60 seconds. Inside it,
                 # spot is no longer leading anything.

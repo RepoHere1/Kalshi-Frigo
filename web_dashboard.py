@@ -109,6 +109,12 @@ dashboard_state = {
     "db_positions_count": 0,
     "kalshi_position_count": 0,
     "ledger": None,
+    # When the Kalshi numbers below were last actually refreshed from the API
+    # (wall-clock string + epoch). A failed sync leaves these untouched, so the
+    # page can say "STALE (6m old)" instead of presenting a dead $0.29 as the
+    # live truth forever.
+    "kalshi_at": None,
+    "kalshi_at_ts": 0.0,
     "market": {},
     "market_titles": {},
 }
@@ -450,8 +456,15 @@ async def _fetch_kalshi_data():
         # the extra paginated requests.
         client = KalshiClient(private_key_path=key_path) if key_path else KalshiClient()
         try:
-            fills = await _fetch_all_fills(client)
-            settlements = await _fetch_all_settlements(client)
+            # Bounded: balance + positions above already stand on their own, so
+            # a hung history walk degrades realized P&L to "unknown" instead
+            # of holding a gthread for the full 120s _run_async timeout.
+            fills = await asyncio.wait_for(
+                _fetch_all_fills(client), _KALSHI_HISTORY_BUDGET_SEC
+            )
+            settlements = await asyncio.wait_for(
+                _fetch_all_settlements(client), _KALSHI_HISTORY_BUDGET_SEC
+            )
         finally:
             await client.close()
     except Exception as e:  # noqa: BLE001 - the balance/positions result still stands
@@ -886,6 +899,11 @@ def _refresh_kalshi():
         # Kalshi reports cents; the dashboard shows dollars.
         balance = _normalise_balance(balance)
         dashboard_state["balance"] = float(balance.get("balance", 0) or 0) / 100.0
+        # Freshness truth: only a sync that actually delivered a balance moves
+        # this. Failures and empty answers keep the previous stamp, so the
+        # page ages the numbers instead of freezing them silently.
+        dashboard_state["kalshi_at"] = _now()
+        dashboard_state["kalshi_at_ts"] = time.time()
     if positions:
         # Kalshi uses different keys for event markets vs market tickers.
         merged = list(positions.get("market_positions") or [])
@@ -1209,31 +1227,91 @@ def _monitor_loop():
     interval = max(15, int(os.environ.get("KALSHI_REFRESH_SECONDS", "60")))
     warned_missing = False
     while True:
-        dashboard_state["status"] = "online"
-        dashboard_state["has_openrouter_creds"] = bool(
-            os.environ.get("OPENROUTER_API_KEY", "").strip()
-        )
-        dashboard_state["has_kalshi_creds"] = kalshi_configured()
-
-        # Make sure the schema exists so the dashboard shows real numbers even
-        # on a fresh container where the trading loop has never run.
-        try:
-            _db()
-        except Exception as e:
-            _push_error(f"Database init: {e}")
-
-        if not dashboard_state["has_kalshi_creds"]:
-            if not warned_missing:
-                _push_error("Kalshi credentials not configured — info mode only")
-                warned_missing = True
-            dashboard_state["last_update"] = _now()
-        else:
-            try:
-                _refresh_kalshi()
-            except Exception as e:
-                _push_error(f"Kalshi connect: {e}")
-
+        _monitor_once(interval, {"warned_missing": warned_missing})
+        warned_missing = True  # _monitor_once warns only on the first miss
         time.sleep(interval)
+
+
+def _kalshi_digest() -> str:
+    """Fingerprint of the Kalshi numbers the tally tiles render.
+
+    Balance, position rows and the realized ledger: anything a fill,
+    settlement or funding event would move. Deliberately excludes the error
+    list, so a failing sync does not look like fresh activity.
+    """
+    try:
+        return json.dumps(
+            {
+                "balance": dashboard_state.get("balance"),
+                "positions": dashboard_state.get("positions"),
+                "ledger": dashboard_state.get("ledger"),
+            },
+            sort_keys=True,
+            default=str,
+        )
+    except Exception:  # noqa: BLE001 - a digest never breaks the loop
+        return ""
+
+
+def _kalshi_age_sec() -> int:
+    """Age of the Kalshi numbers in seconds, or -1 when never synced."""
+    try:
+        ts = float(dashboard_state.get("kalshi_at_ts") or 0.0)
+    except (TypeError, ValueError):
+        return -1
+    if ts <= 0:
+        return -1
+    return max(0, int(time.time() - ts))
+
+
+_LAST_SNAPSHOT_DIGEST: Optional[str] = None
+
+
+def _publish_if_changed() -> bool:
+    """Bust the snapshot memo and push an SSE event when Kalshi moved.
+
+    Returns True when something changed. The monitor calls this after every
+    sync: connected pages refetch exactly when there is something new instead
+    of polling blind, and a quiet hour costs no rebuilds at all.
+    """
+    global _LAST_SNAPSHOT_DIGEST
+    digest = _kalshi_digest()
+    if digest == _LAST_SNAPSHOT_DIGEST:
+        return False
+    _LAST_SNAPSHOT_DIGEST = digest
+    _SNAPSHOT_CACHE["payload"] = None
+    _SNAPSHOT_CACHE["at"] = 0.0
+    _broadcast("snapshot", {"at": _now(), "kalshi_at": dashboard_state.get("kalshi_at")})
+    return True
+
+
+def _monitor_once(interval: int, flags: Dict[str, Any]) -> bool:
+    """One monitor pass. Split out so tests can drive it without the sleep."""
+    dashboard_state["status"] = "online"
+    dashboard_state["has_openrouter_creds"] = bool(
+        os.environ.get("OPENROUTER_API_KEY", "").strip()
+    )
+    dashboard_state["has_kalshi_creds"] = kalshi_configured()
+
+    # Make sure the schema exists so the dashboard shows real numbers even
+    # on a fresh container where the trading loop has never run.
+    try:
+        _db()
+    except Exception as e:
+        _push_error(f"Database init: {e}")
+
+    if not dashboard_state["has_kalshi_creds"]:
+        if not flags.get("warned_missing"):
+            _push_error("Kalshi credentials not configured — info mode only")
+            flags["warned_missing"] = True
+        dashboard_state["last_update"] = _now()
+    else:
+        try:
+            _refresh_kalshi()
+        except Exception as e:
+            _push_error(f"Kalshi connect: {e}")
+        _publish_if_changed()
+    return True
 
 
 def _market_data_loop():
@@ -2175,6 +2253,12 @@ def build_snapshot() -> Dict[str, Any]:
         "uptime_sec": int(time.time() - _STARTED_AT),
         "status": dashboard_state["status"],
         "last_update": dashboard_state["last_update"],
+        # Freshness truth for the tally tiles: when the Kalshi numbers were
+        # last actually refreshed, and how old that makes them. -1 means the
+        # sync has never delivered, so the page says "syncing" instead of
+        # showing a number with no age at all.
+        "kalshi_at": dashboard_state.get("kalshi_at"),
+        "kalshi_age_sec": _kalshi_age_sec(),
         "has_kalshi_creds": kalshi_configured(),
         "has_openrouter_creds": bool(os.environ.get("OPENROUTER_API_KEY", "").strip()),
         # Real-money figures belong to the LIVE book. A DRY snapshot carries no
@@ -2765,7 +2849,19 @@ def dashboard():
 
 
 _SNAPSHOT_CACHE: Dict[str, Any] = {"at": 0.0, "payload": None}
-_SNAPSHOT_TTL = 2.0
+# 15s memo: one rebuild walks up to 42 serial Kalshi calls (balance +
+# positions + 20 fills pages + 20 settlements pages at 30s timeout each), so
+# a 2s TTL under several polling clients piled every gthread onto the same
+# walk and every request died a 499. Correctness is kept (the walk still
+# runs to the end) and freshness loss is 15s of dashboard numbers.
+_SNAPSHOT_TTL = 15.0
+# Single-flight: only one thread rebuilds at a time. The rest serve the
+# last-known payload instead of starting a second 42-call walk.
+_SNAPSHOT_LOCK = threading.Lock()
+# Time budget for the fills/settlements history walk inside one snapshot.
+# Balance + positions (fetched first) still stand on timeout; realized P&L
+# degrades to "unknown" instead of hanging the page.
+_KALSHI_HISTORY_BUDGET_SEC = 20.0
 
 
 def build_snapshot_cached() -> Dict[str, Any]:
@@ -2784,19 +2880,39 @@ def build_snapshot_cached() -> Dict[str, Any]:
     So: a short TTL so a burst of polls costs one query rather than six, a read
     timeout short enough that a blocked read fails in seconds instead of hanging
     the page, and a last-known-good payload if the rebuild fails outright.
+
+    Single-flight on top: the first thread to miss the cache rebuilds while
+    every other thread serves the stale payload instead of starting its own
+    Kalshi walk (that pileup was the 499 storm: 32 threads × 42 serial
+    calls each).
     """
     now = time.time()
     cached = _SNAPSHOT_CACHE.get("payload")
     ttl = 0.0 if app.config.get("TESTING") else _SNAPSHOT_TTL
     if cached is not None and now - float(_SNAPSHOT_CACHE.get("at") or 0) < ttl:
         return cached
-    try:
-        payload = build_snapshot()
-    except Exception as exc:  # noqa: BLE001 - never blank the page
-        _push_error(f"Snapshot rebuild failed, serving last known: {exc}")
+    if not _SNAPSHOT_LOCK.acquire(blocking=False):
+        # A rebuild is already in flight: serve stale, never pile up. Cold
+        # start (nothing cached yet) waits for the builder instead.
         if cached is not None:
             return cached
-        return {
+        _SNAPSHOT_LOCK.acquire()
+    try:
+        # Re-check: the builder may have finished while waiting on the lock.
+        now = time.time()
+        cached = _SNAPSHOT_CACHE.get("payload")
+        if (
+            cached is not None
+            and now - float(_SNAPSHOT_CACHE.get("at") or 0) < ttl
+        ):
+            return cached
+        try:
+            payload = build_snapshot()
+        except Exception as exc:  # noqa: BLE001 - never blank the page
+            _push_error(f"Snapshot rebuild failed, serving last known: {exc}")
+            if cached is not None:
+                return cached
+            return {
             "mode": _safe_mode_payload(),
             "error": str(exc),
             "positions": [],
@@ -2818,6 +2934,8 @@ def build_snapshot_cached() -> Dict[str, Any]:
             "errors": [],
             "funding": {"connected": False, "balance": 0.0, "can_fund": False, "reason": ""},
         }
+    finally:
+        _SNAPSHOT_LOCK.release()
     _SNAPSHOT_CACHE["at"] = now
     _SNAPSHOT_CACHE["payload"] = payload
     return payload
@@ -3014,11 +3132,18 @@ def api_stream():
         try:
             # Unnamed event so the browser's default onmessage handler fires.
             yield f"data: {json.dumps({'event': 'connected', 'msg': 'connected'})}\n\n"
+            last_ping = time.time()
             while True:
                 try:
                     msg = q.popleft()
                     yield msg
+                    last_ping = time.time()
                 except IndexError:
+                    # Keep idle connections alive through proxies that reap
+                    # quiet streams; a comment is ignored by EventSource.
+                    if time.time() - last_ping >= 25.0:
+                        yield ":ping\n\n"
+                        last_ping = time.time()
                     time.sleep(0.5)
         finally:
             try:
@@ -4352,7 +4477,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   <div class="tile">
     <div class="k">Real balance</div>
     <div class="v" id="tBalance">{{ '$%.2f'|format(s.balance) if s.balance is not none else '-' }}</div>
-    <div class="s">live Kalshi account</div>
+    <div class="s">live Kalshi account <span id="tBalanceAge">{% if s.kalshi_age_sec is not none and s.kalshi_age_sec >= 0 %}{% if s.kalshi_age_sec > 180 %}· STALE ({{ s.kalshi_age_sec // 60 }}m old){% else %}· updated {{ s.kalshi_age_sec }}s ago{% endif %}{% else %}· syncing…{% endif %}</span></div>
   </div>
   <div class="tile">
     <div class="k">Live positions</div>
@@ -4972,6 +5097,10 @@ const es = new EventSource('/api/stream');
 es.onmessage = e => {
   try { note(JSON.stringify(JSON.parse(e.data))); } catch (_) { note(e.data); }
 };
+// Event-driven tally: the server pushes a snapshot event the moment the
+// Kalshi numbers move, so the page refetches exactly when there is
+// something new. The interval below is fallback only.
+es.addEventListener('snapshot', () => { refresh(); });
 ['strategy', 'alert', 'config'].forEach(n =>
   es.addEventListener(n, e => note(n + ': ' + e.data)));
 es.onerror = () => note('stream disconnected - retrying...');
@@ -5045,6 +5174,16 @@ function paint(s) {
   // versa, so each write is a no-op in the other mode rather than a leak.
   if (s.mode && s.mode.mode === 'live') {
     set('tBalance', s.balance == null ? '-' : money(s.balance));
+    // Freshness truth under the balance: a number with no age is how a dead
+    // $0.29 reads as the live truth forever. Over 3 minutes old means the
+    // Kalshi sync is failing, and the errors panel says why.
+    var ageEl = $('tBalanceAge');
+    if (ageEl) {
+      var age = s.kalshi_age_sec;
+      if (age == null || age < 0) { ageEl.textContent = '· syncing…'; ageEl.style.color = ''; }
+      else if (age > 180) { ageEl.textContent = '· STALE (' + Math.round(age / 60) + 'm old) — sync failing'; ageEl.style.color = '#ff5555'; }
+      else { ageEl.textContent = '· updated ' + age + 's ago'; ageEl.style.color = ''; }
+    }
     // Held contracts, not raw rows: Kalshi keeps a zero-share row per ticker the
     // account ever touched, and summing those reported 31 "positions" when 3
     // were held.
@@ -5964,7 +6103,7 @@ function safeRun(fn, label) {
 }
 
 // Pollers are registered before anything can throw.
-setInterval(refresh, 10000);
+setInterval(refresh, 30000);
 setInterval(loadLogs, 30000);
 setInterval(refreshFeeds, 5000);
 setInterval(tickClock, 500);
