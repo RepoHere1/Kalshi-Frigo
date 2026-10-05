@@ -817,6 +817,21 @@ class UpDownTrader:
                 _session_bump = float(_live_fees_rep.live_session_extra_edge())
             except Exception:  # noqa: BLE001
                 _session_bump = 0.0
+        # BRTI observability: why the score used retail spot instead of the
+        # index (degraded reason, staleness) -- read from the cycle print.
+        try:
+            _b = getattr(self, "brti", None)
+            if _b is None:
+                _brti_state = "no-feed"
+            elif bool(getattr(_b, "fresh", False)):
+                _brti_state = f"live-{_b.estimate_kind()}:{_b.estimate():,.0f}"
+            else:
+                _brti_state = (
+                    f"stale-{getattr(_b, 'degraded_reason', '') or 'no ticks'}"
+                    f"{(';' + str(getattr(_b, 'last_error', ''))[:80]) if getattr(_b, 'last_error', '') else ''}"
+                )
+        except Exception:  # noqa: BLE001
+            _brti_state = "unknown"
         result = self.book.summary()
         result.update(
             {
@@ -837,6 +852,7 @@ class UpDownTrader:
                 "live_budget": live_budget,
                 "variance_mult": variance_mult if live else 1.0,
                 "truth_source": (signal.truth if signal else "") or "none",
+                "brti_state": _brti_state,
                 "required_edge": round(
                     self.config.min_edge
                     + (self.config.live_fee_rate if live else 0.0)

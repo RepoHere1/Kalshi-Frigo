@@ -9,6 +9,7 @@ incoming messages to registered callbacks and/or the global EventBus.
 import asyncio
 import base64
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -108,7 +109,7 @@ class KalshiWebSocket(TradingLoggerMixin):
     def __init__(
         self,
         api_key: Optional[str] = None,
-        private_key_path: str = "kalshi_private_key",
+        private_key_path: Optional[str] = None,
         publish_to_event_bus: bool = True,
     ) -> None:
         """
@@ -121,7 +122,9 @@ class KalshiWebSocket(TradingLoggerMixin):
                 published to the global :class:`EventBus`.
         """
         self.api_key: str = api_key or settings.api.kalshi_api_key
-        self.private_key_path: str = private_key_path
+        self.private_key_path: str = private_key_path or os.environ.get(
+            "KALSHI_PRIVATE_KEY_PATH", "kalshi_private_key.pem"
+        )
         self.publish_to_event_bus: bool = publish_to_event_bus
 
         self._private_key: Any = None
