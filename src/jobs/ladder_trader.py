@@ -252,7 +252,18 @@ class UpDownTrader:
         down_edge = ((1.0 - fair) - down_ask) if down_ask is not None else 0.0
 
         # LIVE pays the fee out of exactly this edge, so the bar is higher there.
+        # DRY keeps the raw min_edge so the two books stay comparable.
         required = self.config.min_edge + (self.config.live_fee_rate if live else 0.0)
+        if live:
+            # LIVE-ONLY session filter: the 18 UTC hour lost money in the
+            # forever log (17 trades, 41.2%, -$2.70). LIVE demands extra edge
+            # there. DRY never takes this branch and still trades the hour.
+            try:
+                from src.jobs import live_fees as _live_fees
+
+                required += _live_fees.live_session_extra_edge()
+            except Exception:  # noqa: BLE001 - session filter must not block entry
+                pass
 
         up_fill = up_ask if up_ask is not None else None
         down_fill = (1.0 - down_ask) if down_ask is not None else None
@@ -533,10 +544,47 @@ class UpDownTrader:
             self.book.last_error = f"position tracking: {type(exc).__name__}: {exc}"
 
         try:
-            await self.feed.fetch()
+            # LIVE-ONLY fetch throttle: far from expiry the book barely moves,
+            # so reuse a fresh cache instead of hammering /markets into 429s.
+            # DRY always fetches (aggressive rehearsal); LIVE reuses a cache
+            # younger than 15s when more than 180s remain.
+            _use_cache = False
+            if live:
+                try:
+                    import time as _time
+
+                    _age = _time.time() - float(getattr(self.feed, "ts", 0.0) or 0.0)
+                    _nearest_cached = self.feed.nearest()
+                    _left = (
+                        float(_nearest_cached.seconds_left or 0.0)
+                        if _nearest_cached is not None
+                        else 0.0
+                    )
+                    if _nearest_cached is not None and _age < 15.0 and _left > 180.0:
+                        _use_cache = True
+                except Exception:  # noqa: BLE001 - fall through to fetch
+                    _use_cache = False
+            if not _use_cache:
+                await self.feed.fetch()
         except Exception as exc:  # noqa: BLE001
-            self.book.last_error = f"series fetch: {type(exc).__name__}: {exc}"
-            return self.book.summary()
+            # LIVE-ONLY 429 resilience: on rate-limit, reuse the last good
+            # cache with jittered backoff instead of blanking the cycle.
+            # DRY keeps the old fail-fast behaviour untouched.
+            _msg = f"{type(exc).__name__}: {exc}"
+            _is_429 = "429" in _msg or "Too Many Requests" in _msg
+            if live and _is_429 and getattr(self.feed, "markets", None):
+                try:
+                    from src.jobs import live_fees as _live_fees
+
+                    import asyncio as _asyncio
+
+                    await _asyncio.sleep(_live_fees.backoff_delay_seconds(1))
+                except Exception:  # noqa: BLE001
+                    pass
+                self.book.last_error = f"series fetch 429 (LIVE cache reused): {_msg[:120]}"
+            else:
+                self.book.last_error = f"series fetch: {_msg}"
+                return self.book.summary()
 
         market = self.feed.nearest()
 
@@ -681,6 +729,15 @@ class UpDownTrader:
                 }
 
         # One flat summary: the book counters plus this cycle's reading.
+        # LIVE-ONLY session bump is reported truthfully; DRY reports the raw bar.
+        _session_bump = 0.0
+        if live:
+            try:
+                from src.jobs import live_fees as _live_fees_rep
+
+                _session_bump = float(_live_fees_rep.live_session_extra_edge())
+            except Exception:  # noqa: BLE001
+                _session_bump = 0.0
         result = self.book.summary()
         result.update(
             {
@@ -700,7 +757,10 @@ class UpDownTrader:
                 "kalshi_up": signal.kalshi_price if signal else None,
                 "live_budget": live_budget,
                 "required_edge": round(
-                    self.config.min_edge + (self.config.live_fee_rate if live else 0.0), 4
+                    self.config.min_edge
+                    + (self.config.live_fee_rate if live else 0.0)
+                    + _session_bump,
+                    4,
                 ),
                 "reason": (signal.reason if signal else refusal) or "no quotable contract",
             }

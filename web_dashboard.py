@@ -1325,6 +1325,14 @@ def _strategy_supervisor_loop():
                     if _runtime_key(name) in wanted:
                         continue
                     row = recorded.get(_runtime_key(name))
+                    # LAW + cost guard: heavy API abusers (quick_flip) are never
+                    # auto-started onto a book with no record. The operator left
+                    # them OFF on purpose; AUTO_START_ALL must not resurrect
+                    # them. An explicit Start press still goes through the toggle
+                    # endpoint (which refuses abusers with an explanation), and
+                    # a pre-existing desired=1 row is still honoured/resumed.
+                    if row is None and name in HEAVY_API_ABUSERS:
+                        continue
                     if row is not None:
                         # A row exists, so this book's button has been pushed
                         # before. The operator's last click is PERMANENT truth:
@@ -2381,6 +2389,21 @@ def _mode_payload() -> Dict[str, Any]:
     # Only the live path needs the network, so only probe it in LIVE mode.
     if mode == MODE_LIVE:
         payload["funding"] = run(mgr.funding(materialize_private_key()))
+        # LIVE-ONLY funding guidance (display only, never blocks, never touches
+        # DRY): 20%-fraction clips with a $25 book cap need ~$125 to hold a
+        # full book and $200+ to survive a losing streak at real size.
+        try:
+            _bal = float((payload["funding"] or {}).get("balance") or 0.0)
+            if _bal < 125.0:
+                _why = str((payload["funding"] or {}).get("reason") or "")
+                payload["funding"]["recommendation"] = (
+                    f"LIVE BTC 15-min wants a $200 minimum ($125 to hold a full "
+                    f"$25 book at 20% clips). Current ${_bal:.2f}. "
+                    + (_why + " " if _why else "")
+                    + "Fund before expecting DRY-like trade counts."
+                )
+        except Exception:  # noqa: BLE001 - guidance never breaks the payload
+            pass
     else:
         # DRY's payload must not carry the real balance at all. Nothing on the
         # DRY screen reads funding.balance - the funding card reads dry_funding -
@@ -3231,6 +3254,33 @@ def api_strategy_toggle(name):
     if name not in strategy_state:
         return jsonify({"error": f"Unknown strategy: {name}"}), 404
 
+    # LAW + cost guard: heavy API abusers stay OFF until the operator
+    # deliberately re-enables them in code. The page button already pops an
+    # explanation; the API enforces the same rule so a direct POST or bulk
+    # Start cannot resurrect the lane behind the operator's back. Stops are
+    # always allowed.
+    if name in HEAVY_API_ABUSERS:
+        try:
+            _rec = _run_async(_runtime_store().snapshot())
+            _row = _rec.get(_runtime_key(name)) or {}
+            _pid = _row.get("pid")
+            _running = bool(_pid) and _pid_alive(_pid, _row)
+        except Exception:  # noqa: BLE001
+            _running = False
+        if not _running:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            f"{name} is locked OFF as a heavy API abuser: "
+                            f"{HEAVY_API_ABUSERS.get(name, '')} Re-enable it in "
+                            f"code if you accept the LLM burn."
+                        )
+                    }
+                ),
+                403,
+            )
+
     st = strategy_state[name]
     # The persisted book mode is the SOURCE OF TRUTH for which book we are in.
     # A button pressed while the switch reads DRY cannot spawn a LIVE process,
@@ -3295,9 +3345,13 @@ def api_strategy_toggle(name):
             }
         )
 
-    # Stopping is recorded as an explicit instruction, not just a cleared pid, so
-    # the supervisor knows this strategy is meant to stay down.
-    _run_async(store.set_desired(name, False, mode))
+    # LAW: the operator's last button push is permanent truth. This point is
+    # reached only when the DB says the lane is NOT running, so this is a
+    # START request. Never clear intent here: a Start that fails validation
+    # (mode mismatch, missing creds, spawn error) must leave the previous
+    # intent exactly as it was, not flip a lane the operator turned ON into
+    # OFF-forever. _spawn_strategy records desired=True on success; the Stop
+    # path above (db_running) is the only place desired=False is written.
 
     if requested_mode is not None and requested_mode != runtime_mode:
         # Starting is gated on the book: the page controls the book it shows.

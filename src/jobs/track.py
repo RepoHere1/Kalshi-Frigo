@@ -329,6 +329,46 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                     # before touching the DB. Kalshi auto-settles resolved markets,
                     # so we skip order placement only in the market_resolution case.
                     is_resolution = exit_reason == "market_resolution"
+                    # LIVE-ONLY settled-book bypass: a 15-min book that has
+                    # expired rolls into asks of $1.00/$1.00 (the collection
+                    # shape) or status closed. Selling into it is refused by
+                    # build_order_request, which used to strand LIVE capital
+                    # open for hours (the 16:45 bucket still open at 23:52).
+                    # LIVE closes those as resolutions with no sell order.
+                    # DRY keeps the existing attempt-and-fail path untouched.
+                    # Per-position book check (not the global mode): legacy and
+                    # test rows with no mode set stay on the DRY path.
+                    _pos_is_live = str(position.mode or "").lower() == "live"
+                    if not is_resolution and _pos_is_live:
+                        try:
+                            from src.jobs import live_fees as _live_fees
+
+                            if _live_fees.is_settled_market(market_data):
+                                _res = str(market_result or "").lower()
+                                _side = str(position.side or "").lower()
+                                if _res in ("yes", "no"):
+                                    exit_price = (
+                                        1.0 if _res == _side else 0.0
+                                    )
+                                else:
+                                    # No result published yet: settle at the
+                                    # side's current quote if quoted, else 0.
+                                    _cur = (
+                                        current_yes_price
+                                        if position.side == "YES"
+                                        else current_no_price
+                                    )
+                                    exit_price = float(_cur or 0.0)
+                                exit_reason = "market_resolution"
+                                is_resolution = True
+                                logger.info(
+                                    f"LIVE settled-book bypass for "
+                                    f"{position.market_id}: closing as "
+                                    f"market_resolution at {exit_price:.3f} "
+                                    f"instead of selling into a closed book"
+                                )
+                        except Exception:  # noqa: BLE001 - bypass never blocks
+                            pass
 
                     if not is_resolution:
                         # Sanity guard: a $0 exit on an active market means we're
@@ -387,12 +427,40 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
 
                     # Calculate PnL
                     pnl = (exit_price - position.entry_price) * position.quantity
+                    # LIVE-ONLY fee-net accounting: estimate the round-trip
+                    # Kalshi fee (taker entry + maker-or-taker exit) and net it
+                    # out so LIVE trade_logs show what the account kept. DRY
+                    # keeps gross PnL with fee 0 -- its historic numbers are
+                    # untouched. Per-position book check: only rows stamped
+                    # mode='live' (which every LIVE insert writes) take this
+                    # branch. Legacy/test rows with no mode stay gross.
+                    fee_paid = 0.0
+                    _fee_is_live = str(position.mode or "").lower() == "live"
+                    if _fee_is_live:
+                        try:
+                            from src.jobs import live_fees as _live_fees2
+
+                            _maker_exit = not is_resolution
+                            fee_paid = float(
+                                _live_fees2.roundtrip_fee_dollars(
+                                    position.entry_price,
+                                    exit_price,
+                                    int(position.quantity or 0),
+                                    maker_exit=_maker_exit,
+                                )
+                            )
+                            pnl = round(pnl - fee_paid, 2)
+                        except Exception:  # noqa: BLE001 - fees never block a close
+                            fee_paid = 0.0
 
                     # Create trade log.
                     # strategy / exit_reason / mode were all omitted, so every
                     # close landed with strategy NULL (making per-strategy P&L
                     # permanently "unattributed") and with no record of why it
                     # exited or which book it belonged to.
+                    _rationale = f"{position.rationale} | EXIT: {exit_reason}"
+                    if fee_paid > 0:
+                        _rationale += f" | LIVE fees est ${fee_paid:.2f} (net PnL)"
                     trade_log = TradeLog(
                         market_id=position.market_id,
                         side=position.side,
@@ -402,10 +470,11 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                         pnl=pnl,
                         entry_timestamp=position.timestamp,
                         exit_timestamp=datetime.now(),
-                        rationale=f"{position.rationale} | EXIT: {exit_reason}",
+                        rationale=_rationale,
                         strategy=position.strategy or _infer_strategy(position),
                         exit_reason=exit_reason,
                         mode=position.mode or _current_mode(),
+                        fee_paid=round(fee_paid, 2),
                     )
 
                     # Record the exit. For non-resolution exits the sell order

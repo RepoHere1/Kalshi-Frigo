@@ -2227,7 +2227,13 @@ def test_every_strategy_command_is_paper(client, auth, monkeypatch, tmp_path):
     _toggle_env(monkeypatch, tmp_path)
     for name in wd.strategy_state:
         _RecordingPopen.instances = []
-        client.post(f"/api/strategy/{name}/toggle", json={"mode": "paper"}, headers=auth)
+        r = client.post(f"/api/strategy/{name}/toggle", json={"mode": "paper"}, headers=auth)
+        if name in wd.HEAVY_API_ABUSERS:
+            # quick_flip is locked OFF as the #1 OpenRouter spender: the API
+            # refuses Start with 403 and spawns nothing.
+            assert r.status_code == 403, f"{name} abuser lockout bypassed"
+            assert _RecordingPopen.instances == []
+            continue
         args = list(_RecordingPopen.instances[-1].args[0])
         assert "--live" not in args, f"{name} was spawned with --live"
         assert "--paper" in args, f"{name} was spawned without --paper"
@@ -2540,14 +2546,16 @@ def test_toggle_defaults_to_the_current_book(client, auth, monkeypatch):
         st.update({"running": False, "pid": None, "stop_reason": ""})
 
     # DRY book: the toggle request carries no mode and must resolve to paper.
-    r = client.post("/api/strategy/quick_flip/toggle", json={}, headers=auth)
+    # (Uses btc_updown: quick_flip is locked OFF as a heavy API abuser and its
+    # Start is refused with 403.)
+    r = client.post("/api/strategy/btc_updown/toggle", json={}, headers=auth)
     assert r.status_code == 200
     args = list(_RecordingPopen.instances[-1].args[0])
     assert "--paper" in args
     assert "--live" not in args
     # Simulate the stop so the next start is clean.
     _RecordingPopen.instances[-1].poll = lambda: 1
-    wd.strategy_state["quick_flip"].update({"running": False, "pid": None})
+    wd.strategy_state["btc_updown"].update({"running": False, "pid": None})
 
     # Flip to LIVE (funded), then the same bare toggle resolves to live.
     from src.utils.mode import TradingMode
@@ -2560,7 +2568,7 @@ def test_toggle_defaults_to_the_current_book(client, auth, monkeypatch):
         client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth).status_code
         == 200
     )
-    r = client.post("/api/strategy/quick_flip/toggle", json={}, headers=auth)
+    r = client.post("/api/strategy/btc_updown/toggle", json={}, headers=auth)
     assert r.status_code == 200
     args = list(_RecordingPopen.instances[-1].args[0])
     assert "--live" in args

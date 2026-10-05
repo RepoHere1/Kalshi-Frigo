@@ -118,6 +118,10 @@ class TradeLog:
     # Which book the close belongs to, so simulated P&L never inflates the
     # live record.
     mode: Optional[str] = None
+    # LIVE-only: estimated Kalshi fees for the round trip (entry taker + exit).
+    # DRY rows store 0/None and keep gross PnL; LIVE rows store the estimate
+    # and net it out of pnl so the dashboard shows fee-net results.
+    fee_paid: Optional[float] = None
     id: Optional[int] = None
 
 
@@ -384,7 +388,8 @@ class DatabaseManager(TradingLoggerMixin):
                 entry_timestamp TEXT NOT NULL,
                 exit_timestamp TEXT NOT NULL,
                 rationale TEXT,
-                strategy TEXT
+                strategy TEXT,
+                fee_paid REAL DEFAULT 0
             )
         """
         )
@@ -517,6 +522,9 @@ class DatabaseManager(TradingLoggerMixin):
             ),
             lambda: add_column("trade_logs", "exit_reason", "TEXT"),
             lambda: add_column("trade_logs", "mode", "TEXT"),
+            # LIVE-only fee accounting. Additive column, default 0: existing
+            # DRY rows read back as 0/None and their gross PnL is untouched.
+            lambda: add_column("trade_logs", "fee_paid", "REAL DEFAULT 0"),
             # Backfill the book for pre-existing rows. `live` is the best signal
             # available for them: live=1 meant a real order was sent.
             lambda: self._backfill_position_mode(db),
@@ -826,13 +834,22 @@ class DatabaseManager(TradingLoggerMixin):
         trade_dict["exit_timestamp"] = trade_log.exit_timestamp.isoformat()
 
         async with connect(self.db_path) as db:
-            await db.execute(
-                """
-                INSERT INTO trade_logs (market_id, side, entry_price, exit_price, quantity, pnl, entry_timestamp, exit_timestamp, rationale, strategy, exit_reason, mode)
-                VALUES (:market_id, :side, :entry_price, :exit_price, :quantity, :pnl, :entry_timestamp, :exit_timestamp, :rationale, :strategy, :exit_reason, :mode)
-            """,
-                trade_dict,
-            )
+            try:
+                await db.execute(
+                    """
+                    INSERT INTO trade_logs (market_id, side, entry_price, exit_price, quantity, pnl, entry_timestamp, exit_timestamp, rationale, strategy, exit_reason, mode, fee_paid)
+                    VALUES (:market_id, :side, :entry_price, :exit_price, :quantity, :pnl, :entry_timestamp, :exit_timestamp, :rationale, :strategy, :exit_reason, :mode, :fee_paid)
+                """,
+                    {**trade_dict, "fee_paid": trade_dict.get("fee_paid") or 0.0},
+                )
+            except Exception:  # noqa: BLE001 - pre-migration DB without fee_paid
+                await db.execute(
+                    """
+                    INSERT INTO trade_logs (market_id, side, entry_price, exit_price, quantity, pnl, entry_timestamp, exit_timestamp, rationale, strategy, exit_reason, mode)
+                    VALUES (:market_id, :side, :entry_price, :exit_price, :quantity, :pnl, :entry_timestamp, :exit_timestamp, :rationale, :strategy, :exit_reason, :mode)
+                """,
+                    trade_dict,
+                )
             await db.commit()
             self.logger.info(f"Added trade log for market {trade_log.market_id}.")
 

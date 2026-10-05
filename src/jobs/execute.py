@@ -196,6 +196,30 @@ async def place_sell_limit_order(
     try:
         side = position.side.lower()  # "YES" -> "yes", "NO" -> "no"
         mode = MODE_LIVE if live_mode else MODE_DRY
+        # LIVE-ONLY sell dedupe: refuse a sell when no open LIVE quantity is
+        # held for this ticker/side. Profit-taking, stop-loss and tracking all
+        # scan the same book, and without this each of them credits/sells the
+        # same row every cycle (the 962-fills-vs-300-closes inflation seen in
+        # DRY). DRY skips this check entirely so its historic ledger behaviour
+        # is byte-identical.
+        if live_mode:
+            try:
+                _live_open = await db_manager.get_open_positions(mode=MODE_LIVE)
+                _held = sum(
+                    int(p.quantity or 0)
+                    for p in _live_open
+                    if str(p.market_id) == str(position.market_id)
+                    and str(p.side or "").upper()
+                    == str(position.side or "").upper()
+                )
+                if _held <= 0:
+                    logger.warning(
+                        f"Skipping LIVE sell for {position.market_id}: "
+                        f"no open LIVE quantity held on {position.side}"
+                    )
+                    return False
+            except Exception:  # noqa: BLE001 - dedupe must not block a real exit
+                pass
         mode_manager = _mode_manager()
 
         # A sell needs the live book so the limit price can be validated the same
@@ -317,10 +341,39 @@ async def place_profit_taking_orders(
 
                     # Check if we should place a profit-taking sell order
                     if profit_pct >= profit_threshold:
-                        # Calculate sell limit price (slightly below current to ensure execution)
-                        sell_price = (
-                            current_price * 0.98
-                        )  # 2% below current price for quick execution
+                        # DRY keeps the historic 2% discount (taker-style, fast
+                        # fill, simulated anyway). LIVE rests at the quote when
+                        # time allows (maker fee, ~1/4 the cost) and only takes
+                        # when urgent. DRY behaviour is byte-identical.
+                        if live_mode:
+                            try:
+                                from src.jobs import live_fees as _live_fees
+
+                                _secs = None
+                                try:
+                                    _close_ts = market_data.get("close_time")
+                                    if _close_ts:
+                                        from datetime import datetime, timezone
+
+                                        _ct = datetime.fromisoformat(
+                                            str(_close_ts).replace("Z", "+00:00")
+                                        )
+                                        if _ct.tzinfo is None:
+                                            _ct = _ct.replace(tzinfo=timezone.utc)
+                                        _secs = (
+                                            _ct - datetime.now(timezone.utc)
+                                        ).total_seconds()
+                                except Exception:  # noqa: BLE001
+                                    _secs = None
+                                sell_price = _live_fees.live_exit_limit_price(
+                                    position.side, current_price, _secs
+                                )
+                            except Exception:  # noqa: BLE001
+                                sell_price = current_price * 0.98
+                        else:
+                            sell_price = (
+                                current_price * 0.98
+                            )  # 2% below current price for quick execution
 
                         logger.info(
                             f"💰 PROFIT TARGET HIT: {position.market_id} - {profit_pct:.1%} profit (${unrealized_pnl:.2f})"
