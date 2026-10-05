@@ -70,6 +70,27 @@ def parse_brti_message(msg: object) -> Dict[str, Optional[float]]:
     if not isinstance(msg, dict):
         return out
     scopes: List[Any] = [msg]
+    # Real Kalshi WS frame (verified live 2026-10-05):
+    #   {"type":"cfbenchmarks_value","sid":1,"seq":1,
+    #    "msg":{"index_id":"BRTI","received_at":<ms>,
+    #           "data":"{\"type\":\"value\",\"time\":<ms>,\"id\":\"BRTI\",
+    #                    \"value\":\"85850.67\"}",   <-- JSON-encoded STRING
+    #           "avg_60s_data":{"value":"85850.67",...}},
+    #    "sending_ts_ms":<ms>}
+    # The envelope is `msg`, and the live value rides inside a JSON string.
+    envelope = msg.get("msg")
+    if isinstance(envelope, dict):
+        scopes.append(envelope)
+        data_str = envelope.get("data")
+        if isinstance(data_str, str):
+            try:
+                import json as _json
+
+                inner = _json.loads(data_str)
+                if isinstance(inner, dict):
+                    scopes.append(inner)
+            except (ValueError, TypeError):
+                pass
     for key in ("data", "value", "index", "payload"):
         sub = msg.get(key)
         if isinstance(sub, (dict, int, float, str)):
@@ -107,7 +128,15 @@ def parse_brti_message(msg: object) -> Dict[str, Optional[float]]:
                 if out["win_avg"] is not None:
                     break
         if out["source_ts"] is None:
-            for key in ("source_ts_ms", "timestamp_ms", "ts_ms", "source_ts"):
+            for key in (
+                "time",
+                "source_ts_ms",
+                "timestamp_ms",
+                "ts_ms",
+                "source_ts",
+                "sending_ts_ms",
+                "received_at",
+            ):
                 raw = scope.get(key)
                 if raw is None or isinstance(raw, bool):
                     continue

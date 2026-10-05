@@ -210,6 +210,35 @@ def test_brti_parser_reads_flat_and_nested_shapes():
     assert parse_brti_message("garbage")["value"] is None
 
 
+def test_brti_parser_reads_the_real_kalshi_ws_frame():
+    """The exact frame captured live from the cfbenchmarks_value channel."""
+    from src.jobs.brti_feed import parse_brti_message
+
+    frame = {
+        "type": "cfbenchmarks_value",
+        "sid": 1,
+        "seq": 1,
+        "msg": {
+            "index_id": "BRTI",
+            "received_at": 1791180714074,
+            "data": '{"type":"value","time":1791180714000,"id":"BRTI","value":"85850.67"}',
+            "avg_60s_data": {
+                "value": "85850.67000000",
+                "window_size": 0,
+                "window_start_ts_ms": 1791180654000,
+                "window_end_ts_exclusive": 1791180714000,
+            },
+        },
+        "sending_ts_ms": 1791180714077,
+    }
+    out = parse_brti_message(frame)
+    assert out["value"] == 85850.67
+    assert out["avg60"] == 85850.67
+    # Inner data.time (1791180714000) or the envelope's sending_ts_ms
+    # (1791180714077) are both valid millisecond source stamps.
+    assert abs((out["source_ts"] or 0) - 1791180714.0) < 1.0
+
+
 def test_brti_estimate_prefers_windowed_then_avg60_then_value():
     from src.jobs.brti_feed import BrtiFeed
 
