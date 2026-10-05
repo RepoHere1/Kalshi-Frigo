@@ -141,6 +141,8 @@ class BrtiFeed:
         self.connected = False
         self.degraded_reason = ""
         self.last_error = ""
+        self.frames_seen = 0
+        self.last_msg_type = ""
         self.history: Deque[Tuple[float, float]] = deque(maxlen=BRTI_POINTS)
         self._ws: Any = None
         self._task: Optional[asyncio.Task] = None
@@ -168,6 +170,9 @@ class BrtiFeed:
         return "none"
 
     async def _on_msg(self, msg: Dict[str, Any]) -> None:
+        self.frames_seen += 1
+        if isinstance(msg, dict):
+            self.last_msg_type = str(msg.get("type", ""))[:40]
         parsed = parse_brti_message(msg)
         if parsed["value"] is None and parsed["avg60"] is None:
             return

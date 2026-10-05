@@ -2908,3 +2908,48 @@ def test_an_unreachable_history_leaves_the_tally_unknown_not_zero(client, auth, 
     assert k["realized_known"] is False
     assert k["realized"] == 0.0
     assert k["cost_basis"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# /api/live/journal: the local mode='live' book must be fully visible
+# ---------------------------------------------------------------------------
+def test_live_journal_empty_shape(client):
+    r = client.get("/api/live/journal")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["book"] == "live"
+    assert body["open"] == [] and body["open_count"] == 0
+    assert body["recent_closes"] == [] and body["closed_count"] == 0
+
+
+def test_live_journal_shows_mode_live_rows_only(client):
+    import aiosqlite
+
+    async def seed():
+        from src.utils.database import DatabaseManager
+
+        db = DatabaseManager(db_path=wd.DB_PATH)
+        await db.initialize()
+        async with aiosqlite.connect(wd.DB_PATH) as conn:
+            await conn.execute(
+                "INSERT INTO positions (market_id, side, entry_price, quantity,"
+                " timestamp, live, status, strategy, mode)"
+                " VALUES ('LIVE-1', 'YES', 0.64, 2, '2026-10-05T00:00:00', 0,"
+                " 'open', 'btc_updown', 'live')"
+            )
+            await conn.execute(
+                "INSERT INTO positions (market_id, side, entry_price, quantity,"
+                " timestamp, live, status, strategy, mode)"
+                " VALUES ('DRY-1', 'YES', 0.50, 10, '2026-10-05T00:00:00', 0,"
+                " 'open', 'btc_updown', 'dry')"
+            )
+            await conn.commit()
+
+    import asyncio
+
+    asyncio.run(seed())
+    body = client.get("/api/live/journal").get_json()
+    assert body["open_count"] == 1
+    assert body["open"][0]["market_id"] == "LIVE-1"
+    assert body["open"][0]["notional"] == 1.28
+    assert body["open_notional"] == 1.28

@@ -2857,6 +2857,64 @@ def api_positions():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/live/journal")
+def api_live_journal():
+    """Read-only LIVE book journal: local mode='live' rows plus Kalshi truth.
+
+    /api/positions answers from legacy live-flagged rows and falls back to
+    Kalshi truth, so the ladder's own mode='live' rows (inserted with
+    live=False) are invisible there. This endpoint shows them exactly:
+    every open mode='live' row with id/entry/qty/strategy, the 20 most
+    recent mode='live' closes with fee_net PnL, and both counts side by
+    side. Every fill must leave a visible row -- this is where to check.
+    """
+    try:
+        import aiosqlite
+
+        db = _db()
+
+        async def _read():
+            async with aiosqlite.connect(db.db_path) as conn:
+                conn.row_factory = aiosqlite.Row
+                cur = await conn.execute(
+                    "SELECT id, market_id, side, entry_price, quantity,"
+                    " strategy, status, mode, timestamp FROM positions"
+                    " WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'live'"
+                    " AND status = 'open' ORDER BY id DESC LIMIT 100"
+                )
+                opens = [dict(r) for r in await cur.fetchall()]
+                cur = await conn.execute(
+                    "SELECT market_id, side, entry_price, exit_price, quantity,"
+                    " pnl, fee_paid, exit_reason, strategy, exit_timestamp"
+                    " FROM trade_logs"
+                    " WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'live'"
+                    " ORDER BY COALESCE(exit_timestamp, '') DESC LIMIT 20"
+                )
+                closes = [dict(r) for r in await cur.fetchall()]
+                return opens, closes
+
+        opens, closes = _run_async(_read())
+        for r in opens:
+            r["timestamp"] = str(r.get("timestamp") or "")[:19]
+            r["notional"] = round(
+                float(r.get("entry_price") or 0.0) * int(r.get("quantity") or 0), 2
+            )
+        for r in closes:
+            r["exit_timestamp"] = str(r.get("exit_timestamp") or "")[:19]
+        return jsonify(
+            {
+                "book": "live",
+                "open": opens,
+                "open_count": len(opens),
+                "open_notional": round(sum(r["notional"] for r in opens), 2),
+                "recent_closes": closes,
+                "closed_count": len(closes),
+            }
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # 2. Real-time trade feed (SSE)
 @app.route("/api/stream")
 def api_stream():

@@ -828,6 +828,8 @@ class UpDownTrader:
             else:
                 _brti_state = (
                     f"stale-{getattr(_b, 'degraded_reason', '') or 'no ticks'}"
+                    f"[frames={getattr(_b, 'frames_seen', 0)}"
+                    f" last={getattr(_b, 'last_msg_type', '') or '-'}]"
                     f"{(';' + str(getattr(_b, 'last_error', ''))[:80]) if getattr(_b, 'last_error', '') else ''}"
                 )
         except Exception:  # noqa: BLE001
