@@ -204,6 +204,116 @@ async def calculate_dynamic_exit_levels(position: Position) -> dict:
     return exit_levels
 
 
+async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
+    """Close stale LIVE rows Kalshi confirms settled. LIVE-only, DRY untouched.
+
+    Only acts on open mode='live' rows older than 3 hours, at most 10 per
+    pass, and only when /portfolio/settlements returns a receipt for the
+    exact ticker. No receipt means the row stays open -- a close is never
+    invented. Closes are claimed first so the tracking loop below skips them.
+    """
+    from datetime import timezone
+
+    from src.jobs import live_fees as _live_fees
+
+    result = {"reconciled": 0, "unreconciled": 0, "checked": 0}
+    try:
+        rows = await db_manager.get_open_positions(mode=MODE_LIVE)
+    except Exception:  # noqa: BLE001
+        return result
+    now = datetime.now(timezone.utc)
+    for position in rows:
+        if result["checked"] >= 10:
+            break
+        try:
+            ts = position.timestamp
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age_hours = (now - ts).total_seconds() / 3600.0
+        except Exception:  # noqa: BLE001 - unparsable age: leave open
+            continue
+        if age_hours < 3.0:
+            continue
+        result["checked"] += 1
+        try:
+            if position.id is not None and not await db_manager.claim_position_for_close(
+                position.id
+            ):
+                continue
+            claimed = position.id is not None
+            try:
+                payload = await kalshi_client.get_settlements(ticker=position.market_id)
+            except Exception:  # noqa: BLE001 - API error: release, retry later
+                if claimed:
+                    await db_manager.release_position_claim(position.id)
+                continue
+            receipt = _live_fees.parse_settlement_result(payload, position.market_id)
+            if receipt is None:
+                if claimed:
+                    await db_manager.release_position_claim(position.id)
+                result["unreconciled"] += 1
+                continue
+            side = str(position.side or "").lower()
+            exit_price = 1.0 if receipt["result"] == side else 0.0
+            gross = (exit_price - float(position.entry_price or 0.0)) * int(
+                position.quantity or 0
+            )
+            fee_paid = float(receipt.get("fees") or 0.0)
+            if fee_paid <= 0:
+                fee_paid = float(
+                    _live_fees.roundtrip_fee_dollars(
+                        float(position.entry_price or 0.0),
+                        exit_price,
+                        int(position.quantity or 0),
+                        maker_exit=False,
+                    )
+                )
+            trade_log = TradeLog(
+                market_id=position.market_id,
+                side=position.side,
+                entry_price=position.entry_price,
+                exit_price=exit_price,
+                quantity=position.quantity,
+                pnl=round(gross - fee_paid, 2),
+                entry_timestamp=position.timestamp,
+                exit_timestamp=datetime.now(),
+                rationale=(
+                    f"{position.rationale} | EXIT: market_resolution "
+                    f"(LIVE settlement receipt) | LIVE fees ${fee_paid:.2f} (net PnL)"
+                ),
+                strategy=position.strategy or _infer_strategy(position),
+                exit_reason="market_resolution",
+                mode="live",
+                fee_paid=round(fee_paid, 2),
+            )
+            await db_manager.add_trade_log(trade_log)
+            if position.id is not None:
+                await db_manager.update_position_status(position.id, "closed")
+            result["reconciled"] += 1
+            logger.info(
+                f"LIVE reconciled {position.market_id} as market_resolution "
+                f"at {exit_price:.2f} (receipt {receipt['result']}, "
+                f"net ${trade_log.pnl:.2f})"
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad row never stops recon
+            logger.error(f"LIVE reconcile failed for {position.market_id}: {exc}")
+            try:
+                if position.id is not None:
+                    await db_manager.release_position_claim(position.id)
+            except Exception:  # noqa: BLE001
+                pass
+            continue
+    if result["checked"]:
+        logger.info(
+            f"LIVE settlement reconciliation: {result['reconciled']} closed on "
+            f"receipt, {result['unreconciled']} left open (no receipt) "
+            f"of {result['checked']} stale rows checked"
+        )
+    return result
+
+
 async def run_tracking(db_manager: Optional[DatabaseManager] = None):
     """
     Enhanced position tracking with smart exit strategies and sell limit orders.
@@ -247,6 +357,19 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
             logger.info(f"📈 SELL LIMIT ORDERS SUMMARY: {total_sell_orders} orders placed")
             logger.info(f"   Profit-taking: {profit_results['orders_placed']} orders")
             logger.info(f"   Stop-loss: {stop_loss_results['orders_placed']} orders")
+
+        # LIVE-ONLY stale-settlement reconciliation: local LIVE rows on
+        # long-expired buckets never see an exit signal (their quote reads 0),
+        # so they sit open forever and pin deployed capital above
+        # max_open_notional -- which blocks every new LIVE entry. Kalshi's own
+        # /portfolio/settlements receipt is ground truth: close rows it
+        # confirms as market_resolution, leave everything else open. DRY is
+        # never touched by this function.
+        if is_live:
+            try:
+                await _reconcile_live_settled(db_manager, kalshi_client, logger)
+            except Exception as exc:  # noqa: BLE001 - recon never blocks tracking
+                logger.error(f"LIVE settlement reconciliation failed: {exc}")
 
         # Step 2: Continue with existing position tracking (market resolution, etc.)
         open_positions = await db_manager.get_open_live_positions()

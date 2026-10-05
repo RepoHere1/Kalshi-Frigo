@@ -594,6 +594,7 @@ class UpDownTrader:
         # fixed clip and lets execute_position's own fail-closed balance check
         # refuse if the account genuinely cannot pay.
         live_budget: Optional[float] = None
+        variance_mult: float = 1.0
         if live:
             try:
                 if self._client is None:
@@ -607,6 +608,24 @@ class UpDownTrader:
                 )
             except Exception as exc:  # noqa: BLE001
                 self.book.last_error = f"LIVE balance read: {type(exc).__name__}: {exc}"
+            # LIVE-ONLY variance-commensurate sizing: the bigger Kalshi's lie
+            # (spot far from target with minutes to close), the bigger the clip
+            # -- up to 2.5x -- because convergence is proportionally more
+            # certain. Bounded by the balance fraction, the $1 minimum order
+            # floor and max_open_notional downstream. DRY keeps its fixed $5.
+            if live_budget is not None and market is not None:
+                try:
+                    from src.jobs import live_fees as _live_fees_var
+
+                    _tgt = market.target
+                    if _tgt is not None and self.spot.price > 0:
+                        variance_mult = _live_fees_var.variance_clip_multiplier(
+                            self.spot.price - float(_tgt),
+                            self.config.noise_usd,
+                        )
+                        live_budget = round(live_budget * variance_mult, 2)
+                except Exception:  # noqa: BLE001 - sizing never blocks entry
+                    variance_mult = 1.0
 
         signal = self.evaluate(market, live=live, clip_usd=live_budget if live else None)
         # Clear stale errors, but never wipe the explanation of a failed LIVE
@@ -756,6 +775,7 @@ class UpDownTrader:
                 "fair_up": signal.fair if signal else None,
                 "kalshi_up": signal.kalshi_price if signal else None,
                 "live_budget": live_budget,
+                "variance_mult": variance_mult if live else 1.0,
                 "required_edge": round(
                     self.config.min_edge
                     + (self.config.live_fee_rate if live else 0.0)

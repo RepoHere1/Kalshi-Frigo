@@ -143,3 +143,74 @@ def backoff_delay_seconds(attempt: int) -> float:
     """429 backoff with jitter. LIVE-only; DRY fails fast as before."""
     attempt = max(int(attempt or 0), 0)
     return round(min(2.0**attempt, 30.0) + random.uniform(0.0, 1.5), 2)
+
+
+# Variance-commensurate sizing: how far live spot sits from the target, in
+# units of the noise band. A $58 lie with minutes to close is a stronger
+# convergence bet than a $16 twitch just outside the deadband, so LIVE bets
+# proportionally more. DRY never calls this and keeps its fixed $5 clip.
+VARIANCE_UNIT_MULTIPLE = 2.0
+VARIANCE_MAX_MULTIPLE = 2.5
+
+
+def variance_clip_multiplier(delta: float, noise_usd: float = 15.0) -> float:
+    """Clip multiplier from the size of Kalshi's mispricing. LIVE-only."""
+    try:
+        noise = float(noise_usd or 15.0)
+    except (TypeError, ValueError):
+        noise = 15.0
+    if noise <= 0:
+        return 1.0
+    try:
+        units = abs(float(delta or 0.0)) / noise
+    except (TypeError, ValueError):
+        return 1.0
+    mult = units / VARIANCE_UNIT_MULTIPLE
+    return round(max(1.0, min(VARIANCE_MAX_MULTIPLE, mult)), 2)
+
+
+def parse_settlement_result(payload: object, ticker: str) -> dict | None:
+    """Find Kalshi's own settlement receipt for `ticker`. LIVE-only.
+
+    Returns {"result": "yes"|"no", "fees": float} or None when no receipt
+    exists. Parsing is defensive: the settlements payload shape is walked
+    generically (any list of dicts, ticker under several possible keys,
+    result/fees under several possible keys). No receipt ever means no
+    action -- the caller must leave the position open, never invent a close.
+    """
+    want = str(ticker or "").strip()
+    if not want or not isinstance(payload, dict):
+        return None
+    cands: list = []
+    for value in payload.values():
+        if isinstance(value, list):
+            cands.extend(value)
+        elif isinstance(value, dict):
+            for sub in value.values():
+                if isinstance(sub, list):
+                    cands.extend(sub)
+    for row in cands:
+        if not isinstance(row, dict):
+            continue
+        for key in ("ticker", "market_ticker", "event_ticker"):
+            if str(row.get(key) or "").strip() == want:
+                break
+        else:
+            continue
+        result = None
+        for key in ("result", "market_result", "outcome", "settlement_result"):
+            val = str(row.get(key) or "").strip().lower()
+            if val in ("yes", "no"):
+                result = val
+                break
+        if result is None:
+            continue
+        fees = 0.0
+        for key in ("fees", "fee", "total_fees", "taker_fees", "fees_paid"):
+            try:
+                fees = abs(float(row.get(key) or 0.0))
+                break
+            except (TypeError, ValueError):
+                continue
+        return {"result": result, "fees": round(fees, 2)}
+    return None

@@ -136,9 +136,57 @@ def test_backoff_is_bounded_and_jittered():
 
 
 # ---------------------------------------------------------------------------
+# Variance-commensurate sizing is LIVE-only (DRY keeps its fixed $5 clip)
+# ---------------------------------------------------------------------------
+def test_variance_multiplier_scales_with_the_lie():
+    assert live_fees.variance_clip_multiplier(0.0) == 1.0
+    assert live_fees.variance_clip_multiplier(15.0) == 1.0
+    assert live_fees.variance_clip_multiplier(30.0) == 1.0
+    assert live_fees.variance_clip_multiplier(58.0) == 1.93
+    assert live_fees.variance_clip_multiplier(-58.0) == 1.93
+    assert live_fees.variance_clip_multiplier(200.0) == 2.5
+
+
+# ---------------------------------------------------------------------------
+# Settlement receipts: only a real receipt may close a stale LIVE row
+# ---------------------------------------------------------------------------
+def test_settlement_parser_finds_a_receipt():
+    payload = {
+        "settlements": [
+            {"ticker": "KXBTC15M-OLD", "result": "yes", "fees": 0.35},
+            {"ticker": "OTHER", "result": "no", "fees": 0.10},
+        ]
+    }
+    assert live_fees.parse_settlement_result(payload, "KXBTC15M-OLD") == {
+        "result": "yes",
+        "fees": 0.35,
+    }
+
+
+def test_settlement_parser_never_invents_a_close():
+    assert live_fees.parse_settlement_result({}, "KXBTC15M-OLD") is None
+    assert live_fees.parse_settlement_result(None, "KXBTC15M-OLD") is None
+    assert (
+        live_fees.parse_settlement_result({"settlements": []}, "KXBTC15M-OLD")
+        is None
+    )
+    assert (
+        live_fees.parse_settlement_result(
+            {"settlements": [{"ticker": "OTHER", "result": "yes"}]}, "KXBTC15M-OLD"
+        )
+        is None
+    )
+    assert (
+        live_fees.parse_settlement_result(
+            {"settlements": [{"ticker": "KXBTC15M-OLD"}]}, "KXBTC15M-OLD"
+        )
+        is None
+    )
+# ---------------------------------------------------------------------------
 # DB migration: fee_paid is additive, DRY rows read back unaffected
 # ---------------------------------------------------------------------------
 def test_fee_column_migrates_and_defaults_to_zero(tmp_path):
+
     import asyncio
 
     from src.utils.database import DatabaseManager, TradeLog
