@@ -41,7 +41,11 @@ from src.utils.database import TradeLog
 from src.utils.market_prices import get_market_prices
 from src.utils.mode import MODE_LIVE
 
-logger = logging.getLogger("live_reaper")
+# The dashboard reads the trading_system log file, so a plain module logger
+# would make every reaper message - including every failure - invisible.
+from src.utils.logging_setup import get_trading_logger
+
+logger = get_trading_logger("live_reaper")
 
 # How often the reaper runs.
 REAP_INTERVAL_SEC = 900.0
@@ -419,7 +423,13 @@ class LiveReaper:
             )
         except Exception as exc:  # noqa: BLE001 - the reaper never kills the loop
             logger.error(f"LIVE reaper pass failed: {type(exc).__name__}: {exc}")
-            return None
+            # Returned, not swallowed: a failure must be visible in the cycle log
+            # and must not read as "no pass was due".
+            return {
+                "failed": True,
+                "error": f"{type(exc).__name__}: {exc}",
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
 
 
 def _now_ts() -> float:

@@ -1086,15 +1086,21 @@ async def run_updown_trader(
                         reaper = LiveReaper(trader.db_manager, trader._client)
                     summary = await reaper.maybe_run()
                     if summary:
-                        print(
-                            f"LIVE reaper: {summary['phantom_closed']} phantom rows "
-                            f"closed, {len(summary['liquidated'])} orphan holdings "
-                            f"liquidated, {len(summary['shorts_flagged'])} shorts "
-                            f"flagged, {summary.get('holdings_after')} Kalshi "
-                            f"holdings left ({summary['flat_rows_on_kalshi']} flat "
-                            f"rows ignored)",
-                            flush=True,
-                        )
+                        if summary.get("failed"):
+                            print(
+                                f"LIVE reaper FAILED: {summary['error']}",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"LIVE reaper: {summary['phantom_closed']} phantom rows "
+                                f"closed, {len(summary['liquidated'])} orphan holdings "
+                                f"liquidated, {len(summary['shorts_flagged'])} shorts "
+                                f"flagged, {summary.get('holdings_after')} Kalshi "
+                                f"holdings left ({summary['flat_rows_on_kalshi']} flat "
+                                f"rows ignored)",
+                                flush=True,
+                            )
             except Exception as exc:  # noqa: BLE001 - reaping never kills the loop
                 print(f"BTC 15m: reaper pass failed: {type(exc).__name__}: {exc}", flush=True)
 
