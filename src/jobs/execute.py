@@ -264,8 +264,11 @@ async def execute_position(
 
         if live_mode:
             await db_manager.update_position_to_live(position.id, fill_price)
-            logger.info(f"✅ LIVE ORDER PLACED for {position.market_id}. Order ID: {order_id}")
-            logger.info(f"💰 Real money used: ${request.notional:.2f}")
+            logger.info(
+                f"✅ LIVE ORDER PLACED {position.market_id} @ {fill_price:.3f} "
+                f"({request.count} contracts, ${request.notional:.2f} notional, "
+                f"~${request.notional * 0.03:.2f} fee)"
+            )
         else:
             # Deliberately NOT promoted to live. `live` is what distinguishes a
             # real position from a simulated one everywhere downstream - the

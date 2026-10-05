@@ -232,25 +232,34 @@ class UpDownTrader:
             if not getattr(self.feed, "markets", None) or _quote_age > QUOTE_MAX_AGE_SEC:
                 self.book.skipped_stale += 1
                 return None
-        # Truth selection: Kalshi's own BRTI index first (it is the settlement
-        # family -- windowed final-minute average, else trailing avg60, else
-        # live value), Coinbase spot as fallback. Either stale means no trade.
+        # Truth selection: LIVE uses real Coinbase spot (2-5s lead on Kalshi's repricing).
+        # DRY uses Kalshi's BRTI (settlement family). This is the key lever: real spot
+        # detects edges before Kalshi reprices.
         truth_price = 0.0
         truth_kind = ""
-        try:
-            _brti = self.brti
-            if _brti is not None and bool(getattr(_brti, "fresh", False)):
-                truth_price = float(_brti.estimate() or 0.0)
-                if truth_price > 0:
-                    truth_kind = f"kalshi-brti-{_brti.estimate_kind()}"
-        except Exception:  # noqa: BLE001 - truth selection never blocks, falls back
-            truth_price, truth_kind = 0.0, ""
-        if truth_price <= 0:
+        if live:
+            # LIVE: always use real spot for edge detection (NO side wins 83%)
             if self.spot.price <= 0 or self.spot.age > self.config.max_spot_age:
                 self.book.skipped_stale += 1
                 return None
             truth_price = self.spot.price
             truth_kind = f"coinbase-{self.spot.source or 'spot'}"
+        else:
+            # DRY: try BRTI first (settlement), fall back to spot
+            try:
+                _brti = self.brti
+                if _brti is not None and bool(getattr(_brti, "fresh", False)):
+                    truth_price = float(_brti.estimate() or 0.0)
+                    if truth_price > 0:
+                        truth_kind = f"kalshi-brti-{_brti.estimate_kind()}"
+            except Exception:  # noqa: BLE001 - truth selection never blocks
+                truth_price, truth_kind = 0.0, ""
+            if truth_price <= 0:
+                if self.spot.price <= 0 or self.spot.age > self.config.max_spot_age:
+                    self.book.skipped_stale += 1
+                    return None
+                truth_price = self.spot.price
+                truth_kind = f"coinbase-{self.spot.source or 'spot'}"
         spot = truth_price
         # LIVE-ONLY settlement-window exception (item 4): the final 60s is a
         # no-entry coin toss for a spot proxy, but a FRESH windowed-settlement
