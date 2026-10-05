@@ -275,6 +275,69 @@ async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
                 continue
             receipt = _live_fees.parse_settlement_result(payload, position.market_id)
             if receipt is None:
+                # A market Kalshi still returns with status closed is
+                # closable right now: read its result (win pays 1.0, loss 0.0)
+                # instead of waiting on a receipt that may never come.
+                # Anything still trading, or gone without answers, is handled
+                # by the expiry path below or left open.
+                try:
+                    _m = await kalshi_client.get_market(position.market_id)
+                    _md = (_m or {}).get("market") or {}
+                except Exception:  # noqa: BLE001 - gone from the API
+                    _md = {}
+                _status = str(_md.get("status", "") or "").lower()
+                if _status == "closed":
+                    try:
+                        _res = str(_md.get("result", "") or "").lower()
+                        _side = str(position.side or "").lower()
+                        if _res in ("yes", "no"):
+                            _exit = 1.0 if _res == _side else 0.0
+                        else:
+                            _exit = 0.0
+                        _entry = float(position.entry_price or 0.0)
+                        _qty = int(position.quantity or 0)
+                        _fee = float(
+                            _live_fees.roundtrip_fee_dollars(
+                                _entry, _exit, _qty, maker_exit=False
+                            )
+                        )
+                        _log = TradeLog(
+                            market_id=position.market_id,
+                            side=position.side,
+                            entry_price=position.entry_price,
+                            exit_price=_exit,
+                            quantity=position.quantity,
+                            pnl=round((_exit - _entry) * _qty - _fee, 2),
+                            entry_timestamp=position.timestamp,
+                            exit_timestamp=datetime.now(),
+                            rationale=(
+                                f"{position.rationale} | EXIT:"
+                                f" market_resolution (closed book read)"
+                                f" | LIVE fees ${_fee:.2f} (net PnL)"
+                            ),
+                            strategy=position.strategy
+                            or _infer_strategy(position),
+                            exit_reason="market_resolution",
+                            mode="live",
+                            fee_paid=round(_fee, 2),
+                        )
+                        await db_manager.add_trade_log(_log)
+                        if position.id is not None:
+                            await db_manager.update_position_status(
+                                position.id, "closed"
+                            )
+                        result["reconciled"] += 1
+                        logger.info(
+                            f"LIVE closed-book {position.market_id} as"
+                            f" market_resolution at {_exit:.2f}"
+                            f" (net ${_log.pnl:.2f})"
+                        )
+                        continue
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            f"LIVE closed-book close failed for"
+                            f" {position.market_id}: {exc}"
+                        )
                 # Last resort for ancient rows: older than 6h, no receipt,
                 # AND the market itself unresolvable (expired off the API).
                 # Kalshi auto-settled these long ago; the cash truth already

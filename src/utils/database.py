@@ -741,6 +741,12 @@ class DatabaseManager(TradingLoggerMixin):
         # attribute was eligible for real sell orders in both books at once. DRY
         # still inherits them (they are simulated by definition); LIVE no longer
         # touches a row it cannot prove is its own.
+        #
+        # The LIVE query keys off `mode` alone, not the legacy `live` flag:
+        # rows the ladder books as mode='live' with live=0 (a local clip the
+        # canonical order path recorded without flipping the flag) were
+        # invisible to every exit path while still pinning deployed capital.
+        # That is how 29 dead YES clips sat unclosable for a day.
         book_clause = (
             "(mode = ? OR mode IS NULL OR mode = '')" if resolved == "dry" else "(mode = ?)"
         )
@@ -748,9 +754,8 @@ class DatabaseManager(TradingLoggerMixin):
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT * FROM positions WHERE status = 'open'"
-                f" AND {book_clause}"
-                " AND (live = 1 OR ? = 'dry')",
-                (resolved, resolved),
+                f" AND {book_clause}",
+                (resolved,),
             )
             rows = await cursor.fetchall()
             return [_position_from_row(r) for r in rows]

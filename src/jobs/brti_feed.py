@@ -173,6 +173,19 @@ class BrtiFeed:
         self.frames_seen += 1
         if isinstance(msg, dict):
             self.last_msg_type = str(msg.get("type", ""))[:40]
+        # One-time shape discovery: if frames arrive but nothing parses, print
+        # one truncated frame to the strategy log so the real key names can be
+        # wired in. Price data only, no credentials.
+        if self.frames_seen == 5 and self.value <= 0 and self.avg60 <= 0:
+            try:
+                import json as _json
+
+                print(
+                    f"BRTI unparsed frame shape: {_json.dumps(msg)[:600]}",
+                    flush=True,
+                )
+            except Exception:  # noqa: BLE001
+                pass
         parsed = parse_brti_message(msg)
         if parsed["value"] is None and parsed["avg60"] is None:
             return
