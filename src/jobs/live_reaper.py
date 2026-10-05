@@ -55,6 +55,11 @@ REAP_INTERVAL_SEC = 900.0
 PHANTOM_GRACE_SEC = 600.0
 # Bounded work per pass: one sell per orphan, at most this many.
 MAX_LIQUIDATIONS_PER_PASS = 10
+# A holding whose side has no bid at all (Kalshi prints 0.0000 once the market
+# has resolved against it) cannot be sold: the order would rest forever. Such
+# a ticker is recorded and left alone for this long instead of being re-queued
+# every pass, which is itself a resource leak.
+UNSELLABLE_COOLDOWN_SEC = 6 * 3600.0
 # Covering a short spends real cash, so it stays an operator decision.
 ALLOW_SHORTS = str(os.environ.get("LIVE_REAP_SHORTS", "0")).lower() in (
     "1",
@@ -63,25 +68,33 @@ ALLOW_SHORTS = str(os.environ.get("LIVE_REAP_SHORTS", "0")).lower() in (
 )
 
 _LAST_SUMMARY: Dict[str, Any] = {}
+# ticker -> epoch seconds of the last attempt that failed to move the holding.
+_UNSELLABLE_UNTIL: Dict[str, float] = {}
 
 
-def _summary_path() -> str:
+def _summary_path(db_path: Optional[str] = None) -> str:
     """Where the pass is written so the dashboard process can read it.
 
-    The reaper runs in the trader process and the journal endpoint runs in the
-    web process; in-memory state is invisible across them even on one box.
+    The reaper runs in the trader process and the journal endpoint in the web
+    process, so in-memory state is invisible across them. The file sits beside
+    the database BOTH of them already open: the trader passes its own
+    db_path (env or a relative default can differ per process, which is how
+    the first attempt wrote a file nobody could find), and the web side falls
+    back to DB_PATH.
     """
     import os
 
-    db_path = os.environ.get("DB_PATH", "trading_system.db")
-    return os.path.join(os.path.dirname(os.path.abspath(db_path)), "live_reaper_summary.json")
+    target = db_path or os.environ.get("DB_PATH", "trading_system.db")
+    return os.path.join(
+        os.path.dirname(os.path.abspath(target)), "live_reaper_summary.json"
+    )
 
 
-def _persist(summary: Dict[str, Any]) -> None:
+def _persist(summary: Dict[str, Any], db_path: Optional[str] = None) -> None:
     try:
         import json
 
-        with open(_summary_path(), "w", encoding="utf-8") as fh:
+        with open(_summary_path(db_path), "w", encoding="utf-8") as fh:
             json.dump(summary, fh, default=str)
     except Exception as exc:  # noqa: BLE001 - visibility never blocks a pass
         logger.warning(f"Reaper summary not persisted: {type(exc).__name__}: {exc}")
@@ -146,6 +159,30 @@ async def _newest_fill(client: Any, ticker: str) -> Optional[Dict[str, Any]]:
     return max(rows, key=lambda r: str(r.get("created_time") or ""))
 
 
+async def _confirm_orphan_sell(
+    client: Any, ticker: str, before: float, wait_seconds: float = 6.0
+) -> bool:
+    """Did the liquidation sell actually leave the account?
+
+    Kalshi prints a 0.0000 bid on a market that has resolved against the
+    holding, so an order priced there rests forever. Cancel those instead of
+    re-queueing them every pass.
+    """
+    import asyncio as _asyncio
+
+    order_deadline = float(wait_seconds)
+    while True:
+        held, _flat = await _holdings(client)
+        now = held.get(ticker)
+        if now is None or abs(now) < abs(before) - 1e-9:
+            return True
+        if order_deadline <= 0:
+            return False
+        step = min(2.0, order_deadline)
+        await _asyncio.sleep(step)
+        order_deadline -= step
+
+
 async def _orphan_sell(client: Any, ticker: str, side: str, contracts: int) -> Dict[str, Any]:
     """Sell `contracts` at the bid: the best price a seller can get, now."""
     market_data = await client.get_market(ticker)
@@ -178,6 +215,15 @@ async def _orphan_sell(client: Any, ticker: str, side: str, contracts: int) -> D
         "order_id": response.get("order", {}).get("order_id", ""),
         "side": side,
     }
+
+
+async def _cancel(client: Any, order_id: str) -> None:
+    if not order_id:
+        return
+    try:
+        await client.cancel_order(order_id)
+    except Exception as exc:  # noqa: BLE001 - best effort; the cooldown stops the loop
+        logger.warning(f"Reaper cancel of {order_id} failed: {exc}")
 
 
 async def _short_cover(client: Any, ticker: str, side: str, contracts: int) -> Dict[str, Any]:
@@ -218,6 +264,7 @@ async def reap_live_book(
     *,
     allow_shorts: Optional[bool] = None,
     max_liquidations: Optional[int] = None,
+    db_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """One bounded reaping pass. Returns (and logs) what it killed."""
     allow_shorts = ALLOW_SHORTS if allow_shorts is None else bool(allow_shorts)
@@ -234,6 +281,8 @@ async def reap_live_book(
         "shorts_flagged": [],
         "dust": 0,
         "dust_tickers": [],
+        "unsellable": [],
+        "unsellable_skipped": 0,
         "protected": [],
         "errors": [],
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -317,6 +366,9 @@ async def reap_live_book(
     for ticker, net_yes in sorted(orphans.items())[:max_liquidations]:
         held_side = "yes" if net_yes > 0 else "no"
         contracts = int(abs(net_yes))
+        if _UNSELLABLE_UNTIL.get(ticker, 0.0) > _now_ts():
+            summary["unsellable_skipped"] += 1
+            continue
         if contracts < 1:
             # Under one whole contract (a dust position from rounding): there
             # is nothing to sell, so say so instead of pretending to act.
@@ -351,6 +403,32 @@ async def reap_live_book(
             result = await _short_cover(client, ticker, "yes", contracts)
         else:
             result = await _orphan_sell(client, ticker, held_side, contracts)
+            if result.get("ok"):
+                # A submitted sell is not a sale. Confirm against the holding
+                # and cancel if it never moved: an order that rests forever on
+                # a resolved market is the resource leak this whole pass exists
+                # to stop.
+                filled = await _confirm_orphan_sell(client, ticker, net_yes)
+                if not filled:
+                    _UNSELLABLE_UNTIL[ticker] = _now_ts() + UNSELLABLE_COOLDOWN_SEC
+                    summary["unsellable"].append(
+                        {
+                            "ticker": ticker,
+                            "net_yes": net_yes,
+                            "side": held_side,
+                            "reason": "order did not fill; holding left as is",
+                        }
+                    )
+                    await _cancel(client, str(result.get("order_id") or ""))
+                    logger.warning(
+                        f"REAPER could not sell orphan {ticker} "
+                        f"({abs(net_yes):.2f} net {held_side.upper()}): the order did "
+                        f"not fill, cancelled it, and will not retry for "
+                        f"{UNSELLABLE_COOLDOWN_SEC / 3600:.0f}h. A 0.0000 bid means "
+                        f"Kalshi has priced this holding at zero - there is nothing "
+                        f"left to recover."
+                    )
+                    continue
         if result.get("ok"):
             summary["liquidated"].append(
                 {
@@ -384,7 +462,7 @@ async def reap_live_book(
 
     global _LAST_SUMMARY
     _LAST_SUMMARY = summary
-    _persist(summary)
+    _persist(summary, db_path or getattr(db_manager, "db_path", None))
     logger.info(
         f"LIVE reaper pass: {summary['phantom_closed']} phantom rows closed, "
         f"{len(summary['liquidated'])} orphan holdings liquidated, "
@@ -419,7 +497,10 @@ class LiveReaper:
         self._next_at = _now_ts() + self.interval_sec
         try:
             return await reap_live_book(
-                self.db_manager, self.client, allow_shorts=self.allow_shorts
+                self.db_manager,
+                self.client,
+                allow_shorts=self.allow_shorts,
+                db_path=getattr(self.db_manager, "db_path", None),
             )
         except Exception as exc:  # noqa: BLE001 - the reaper never kills the loop
             logger.error(f"LIVE reaper pass failed: {type(exc).__name__}: {exc}")

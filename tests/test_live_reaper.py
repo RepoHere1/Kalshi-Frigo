@@ -27,9 +27,11 @@ def _pos(market_id="KXORPHAN-1", side="YES", entry=0.44, qty=9, strategy="immedi
 
 
 class _FakeClient:
-    def __init__(self, holdings, fills=None, market=None):
+    def __init__(self, holdings, fills=None, market=None, sell_fills=True):
+        self.sell_fills = sell_fills
         self._holdings = dict(holdings)
         self._fills = fills or {}
+        self.cancelled = []
         self._market = market or {
             "status": "open",
             "yes_bid_dollars": "0.40",
@@ -38,7 +40,6 @@ class _FakeClient:
             "no_ask_dollars": "0.60",
         }
         self.placed = []
-        self.cancelled = []
 
     async def get_positions(self, ticker=None):
         if ticker:
@@ -56,11 +57,22 @@ class _FakeClient:
     async def get_market(self, ticker):
         return {"market": self._market}
 
+    async def cancel_order(self, order_id):
+        self.cancelled.append(order_id)
+        return {}
+
     async def get_balance(self):
         return {"balance": 100000}
 
     async def place_order(self, **kw):
         self.placed.append(kw)
+        if kw.get("action") == "sell":
+            # A sell that fills empties the holding; `sell_fills = False`
+            # models a resting order on a market Kalshi has priced at zero.
+            if self.sell_fills:
+                for t, q in list(self._holdings.items()):
+                    n = int(abs(q))
+                    self._holdings[t] = 0.0 if n else q
         return {"order": {"order_id": "oid-1", "status": "resting"}}
 
 
@@ -260,3 +272,41 @@ def test_reaper_interval_gate():
     reaper.maybe_run  # attribute exists
     reaper._next_at = 10_000.0
     assert reaper.due(1.0) is False
+
+def test_an_unsellable_holding_is_cancelled_and_cooled_down(db):
+    """A 0.0000 bid means Kalshi priced it at zero: cancel, do not re-queue."""
+    client = _FakeClient(
+        {"KXDEAD-1": 9.40},
+        fills={
+            "KXDEAD-1": [
+                {"ticker": "KXDEAD-1", "side": "yes", "action": "buy", "created_time": "2026-10-04T10:00:00Z"}
+            ]
+        },
+        sell_fills=False,
+    )
+    summary = asyncio.run(live_reaper.reap_live_book(db, client))
+    assert summary["liquidated"] == [], "an unfilled sell is not a liquidation"
+    assert len(summary["unsellable"]) == 1
+    assert summary["unsellable"][0]["ticker"] == "KXDEAD-1"
+    assert client.cancelled == ["oid-1"], "the resting order must be cancelled"
+    # Second pass inside the cooldown: not even an order is placed.
+    summary2 = asyncio.run(live_reaper.reap_live_book(db, client))
+    assert summary2["unsellable_skipped"] == 1
+    assert len(client.placed) == 1, "no retry while the cooldown holds"
+
+
+def test_an_unsellable_holding_is_retried_after_the_cooldown(db, monkeypatch):
+    client = _FakeClient(
+        {"KXDEAD-2": 9.40},
+        fills={
+            "KXDEAD-2": [
+                {"ticker": "KXDEAD-2", "side": "yes", "action": "buy", "created_time": "2026-10-04T10:00:00Z"}
+            ]
+        },
+        sell_fills=False,
+    )
+    asyncio.run(live_reaper.reap_live_book(db, client))
+    live_reaper._UNSELLABLE_UNTIL["KXDEAD-2"] = 0.0  # cooldown expired
+    summary = asyncio.run(live_reaper.reap_live_book(db, client))
+    assert len(client.placed) == 2
+    assert len(summary["unsellable"]) == 1
