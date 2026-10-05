@@ -2738,6 +2738,16 @@ def dashboard():
     # connected yet must still render a page, with its own honest empty state.
     context = _market_context()
     acct = _account_payload(_current_book_mode())
+    
+    def _format_date(date_str: str) -> str:
+        """Convert YYYY-MM-DD to MON DD, YYYY."""
+        try:
+            from datetime import datetime
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            return dt.strftime("%b %d, %Y").upper()
+        except:
+            return date_str
+    
     return render_template_string(
         _TEMPLATE,
         s=snap,
@@ -2750,6 +2760,7 @@ def dashboard():
         lead=context["lead"],
         acct=acct,
         _market_title=_market_title,
+        _format_date=_format_date,
     )
 
 
@@ -4367,7 +4378,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
         "fees $50.01" underneath invites the obvious suspicion that the number is
         wrong; showing that it is +$162.71 of sales against -$492.29 of
         settlements over Aug 1 - Oct 4 is what makes it checkable. -#}
-    <div class="s" id="tKalshiPnlNote">{% if s.kalshi and s.kalshi.realized_known %}sales {{ '$%.2f'|format(s.kalshi.ledger.get('sales_realized', 0.0)) }} &middot; settled {{ '$%.2f'|format(s.kalshi.ledger.get('settlement_realized', 0.0)) }} &middot; fees {{ '$%.2f'|format(s.kalshi.fees) }}{% if s.kalshi.ledger.get('window_start') %} &middot; since {{ s.kalshi.ledger.get('window_start')[:10]|strptime('%Y-%m-%d')|strftime('%b %d, %Y') }}{% endif %}{% else %}fill history unavailable{% endif %}</div>
+    <div class="s" id="tKalshiPnlNote">{% if s.kalshi and s.kalshi.realized_known %}sales {{ '$%.2f'|format(s.kalshi.ledger.get('sales_realized', 0.0)) }} &middot; settled {{ '$%.2f'|format(s.kalshi.ledger.get('settlement_realized', 0.0)) }} &middot; fees {{ '$%.2f'|format(s.kalshi.fees) }}{% if s.kalshi.ledger.get('window_start') %} &middot; since {{ _format_date(s.kalshi.ledger.get('window_start')[:10]) }}{% endif %}{% else %}fill history unavailable{% endif %}</div>
   </div>
   {% else %}
   <div class="tile">
