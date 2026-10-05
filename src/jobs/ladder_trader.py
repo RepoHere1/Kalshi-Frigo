@@ -43,6 +43,12 @@ QUOTE_MAX_AGE_SEC = 30.0
 # LIVE-ONLY: max open clips of one ticker. One 15-minute bucket is one bet;
 # DRY is uncapped so its historic pyramiding pattern is untouched.
 LIVE_MAX_CLIPS_PER_TICKER = 3
+# LIVE-ONLY entry price band. The forever log: 0.10-0.50 won 85-100% and the
+# fee formula P(1-P) is cheapest per dollar of edge there; 0.50-0.75 went
+# flat and 0.75+ lost even fee-free. DRY keeps the 0.90 ceiling and the
+# sweet-band surcharge so its historic decision pattern is untouched.
+LIVE_ENTRY_BAND_LOW = 0.10
+LIVE_ENTRY_BAND_HIGH = 0.50
 
 
 @dataclass
@@ -246,11 +252,65 @@ class UpDownTrader:
             truth_price = self.spot.price
             truth_kind = f"coinbase-{self.spot.source or 'spot'}"
         spot = truth_price
+        # LIVE-ONLY settlement-window exception (item 4): the final 60s is a
+        # no-entry coin toss for a spot proxy, but a FRESH windowed-settlement
+        # average IS the number the contract settles on, still accumulating.
+        # When BRTI carries that and the book still disagrees, it is the
+        # strongest signal this strategy gets -- allowed in LIVE only. DRY
+        # keeps the historic 45s window, and any non-windowed truth stays out.
         if (market.seconds_left or 0) < self.config.min_seconds_left:
-            # The settlement window is the final 60 seconds. Inside it, spot is
-            # no longer leading anything.
-            self.book.skipped_too_close += 1
-            return None
+            _late_ok = False
+            if live:
+                try:
+                    _b = getattr(self, "brti", None)
+                    _late_ok = bool(
+                        _b is not None
+                        and getattr(_b, "fresh", False)
+                        and _b.estimate_kind() == "windowed-settlement-avg"
+                        and float(market.seconds_left or 0.0) >= 15.0
+                    )
+                except Exception:  # noqa: BLE001 - no exception buys an entry
+                    _late_ok = False
+            if not _late_ok:
+                # The settlement window is the final 60 seconds. Inside it,
+                # spot is no longer leading anything.
+                self.book.skipped_too_close += 1
+                return None
+
+        # LIVE-ONLY hard session skip (item 5): the 18 UTC hour lost money in
+        # the forever log (17 trades, 41.2%, -$2.70). Extra edge still paid
+        # the fee on a coin flip, so LIVE sits the hour out entirely. DRY
+        # never takes this branch and still trades it.
+        if live:
+            try:
+                from src.jobs import live_fees as _live_fees_skip
+
+                if _live_fees_skip.live_session_skip():
+                    self.book.skipped_no_edge += 1
+                    signal = UpDownSignal(
+                        ticker=market.ticker,
+                        bucket=market.bucket,
+                        side="",
+                        target=float(market.target or 0.0),
+                        spot=spot,
+                        spot_vs_target=0.0,
+                        fair=0.5,
+                        kalshi_price=market.up_price,
+                        edge=0.0,
+                        ask=None,
+                        contracts=0,
+                        notional=0.0,
+                        seconds_left=round(market.seconds_left or 0.0, 1),
+                        reason=(
+                            "18 UTC hard skip (LIVE): the hour lost money in "
+                            "the forever log; DRY still trades it"
+                        ),
+                        truth=truth_kind,
+                    )
+                    self.book.signals = [signal]
+                    return signal
+            except Exception:  # noqa: BLE001 - a clock error never buys an entry
+                pass
 
         target = float(market.target)
         delta = round(spot - target, 2)
@@ -321,6 +381,12 @@ class UpDownTrader:
                 return False
             # Hard block from the log: $0.90+ entries won 4% of the time.
             if fill_price >= self.config.max_entry_price:
+                return False
+            # LIVE-ONLY band (item 3): entries only at $0.10-$0.50. The
+            # forever log won 85-100% there and the fee curve P(1-P) is
+            # cheapest per dollar of edge; 0.50-0.75 went flat and 0.75+
+            # lost even fee-free. DRY keeps the old ceiling and surcharge.
+            if live and not (LIVE_ENTRY_BAND_LOW <= fill_price <= LIVE_ENTRY_BAND_HIGH):
                 return False
             r = required
             # The sweet band wins 100%; outside it, demand more edge.
@@ -513,6 +579,28 @@ class UpDownTrader:
         # Both sides fill at their own ask (UP at yes_ask, DOWN at no_ask).
         # See the note at sizing: (1 - ask) here once booked $48 as $4.93.
         price = ask
+        # LIVE-ONLY maker entry (item 2): with time on the clock, rest the buy
+        # at the side's bid (maker fee ~1/4 of taker) and wait a few seconds
+        # for the book to come to us. The signal prices the edge at the ask,
+        # so a fill at the bid is strictly better than the price that already
+        # cleared the bar. No usable bid -> the taker path below, unchanged.
+        _maker_wait = 0.0
+        if live:
+            try:
+                from src.jobs import live_fees as _live_fees_mk
+                from src.utils.market_prices import get_market_prices as _gmp
+
+                if _live_fees_mk.should_use_maker_entry(signal.seconds_left):
+                    _md = await self._client.get_market(signal.ticker)
+                    _yb, _ya, _nb, _na = _gmp((_md or {}).get("market") or {})
+                    _bid = _yb if signal.side == "up" else _nb
+                    _mk = _live_fees_mk.maker_entry_price(signal.side, _bid, ask)
+                    if _mk is not None:
+                        price = _mk
+                        _maker_wait = _live_fees_mk.MAKER_ENTRY_WAIT_SECONDS
+            except Exception:  # noqa: BLE001 - a failed bid read falls back to taker
+                _maker_wait = 0.0
+                price = ask
         position = Position(
             market_id=signal.ticker,
             side="YES" if signal.side == "up" else "NO",
@@ -555,7 +643,13 @@ class UpDownTrader:
         position.id = position_id
 
         try:
-            filled = await execute_position(position, live, self.db_manager, self._client)
+            filled = await execute_position(
+                position,
+                live,
+                self.db_manager,
+                self._client,
+                maker_wait_seconds=_maker_wait,
+            )
         except Exception as exc:  # noqa: BLE001
             self.book.last_error = f"submit failed: {type(exc).__name__}: {exc}"
             filled = False

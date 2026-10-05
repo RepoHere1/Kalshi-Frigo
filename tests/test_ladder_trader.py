@@ -340,7 +340,8 @@ def test_live_requires_the_fee_on_top_of_the_edge(monkeypatch):
 def test_live_takes_an_edge_that_clears_fee_and_minimum():
     trader = _scorer()
     trader.spot.price = 85000.0
-    market = _quoted_market(yes_ask=0.85, no_ask=0.15, target=84000.0)
+    # In the LIVE 0.10-0.50 entry band: the fee-aware bar is the gate here.
+    market = _quoted_market(yes_ask=0.40, no_ask=0.60, target=84000.0)
     live = trader.evaluate(market, live=True)
     assert live is not None and live.actionable
     assert live.edge >= trader.config.min_edge + trader.config.live_fee_rate
@@ -400,11 +401,13 @@ def test_the_no_side_is_preferred_when_edges_are_close(monkeypatch):
 def test_live_clip_sizes_against_the_balance_budget():
     trader = _scorer()
     trader.spot.price = 85000.0
-    market = _quoted_market(yes_ask=0.85, no_ask=0.15, target=84000.0)
-    # A $4 budget -> 4 contracts at 0.85, not the fixed $5 clip's 5.
+    # In-band price: the LIVE entry band is 0.10-0.50.
+    market = _quoted_market(yes_ask=0.40, no_ask=0.60, target=84000.0)
+    # A $4 budget -> 10 contracts at 0.40, not the fixed $5 clip's 12.
     live = trader.evaluate(market, live=True, clip_usd=4.0)
-    assert live.contracts == 4
-    assert live.notional == pytest.approx(3.40, abs=0.01)
+    assert live is not None
+    assert live.contracts == 10
+    assert live.notional == pytest.approx(4.00, abs=0.01)
 
 
 def test_a_zero_dollar_live_budget_produces_no_clip():
@@ -524,7 +527,7 @@ async def test_clip_is_persisted_before_the_fill_is_sought(tmp_path, monkeypatch
 
     submitted = []
 
-    async def _never(position, live_mode, db_manager, kalshi_client):
+    async def _never(position, live_mode, db_manager, kalshi_client, maker_wait_seconds=0.0):
         submitted.append(position.market_id)
         return True
 
@@ -560,7 +563,7 @@ async def test_more_clips_of_the_same_contract_are_allowed_by_design(tmp_path, m
 
     fills = []
 
-    async def _count(position, live_mode, db_manager, kalshi_client):
+    async def _count(position, live_mode, db_manager, kalshi_client, maker_wait_seconds=0.0):
         fills.append(position.market_id)
         return True
 

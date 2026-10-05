@@ -28,8 +28,97 @@ def _mode_manager():
     return default_mode_manager(os.getenv("DB_PATH", "trading_system.db"))
 
 
+async def _confirm_maker_fill(
+    kalshi_client: KalshiClient,
+    request,
+    position: Position,
+    wait_seconds: float,
+    logger,
+    placed_order_id: str = "",
+) -> bool:
+    """LIVE-only: did the resting entry actually fill? Never guess.
+
+    Polls the resting-orders list for up to `wait_seconds`. An order that
+    disappears from the book is checked against the account holding for the
+    ticker -- the holding is the only authority, so a partial fill is still
+    recorded (loudly, with the size mismatch named) rather than lost. A
+    still-resting order is cancelled and the holding re-checked once more;
+    nothing held means nothing happened and the caller deletes the row.
+    """
+    import asyncio as _asyncio
+
+    order_id = str(placed_order_id or request.client_order_id)
+
+    async def _resting() -> bool:
+        try:
+            resp = await kalshi_client.get_orders(
+                ticker=position.market_id, status="resting"
+            )
+            rows = resp.get("orders") or [] if isinstance(resp, dict) else []
+            for o in rows:
+                if not isinstance(o, dict):
+                    continue
+                if str(o.get("client_order_id") or "") == str(
+                    request.client_order_id
+                ) or str(o.get("order_id") or "") == order_id:
+                    return True
+        except Exception:  # noqa: BLE001 - a failed read retries on the next poll
+            pass
+        return False
+
+    async def _held_qty() -> float:
+        try:
+            raw = await kalshi_client.get_positions(ticker=position.market_id)
+        except Exception:  # noqa: BLE001 - unknown: treat as filled, keep the row
+            return -1.0
+        for bucket in ("market_positions", "event_positions"):
+            for entry in (raw or {}).get(bucket) or []:
+                ticker = entry.get("ticker") or entry.get("event_ticker")
+                if ticker != position.market_id:
+                    continue
+                try:
+                    return float(entry.get("position_fp", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    return -1.0
+        return 0.0
+
+    deadline = wait_seconds
+    while deadline > 0:
+        if not await _resting():
+            break
+        step = min(2.5, deadline)
+        await _asyncio.sleep(step)
+        deadline -= step
+
+    if await _resting():
+        # Never filled: cancel so nothing can execute behind the local book.
+        try:
+            await kalshi_client.cancel_order(order_id)
+        except Exception as exc:  # noqa: BLE001 - cancel is best-effort
+            logger.warning(
+                f"Maker entry cancel failed for {position.market_id}: {exc}"
+            )
+
+    held = await _held_qty()
+    if held != 0.0:
+        if held < 0:
+            logger.warning(
+                f"Maker entry holding unreadable for {position.market_id}; "
+                f"keeping the row and reconciling from Kalshi truth"
+            )
+        elif abs(held - int(position.quantity or 0)) > 1e-9:
+            logger.warning(
+                f"Maker entry partial fill on {position.market_id}: "
+                f"ordered {position.quantity}, holding {held:.2f} - "
+                f"the position reconciles from Kalshi truth"
+            )
+        return True
+    return False
+
+
 async def execute_position(
-    position: Position, live_mode: bool, db_manager: DatabaseManager, kalshi_client: KalshiClient
+    position: Position, live_mode: bool, db_manager: DatabaseManager, kalshi_client: KalshiClient,
+    maker_wait_seconds: float = 0.0,
 ) -> bool:
     """
     Executes a single trade position.
@@ -109,6 +198,11 @@ async def execute_position(
         )
 
         available_cents = await broker.available_cents()
+        # LIVE-ONLY maker entry (item 2): with time on the clock the buy rests
+        # at the side's bid (maker fee, ~1/4 of taker) instead of crossing the
+        # spread. position.entry_price carries the bid in that case; DRY never
+        # takes this branch and keeps its market-style fill at the ask.
+        _maker = bool(live_mode and maker_wait_seconds and maker_wait_seconds > 0)
         request, reason = build_order_request(
             market_id=position.market_id,
             side=position.side,
@@ -116,6 +210,7 @@ async def execute_position(
             quantity=position.quantity,
             market=market,
             available_cents=available_cents,
+            limit_price_dollars=(position.entry_price if _maker else None),
         )
         if request is None:
             logger.warning(f"⚠️  Skipping {position.market_id}: {reason}")
@@ -123,8 +218,8 @@ async def execute_position(
 
         if live_mode:
             logger.warning(
-                f"💰 PLACING LIVE ORDER - real money - {position.market_id} "
-                f"notional ${request.notional:.2f}"
+                f"💰 PLACING LIVE {'MAKER' if _maker else 'TAKER'} ORDER - real money - "
+                f"{position.market_id} notional ${request.notional:.2f}"
             )
         else:
             logger.info(
@@ -140,6 +235,30 @@ async def execute_position(
 
         order_id = response.get("order", {}).get("order_id", request.client_order_id)
         fill_price = position.entry_price or request.fill_price
+
+        if live_mode and _maker:
+            # A resting limit order is not a fill. Confirm against the book and
+            # the account holding; cancel and report unfilled if nothing moved,
+            # so the caller can drop the row instead of booking a phantom.
+            filled = await _confirm_maker_fill(
+                kalshi_client,
+                request,
+                position,
+                float(maker_wait_seconds),
+                logger,
+                placed_order_id=str(order_id or ""),
+            )
+            if not filled:
+                logger.warning(
+                    f"⏳ Maker entry on {position.market_id} did not fill in "
+                    f"{maker_wait_seconds:.0f}s; cancelled, nothing left behind"
+                )
+                return False
+            await db_manager.update_position_to_live(position.id, fill_price)
+            logger.info(
+                f"✅ LIVE MAKER ENTRY FILLED for {position.market_id} @ {fill_price:.3f}"
+            )
+            return True
 
         if live_mode:
             await db_manager.update_position_to_live(position.id, fill_price)
@@ -365,6 +484,23 @@ async def place_profit_taking_orders(
                                         ).total_seconds()
                                 except Exception:  # noqa: BLE001
                                     _secs = None
+                                # Item 4b: a winning position inside the
+                                # settlement window rides to the $1.00 print
+                                # instead of scalping out for a few cents and
+                                # paying a second fee. Losing positions keep
+                                # every exit they had.
+                                if (
+                                    _secs is not None
+                                    and 0 < _secs <= _live_fees.SETTLEMENT_WINDOW_SECONDS
+                                    and current_price > float(position.entry_price or 0.0)
+                                ):
+                                    logger.info(
+                                        f"🏆 Riding {position.market_id} to settlement: "
+                                        f"{_secs:.0f}s left, in profit at "
+                                        f"{current_price:.3f} vs entry "
+                                        f"{position.entry_price:.3f} - no scalp"
+                                    )
+                                    continue
                                 sell_price = _live_fees.live_exit_limit_price(
                                     position.side, current_price, _secs
                                 )

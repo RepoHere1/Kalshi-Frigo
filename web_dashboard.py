@@ -2931,9 +2931,22 @@ def api_live_journal():
                     " ORDER BY COALESCE(exit_timestamp, '') DESC LIMIT 20"
                 )
                 closes = [dict(r) for r in await cur.fetchall()]
-                return opens, closes
+                # Item 7: the weekly one-number check. Totals over EVERY live
+                # close, fee-net -- this is the figure to hold against Kalshi's
+                # own settlements when judging the book, never a partial sum
+                # over the 20 shown rows.
+                cur = await conn.execute(
+                    "SELECT COUNT(*) AS n,"
+                    " COALESCE(SUM(pnl), 0.0) AS net,"
+                    " COALESCE(SUM(fee_paid), 0.0) AS fees,"
+                    " COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins"
+                    " FROM trade_logs"
+                    " WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'live'"
+                )
+                totals = dict(await cur.fetchone() or {})
+                return opens, closes, totals
 
-        opens, closes = _run_async(_read())
+        opens, closes, totals = _run_async(_read())
         for r in opens:
             r["timestamp"] = str(r.get("timestamp") or "")[:19]
             r["notional"] = round(
@@ -2949,6 +2962,10 @@ def api_live_journal():
                 "open_notional": round(sum(r["notional"] for r in opens), 2),
                 "recent_closes": closes,
                 "closed_count": len(closes),
+                "closed_total": int(totals.get("n") or 0),
+                "net_pnl": round(float(totals.get("net") or 0.0), 2),
+                "fee_total": round(float(totals.get("fees") or 0.0), 2),
+                "wins_total": int(totals.get("wins") or 0),
             }
         )
     except Exception as e:

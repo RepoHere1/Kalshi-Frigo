@@ -6,8 +6,9 @@ Contract under test (see src/jobs/live_fees.py):
     tests/test_ladder_trader.py; they only assert the LIVE branches.
 """
 
+import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src.jobs import live_fees
 from src.jobs.execute import place_sell_limit_order  # noqa: F401 (signature guard)
@@ -397,3 +398,231 @@ def test_fee_column_migrates_and_defaults_to_zero(tmp_path):
     fee, pnl = asyncio.run(_run())
     assert fee == 0.0
     assert pnl == 2.0
+
+
+# ---------------------------------------------------------------------------
+# Item 5: 18 UTC is a hard skip in LIVE, never in DRY
+# ---------------------------------------------------------------------------
+def test_live_session_skip_only_hits_18_utc():
+    assert live_fees.live_session_skip(datetime(2026, 10, 4, 18, 59, tzinfo=timezone.utc))
+    assert not live_fees.live_session_skip(datetime(2026, 10, 4, 17, 59, tzinfo=timezone.utc))
+    assert not live_fees.live_session_skip(datetime(2026, 10, 4, 19, 0, tzinfo=timezone.utc))
+
+
+def test_hard_skip_refuses_live_entries_and_never_touches_dry(monkeypatch):
+    monkeypatch.setattr(live_fees, "live_session_skip", lambda now=None: True)
+    trader = _scorer()
+    market = _quoted_market(yes_ask=0.40, no_ask=0.60, target=84000.0)
+    trader.feed.markets = [market]
+    out = trader.evaluate(market, live=True)
+    assert out is not None and not out.actionable
+    assert "hard skip" in out.reason
+    out_dry = trader.evaluate(market, live=False)
+    assert out_dry is not None and out_dry.actionable
+
+
+# ---------------------------------------------------------------------------
+# Item 3: LIVE entries only at $0.10-$0.50; DRY keeps its old bands
+# ---------------------------------------------------------------------------
+def test_live_refuses_entries_above_the_band_but_dry_takes_them():
+    market = _quoted_market(yes_ask=0.60, no_ask=0.40, target=84000.0)
+    trader = _scorer()
+    trader.feed.markets = [market]
+    out_live = trader.evaluate(market, live=True)
+    assert out_live is not None and not out_live.actionable
+    out_dry = trader.evaluate(market, live=False)
+    assert out_dry is not None and out_dry.actionable
+    assert out_dry.side == "up"
+
+
+def test_live_refuses_entries_below_the_band():
+    market = _quoted_market(yes_ask=0.06, no_ask=0.94, target=84000.0)
+    trader = _scorer()
+    trader.feed.markets = [market]
+    out_live = trader.evaluate(market, live=True)
+    assert out_live is not None and not out_live.actionable
+
+
+# ---------------------------------------------------------------------------
+# Item 4a: the final 60s opens only for a fresh windowed settlement average
+# ---------------------------------------------------------------------------
+def test_final_minute_entry_needs_windowed_brti_in_live():
+    market = _quoted_market(yes_ask=0.40, no_ask=0.60, target=84000.0, seconds_left=30)
+    # Coinbase-only truth inside the window: refused, as always.
+    trader = _scorer()
+    trader.feed.markets = [market]
+    assert trader.evaluate(market, live=True) is None
+    # A stale/avg60 BRTI is not the settlement number: still refused.
+    trader2 = _scorer()
+    trader2.feed.markets = [market]
+    trader2.brti = _brti_fake(85100.0, kind="trailing-avg60")
+    assert trader2.evaluate(market, live=True) is None
+    # A fresh windowed-settlement average IS the settlement, accumulating:
+    # the one reading strong enough to trade the last minute on.
+    trader3 = _scorer()
+    trader3.feed.markets = [market]
+    trader3.brti = _brti_fake(85100.0, kind="windowed-settlement-avg")
+    out = trader3.evaluate(market, live=True)
+    assert out is not None and out.actionable
+    assert out.truth.startswith("kalshi-brti")
+
+
+def test_final_minute_window_never_opens_for_dry():
+    market = _quoted_market(yes_ask=0.40, no_ask=0.60, target=84000.0, seconds_left=30)
+    trader = _scorer()
+    trader.feed.markets = [market]
+    trader.brti = _brti_fake(85100.0, kind="windowed-settlement-avg")
+    assert trader.evaluate(market, live=False) is None
+
+
+# ---------------------------------------------------------------------------
+# Item 2: maker entry fill confirmation - never books a resting order
+# ---------------------------------------------------------------------------
+class _FakeMakerClient:
+    def __init__(self, resting, held, raise_positions=False):
+        self._resting = list(resting)
+        self._held = held
+        self._raise_positions = raise_positions
+        self.cancelled = []
+
+    async def get_orders(self, ticker=None, status=None):
+        return {"orders": list(self._resting)}
+
+    async def cancel_order(self, order_id):
+        self.cancelled.append(str(order_id))
+        self._resting = []
+        return {}
+
+    async def get_positions(self, ticker=None):
+        if self._raise_positions:
+            raise RuntimeError("api down")
+        return {"market_positions": [{"ticker": ticker, "position_fp": str(self._held)}]}
+
+
+class _Req:
+    client_order_id = "cid-1"
+
+
+def _pos(ticker="KXBTC15M-T", qty=12):
+    from src.utils.database import Position
+
+    return Position(
+        market_id=ticker,
+        side="YES",
+        entry_price=0.44,
+        quantity=qty,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+def test_maker_fill_confirmed_when_holding_appears():
+    import logging
+
+    from src.jobs.execute import _confirm_maker_fill
+
+    client = _FakeMakerClient(resting=[], held=12)
+    ok = asyncio.run(
+        _confirm_maker_fill(client, _Req(), _pos(), 0.1, logging.getLogger("t"), "oid-1")
+    )
+    assert ok is True
+    assert client.cancelled == []
+
+
+def test_maker_unfilled_order_is_cancelled_and_reports_false():
+    import logging
+
+    from src.jobs.execute import _confirm_maker_fill
+
+    client = _FakeMakerClient(
+        resting=[{"client_order_id": "cid-1", "order_id": "oid-1"}], held=0
+    )
+    ok = asyncio.run(
+        _confirm_maker_fill(client, _Req(), _pos(), 0.1, logging.getLogger("t"), "oid-1")
+    )
+    assert ok is False
+    assert client.cancelled == ["oid-1"]
+
+
+def test_maker_unreadable_holding_keeps_the_row():
+    import logging
+
+    from src.jobs.execute import _confirm_maker_fill
+
+    client = _FakeMakerClient(resting=[], held=0, raise_positions=True)
+    ok = asyncio.run(
+        _confirm_maker_fill(client, _Req(), _pos(), 0.1, logging.getLogger("t"), "oid-1")
+    )
+    assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# Item 4b: a winning LIVE position rides the settlement window, no scalp
+# ---------------------------------------------------------------------------
+def test_winning_position_rides_the_settlement_window(monkeypatch):
+    from src.jobs import execute as ex
+
+    close_soon = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
+    market = {
+        "status": "open",
+        "yes_bid_dollars": "0.55",
+        "yes_ask_dollars": "0.57",
+        "no_bid_dollars": "0.43",
+        "no_ask_dollars": "0.45",
+        "close_time": close_soon,
+    }
+
+    class _FakeDB:
+        async def get_open_live_positions(self):
+            return [_pos(qty=10)]
+
+    class _FakeClient:
+        async def get_market(self, ticker):
+            return {"market": market}
+
+    sells = []
+
+    async def _fake_sell(**kw):
+        sells.append(kw)
+        return True
+
+    monkeypatch.setattr(ex, "place_sell_limit_order", _fake_sell)
+    res = asyncio.run(
+        ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=True)
+    )
+    assert res["orders_placed"] == 0
+    assert sells == []
+
+
+def test_winning_position_with_time_left_still_takes_profit(monkeypatch):
+    from src.jobs import execute as ex
+
+    close_later = (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat()
+    market = {
+        "status": "open",
+        "yes_bid_dollars": "0.55",
+        "yes_ask_dollars": "0.57",
+        "no_bid_dollars": "0.43",
+        "no_ask_dollars": "0.45",
+        "close_time": close_later,
+    }
+
+    class _FakeDB:
+        async def get_open_live_positions(self):
+            return [_pos(qty=10)]
+
+    class _FakeClient:
+        async def get_market(self, ticker):
+            return {"market": market}
+
+    sells = []
+
+    async def _fake_sell(**kw):
+        sells.append(kw)
+        return True
+
+    monkeypatch.setattr(ex, "place_sell_limit_order", _fake_sell)
+    res = asyncio.run(
+        ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=True)
+    )
+    assert res["orders_placed"] == 1
+    assert len(sells) == 1

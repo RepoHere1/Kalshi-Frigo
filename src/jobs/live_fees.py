@@ -29,13 +29,29 @@ LIVE_MIN_BALANCE_WARN = 125.0
 LIVE_RECOMMENDED_BALANCE = 200.0
 
 # The forever log: 18 UTC went 17 trades at 41.2% for -$2.70 while neighbours
-# printed. LIVE demands extra edge there; DRY is untouched and still trades it.
+# printed. LIVE used to demand extra edge there; it now skips the hour
+# outright -- a losing hour is cheaper to sit out than to re-learn with real
+# money. DRY is untouched and still trades it.
 LOSING_HOUR_UTC = 18
-LOSING_HOUR_EXTRA_EDGE = 0.03
+LOSING_HOUR_EXTRA_EDGE = 0.03  # legacy constant; the skip below supersedes it
 
 # Maker patience: above this many seconds to settlement, LIVE rests its exit
 # at the quote (maker fee). Below it, LIVE takes (same 2% discount DRY uses).
 MAKER_PATIENT_SECONDS = 120.0
+
+# Maker entries: with more than this many seconds left, LIVE posts its buy at
+# the side's bid (maker fee, ~1/4 of taker) and waits MAKER_ENTRY_WAIT_SECONDS
+# for a fill before cancelling and falling back to the taker ask. Below the
+# patience window the entry takes immediately -- a stale book is a bigger
+# risk than the fee.
+MAKER_ENTRY_WAIT_SECONDS = 8.0
+
+# The settlement window is the final 60 seconds of a 15-minute bucket. Inside
+# it the BRTI feed carries the accumulating windowed average -- the number the
+# contract settles on -- so a fresh windowed reading plus a book that still
+# disagrees is the strongest signal this strategy gets. LIVE may enter there
+# (and holds to settlement); DRY keeps the historic 45s no-entry window.
+SETTLEMENT_WINDOW_SECONDS = 60.0
 
 
 def taker_fee_dollars(price: float, contracts: int) -> float:
@@ -79,10 +95,60 @@ def live_session_extra_edge(now: datetime | None = None) -> float:
     """Extra edge LIVE demands during the historically losing hour.
 
     DRY never calls this. LIVE adds the result to its required edge bar.
+    Kept for callers/tests that still ask; the hard skip below is what
+    actually keeps LIVE out of the hour now.
     """
     ts = now or datetime.now(timezone.utc)
     hour = ts.hour if ts.tzinfo is not None else ts.hour
     return LOSING_HOUR_EXTRA_EDGE if hour == LOSING_HOUR_UTC else 0.0
+
+
+def live_session_skip(now: datetime | None = None) -> bool:
+    """True when LIVE must not open anything at all this hour.
+
+    The 18 UTC hour lost money in the forever log (17 trades, 41.2%,
+    -$2.70) while every neighbouring hour printed. Demanding extra edge
+    there still paid the fee on a coin flip; skipping costs nothing.
+    DRY never calls this and still trades the hour.
+    """
+    ts = now or datetime.now(timezone.utc)
+    return ts.hour == LOSING_HOUR_UTC
+
+
+def should_use_maker_entry(seconds_left: float | None) -> bool:
+    """True when a LIVE entry may rest at the bid instead of taking the ask.
+
+    Patient only when the book has time to come to us. Inside the maker
+    patience window the entry takes immediately: a stale quote is a bigger
+    risk than the taker fee.
+    """
+    if seconds_left is None:
+        return False
+    try:
+        return float(seconds_left) > MAKER_PATIENT_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
+def maker_entry_price(side: str, bid: float | None, ask: float | None) -> float | None:
+    """The price a patient LIVE entry posts at: the side's own bid.
+
+    Returns None when the bid is missing or degenerate -- the caller then
+    takes the ask instead of resting a bad order.
+    """
+    try:
+        b = float(bid or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if b <= 0.0 or b >= 1.0:
+        return None
+    try:
+        a = float(ask or 0.0)
+    except (TypeError, ValueError):
+        a = 0.0
+    if a > 0.0 and b >= a:
+        return None
+    return round(b, 4)
 
 
 def should_use_maker(seconds_left: float | None) -> bool:
