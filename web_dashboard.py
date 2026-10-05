@@ -2656,6 +2656,38 @@ def api_dry_ledger():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/trades")
+def api_trades():
+    """Recent closed trades for veto replay harness (limit 500)."""
+    try:
+        import aiosqlite
+        import asyncio
+        
+        async def _fetch():
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute(
+                    "SELECT market_id, side, entry_price, pnl, quantity, exit_timestamp "
+                    "FROM trade_logs WHERE exit_timestamp IS NOT NULL "
+                    "ORDER BY exit_timestamp DESC LIMIT 500"
+                ) as cur:
+                    rows = await cur.fetchall()
+            trades = []
+            for market_id, side, entry_price, pnl, quantity, exit_ts in rows:
+                trades.append({
+                    "market_id": market_id,
+                    "side": side,
+                    "entry_price": entry_price,
+                    "pnl": pnl,
+                    "quantity": quantity,
+                    "exit_timestamp": exit_ts,
+                })
+            return {"trades": trades}
+        
+        return jsonify(asyncio.run(_fetch()))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/live/flatten")
 def api_live_flatten():
     """Inspect what closing every real position would actually fetch.
