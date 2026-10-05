@@ -572,6 +572,7 @@ class UpDownTrader:
         if self.config.ai_veto_enabled:
             try:
                 from src.jobs import ai_veto as _ai_veto
+                from src.jobs import venue_feeds as _venue
 
                 if self._ai_client is None:
                     from src.clients.openrouter_client import OpenRouterClient
@@ -583,6 +584,7 @@ class UpDownTrader:
                     _streak = _recent
                 except Exception:  # noqa: BLE001
                     _streak = "unknown"
+                _venue_state = _venue.snapshot()
                 _clip = {
                     "ticker": signal.ticker,
                     "side": signal.side,
@@ -595,7 +597,7 @@ class UpDownTrader:
                     "headlines": "none",
                     "required": self.config.min_edge + (self.config.live_fee_rate if live else 0.0),
                 }
-                _veto = await _ai_veto.check_veto(self._ai_client, _clip)
+                _veto = await _ai_veto.check_veto(self._ai_client, _clip, _venue_state)
                 if _veto:
                     self.book.skipped_ai_veto += 1
                     return f"AI veto: {_veto}"[:200]

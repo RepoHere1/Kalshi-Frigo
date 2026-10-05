@@ -24,8 +24,23 @@ Veto ONLY for: a scheduled macro event inside the window (FOMC/CPI/Powell/ETF de
 Reply with exactly this JSON and nothing else: {{"veto": false, "reason": ""}}"""
 
 
-def build_prompt(clip: Dict[str, Any]) -> str:
+def build_prompt(clip: Dict[str, Any], venue: Optional[Dict[str, Any]] = None) -> str:
     """Render the veto prompt from a clip facts dict (pure, tested)."""
+    venue_txt = ""
+    if venue:
+        imb = venue.get("imb", 0.0)
+        basis = venue.get("basis_pct")
+        funding = venue.get("funding")
+        parts = []
+        if abs(imb) > 20:
+            parts.append(f"book leans {'+buy' if imb > 0 else 'sell'} {abs(imb):.0f}%")
+        if basis is not None and abs(basis) > 0.03:
+            parts.append(f"perp basis {basis:+.4f}%")
+        if funding is not None and abs(funding) > 0.0005:
+            parts.append(f"funding {funding:+.4%}")
+        if parts:
+            venue_txt = f" | venue: {', '.join(parts)}"
+
     return VETO_PROMPT.format(
         ticker=clip.get("ticker", "?"),
         side=str(clip.get("side", "")).upper(),
@@ -36,7 +51,7 @@ def build_prompt(clip: Dict[str, Any]) -> str:
         seconds_left=float(clip.get("seconds_left") or 0.0),
         streak=str(clip.get("streak", "unknown")),
         vol_pct=float(clip.get("vol_pct") or 0.0),
-        headlines=str(clip.get("headlines") or "none")[:800],
+        headlines=str(clip.get("headlines") or "none")[:800] + venue_txt,
     )
 
 
@@ -49,13 +64,16 @@ def interpret_reply(text: Optional[str]) -> str:
     return reason[:200] if reason else "AI veto"
 
 
-async def check_veto(client: Any, clip: Dict[str, Any]) -> str:
-    """Ask the veto judge. Returns '' or the veto reason (fail-open)."""
+async def check_veto(client: Any, clip: Dict[str, Any], venue: Optional[Dict[str, Any]] = None) -> str:
+    """Ask the veto judge. Returns '' or the veto reason (fail-open).
+    
+    venue: optional {"spot": float, "imb": float, "funding": float|None, "basis_pct": float|None}
+    """
     try:
         reply = await complete_for_job(
             client,
             "veto",
-            build_prompt(clip),
+            build_prompt(clip, venue),
             market_id=str(clip.get("ticker") or None),
         )
     except Exception:  # noqa: BLE001 - a judge error never blocks trading
