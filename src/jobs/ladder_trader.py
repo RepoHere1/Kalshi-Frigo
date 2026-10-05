@@ -1014,6 +1014,8 @@ async def run_updown_trader(
     sleep_for = interval or (config and config.poll_seconds) or 4.0
     started = False
     backoff = 1.0
+    # LIVE-only; created on the first due pass so DRY never builds one.
+    reaper = None
     try:
         while True:
             try:
@@ -1069,6 +1071,32 @@ async def run_updown_trader(
                 )
             except Exception as exc:  # noqa: BLE001 - proof must not kill the loop
                 print(f"BTC 15m: heartbeat write failed: {type(exc).__name__}: {exc}", flush=True)
+
+            # LIVE-ONLY book reaper: every 15 minutes, kill local rows Kalshi
+            # holds nothing behind (freeing the strategy slot they occupied) and
+            # liquidate Kalshi holdings no local row is tracking. Real money
+            # moves here, so it only ever runs on the LIVE client.
+            try:
+                from src.jobs.broker import should_trade_live
+
+                if should_trade_live():
+                    from src.jobs.live_reaper import LiveReaper
+
+                    if reaper is None:
+                        reaper = LiveReaper(trader.db_manager, trader._client)
+                    summary = await reaper.maybe_run()
+                    if summary:
+                        print(
+                            f"LIVE reaper: {summary['phantom_closed']} phantom rows "
+                            f"closed, {len(summary['liquidated'])} orphan holdings "
+                            f"liquidated, {len(summary['shorts_flagged'])} shorts "
+                            f"flagged, {summary.get('holdings_after')} Kalshi "
+                            f"holdings left ({summary['flat_rows_on_kalshi']} flat "
+                            f"rows ignored)",
+                            flush=True,
+                        )
+            except Exception as exc:  # noqa: BLE001 - reaping never kills the loop
+                print(f"BTC 15m: reaper pass failed: {type(exc).__name__}: {exc}", flush=True)
 
             if not loop:
                 return

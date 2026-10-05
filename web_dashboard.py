@@ -2954,6 +2954,13 @@ def api_live_journal():
             )
         for r in closes:
             r["exit_timestamp"] = str(r.get("exit_timestamp") or "")[:19]
+        # The reaper's latest pass: what it killed and what Kalshi still holds.
+        try:
+            from src.jobs.live_reaper import last_summary
+
+            reaper = last_summary()
+        except Exception:  # noqa: BLE001 - visibility only
+            reaper = {}
         return jsonify(
             {
                 "book": "live",
@@ -2966,6 +2973,7 @@ def api_live_journal():
                 "net_pnl": round(float(totals.get("net") or 0.0), 2),
                 "fee_total": round(float(totals.get("fees") or 0.0), 2),
                 "wins_total": int(totals.get("wins") or 0),
+                "reaper": reaper,
             }
         )
     except Exception as e:
@@ -4331,7 +4339,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
         position count and reporting it as one made the account look like it had
         31 open bets when 3 were held. The zero-share rows are named below. -#}
     <div class="v" id="tLivePos">{{ s.kalshi.held_count if s.kalshi else 0 }}</div>
-    <div class="s" id="tLivePosNote">{% if s.kalshi %}{{ s.kalshi.market_count }} market &middot; {{ s.kalshi.event_count }} event{% if s.kalshi.ghost_count %} &middot; {{ s.kalshi.ghost_count }} zero-share rows{% endif %}{% else %}&mdash;{% endif %}</div>
+    <div class="s" id="tLivePosNote">{% if s.kalshi %}{{ s.kalshi.held_count }} held &middot; {{ s.kalshi.ghost_count }} flat rows on Kalshi's side (no shares, cannot be deleted){% else %}&mdash;{% endif %}</div>
   </div>
   <div class="tile">
     <div class="k">Real exposure</div>
@@ -5022,8 +5030,8 @@ function paint(s) {
       ? k.held_count : (k.market_count || 0) + (k.event_count || 0);
     set('tLivePos', held);
     set('tLivePosNote',
-      (k.market_count || 0) + ' market · ' + (k.event_count || 0) + ' event' +
-      (k.ghost_count ? ' · ' + k.ghost_count + ' zero-share rows' : ''));
+          (k.held_count || 0) + ' held · ' + (k.ghost_count || 0) +
+          ' flat rows on Kalshi\'s side (no shares, cannot be deleted)');
     set('tExposure', money(k.exposure));
     set('tExposureNote',
       'mark-to-market · ' + (k.cost_basis_known

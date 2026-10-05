@@ -322,8 +322,10 @@ def test_the_live_position_tile_counts_held_rows_not_raw_rows(client, auth, monk
         html = client.get("/").get_data(as_text=True)
     finally:
         wd.dashboard_state["positions"] = []
-    # "1" held, with the zero-share rows named rather than silently added in.
-    assert "zero-share rows" in html
+    # "1" held, with Kalshi's flat rows named as flat rather than silently
+    # added in or dressed up as positions.
+    assert "flat rows on Kalshi" in html
+    assert "cannot be deleted" in html
 
 
 def test_a_zero_share_row_is_not_spent_a_title_lookup(client, auth, monkeypatch):
