@@ -19,6 +19,13 @@ from src.utils.logging_setup import get_trading_logger, setup_logging
 from src.utils.market_prices import get_market_prices
 from src.utils.mode import MODE_LIVE
 
+# In-memory throttle for the LIVE settlement reconciler: position id ->
+# epoch seconds of the last receipt check with no result. Keeps unreceipted
+# rows from costing a settlements call every few seconds. Process-local by
+# design; a restart simply re-checks, which is safe (read-only until receipt).
+_RECON_CHECKED_AT: dict = {}
+_RECON_RECHECK_SECONDS = 3600.0
+
 
 def _current_mode() -> str:
     """The book currently being traded, for stamping on writes."""
@@ -211,10 +218,16 @@ async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
     pass, and only when /portfolio/settlements returns a receipt for the
     exact ticker. No receipt means the row stays open -- a close is never
     invented. Closes are claimed first so the tracking loop below skips them.
+
+    Rows already checked without a receipt are skipped for an hour
+    (in-memory): without this the same unreceipted rows cost one settlements
+    call every few seconds and the pass never progresses past them.
     """
     from datetime import timezone
 
     from src.jobs import live_fees as _live_fees
+
+    checked_at = _RECON_CHECKED_AT
 
     result = {"reconciled": 0, "unreconciled": 0, "checked": 0}
     try:
@@ -236,6 +249,17 @@ async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
             continue
         if age_hours < 3.0:
             continue
+        # Throttle: a row checked within the hour with no receipt is skipped
+        # until the window passes, so the pass reaches new rows instead of
+        # re-burning API calls on the same unreceipted ones.
+        try:
+            import time as _time
+
+            _last = float(checked_at.get(position.id, 0.0))
+            if _time.time() - _last < _RECON_RECHECK_SECONDS:
+                continue
+        except Exception:  # noqa: BLE001 - throttle never blocks a check
+            pass
         result["checked"] += 1
         try:
             if position.id is not None and not await db_manager.claim_position_for_close(
@@ -253,6 +277,12 @@ async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
             if receipt is None:
                 if claimed:
                     await db_manager.release_position_claim(position.id)
+                try:
+                    import time as _time2
+
+                    checked_at[position.id] = _time2.time()
+                except Exception:  # noqa: BLE001
+                    pass
                 result["unreconciled"] += 1
                 continue
             side = str(position.side or "").lower()
