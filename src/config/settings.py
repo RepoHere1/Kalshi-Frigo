@@ -269,6 +269,14 @@ class Settings:
         """Validate configuration settings."""
         if not self.api.kalshi_api_key:
             raise ValueError("KALSHI_API_KEY environment variable is required")
+        
+        # OpenRouter is critical for trading logic and signals
+        if not self.api.openrouter_api_key:
+            raise ValueError(
+                "OPENROUTER_API_KEY environment variable is missing or empty. "
+                "This is required for LIVE trading to function. "
+                "Add it to Railway's environment variables or D:/master.env"
+            )
 
         if self.trading.max_position_size_pct <= 0 or self.trading.max_position_size_pct > 100:
             raise ValueError("max_position_size_pct must be between 0 and 100")
