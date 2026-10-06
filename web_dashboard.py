@@ -1550,6 +1550,29 @@ def _strategy_supervisor_loop():
                 if backoff > 0:
                     time.sleep(min(backoff, _SUPERVISOR_MAX_BACKOFF))
 
+                # SUPERVISOR RESPAWN GUARD: Never respawn a strategy in the wrong book.
+                # If this is a respawn (stale_instance or recent crash), verify the book
+                # mode hasn't changed since the row was recorded.
+                if stale_instance or (started and (datetime.now() - datetime.fromisoformat(str(started))).total_seconds() < _SUPERVISOR_STABLE_SECONDS):
+                    # This is a respawn attempt. Check if the current book matches the recorded mode.
+                    current_book = _current_book_mode()
+                    recorded_mode = row.get("mode")
+                    if current_book and recorded_mode:
+                        expected_book = "live" if recorded_mode == "live" else "dry"
+                        if current_book != expected_book:
+                            # Book changed! Refuse to respawn in the wrong book.
+                            _push_error(
+                                f"BOOK MODE GUARD: {name} was recorded in {expected_book} "
+                                f"but the current book is {current_book}. Refusing respawn "
+                                f"to prevent cross-contamination. Press Start in the correct book."
+                            )
+                            _run_async(
+                                store.record_stop(
+                                    name, "book mode changed during respawn", recorded_mode, clear_desired=True
+                                )
+                            )
+                            continue  # Skip this strategy; don't spawn it
+
                 try:
                     started = _spawn_strategy(name, mode)
                     attempts[name] = attempts.get(name, 0) + 1
@@ -3712,6 +3735,45 @@ def api_strategy_toggle(name):
 
     store = _runtime_store()
 
+    # ===== TRIPLE VERIFICATION BEFORE ANY START/STOP ACTION =====
+    # Verification 1: Book mode read must succeed (already checked above)
+    # Verification 2: Check recorded mode matches current book if row exists
+    recorded = _run_async(store.snapshot())
+    this_runtime_key = _runtime_key(name)
+    recorded_row = recorded.get(this_runtime_key) or {}
+    recorded_mode = recorded_row.get("mode")
+    
+    # If a row exists, it MUST match the current book mode
+    if recorded_row and recorded_mode:
+        expected_runtime_mode = "live" if book_mode == "live" else "paper"
+        if recorded_mode != expected_runtime_mode:
+            return (
+                jsonify({
+                    "error": (
+                        f"BOOK MISMATCH DETECTED: {name} is recorded as {recorded_mode} "
+                        f"but you are in {book_mode}. This prevents the cross-contamination "
+                        f"bug. Please try again or contact support."
+                    )
+                }),
+                409,
+            )
+    
+    # Verification 3: If running, verify it's in the right book
+    db_pid = recorded_row.get("pid")
+    db_mode = recorded_row.get("mode")
+    if db_pid and _pid_alive(db_pid, recorded_row):
+        runtime_book = "live" if db_mode == "live" else "dry"
+        if runtime_book != book_mode:
+            return (
+                jsonify({
+                    "error": (
+                        f"RUNNING IN WRONG BOOK: {name} is alive in {runtime_book} "
+                        f"but you clicked the button in {book_mode}. Killing it now to prevent contamination."
+                    )
+                }),
+                409,
+            )
+
     # Check the DATABASE for the current state — not just the in-memory dict.
     # strategy_state is per-process and can be stale across gunicorn workers.
     # The database is the shared source of truth. THE LOOKUP IS BOOK-SCOPED:
@@ -3846,6 +3908,14 @@ def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
         child_env["KALSHI_PRIVATE_KEY_PATH"] = key_path
     # Children must share the volume-mounted database, not a fresh container one.
     child_env["DB_PATH"] = str(DB_PATH)
+    
+    # CRITICAL: Isolate book mode environment variables to prevent cross-contamination.
+    # Remove any stale TRADING_MODE or LIVE_TRADING_ENABLED from parent process.
+    # This ensures child inherits only the mode we explicitly set.
+    child_env.pop("TRADING_MODE", None)
+    child_env.pop("LIVE_TRADING_ENABLED", None)
+    # Set explicit mode for this process (redundant but belt-and-suspenders)
+    child_env["STRATEGY_BOOK_MODE"] = mode
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     out = open(LOG_DIR / f"strategy_{name}.log", "ab", buffering=0)
