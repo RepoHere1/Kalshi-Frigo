@@ -3682,10 +3682,13 @@ def _strategy_log_tail(name: str, lines: int = 60) -> List[str]:
 @app.route("/api/strategy/<name>/toggle", methods=["POST"])
 def api_strategy_toggle(name):
     """Start/stop a strategy subprocess."""
+    print(f"[api_strategy_toggle] RECEIVED REQUEST for {name}", flush=True)
     denied = require_token()
     if denied is not None:
+        print(f"[api_strategy_toggle] {name} DENIED: token error", flush=True)
         return denied
     if name not in strategy_state:
+        print(f"[api_strategy_toggle] {name} NOT FOUND in strategy_state", flush=True)
         return jsonify({"error": f"Unknown strategy: {name}"}), 404
 
     # LAW + cost guard: heavy API abusers stay OFF until the operator
@@ -3829,11 +3832,13 @@ def api_strategy_toggle(name):
     # RUNNING IN THIS BOOK = a deliberate Stop, scoped to THIS BOOK. The other
     # book's row - its pid, its desired flag - is never touched.
     if db_running:
+        print(f"[api_strategy_toggle] {name} is RUNNING (PID {db_pid}), executing STOP", flush=True)
         code = _stop_child({"pid": db_pid, "running": True})
         _run_async(store.record_stop(name, "stopped by operator", mode))
         _run_async(store.set_desired(name, False, mode))
         _recorded_state()
         _broadcast("strategy", {"name": name, "action": "stopped"})
+        print(f"[api_strategy_toggle] {name} STOPPED successfully", flush=True)
         return jsonify(
             {
                 "name": name,
@@ -3851,6 +3856,8 @@ def api_strategy_toggle(name):
     # intent exactly as it was, not flip a lane the operator turned ON into
     # OFF-forever. _spawn_strategy records desired=True on success; the Stop
     # path above (db_running) is the only place desired=False is written.
+    
+    print(f"[api_strategy_toggle] {name} is NOT RUNNING, executing START in {book_mode} book", flush=True)
 
     if requested_mode is not None and requested_mode != runtime_mode:
         # Starting is gated on the book: the page controls the book it shows.
@@ -3873,6 +3880,7 @@ def api_strategy_toggle(name):
     if not os.environ.get("KALSHI_API_KEY") or not (
         os.environ.get("KALSHI_PRIVATE_KEY") or os.environ.get("KALSHI_PRIVATE_KEY_PATH")
     ):
+        print(f"[api_strategy_toggle] {name} START BLOCKED: missing Kalshi credentials", flush=True)
         return (
             jsonify(
                 {
@@ -3912,6 +3920,7 @@ def api_strategy_toggle(name):
                 503,
             )
     except Exception as e:  # noqa: BLE001
+        print(f"[api_strategy_toggle] {name} SPAWN FAILED: {type(e).__name__}: {e}", flush=True)
         _push_error(f"Strategy start ({name}): {e}")
         return jsonify({"error": f"Failed to start: {e}"}), 500
 
