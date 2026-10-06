@@ -4,6 +4,7 @@ Trade Execution Job
 This job takes a position and executes it as a trade.
 """
 import asyncio
+import os
 import uuid
 from datetime import datetime
 from typing import Dict, Optional
@@ -243,6 +244,61 @@ async def execute_position(
                 f"notional ${request.notional:.2f} against ${available_cents / 100:.2f} "
                 f"simulated cash"
             )
+
+        # DRY taker realism: the fill is priced after the round trip, off the
+        # live book - slippage cap, depth walk, partials, empty books. The
+        # decision-time price was only an estimate; this is what the exchange
+        # would actually have done. DRY_EXEC_SIM=0 reverts to the old instant
+        # fill at the decision price.
+        _exec_sim = (
+            (not live_mode)
+            and (not _maker)
+            and os.environ.get("DRY_EXEC_SIM", "1") == "1"
+        )
+        if _exec_sim:
+            from src.jobs.execution_sim import simulate_taker_fill
+
+            _latency = int(os.environ.get("DRY_LATENCY_MS", "400"))
+            _slip = float(os.environ.get("DRY_MAX_SLIPPAGE_CENTS", "3")) / 100.0
+            sim = await simulate_taker_fill(
+                kalshi_client,
+                position.market_id,
+                position.side,
+                position.quantity,
+                float(request.fill_price),
+                max_slippage=_slip,
+                latency_ms=_latency,
+            )
+            if not sim.filled:
+                logger.warning(
+                    f"🚫 DRY execution refused {position.market_id}: {sim.reason}"
+                )
+                return False
+            if sim.quantity != request.count or abs(sim.price - float(request.fill_price)) > 1e-9:
+                # Re-price the order to what the book actually gave: the
+                # ledger, the fee and the row must all carry the real fill.
+                request, _rs = build_order_request(
+                    market_id=position.market_id,
+                    side=position.side,
+                    action="buy",
+                    quantity=sim.quantity,
+                    market=market,
+                    available_cents=available_cents,
+                    limit_price_dollars=sim.price,
+                )
+                if request is None:
+                    logger.warning(f"⚠️  Re-priced order refused {position.market_id}: {_rs}")
+                    return False
+                position.entry_price = sim.price
+                position.quantity = sim.quantity
+                if position.id is not None:
+                    await db_manager.update_position_fill(
+                        position.id, sim.price, sim.quantity
+                    )
+                logger.info(
+                    f"📉 DRY execution reality on {position.market_id}: "
+                    f"{sim.quantity} @ {sim.price:.3f} ({sim.reason})"
+                )
 
         response = await broker.submit(request)
         if response.get("error"):

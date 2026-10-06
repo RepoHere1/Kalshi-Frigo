@@ -283,7 +283,27 @@ def test_dry_refuses_when_simulated_cash_is_gone(mode_manager):
     assert "available" in reason
 
 
-def test_dry_sell_credits_cash(mode_manager):
+def test_dry_sell_credits_cash(mode_manager, tmp_path):
+    """A sell credits cash ONLY when an open DRY position backs it."""
+    from datetime import datetime
+
+    from src.utils.database import DatabaseManager, Position
+
+    db = DatabaseManager(db_path=str(tmp_path / "frigo_broker.db"))
+    asyncio.run(db.initialize())
+    position = Position(
+        market_id="KXTEST-26",
+        side="YES",
+        entry_price=0.60,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="backing",
+        confidence=0.5,
+        live=False,
+        strategy="btc_updown",
+        mode="dry",
+    )
+    position.id = asyncio.run(db.add_position(position, allow_duplicate=True))
     req, _ = build_order_request(
         market_id="KXTEST-26",
         side="YES",
@@ -295,6 +315,22 @@ def test_dry_sell_credits_cash(mode_manager):
     )
     asyncio.run(DryBroker(mode_manager).submit(req))
     assert run(mode_manager.dry_account())["cash"] == pytest.approx(305.83)
+
+
+def test_dry_sell_without_a_backing_position_is_refused(mode_manager):
+    """The phantom-cash fix: no open row, no credit, ever."""
+    req, _ = build_order_request(
+        market_id="KXTEST-26",
+        side="YES",
+        action="sell",
+        quantity=10,
+        market=NORMAL_MARKET,
+        available_cents=300_00,
+        limit_price_dollars=0.60,
+    )
+    response = asyncio.run(DryBroker(mode_manager).submit(req))
+    assert response.get("error")
+    assert run(mode_manager.dry_account())["cash"] == pytest.approx(300.0)
 
 
 def test_live_broker_calls_place_order_with_validated_kwargs():

@@ -1930,10 +1930,16 @@ def _row_trades(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     row = rows[0] if rows else {}
     trades = int(row.get("trades") or 0)
     wins = int(row.get("wins") or 0)
+    if wins > trades:
+        wins = trades
     return {
         "trades": trades,
         "wins": wins,
-        "losses": int(row.get("losses") or 0),
+        # Derived, never trusted from SQL: a row whose pnl is exactly 0 was
+        # counted as neither win nor loss by the query, which once rendered
+        # "36.4% · 30W / 0L" on the same card - an impossibility that made
+        # every tally suspect. losses is BY DEFINITION trades minus wins.
+        "losses": trades - wins,
         "realized_pnl": round(float(row.get("realized_pnl") or 0.0), 2),
         "avg_pnl": round(float(row.get("avg_pnl") or 0.0), 2),
         "best_trade": round(float(row.get("best_trade") or 0.0), 2),
@@ -4638,7 +4644,7 @@ footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
   <div class="tile">
     <div class="k">Win rate</div>
     <div class="v" id="tWinRate">{{ s.trades.win_rate if s.trades else 0 }}%</div>
-    <div class="s">{{ s.trades.wins if s.trades else 0 }}W / {{ s.trades.losses if s.trades else 0 }}L</div>
+    <div class="s" id="tWinRateNote">{{ s.trades.wins if s.trades else 0 }}W / {{ s.trades.losses if s.trades else 0 }}L</div>
   </div>
   <div class="tile">
     <div class="k">AI spend today</div>
@@ -5327,6 +5333,7 @@ function paint(s) {
   const br = document.getElementById('tBotPnl');
   if (br) br.className = 'v ' + sgn(t.realized_pnl || 0);
   set('tWinRate', (t.win_rate || 0) + '%');
+  set('tWinRateNote', (t.wins || 0) + 'W / ' + (t.losses || 0) + 'L');
   set('tAiSpend', money(d.ai_cost_today));
   set('tRunning', s.running_count || 0);
   set('tUptime', Math.floor((s.uptime_sec || 0) / 60) + 'm');

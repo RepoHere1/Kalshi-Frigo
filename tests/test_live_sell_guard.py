@@ -178,16 +178,35 @@ class _StubBroker:
         return {"order": {"order_id": "oid-sell", "status": "resting"}}
 
 
-def test_dry_sell_never_reads_the_holding(monkeypatch):
-    """DRY keeps its historic behaviour: place, report success, move on."""
+def test_dry_sell_backed_by_the_local_book_never_touches_kalshi(tmp_path, monkeypatch):
+    """DRY sells read the LOCAL position table, never Kalshi's holdings.
+
+    The backing check is what keeps phantom sells out of the ledger (a sell
+    with no open row used to credit free cash). Kalshi's account is still
+    none of the DRY book's business.
+    """
+    from datetime import datetime
+
     from src.jobs import broker as broker_mod
+    from src.jobs.broker import DryBroker
+    from src.utils.database import DatabaseManager
+    from src.utils.mode import TradingMode
 
-    class _DryBroker(_StubBroker):
-        async def submit(self, req):
-            return {"order": {"order_id": "dry-1", "status": "filled", "simulated": True}}
+    db = DatabaseManager(db_path=str(tmp_path / "t.db"))
+    asyncio.run(db.initialize())
+    held = _pos()
+    held.live = False
+    held.mode = "dry"
+    held.timestamp = datetime.now()
+    held.rationale = "backing test"
+    held.confidence = 0.5
+    held.strategy = "btc_updown"
+    held.id = asyncio.run(db.add_position(held, allow_duplicate=True))
+    assert held.id is not None, "the backing row must persist"
 
+    broker = DryBroker(TradingMode(db_path=str(tmp_path / "t.db")))
     monkeypatch.setattr(
-        broker_mod, "broker_for_mode", lambda mode, **kw: _DryBroker()
+        "src.jobs.execute.broker_for_mode", lambda mode, **kw: broker
     )
     reads = []
 
@@ -198,7 +217,7 @@ def test_dry_sell_never_reads_the_holding(monkeypatch):
 
     client = _Counting(holdings=0.0)
     ok = asyncio.run(
-        place_sell_limit_order(_pos(), 0.68, _DB(), client, live_mode=False)
+        place_sell_limit_order(_pos(), 0.68, db, client, live_mode=False)
     )
     assert ok is True
     assert reads == [], "DRY must not consult Kalshi holdings"

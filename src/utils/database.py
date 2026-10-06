@@ -1291,6 +1291,26 @@ class DatabaseManager(TradingLoggerMixin):
             await db.commit()
         self.logger.info(f"Updated position {position_id} to live.")
 
+    async def update_position_fill(self, position_id: int, entry_price: float, quantity: int):
+        """Record the ACTUAL simulated fill for a DRY position.
+
+        The execution simulator prices DRY entries off the live book at
+        execution time - slippage, partials and all. The row must carry that
+        price and quantity, or closes compute P&L off the decision-time price
+        while the ledger debited the real one: the two books diverge by
+        exactly the slippage, and the audit reads it as theft.
+        """
+        async with connect(self.db_path) as db:
+            await db.execute(
+                """
+                UPDATE positions
+                SET entry_price = ?, quantity = ?
+                WHERE id = ?
+            """,
+                (float(entry_price), int(quantity), position_id),
+            )
+            await db.commit()
+
     async def add_position(
         self, position: Position, allow_duplicate: bool = False
     ) -> Optional[int]:

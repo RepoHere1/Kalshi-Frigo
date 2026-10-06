@@ -240,8 +240,65 @@ class DryBroker:
         account = await self._mode.dry_account()
         return int(round(float(account["cash"]) * 100))
 
+    async def _held_qty(self, ticker: str, side: str) -> int:
+        """Open DRY contracts actually held for (ticker, side).
+
+        The sell-backing check reads the same positions table the closes
+        write. Kalshi refuses a sell of contracts you do not hold; the
+        simulated book must refuse it too, or every duplicated close credits
+        cash the strategy never earned - which is exactly how the DRY
+        "realized P&L" once ran +$278 ahead of the bot's own trade log.
+        """
+        import os
+
+        import aiosqlite
+
+        db_path = getattr(self._mode, "db_path", None) or os.environ.get(
+            "DB_PATH", "trading_system.db"
+        )
+        try:
+            async with aiosqlite.connect(db_path) as conn:
+                cur = await conn.execute(
+                    "SELECT COALESCE(SUM(quantity), 0) FROM positions "
+                    "WHERE status = 'open' AND market_id = ? "
+                    "AND UPPER(side) = ? AND mode = 'dry'",
+                    (ticker, (side or "").upper()),
+                )
+                row = await cur.fetchone()
+                return int(row[0] or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                f"DRY sell-backing check unreadable for {ticker} {side}: "
+                f"{type(exc).__name__}: {exc} - refusing the sell (fail closed)"
+            )
+            return 0
+
     async def submit(self, req: OrderRequest) -> Dict[str, Any]:
         from src.utils.mode import ModeError
+
+        # Sells must be backed by held contracts. A sell without a position is
+        # free money in a cash ledger and pure fiction everywhere else.
+        if req.action == "sell":
+            held = await self._held_qty(req.ticker, req.side)
+            if req.count > held:
+                if held <= 0:
+                    return {
+                        "error": (
+                            f"refused: no open DRY position backs the sell of "
+                            f"{req.count} {req.side.upper()} on {req.ticker}"
+                        ),
+                        "simulated": True,
+                    }
+                logger.warning(
+                    f"DRY sell clamped to holdings on {req.ticker}: "
+                    f"asked {req.count}, held {held}"
+                )
+                req.count = held
+                req.notional = round(req.fill_price * held, 2)
+                if req.side == "yes":
+                    req.yes_price = int(round(req.fill_price * 100))
+                else:
+                    req.no_price = int(round(req.fill_price * 100))
 
         # DRY fakes Kalshi's taker fee (0.07 * price * (1-price))
         # so the simulated P&L matches what LIVE actually pays.
