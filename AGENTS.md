@@ -28,6 +28,7 @@ black . && isort . && mypy src/
 
 # Deploy (Railway)
 railway deploy
+# For troubleshooting & automation: See RAILWAY_DEPLOY_AI_CLI_GUIDE.md
 ```
 
 ## Architecture
