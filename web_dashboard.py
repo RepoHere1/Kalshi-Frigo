@@ -3617,6 +3617,27 @@ def api_strategy_toggle(name):
         return jsonify({"error": f"Unknown strategy: {name}"}), 404
 
     # LAW + cost guard: heavy API abusers stay OFF until the operator
+
+    #
+    # PERMANENT GUARD: THE OPERATOR'S BUTTON IS LAW. DRY and LIVE are separate
+    # forever. If the book mode read fails, refuse the operation rather than
+    # guess. A guessed mode is THE EXACT BUG that armed LIVE when DRY was
+    # pushed. Every other strategy start/stop must obey this same law.
+    #
+    book_mode_read = _current_book_mode()
+    if book_mode_read is None:
+        return (
+            jsonify(
+                {
+                    "error": (
+                        "CRITICAL: Cannot determine which book (DRY/LIVE) you are in right now. "
+                        "The mode read failed. Refusing the toggle to prevent the LIVE strategy "
+                        "from being armed by a DRY button push. Retry in a moment."
+                    )
+                }
+            ),
+            503,
+        )
     # deliberately re-enables them in code. The page button already pops an
     # explanation; the API enforces the same rule so a direct POST or bulk
     # Start cannot resurrect the lane behind the operator's back. Stops are
@@ -3765,6 +3786,30 @@ def api_strategy_toggle(name):
 
     try:
         result = _spawn_strategy(name, mode)
+        # PERMANENT ASSERTION: The book we read must match the mode we spawned.
+        # If they differ, it means a guessed/stale book mode snuck through and the
+        # wrong strategy is now running. This is THE BUG the operator complained about.
+        actual_book = _current_book_mode()
+        expected_book = "dry" if mode == "paper" else mode
+        if actual_book != expected_book:
+            _stop_child({"pid": result["pid"], "running": True})
+            _push_error(
+                f"CRITICAL BUG PREVENTED: Spawned {name} in {mode} but book reads as "
+                f"{actual_book} now! Killing the process immediately. This is the exact "
+                f"DRY/LIVE cross-contamination bug - refusing it by assertion."
+            )
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            "CRITICAL: Book mode changed between reading it and spawning. "
+                            "The strategy was NOT started to prevent the LIVE strategy from "
+                            "being armed by a DRY button push. Retry in a moment."
+                        )
+                    }
+                ),
+                503,
+            )
     except Exception as e:  # noqa: BLE001
         _push_error(f"Strategy start ({name}): {e}")
         return jsonify({"error": f"Failed to start: {e}"}), 500
