@@ -523,9 +523,12 @@ class UpDownTrader:
             horizon_seconds=seconds_left, last_price=spot
         )
         # IMPLIED sigma: Kalshi's own price inverted through the diffusion.
-        # Rich implied vs realized -> the binary overcharges for movement and
-        # entries demand extra edge; cheap implied -> the entry is already
-        # getting paid to carry vol.
+        # A RICH implied vs realized is usually momentum - the diffusion fair
+        # value already prices the move, so penalizing it again would
+        # double-count and block every trending window. Rich is therefore
+        # ANNOTATED only; cheap implied keeps its small credit, because the
+        # entry genuinely gets paid to carry volatility the market says won't
+        # happen.
         self._impl_sigma: Optional[float] = None
         self._vol_adj = 0.0
         if self.config.vol_edge_enabled and self._sigma_used:
@@ -535,11 +538,10 @@ class UpDownTrader:
                 self._impl_sigma = implied_sigma(
                     market.up_price, spot, target, seconds_left
                 )
-                if self._impl_sigma is not None:
-                    if self._impl_sigma > self._sigma_used * self.config.vol_rich_ratio:
-                        self._vol_adj = self.config.vol_rich_extra_edge
-                    elif self._impl_sigma < self._sigma_used * self.config.vol_cheap_ratio:
-                        self._vol_adj = -self.config.vol_cheap_edge_credit
+                if self._impl_sigma is not None and self._impl_sigma < (
+                    self._sigma_used * self.config.vol_cheap_ratio
+                ):
+                    self._vol_adj = -self.config.vol_cheap_edge_credit
             except Exception:  # noqa: BLE001 - vol read never blocks scoring
                 self._impl_sigma = None
         fair = fair_up_probability(
@@ -549,6 +551,41 @@ class UpDownTrader:
         up_ask = market.up_price
         down_ask = market.down_price
 
+        # MAKER-FIRST PRICING. A resting order fills at the BID and pays a
+        # QUARTER of the taker fee (live_fees.maker_fee_dollars models
+        # Kalshi's schedule). When the clock allows a rest AND the book is
+        # tight, the edge is priced at the bid and the bar drops to the maker
+        # fee - charging full taker on a resting entry was invented resistance
+        # that a tiny account cannot afford. A wide or crossed book falls back
+        # to taker math: nobody sells into a 47c-wide bid, and an edge priced
+        # against such a bid is fiction.
+        try:
+            from src.jobs.live_fees import should_use_maker_entry
+
+            _maker_clock = bool(should_use_maker_entry(seconds_left))
+        except Exception:  # noqa: BLE001
+            _maker_clock = False
+        _up_ref: float = float(up_ask) if up_ask is not None else 0.0
+        _down_ref: float = float(down_ask) if down_ask is not None else 0.0
+        _up_maker = False
+        _down_maker = False
+        if _maker_clock:
+            try:
+                _ub = float(market.yes_bid or 0.0)
+                _ya = float(market.yes_ask or 0.0)
+                _nb = float(market.no_bid or 0.0)
+                _na = float(market.no_ask or 0.0)
+            except (TypeError, ValueError):
+                _ub = _ya = _nb = _na = 0.0
+            _up_spread = (_ya - _ub) if (_ub > 0 and _ya > 0) else None
+            _down_spread = (_na - _nb) if (_nb > 0 and _na > 0) else None
+            if _up_spread is not None and 0.0 < _up_spread <= 0.05:
+                _up_maker = True
+                _up_ref = _ub
+            if _down_spread is not None and 0.0 < _down_spread <= 0.05:
+                _down_maker = True
+                _down_ref = _nb
+
         # Symmetric comparison: what this contract is worth to us, minus what
         # Kalshi charges for it. Both sides are a probability in [0, 1], so the
         # edge is directly comparable.
@@ -557,8 +594,8 @@ class UpDownTrader:
         # $300 below the target then DOWN is nearly certain, so the edge on DOWN
         # is what we are actually being offered. Getting that backwards made the
         # strategy refuse precisely the trades it exists to take.
-        up_edge = (fair - up_ask) if up_ask is not None else 0.0
-        down_edge = ((1.0 - fair) - down_ask) if down_ask is not None else 0.0
+        up_edge = (fair - _up_ref) if up_ask is not None else 0.0
+        down_edge = ((1.0 - fair) - _down_ref) if down_ask is not None else 0.0
 
         # ONE decision rule for both books: DRY's min_edge. LIVE adds
         # exactly what costs real money - Kalshi's actual taker fee
@@ -568,14 +605,20 @@ class UpDownTrader:
         # built DRY's ledger is the edge LIVE trades on now.
         # DRY also fakes the fee (dry_fee_enabled) so the simulated
         # P&L matches what LIVE actually pays.
-        def _required(fill_price: Optional[float]) -> float:
+        def _required(fill_price: Optional[float], maker: bool = False) -> float:
             if not live and not self.config.dry_fee_enabled:
                 return max(self.config.min_edge + self._vol_adj, 0.0)
-            kalshi_fee = 0.07 * (1.0 - float(fill_price or 0.5))
+            # Maker entries rest at the bid and pay a QUARTER of the taker fee
+            # (live_fees.maker_fee_dollars models Kalshi's schedule). The bar
+            # drops by the other three quarters when the clock allows a rest.
+            _fee_rate = 0.07 * (1.0 - float(fill_price or 0.5))
+            kalshi_fee = 0.25 * _fee_rate if maker else _fee_rate
             return max(self.config.min_edge + kalshi_fee + self._vol_adj, 0.0)
 
-        up_fill = up_ask if up_ask is not None else None
-        down_fill = down_ask if down_ask is not None else None
+        # The band check and sizing run on the price the entry actually pays:
+        # the maker bid when resting, else the taker ask.
+        up_fill = _up_ref if up_ask is not None else None
+        down_fill = _down_ref if down_ask is not None else None
 
         def _side_ok(edge: float, fill_price: Optional[float], req: float) -> bool:
             if fill_price is None or fill_price <= 0.0:
@@ -589,8 +632,8 @@ class UpDownTrader:
                 r += self.config.out_of_band_extra_edge
             return edge >= r
 
-        up_ok = _side_ok(up_edge, up_fill, _required(up_fill))
-        down_ok = _side_ok(down_edge, down_fill, _required(down_fill))
+        up_ok = _side_ok(up_edge, up_fill, _required(up_fill, _up_maker))
+        down_ok = _side_ok(down_edge, down_fill, _required(down_fill, _down_maker))
 
         side = ""
         ask: Optional[float] = None
@@ -610,15 +653,19 @@ class UpDownTrader:
 
         if not side:
             self.book.skipped_no_edge += 1
-            _req = (self.config.min_edge + 0.07 * (1.0 - float(up_fill or 0.5))) if live else self.config.min_edge
+            _req = _required(up_fill, _up_maker)
+            _regime = (
+                "maker-bar (quarter fee, bid-priced)"
+                if (_up_maker or _down_maker)
+                else "taker-bar (fee-aware)"
+            )
             reason = (
                 f"{truth_kind} {spot:,.0f} vs target {target:,.0f} ({delta:+,.0f}): "
                 f"fair {fair:.2f}, Kalshi up "
                 f"{('%.2f' % up_ask) if up_ask is not None else '--'} / down "
                 f"{('%.2f' % down_ask) if down_ask is not None else '--'} - "
                 f"best edge {max(up_edge, down_edge):+.3f} under {_req:.3f}"
-                 + (" (fee-aware)" if (live or self.config.dry_fee_enabled) else "")
-            )
+                f" [{_regime}]")
             if (up_fill is not None and up_fill >= self.config.max_entry_price) or (
                 down_fill is not None and down_fill >= self.config.max_entry_price
             ):
@@ -633,6 +680,9 @@ class UpDownTrader:
                 reason += f" | rv-sigma ${self._sigma_used:,.0f}"
             if self._impl_sigma:
                 reason += f" | impl-sigma ${self._impl_sigma:,.0f}"
+            _chosen_maker = (_up_maker if side == "up" else _down_maker)
+            if _chosen_maker:
+                reason += " | maker-bar (quarter fee, bid-priced)"
 
         # Size on the price the order will actually fill at: the side's own ask.
         # UP fills at yes_ask, DOWN fills at no_ask. An earlier revision filled
@@ -640,7 +690,9 @@ class UpDownTrader:
         # of exposure as a $4.93 clip and credited exits at the real price: ~$43
         # of phantom profit per trade. That inversion is what flattered the DRY
         # NO line. Both sides fill at their own ask now.
-        fill_price = ask if side else 0.0
+        # Size on the price the entry actually pays - the maker bid when the
+        # clip will rest, else the taker ask.
+        fill_price = (_up_ref if side == "up" else _down_ref) if side else 0.0
         contracts = self._size(fill_price, clip_usd=clip_usd) if side else 0
         if side and contracts > 0:
             # The Hyperliquid perp hedge that flattens this clip's direction,
@@ -944,7 +996,14 @@ class UpDownTrader:
                     _yb, _ya, _nb, _na = _gmp((_md or {}).get("market") or {})
                     _bid = _yb if signal.side == "up" else _nb
                     _mk = _live_fees_mk.maker_entry_price(signal.side, _bid, ask)
-                    if _mk is not None:
+                    # Rest only into a tight book: a wide spread means the
+                    # bid is a fiction and the resting order would sit there
+                    # while the market leaves.
+                    if (
+                        _mk is not None
+                        and float(ask or 0.0) > 0
+                        and (float(ask) - float(_mk)) <= 0.05
+                    ):
                         price = _mk
                         _maker_wait = _live_fees_mk.MAKER_ENTRY_WAIT_SECONDS
             except Exception:  # noqa: BLE001 - a failed bid read falls back to taker

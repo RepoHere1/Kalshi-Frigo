@@ -5,6 +5,7 @@ clip all interact at this scale. These tests pin the arithmetic that keeps a
 tiny account trading on every edge instead of stalling or overpaying.
 """
 import math
+import time
 
 import pytest
 
@@ -110,3 +111,69 @@ def test_balance_below_minimum_sets_a_plain_error():
 
     src = inspect.getsource(T.cycle)
     assert "order minimum - sitting out until funded" in src
+
+
+# ---------------------------------------------------------------------------
+# Maker-first bar: fee-free, bid-priced
+# ---------------------------------------------------------------------------
+def _mkt(**kw):
+    import time as _t
+
+    from src.jobs.market_data import UpDownMarket
+
+    return UpDownMarket(
+        ticker=kw.pop("ticker", "KXBTC15M-26OCT011715-15"),
+        event_ticker="KXBTC15M-26OCT011715",
+        bucket=kw.pop("bucket", "26OCT011715"),
+        horizon=15,
+        title="BTC up in 15?",
+        target=kw.pop("target", 84609.34),
+        close_ts=_t.time() + kw.pop("seconds_left", 600),
+        **kw,
+    )
+
+
+def test_maker_bar_takes_what_the_taker_bar_refuses(monkeypatch):
+    """Same book, same fair value: resting at the bid clears where paying the
+    ask plus the taker fee does not. That difference is real money on $10."""
+    import src.jobs.ladder_trader as lt
+
+    monkeypatch.setattr(
+        lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.52
+    )
+    trader = _trader()
+
+    # Maker window (600s > 120s patience): bid 0.44, edge 0.08 >= 0.06 bar.
+    mkt = _mkt(
+        seconds_left=600, yes_bid=0.44, yes_ask=0.45, no_bid=0.55, no_ask=0.56
+    )
+    signal = trader.evaluate(mkt, live=True)
+    assert signal is not None and signal.side == "up"
+    assert "maker-bar" in signal.reason
+
+    # Taker window (60s): ask 0.45, edge 0.07 < 0.06 + 0.0385 fee -> refused.
+    trader2 = _trader()
+    mkt2 = _mkt(
+        seconds_left=60, yes_bid=0.44, yes_ask=0.45, no_bid=0.55, no_ask=0.56
+    )
+    signal2 = trader2.evaluate(mkt2, live=True)
+    assert signal2 is not None and signal2.side == ""
+    assert "taker-bar" in signal2.reason
+
+
+def test_vol_rich_never_raises_the_bar_only_annotates():
+    """Momentum makes implied sigma look rich; the diffusion fair value already
+    prices that move. Penalizing it twice blocked every trending window - the
+    bar may only move DOWN (cheap-vol credit), never up."""
+    trader = _trader()
+    t0 = time.monotonic()
+    for i in range(60):
+        trader.rv.observe(
+            84000.0 + 0.1 * i + (1.0 if i % 2 else -1.0), now=t0 - 300.0 + i * 5.0
+        )
+    # Far-from-target quote -> implied sigma enormous vs realized.
+    mkt = _mkt(
+        seconds_left=300, yes_bid=0.20, yes_ask=0.21, no_bid=0.79, no_ask=0.80
+    )
+    trader.evaluate(mkt, live=False)
+    assert trader._vol_adj <= 0.0

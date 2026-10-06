@@ -419,17 +419,31 @@ def test_live_takes_everything_dry_takes_except_at_the_fee_bar(monkeypatch):
 
 
 def test_live_refuses_only_what_the_fee_makes_unprofitable(monkeypatch):
-    """6c of edge: both DRY and LIVE refuse once the fee is taken out."""
+    """6c of edge at the ask: the TAKER window refuses it on both books - the
+    fee is what refuses it. In the maker window the same 6c clears, because a
+    resting bid pays a quarter of the fee and fills a cent better."""
     import src.jobs.ladder_trader as lt
 
     monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.53)
-    market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0)
+
+    # Taker window (60s < maker patience): the fee refuses both books.
+    market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0, seconds_left=60)
     trader = _scorer()
     trader.feed.markets = [market]
     dry = trader.evaluate(market, live=False)
     live = trader.evaluate(market, live=True)
     assert (dry is None or not dry.actionable), "the fee makes DRY refuse too"
     assert (live is None or not live.actionable), "the fee is what refuses it"
+
+    # Maker window (600s): both books take the same quotes, identically.
+    market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0, seconds_left=600)
+    trader = _scorer()
+    trader.feed.markets = [market]
+    dry = trader.evaluate(market, live=False)
+    live = trader.evaluate(market, live=True)
+    assert dry is not None and dry.actionable, "DRY must mirror the maker window"
+    assert live is not None and live.actionable
+    assert "maker-bar" in live.reason
 
 
 def test_live_trades_the_18_utc_hour_dry_does():
