@@ -4907,14 +4907,13 @@ button.loading::after {
           <div><b id="c-{{ c.name }}-win">{{ c.win_rate }}%</b><span>win rate</span></div>
           <div><b id="c-{{ c.name }}-open">{{ c.open_positions }}</b><span>open</span></div>
         </div>
-        <div class="cfoot">
-          <span class="mono" style="color:var(--faint)">$<span id="c-{{ c.name }}-dep">{{ '%.2f'|format(c.deployed) }}</span> deployed{% if not c.running and c.stop_reason %} &middot; {{ c.stop_reason }}{% endif %}</span>
-          <span class="bar" onclick="event.stopPropagation()">
-            <button id="btn-{{ c.name }}" onclick="toggleStrategy('{{ c.name }}')">{% if c.running %}Stop{% else %}Start{% endif %}</button>
-            <button onclick="showAnalysis('{{ c.name }}')">ANALYSIS OF</button>
-            <button class="danger" onclick="killBot('{{ c.name }}')">Kill</button>
-          </span>
-        </div>
+         <div class="cfoot">
+           <span class="mono" style="color:var(--faint)">$<span id="c-{{ c.name }}-dep">{{ '%.2f'|format(c.deployed) }}</span> deployed{% if not c.running and c.stop_reason %} &middot; {{ c.stop_reason }}{% endif %}</span>
+           <span class="bar" onclick="event.stopPropagation()">
+             <button id="btn-{{ c.name }}" onclick="toggleStrategy('{{ c.name }}')">{% if c.running %}Stop{% else %}Start{% endif %}</button>
+             <button onclick="showAnalysis('{{ c.name }}')">ANALYSIS OF</button>
+           </span>
+         </div>
       </div>
       {%- endfor %}
     </div>
@@ -5802,13 +5801,12 @@ function paintMode(d) {
 
 // --- controls ---
 async function toggleStrategy(name, quiet) {
-  // Start or stop based on the card's actual state, so a bulk "start all" can
-  // never be turned into a bulk "stop all" by a stale button label.
   const card = (SNAPSHOT.strategy_cards || []).find(c => c.name === name);
   const btn = document.getElementById('btn-' + name);
-  const body = {}; // no mode: the server uses whatever the DRY/LIVE switch says
+  const body = {};
+  const wantedRunning = card && !card.running; // true if we're starting, false if stopping
   
-  // Add loading animation to button
+  // Add loading animation to button - keep it spinning until state actually changes
   if (btn) btn.classList.add('loading');
   
   try {
@@ -5816,11 +5814,7 @@ async function toggleStrategy(name, quiet) {
       await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
         method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
       });
-      if (!quiet) note(name + ': stopped');
     } else {
-      // HEAVY API ABUSER gate: quick_flip's Start is blocked with a popup so the
-      // #1 OpenRouter spender stays off, in both books. The popup is the
-      // reminder - it says exactly why the button does nothing.
       if (card && card.heavy_api_abuser) {
         if (!quiet) {
           alert('HEAVY API ABUSER\n\n' + (card.heavy_api_abuser_reason || '') +
@@ -5835,17 +5829,37 @@ async function toggleStrategy(name, quiet) {
       const d = await r.json().catch(() => ({}));
       if (!quiet) note(d.error ? name + ': ' + d.error : name + ': ' + (d.running ? 'started' : 'stopped'));
     }
+    
+    // Poll for actual state change - keep spinner on until running status matches what we want
+    let maxWait = 60; // Max 60 seconds of polling
+    let pollCount = 0;
+    while (pollCount < maxWait) {
+      // Small delay before first poll
+      await new Promise(r => setTimeout(r, 500));
+      pollCount++;
+      
+      try {
+        const strategiesResp = await fetch('/api/strategies', { headers: authHeaders() });
+        const strategiesData = await strategiesResp.json().catch(() => ({}));
+        const strategyData = strategiesData[name];
+        
+        // Check if state matches what we expected
+        if (strategyData && strategyData.running === wantedRunning) {
+          // State changed as expected - stop spinning
+          if (!quiet) {
+            note(name + ': ' + (wantedRunning ? 'started' : 'stopped'));
+          }
+          break;
+        }
+      } catch (e) {
+        // Poll error - keep trying
+      }
+    }
   } finally {
-    // Remove loading animation after response returns
+    // Remove loading animation only after state change confirmed
     if (btn) btn.classList.remove('loading');
     refresh();
   }
-}
-async function killBot(name) {
-  await fetch('/api/bot/' + encodeURIComponent(name) + '/kill',
-    { method: 'POST', headers: authHeaders() });
-  note(name + ': kill requested');
-  refresh();
 }
 async function saveAlerts() {
   const r = await fetch('/api/alerts', {
