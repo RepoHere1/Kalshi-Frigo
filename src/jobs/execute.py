@@ -198,11 +198,12 @@ async def execute_position(
         )
 
         available_cents = await broker.available_cents()
-        # LIVE-ONLY maker entry (item 2): with time on the clock the buy rests
-        # at the side's bid (maker fee, ~1/4 of taker) instead of crossing the
-        # spread. position.entry_price carries the bid in that case; DRY never
-        # takes this branch and keeps its market-style fill at the ask.
-        _maker = bool(live_mode and maker_wait_seconds and maker_wait_seconds > 0)
+        # Maker entry in BOTH books (THE LAW: DRY rehearses what LIVE does):
+        # with time on the clock the buy rests at the side's bid (maker fee,
+        # ~1/4 of taker) instead of crossing the spread. position.entry_price
+        # carries the bid in that case. In DRY nothing is transmitted - the
+        # fill is simulated against the same real order book below.
+        _maker = bool(maker_wait_seconds and maker_wait_seconds > 0)
         request, reason = build_order_request(
             market_id=position.market_id,
             side=position.side,
@@ -215,6 +216,21 @@ async def execute_position(
         if request is None:
             logger.warning(f"⚠️  Skipping {position.market_id}: {reason}")
             return False
+
+        if _maker and not live_mode:
+            # DRY maker: rest the same virtual limit LIVE would rest, watch
+            # the same real book for the same wait, and only book the fill if
+            # the book actually crossed our price. A rehearsal that books
+            # phantom maker fills would be worse than none.
+            filled = await _simulate_dry_maker_fill(
+                kalshi_client, request, position, float(maker_wait_seconds), logger
+            )
+            if not filled:
+                logger.warning(
+                    f"⏳ DRY maker entry on {position.market_id} did not fill in "
+                    f"{maker_wait_seconds:.0f}s; dropped, nothing simulated"
+                )
+                return False
 
         if live_mode:
             logger.warning(
@@ -307,6 +323,40 @@ async def _live_holding_yes(kalshi_client, ticker: str):
             except (TypeError, ValueError):
                 return None
     return 0.0
+
+
+async def _simulate_dry_maker_fill(
+    kalshi_client, request, position, wait_seconds: float, logger=None
+) -> bool:
+    """DRY mirror of the maker wait: did the real book cross our resting price?
+
+    A resting limit BUY at `limit` fills when a seller crosses it - in book
+    terms, when the side's ask trades down to the limit. The same real book
+    LIVE's confirmation reads, with nothing transmitted. Read failures are
+    tolerated and retried within the window, exactly like a resting order
+    would sit through a quiet feed.
+    """
+    import asyncio as _asyncio
+
+    from src.utils.market_prices import get_market_prices
+
+    side = (request.side or "").upper()
+    deadline = float(wait_seconds)
+    while True:
+        try:
+            md = await kalshi_client.get_market(request.ticker)
+            market = (md or {}).get("market") or {}
+            _yb, ya, _nb, na = get_market_prices(market)
+            ask = ya if side == "YES" else na
+            if ask is not None and float(ask) <= float(request.fill_price) + 1e-9:
+                return True
+        except Exception:  # noqa: BLE001 - transient read failure, keep waiting
+            pass
+        if deadline <= 0:
+            return False
+        step = min(2.5, deadline)
+        await _asyncio.sleep(step)
+        deadline -= step
 
 
 async def _confirm_live_sell(kalshi_client, position, before, wait_seconds=8.0, logger=None):

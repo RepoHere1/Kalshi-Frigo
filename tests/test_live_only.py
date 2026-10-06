@@ -86,7 +86,7 @@ def test_dry_ignores_the_session_bump(monkeypatch):
 
     # Force the losing hour for the whole test.
     monkeypatch.setattr(
-        lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.61, raising=False
+        lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.61, raising=False
     )
     trader = _scorer()
     market = _quoted_market(yes_ask=0.55, no_ask=0.45, target=84000.0)
@@ -407,7 +407,7 @@ def test_live_takes_everything_dry_takes_except_at_the_fee_bar(monkeypatch):
     import src.jobs.ladder_trader as lt
 
     # In-band price (no surcharge), 15c of modelled edge: both books act.
-    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.60)
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.60)
     market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0)
     trader = _scorer()
     trader.feed.markets = [market]
@@ -422,7 +422,7 @@ def test_live_refuses_only_what_the_fee_makes_unprofitable(monkeypatch):
     """6c of edge: both DRY and LIVE refuse once the fee is taken out."""
     import src.jobs.ladder_trader as lt
 
-    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.53)
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.53)
     market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0)
     trader = _scorer()
     trader.feed.markets = [market]

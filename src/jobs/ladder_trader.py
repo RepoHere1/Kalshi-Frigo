@@ -103,6 +103,21 @@ class UpDownConfig:
     # Extra edge demanded while the sentinel reads caution (event risk in
     # the air but unconfirmed). Halt blocks outright; see _ai_guards.
     sentinel_caution_extra_edge: float = 0.03
+    # THE LAW in reverse: DRY must rehearse what LIVE actually does, and
+    # LIVE's cheap edge is the maker entry - resting the buy at the side's
+    # bid for MAKER_ENTRY_WAIT_SECONDS instead of crossing the spread. With
+    # this on, DRY rests the same virtual limit against the same real order
+    # book and only books a fill when the book actually crosses it, so the
+    # simulated P&L carries the maker fee advantage (and the fill risk).
+    # DRY_MAKER_ENTRY=0 reverts DRY to always-taker.
+    dry_maker_entry: bool = True
+    # One-venue dislocation guard (the operator's observation: Coinbase can
+    # drop $50 while the venues Kalshi settles on drop $20-$40). When the
+    # other major USD venues sit on the OPPOSITE side of the target by more
+    # than this budget, the move is one venue's order flow - not the market's
+    # - and the entry is refused. Kraken/Bitstamp, keyless, degrade to no-op.
+    venue_guard_enabled: bool = True
+    venue_guard_max_usd: float = 60.0
 
     def __post_init__(self) -> None:
         import os as _os
@@ -119,6 +134,16 @@ class UpDownConfig:
         # it never paid Kalshi's taker fee.
         if _os.environ.get("DRY_FAKE_FEES", "1") == "1":
             self.dry_fee_enabled = True
+        if _os.environ.get("DRY_MAKER_ENTRY", "1") != "1":
+            self.dry_maker_entry = False
+        if _os.environ.get("VENUE_GUARD", "1") != "1":
+            self.venue_guard_enabled = False
+        _vg = _os.environ.get("VENUE_GUARD_MAX_USD", "")
+        if _vg:
+            try:
+                self.venue_guard_max_usd = float(_vg)
+            except ValueError:
+                pass
 
     # Minimum model probability on the chosen side before any entry. The old
     # "one clip per market" guard was removed; this is what replaces it as the
@@ -181,6 +206,7 @@ class UpDownBook:
     skipped_session: int = 0
     skipped_ai_veto: int = 0
     skipped_sentinel: int = 0
+    skipped_venue_guard: int = 0
     last_error: str = ""
     dry: bool = True
 
@@ -202,23 +228,42 @@ class UpDownBook:
             "skipped_session": self.skipped_session,
             "skipped_ai_veto": self.skipped_ai_veto,
             "skipped_sentinel": self.skipped_sentinel,
+            "skipped_venue_guard": self.skipped_venue_guard,
             "last_error": self.last_error,
             "dry": self.dry,
         }
 
 
-def fair_up_probability(spot: float, target: float, noise_usd: float = 15.0, seconds_left: float = 900.0) -> float:
+def fair_up_probability(
+    spot: float,
+    target: float,
+    noise_usd: float = 15.0,
+    seconds_left: float = 900.0,
+    sigma_dollars: Optional[float] = None,
+) -> float:
     """P(the next window settles at or above the target), from live spot.
 
-    A logistic in the distance past the target, in units of the noise band.
-    The noise band is scaled by remaining time: with less time left, the
-    same spot-vs-target distance is more decisive; with more time, more
-    uncertainty. At the target it is exactly 0.5, which is the right prior
-    for a market that has not moved yet; far past it, it saturates near 1.
+    Two models, chosen by what the data supports:
+
+    - WITH a realized-vol estimate (`sigma_dollars` from RealizedVol): the
+      honest diffusion probability `Phi((spot - target) / (sigma * sqrt(t)))`.
+      This is what a binary on a driftless walk is worth, and it is why the
+      operator's "spot moved $50 but the contract moved $30" is geometry, not
+      fraud - the move that matters is measured in sigmas of the time left.
+    - WITHOUT one (fresh process, sparse prints): the legacy logistic in the
+      distance past the target, in units of the noise band, scaled by
+      remaining time. Kept as the cold-start fallback so a fresh process
+      behaves exactly like the old book until the vol window fills.
+
+    At the target both are exactly 0.5; far past it, both saturate.
     """
+    time_scale = math.sqrt(max(seconds_left, 1.0) / 900.0)
+    if sigma_dollars is not None and sigma_dollars > 0:
+        effective = float(sigma_dollars) * time_scale
+        z = max(-6.0, min(6.0, (spot - target) / effective))
+        return float(0.5 * (1.0 + math.erf(z / math.sqrt(2.0))))
     if noise_usd <= 0:
         return 0.5
-    time_scale = math.sqrt(max(seconds_left, 1.0) / 900.0)
     effective_noise = noise_usd * time_scale
     z = max(-6.0, min(6.0, (spot - target) / effective_noise))
     return float(1.0 / (1.0 + math.exp(-z)))
@@ -246,6 +291,18 @@ class UpDownTrader:
         # Lazy OpenRouter client for the veto judge. Built only when
         # ai_veto_enabled, so DRY never pays for it.
         self._ai_client: Any = None
+        # Realized volatility from the same spot prints the strategy trades
+        # against: the honest denominator of the fair-value S-curve.
+        from src.jobs.realized_vol import RealizedVol
+
+        self.rv = RealizedVol()
+        # One-venue dislocation guard (Kraken/Bitstamp consensus vs Coinbase).
+        from src.jobs.venue_dislocation import VenueDislocation
+
+        self.venue_guard = VenueDislocation(
+            max_dislocation_usd=self.config.venue_guard_max_usd
+        )
+        self._sigma_used: Optional[float] = None
         self.book = UpDownBook(max_open_notional=self.config.max_open_notional)
 
     def evaluate(
@@ -312,6 +369,10 @@ class UpDownTrader:
             self.book.skipped_stale += 1
             return None
         spot = truth_price
+        # Every print feeds the realized-vol window; the fair value below
+        # switches from the fixed-band logistic to the measured diffusion
+        # once enough of the tape has been seen.
+        self.rv.observe(spot)
         # No entries inside the no-entry window (both books): the settlement
         # window is the final 60 seconds, and a fill in there is a coin toss
         # whether the truth is spot or the windowed average.
@@ -323,6 +384,37 @@ class UpDownTrader:
 
         target = float(market.target)
         delta = round(spot - target, 2)
+        # One-venue dislocation guard: Kalshi settles on the multi-venue BRTI
+        # composite, not on Coinbase. If the other major venues sit on the
+        # OPPOSITE side of the target by more than the budget, this "lead"
+        # is one venue's order flow and the entry is refused. Degrades to
+        # no-op when the extra feeds are unreachable.
+        if self.config.venue_guard_enabled:
+            try:
+                _veto, _vreason = self.venue_guard.vetoes(
+                    "up" if delta > 0 else "down", delta, spot
+                )
+                if _veto:
+                    self.book.skipped_venue_guard += 1
+                    return UpDownSignal(
+                        ticker=market.ticker,
+                        bucket=market.bucket,
+                        side="",
+                        target=target,
+                        spot=spot,
+                        spot_vs_target=delta,
+                        fair=0.5,
+                        kalshi_price=market.up_price,
+                        edge=0.0,
+                        ask=None,
+                        contracts=0,
+                        notional=0.0,
+                        seconds_left=round(market.seconds_left or 0.0, 1),
+                        reason=f"venue guard: {_vreason} - not the market's move",
+                        truth=truth_kind,
+                    )
+            except Exception:  # noqa: BLE001 - the guard never blocks on its own failure
+                pass
         # Hard deadband. Settlement is the 60-second average of a composite
         # index, so inside this band spot carries no directional information at
         # all. Without an explicit refusal the logistic still produces a small
@@ -352,7 +444,15 @@ class UpDownTrader:
             self.book.signals = [signal]
             return signal
 
-        fair = fair_up_probability(spot, target, self.config.noise_usd, market.seconds_left or 900.0)
+        seconds_left = market.seconds_left or 900.0
+        # Realized $-vol for exactly the time that is left. None until the
+        # window has enough tape; the legacy logistic covers the cold start.
+        self._sigma_used = self.rv.sigma_dollars(
+            horizon_seconds=seconds_left, last_price=spot
+        )
+        fair = fair_up_probability(
+            spot, target, self.config.noise_usd, seconds_left, self._sigma_used
+        )
 
         up_ask = market.up_price
         down_ask = market.down_price
@@ -437,6 +537,8 @@ class UpDownTrader:
                 f"fair {('%.2f' % (fair if side == 'up' else 1.0 - fair))} vs Kalshi "
                 f"{float(kalshi or 0.0):.2f} on {side.upper()} - edge {edge:+.3f}"
             )
+            if self._sigma_used:
+                reason += f" | rv-sigma ${self._sigma_used:,.0f}"
 
         # Size on the price the order will actually fill at: the side's own ask.
         # UP fills at yes_ask, DOWN fills at no_ask. An earlier revision filled
@@ -695,13 +797,17 @@ class UpDownTrader:
         # Both sides fill at their own ask (UP at yes_ask, DOWN at no_ask).
         # See the note at sizing: (1 - ask) here once booked $48 as $4.93.
         price = ask
-        # LIVE-ONLY maker entry (item 2): with time on the clock, rest the buy
-        # at the side's bid (maker fee ~1/4 of taker) and wait a few seconds
-        # for the book to come to us. The signal prices the edge at the ask,
-        # so a fill at the bid is strictly better than the price that already
-        # cleared the bar. No usable bid -> the taker path below, unchanged.
+        # Maker entry - both books now (THE LAW: DRY rehearses what LIVE does).
+        # With time on the clock, rest the buy at the side's bid (maker fee
+        # ~1/4 of taker) and wait a few seconds for the book to come to us.
+        # The signal prices the edge at the ask, so a fill at the bid is
+        # strictly better than the price that already cleared the bar. No
+        # usable bid -> the taker path below, unchanged. In DRY the same
+        # decision runs against the same real order book; execute_position
+        # only books the fill if the book actually crosses the resting price,
+        # so the rehearsal carries the fill risk too.
         _maker_wait = 0.0
-        if live:
+        if live or self.config.dry_maker_entry:
             try:
                 from src.jobs import live_fees as _live_fees_mk
                 from src.utils.market_prices import get_market_prices as _gmp
@@ -796,6 +902,14 @@ class UpDownTrader:
         # Awaited directly: mode.run() builds a fresh event loop, which raises
         # from inside this coroutine.
         mode = await TradingMode(db_path=self._db_path()).current()
+
+        # Refresh the cross-venue consensus once per pass; the (sync) scorer
+        # only ever reads the cached snapshot. Failures degrade to no guard.
+        if self.config.venue_guard_enabled:
+            try:
+                await self.venue_guard.refresh()
+            except Exception:  # noqa: BLE001
+                pass
 
         # This trader used to only ever OPEN positions. Closing them was someone
         # else's job: `run_tracking` lives inside BeastModeBot, so in DRY the
