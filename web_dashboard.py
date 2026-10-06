@@ -3776,42 +3776,31 @@ def api_strategy_toggle(name):
 
     # ===== TRIPLE VERIFICATION BEFORE ANY START/STOP ACTION =====
     # Verification 1: Book mode read must succeed (already checked above)
-    # Verification 2: Check recorded mode matches current book if row exists
+    # Verification 2: Check recorded mode matches current book IF ROW EXISTS AND IS RUNNING
     recorded = _run_async(store.snapshot())
     this_runtime_key = _runtime_key(name)
     recorded_row = recorded.get(this_runtime_key) or {}
     recorded_mode = recorded_row.get("mode")
-    
-    # If a row exists, it MUST match the current book mode
-    if recorded_row and recorded_mode:
-        expected_runtime_mode = "live" if book_mode == "live" else "paper"
-        if recorded_mode != expected_runtime_mode:
-            return (
-                jsonify({
-                    "error": (
-                        f"BOOK MISMATCH DETECTED: {name} is recorded as {recorded_mode} "
-                        f"but you are in {book_mode}. This prevents the cross-contamination "
-                        f"bug. Please try again or contact support."
-                    )
-                }),
-                409,
-            )
-    
-    # Verification 3: If running, verify it's in the right book
     db_pid = recorded_row.get("pid")
-    db_mode = recorded_row.get("mode")
+    
+    # CRITICAL FIX: Only reject mode mismatch if strategy is CURRENTLY RUNNING
+    # This allows switching a strategy from DRY to LIVE or vice versa without
+    # being blocked by old database records. But never allow starting in wrong
+    # book if it's already running there.
     if db_pid and _pid_alive(db_pid, recorded_row):
-        runtime_book = "live" if db_mode == "live" else "dry"
-        if runtime_book != book_mode:
+        # Strategy IS running - verify it's in the right book
+        if recorded_mode and recorded_mode != ("live" if book_mode == "live" else "paper"):
             return (
                 jsonify({
                     "error": (
-                        f"RUNNING IN WRONG BOOK: {name} is alive in {runtime_book} "
-                        f"but you clicked the button in {book_mode}. Killing it now to prevent contamination."
+                        f"RUNNING IN WRONG BOOK: {name} is alive in {recorded_mode} "
+                        f"but you clicked the button in {book_mode}. Refusing to prevent contamination."
                     )
                 }),
                 409,
             )
+    
+    # NOT running - allow mode change without complaint. Old records don't matter.
 
     # Check the DATABASE for the current state — not just the in-memory dict.
     # strategy_state is per-process and can be stale across gunicorn workers.
@@ -5846,29 +5835,52 @@ async function toggleStrategy(name, quiet) {
     }
     
     // Poll for actual state change - keep spinner on until running status matches what we want
-    let maxWait = 60; // Max 60 seconds of polling
+    let maxWait = 120; // Max 120 seconds of polling (increased from 60)
     let pollCount = 0;
+    let lastChartRunning = null;
+    
     while (pollCount < maxWait) {
-      // Small delay before first poll
-      await new Promise(r => setTimeout(r, 500));
+      // Faster initial polling (200ms), then back off
+      const delayMs = pollCount < 10 ? 200 : 500;
+      await new Promise(r => setTimeout(r, delayMs));
       pollCount++;
       
       try {
+        // Poll both strategies API AND snapshot to double-check state
         const strategiesResp = await fetch('/api/strategies', { headers: authHeaders() });
         const strategiesData = await strategiesResp.json().catch(() => ({}));
         const strategyData = strategiesData[name];
         
-        // Check if state matches what we expected
-        if (strategyData && strategyData.running === wantedRunning) {
-          // State changed as expected - stop spinning
+        // Also check if the chart visually shows change (via snapshot)
+        const snapshotResp = await fetch('/api/snapshot', { headers: authHeaders() });
+        const snapshot = await snapshotResp.json().catch(() => ({}));
+        const cards = snapshot.strategy_cards || [];
+        const card = cards.find(c => c.name === name);
+        
+        // Wait for BOTH API and chart to show the desired state
+        const apiReady = strategyData && strategyData.running === wantedRunning;
+        const chartReady = card && card.running === wantedRunning;
+        
+        if (apiReady && chartReady) {
+          // Both API and chart confirm the state - stop spinning
           if (!quiet) {
-            note(name + ': ' + (wantedRunning ? 'started' : 'stopped'));
+            note(name + ': ' + (wantedRunning ? 'started successfully' : 'stopped successfully'));
           }
           break;
         }
+        
+        // If API says running but chart doesn't yet, keep waiting (DB sync lag)
+        // If chart says running but API doesn't, keep waiting (API lag)
+        // This ensures we don't return until visual confirmation
+        
       } catch (e) {
-        // Poll error - keep trying
+        // Poll error - keep trying, don't give up
       }
+    }
+    
+    // If we exit the loop without visual confirmation, log a warning
+    if (pollCount >= maxWait && btn) {
+      note(name + ': Timeout waiting for state change. Check the strategy chart.');
     }
   } finally {
     // Remove loading animation only after state change confirmed
