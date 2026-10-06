@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.config.settings import settings
+from src.jobs.broker import should_trade_live
 from src.utils.logging_setup import TradingLoggerMixin
 
 
@@ -176,11 +177,27 @@ class XAIClient(TradingLoggerMixin):
     # ------------------------------------------------------------------
 
     def _get_openrouter_client(self):
-        """Lazy-init OpenRouter client."""
+        """Lazy-init OpenRouter client.
+
+        Book-aware: DRY always routes to the free DRY model so a simulated
+        cycle never bills the paid default. The DRY key (DRY_OPENROUTER_API_KEY)
+        is used when set; otherwise the only configured key carries the calls —
+        which are ~$0 on the free model. LIVE keeps the paid key and default.
+        """
         if self._openrouter_client is None:
             try:
                 from src.clients.openrouter_client import OpenRouterClient
-                self._openrouter_client = OpenRouterClient(db_manager=self.db_manager)
+
+                if should_trade_live():
+                    self._openrouter_client = OpenRouterClient(
+                        db_manager=self.db_manager
+                    )
+                else:
+                    self._openrouter_client = OpenRouterClient(
+                        api_key=settings.api.dry_openrouter_api_key or None,
+                        default_model=settings.api.dry_openrouter_model,
+                        db_manager=self.db_manager,
+                    )
                 self.logger.info("OpenRouter client initialised (via XAIClient shim)")
             except Exception as e:
                 self.logger.error(f"Failed to init OpenRouter client: {e}")

@@ -21,13 +21,15 @@ class APIConfig:
     openrouter_api_key: str = field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY", ""))
     openai_base_url: str = "https://api.openai.com/v1"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    # Free API key for DRY mode — DRY uses this so it doesn't burn
-    # the paid OPENROUTER_API_KEY balance. Set to empty to disable
-    # AI features in DRY entirely.
+    # Book split mandated by the operator: DRY runs the FREE OpenRouter
+    # configuration, LIVE runs the HOT (paid) one. DRY_OPENROUTER_API_KEY is
+    # used for simulated-book AI calls when set; otherwise the configured
+    # OPENROUTER_API_KEY carries them — the DRY model below is a `:free`
+    # slug, so it bills $0 to whichever key it rides on.
     dry_openrouter_api_key: str = field(default_factory=lambda: os.getenv("DRY_OPENROUTER_API_KEY", ""))
-    # Free model for DRY mode AI features (veto/sentinel). Defaults
-    # to the cheapest available OpenRouter listing.
-    dry_openrouter_model: str = field(default_factory=lambda: os.getenv("DRY_OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash"))
+    # Free model for DRY mode AI features (veto/sentinel). Must be a real
+    # `:free` OpenRouter listing — anything else burns the paid balance.
+    dry_openrouter_model: str = field(default_factory=lambda: os.getenv("DRY_OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free"))
 
     # xai_api_key removed — all models now route through OpenRouter
 
@@ -106,9 +108,10 @@ class TradingConfig:
     
     scan_interval_seconds: int = 60      # SANE: 60-second scan interval (was 30)
     
-    # AI model configuration
-    primary_model: str = "anthropic/claude-sonnet-4.5"  # Primary model via OpenRouter
-    fallback_model: str = "deepseek/deepseek-v3.2"  # Fallback model via OpenRouter
+    # AI model configuration — HOT (paid) OpenRouter config for LIVE,
+    # matching master.env: KALSHI_LLM_MODEL / KALSHI_LLM_FALLBACK.
+    primary_model: str = "deepseek/deepseek-chat"  # HOT primary via OpenRouter
+    fallback_model: str = "google/gemini-2.5-flash"  # HOT fallback via OpenRouter
     ai_temperature: float = 0  # Lower temperature for more consistent JSON output
     ai_max_tokens: int = 8000    # Reasonable limit for reasoning models (grok-4 works better with 8000)
     

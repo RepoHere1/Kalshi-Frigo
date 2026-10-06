@@ -589,9 +589,12 @@ class UpDownTrader:
                 if self._ai_client is None:
                     from src.clients.openrouter_client import OpenRouterClient
 
-                    # DRY uses the free OpenRouter key/model so it
-                    # doesn't burn the paid balance. LIVE uses the
-                    # real key from settings.
+                    # Book split mandated by the operator: DRY runs the FREE
+                    # OpenRouter configuration (free-tier model, `:free` slug,
+                    # $0 billed), LIVE runs the HOT configuration (paid key +
+                    # paid models). The DRY key is used when set; otherwise the
+                    # only configured key carries the calls — a `:free` model
+                    # bills nothing to it either way.
                     _api_key = (
                         settings.api.dry_openrouter_api_key
                         if not live
@@ -603,7 +606,7 @@ class UpDownTrader:
                         else None
                     )
                     self._ai_client = OpenRouterClient(
-                        api_key=_api_key,
+                        api_key=_api_key or None,
                         default_model=_model,
                     )
                 _streak = "unknown"
