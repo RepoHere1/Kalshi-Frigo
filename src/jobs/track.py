@@ -657,6 +657,33 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                                 await db_manager.release_position_claim(position.id)
                             continue
 
+                        # A "take_profit" close that nets zero or less after the
+                        # round-trip fees is not a profit - it converts a live
+                        # 1/0 resolution chance into a locked-in small loss.
+                        # The live log showed take_profit exits realizing
+                        # -$0.26/-$0.42/-$0.29 on two-contract clips. Hold to
+                        # resolution instead; the market pays 1 or 0 at the
+                        # window close regardless.
+                        if exit_reason == "take_profit":
+                            _entry = float(position.entry_price or 0.0)
+                            _qty = int(position.quantity or 0)
+                            _fees = (
+                                0.07 * _entry * (1.0 - _entry) * _qty
+                                + 0.07 * exit_price * (1.0 - exit_price) * _qty
+                            )
+                            _net = (exit_price - _entry) * _qty - _fees
+                            if _net <= 0.0:
+                                logger.info(
+                                    f"Holding {position.market_id} through resolution: "
+                                    f"'take_profit' exit at {exit_price:.3f} would net "
+                                    f"{_net:+.2f} after fees ({_qty} @ {_entry:.3f}). "
+                                    f"A losing 'profit' is a locked loss; resolution "
+                                    f"pays 1 or 0."
+                                )
+                                if position.id is not None:
+                                    await db_manager.release_position_claim(position.id)
+                                continue
+
                         from src.jobs.broker import current_mode
                         from src.jobs.execute import place_sell_limit_order
 

@@ -317,16 +317,20 @@ def test_stale_quote_is_refused_even_with_fresh_truth():
 
 
 def test_live_entry_block_caps_clips_per_ticker():
-    """LIVE takes at most 3 clips of one ticker; DRY is uncapped."""
-    import time as _time
-
-    from src.jobs.ladder_trader import LIVE_MAX_CLIPS_PER_TICKER, UpDownSignal, UpDownTrader
+    """ONE clip of one ticker, BOTH books: the trade log showed every
+    dollar-large loss was a pyramid - same-window clips are the same bet at
+    3-4x the Kelly cap, and the stack dies together."""
+    from src.jobs.ladder_trader import (
+        MAX_CLIPS_PER_TICKER,
+        UpDownSignal,
+        UpDownTrader,
+    )
     from src.jobs.market_data import Btc15mFeed, SpotFeed
 
     def trader():
         spot = SpotFeed()
         spot.price = 85000.0
-        spot.ts = _time.time()
+        spot.ts = time.time()
         return UpDownTrader(spot, Btc15mFeed(), UpDownConfig())
 
     sig = UpDownSignal(
@@ -347,12 +351,13 @@ def test_live_entry_block_caps_clips_per_ticker():
     )
     held = [
         {"ticker": "T", "side": "YES", "notional": 5.0, "contracts": 12}
-        for _ in range(LIVE_MAX_CLIPS_PER_TICKER)
+        for _ in range(MAX_CLIPS_PER_TICKER)
     ]
     assert trader()._entry_block(sig, held, live=True) != ""
-    assert trader()._entry_block(sig, held[:2], live=True) == ""
-    assert trader()._entry_block(sig, held, live=False) == ""
+    assert trader()._entry_block(sig, held, live=False) != ""
     assert trader()._entry_block(sig, [], live=True) == ""
+    assert trader()._entry_block(sig, [], live=False) == ""
+    assert MAX_CLIPS_PER_TICKER == 1
 
 
 # ---------------------------------------------------------------------------
@@ -629,14 +634,18 @@ def test_winning_position_with_time_left_still_takes_profit(monkeypatch):
 # ---------------------------------------------------------------------------
 # Session skip is enforced in LIVE evaluate(), never in DRY
 # ---------------------------------------------------------------------------
-def test_live_skips_losing_hour_and_dry_trades_it(monkeypatch):
+def test_the_losing_hour_ban_is_gone_both_books_trade_it(monkeypatch):
+    """The 18 UTC ban was ancient single-hour data from the old model - and it
+    was also a DRY/LIVE law violation (DRY traded the hour, LIVE sat out).
+    The per-trade guards (edge bar, venue guard, hard blocks) are the data-
+    driven protection now; a clock superstition is not."""
     monkeypatch.setattr(live_fees, "live_session_skip", lambda now=None: True)
     trader = _scorer()
-    assert trader.evaluate(_quoted_market(), live=True) is None
-    assert trader.book.skipped_session == 1
-    # DRY never reads the flag.
-    signal = trader.evaluate(_quoted_market(), live=False)
-    assert signal is not None and signal.actionable
+    live = trader.evaluate(_quoted_market(), live=True)
+    dry = trader.evaluate(_quoted_market(), live=False)
+    assert live is not None and live.actionable, "LIVE must trade the hour now"
+    assert dry is not None and dry.actionable
+    assert trader.book.skipped_session == 0
 
 
 def test_live_trades_outside_losing_hour(monkeypatch):
@@ -646,11 +655,14 @@ def test_live_trades_outside_losing_hour(monkeypatch):
     assert signal is not None and signal.actionable
 
 
-def test_losing_hour_skip_is_configurable(monkeypatch):
-    monkeypatch.setattr(live_fees, "live_session_skip", lambda now=None: True)
-    trader = _scorer(live_skip_losing_hour=False)
-    signal = trader.evaluate(_quoted_market(), live=True)
-    assert signal is not None and signal.actionable
+def test_the_losing_hour_config_field_is_gone():
+    """No clock-based skip flag survives on the config: the guards that matter
+    are per-trade, not per-hour."""
+    from src.jobs.ladder_trader import UpDownConfig
+
+    assert not hasattr(UpDownConfig(), "live_skip_losing_hour")
+    src = open("src/jobs/ladder_trader.py", encoding="utf-8").read()
+    assert "live_session_skip" not in src
 
 
 # ---------------------------------------------------------------------------

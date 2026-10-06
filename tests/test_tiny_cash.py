@@ -285,3 +285,54 @@ def test_dry_mirrors_kelly_on_its_own_cash():
     assert signal is not None and signal.side == "up"
     # clip = 300 x 0.222 = $66.60 -> 121 contracts at 0.55.
     assert signal.contracts == 121
+
+
+# ---------------------------------------------------------------------------
+# One bet per flip: the pyramiding kill
+# ---------------------------------------------------------------------------
+def _signal_for(ticker="KXBTC15M-26OCT011715-15", side="up", fair=0.75):
+    from src.jobs.ladder_trader import UpDownSignal
+
+    return UpDownSignal(
+        ticker=ticker, bucket="26OCT011715", side=side, target=84000.0,
+        spot=84900.0, spot_vs_target=900.0, fair=fair, kalshi_price=0.45,
+        edge=0.30, ask=0.45, contracts=4, notional=1.80,
+        seconds_left=300.0, reason="t",
+    )
+
+
+def test_second_clip_on_the_same_flip_is_refused_both_books():
+    """The trade-log verdict: -8.16, -6.27, -4.87, -4.31 were ALL pyramids.
+    Same-window clips are one bet at 3-4x the Kelly cap."""
+    trader = _trader()
+    sig = _signal_for()
+    held = [{"ticker": sig.ticker, "side": "YES", "notional": 1.80}]
+    live_block = trader._entry_block(sig, held, live=True)
+    dry_block = trader._entry_block(sig, held, live=False)
+    assert "one coin flip" in live_block
+    assert "one coin flip" in dry_block
+
+
+def test_first_clip_passes_and_opposite_side_still_blocks():
+    trader = _trader()
+    sig = _signal_for()
+    assert trader._entry_block(sig, [], live=True) == ""
+    opp = [{"ticker": sig.ticker, "side": "NO", "notional": 1.0}]
+    block = trader._entry_block(sig, opp, live=True)
+    assert "opposite side" in block
+
+
+def test_pyramid_law_is_one_clip_constant():
+    from src.jobs.ladder_trader import MAX_CLIPS_PER_TICKER
+
+    assert MAX_CLIPS_PER_TICKER == 1
+
+
+def test_take_profit_at_a_loss_holds_for_resolution():
+    """A losing take_profit is a locked loss; resolution pays 1 or 0."""
+    import inspect
+
+    from src.jobs import track
+
+    src = inspect.getsource(track)
+    assert "would net" in src

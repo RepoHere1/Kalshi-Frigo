@@ -41,9 +41,15 @@ from src.jobs.market_data import Btc15mFeed, SpotFeed, UpDownMarket
 # A Kalshi quote older than this is not traded against: the book simply has
 # not repriced yet, so any "edge" versus fresh truth is fiction.
 QUOTE_MAX_AGE_SEC = 30.0
-# LIVE-ONLY: max open clips of one ticker. One 15-minute bucket is one bet;
-# DRY is uncapped so its historic pyramiding pattern is untouched.
-LIVE_MAX_CLIPS_PER_TICKER = 3
+# MAX CLIPS OF ONE TICKER: ONE, both books. Evidence from the live trade log
+# (2026-10-06, 145 closed trades): every dollar-large loss (-$8.16, -$6.27,
+# -$4.87, -$4.31) was a PYRAMID - two or three clips stacked on the SAME
+# 15-minute flip. Each clip passed the money rules alone, but they are 100%
+# correlated: the aggregate bet was 3-4x the Kelly cap on a single flip, and
+# when the flip lost, the whole stack died at once. The kelly_cap is a limit
+# PER INDEPENDENT BET; re-betting the same edge is not a new bet. One window,
+# one coin flip, one Kelly-sized clip.
+MAX_CLIPS_PER_TICKER = 1
 # NOTE: a LIVE-only 0.10-0.50 entry band lived here and was removed: it cut
 # LIVE to 52 skips and 0 trades an hour. Both books now share the sweet-band
 # surcharge in UpDownConfig; LIVE adds only the real fee.
@@ -82,12 +88,6 @@ class UpDownConfig:
     # 0.20 on the strength of the forever-log analysis (76% win rate over 283
     # closes - the edge is real, scale up).
     live_cash_fraction: float = 0.20
-    # LIVE only: skip the historically losing 18 UTC hour entirely. The
-    # forever log went 17 trades at 41.2% for -$2.70 there while every
-    # neighbouring hour printed; demanding extra edge still paid the fee on
-    # a coin flip, so LIVE sits the hour out. DRY never reads this flag and
-    # still trades the hour.
-    live_skip_losing_hour: bool = True
     # FRACTIONAL KELLY SIZING - the compounding engine. The mathematically
     # growth-optimal fraction of the book for a binary priced c with model
     # probability f is k* = (f - c) / (1 - c); betting kelly_scale * k* gives
@@ -393,15 +393,6 @@ class UpDownTrader:
         # LIVE-ONLY losing-hour skip: the 18 UTC hour lost money in the
         # forever log, so LIVE sits it out. A losing hour is cheaper to skip
         # than to re-learn with real money. DRY never enters this branch.
-        if live and self.config.live_skip_losing_hour:
-            try:
-                from src.jobs import live_fees as _live_fees_hr
-
-                if _live_fees_hr.live_session_skip():
-                    self.book.skipped_session += 1
-                    return None
-            except Exception:  # noqa: BLE001 - a clock error never buys an entry
-                pass
         if market is None:
             self.book.skipped_unquoted += 1
             return None
@@ -864,10 +855,11 @@ class UpDownTrader:
           - total open notional across all clips stays under
             `max_open_notional`
 
-        LIVE-ONLY: at most LIVE_MAX_CLIPS_PER_TICKER clips of one ticker. One
-        15-minute bucket is one coin flip -- the 26-clip pyramid of 2026-10-04
-        put $21.50 of real exposure on a single flip. DRY keeps unlimited
-        pyramiding so its historic pattern is untouched.
+        ONE clip per ticker, BOTH books: the live trade log showed every
+        dollar-large loss was a pyramid - clips stacked on the same flip are
+        the same bet at 3-4x the Kelly cap, and the stack dies together. The
+        money rules below never fixed that, because each clip passed them
+        alone while the aggregate was one oversized bet.
         """
         opposite = {"up": "NO", "down": "YES"}
         for p in held:
@@ -876,12 +868,11 @@ class UpDownTrader:
                     f"already hold the opposite side of {signal.ticker}; "
                     "closing first (never both sides of one contract)"
                 )
-        if live and sum(1 for p in held if p["ticker"] == signal.ticker) >= (
-            LIVE_MAX_CLIPS_PER_TICKER
-        ):
+        if any(p["ticker"] == signal.ticker for p in held):
             return (
-                f"already hold {LIVE_MAX_CLIPS_PER_TICKER} LIVE clips of"
-                f" {signal.ticker}; one bucket is one bet, no more pyramiding"
+                f"already hold {MAX_CLIPS_PER_TICKER} clip of {signal.ticker}; "
+                "one bucket is one coin flip and one Kelly-sized bet - "
+                "re-betting the same flip is not a new edge"
             )
 
         win_prob = signal.fair if signal.side == "up" else 1.0 - signal.fair

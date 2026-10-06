@@ -260,11 +260,14 @@ def test_book_summary_reports_the_limits_it_enforces():
 # ---------------------------------------------------------------------------
 # Entry gating: probability and money, not clip counts
 # ---------------------------------------------------------------------------
-def test_a_second_clip_of_the_same_contract_is_not_blocked():
+def test_a_second_clip_of_the_same_contract_is_blocked():
+    """The trade-log verdict: every dollar-large loss was a pyramid - clips on
+    the same window are the same bet at 3-4x the Kelly cap, both books."""
     trader = UpDownTrader(SpotFeed(), Btc15mFeed())
     held = [{"ticker": "KXBTC15M-26OCT011715-15", "side": "YES", "notional": 5.0}]
     second = _signal("KXBTC15M-26OCT011715-15", side="up", ask=0.5, contracts=8)
-    assert trader._entry_block(second, held) == ""
+    block = trader._entry_block(second, held)
+    assert "one coin flip" in block
 
 
 def test_the_opposite_side_of_the_same_contract_is_still_blocked():
@@ -285,11 +288,12 @@ def test_an_entry_under_min_win_prob_is_refused():
 
 
 def test_the_notional_cap_stops_accumulation():
-    """max_open_notional is LIVE-only; DRY is uncapped."""
+    """max_open_notional is LIVE-only; DRY is uncapped. Held rows sit on
+    DIFFERENT tickers - the one-clip-per-flip rule is separate from this."""
     trader = UpDownTrader(SpotFeed(), Btc15mFeed())
     held = [
-        {"ticker": "KXBTC15M-26OCT011715-15", "side": "YES", "notional": 12.0},
-        {"ticker": "KXBTC15M-26OCT011715-15", "side": "YES", "notional": 12.0},
+        {"ticker": "KXBTC15M-26OCT061200-00", "side": "YES", "notional": 12.0},
+        {"ticker": "KXBTC15M-26OCT061215-15", "side": "YES", "notional": 12.0},
     ]
     clip = _signal("KXBTC15M-26OCT011715-15", side="up", ask=0.5, contracts=8)
     # LIVE mode: the cap blocks.
@@ -299,11 +303,11 @@ def test_the_notional_cap_stops_accumulation():
     assert trader._entry_block(clip, held, live=False) == ""
 
 
-def test_under_the_notional_cap_repeated_clips_pass():
+def test_under_one_clip_per_window_a_repeat_is_refused():
     trader = UpDownTrader(SpotFeed(), Btc15mFeed())
     held = [{"ticker": "KXBTC15M-26OCT011715-15", "side": "YES", "notional": 5.0}]
     clip = _signal("KXBTC15M-26OCT011715-15", side="up", ask=0.5, contracts=8)
-    assert trader._entry_block(clip, held) == ""
+    assert trader._entry_block(clip, held) != ""
 
 
 # ---------------------------------------------------------------------------
