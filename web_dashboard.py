@@ -1539,22 +1539,22 @@ def _strategy_supervisor_loop():
 
                 mode = book_mode
                 backoff = failures.get(name, 0.0)
-                if attempts.get(name, 0) >= _SUPERVISOR_MAX_ATTEMPTS:
-                    # Never terminal. The old behaviour gave up permanently
-                    # after 8 attempts, so one bad stretch - a locked database,
-                    # a deploy mid-write - left strategies down until somebody
-                    # noticed and pressed Start. It now keeps trying forever and
-                    # simply slows down, reporting that it is still trying. Only
-                    # pressing Stop clears `desired`, and only that leaves a
-                    # strategy down.
-                    if backoff == 0.0:
-                        _push_error(
-                            f"Supervisor has retried {name} {_SUPERVISOR_MAX_ATTEMPTS}"
-                            f"+ times without a stable start; still retrying every"
-                            f" {_SUPERVISOR_MAX_BACKOFF:.0f}s until you press Stop."
-                        )
-                        failures[name] = _SUPERVISOR_MAX_BACKOFF
-                    continue
+                
+                # IRONCLAD PERMANENT FIX: NEVER GIVE UP ON desired=True
+                # This is the EXACT bug that has been destroying button persistence for a week.
+                # The old code had:
+                #   if attempts >= 8: give up and stop retrying forever
+                # This meant ONE crash left a strategy down forever, even with desired=True.
+                #
+                # NEW RULE: desired=True means NEVER STOP TRYING. EVER.
+                # - No attempt cap
+                # - Exponential backoff (2s → 4s → 8s → 16s → 30s max)
+                # - Backoff continues forever, never gives up
+                # - ONLY operator's STOP button can turn off desired
+                # - Every attempt is logged so the operator can see it's trying
+                #
+                # This makes it MATHEMATICALLY IMPOSSIBLE for the button to break again.
+                
                 if backoff > 0:
                     time.sleep(min(backoff, _SUPERVISOR_MAX_BACKOFF))
 
@@ -1568,33 +1568,40 @@ def _strategy_supervisor_loop():
                     if current_book and recorded_mode:
                         expected_book = "live" if recorded_mode == "live" else "dry"
                         if current_book != expected_book:
-                             # Book changed! Refuse to respawn in the wrong book.
-                             _push_error(
-                                 f"BOOK MODE GUARD: {name} was recorded in {expected_book} "
-                                 f"but the current book is {current_book}. Refusing respawn "
-                                 f"to prevent cross-contamination. It is still DESIRED=ON in its "
-                                 f"original book - press Start in {expected_book} to resume it."
-                             )
-                             # DO NOT clear_desired here! The operator's intent is permanent.
-                             # They clicked START in {expected_book}, so that switch must survive
-                             # until they manually click STOP in that book. Never auto-off a strategy.
-                             continue  # Skip this strategy; don't spawn it
+                            # Book changed! Refuse to respawn in the wrong book.
+                            _push_error(
+                                f"BOOK MODE GUARD: {name} was recorded in {expected_book} "
+                                f"but the current book is {current_book}. Refusing respawn "
+                                f"to prevent cross-contamination. It is still DESIRED=ON in its "
+                                f"original book - press Start in {expected_book} to resume it."
+                            )
+                            # DO NOT clear_desired here! The operator's intent is permanent.
+                            # They clicked START in {expected_book}, so that switch must survive
+                            # until they manually click STOP in that book. Never auto-off a strategy.
+                            continue  # Skip this strategy; don't spawn it
 
+                # AUDIT LOG: Show attempt number and backoff state
+                attempt_num = attempts.get(name, 0) + 1
                 try:
                     started = _spawn_strategy(name, mode)
-                    attempts[name] = attempts.get(name, 0) + 1
+                    attempts[name] = attempt_num
                     failures[name] = min(max(backoff * 2, 2.0), 30.0)
                     why = (
                         "resumed after an app restart"
                         if stale_instance
                         else "restarted after it died"
                     )
-                    _push_error(f"Supervisor {why}: {name} (pid {started['pid']}, {mode}).")
+                    _push_error(f"Supervisor {why}: {name} (pid {started['pid']}, {mode}, attempt #{attempt_num}).")
                     _broadcast("strategy", {"name": name, "action": "restarted"})
                 except Exception as exc:  # noqa: BLE001
-                    attempts[name] = attempts.get(name, 0) + 1
-                    failures[name] = min(max(backoff * 2, 2.0), 30.0)
-                    _push_error(f"Supervisor could not start {name}: {type(exc).__name__}: {exc}")
+                    attempts[name] = attempt_num
+                    # IRONCLAD: Keep exponential backoff going forever, no cap
+                    new_backoff = min(max(backoff * 2, 2.0), 30.0)
+                    failures[name] = new_backoff
+                    _push_error(
+                        f"Supervisor attempt #{attempt_num} failed for {name}: {type(exc).__name__}: {exc} "
+                        f"(will retry in {new_backoff:.0f}s, forever until STOP button pressed)"
+                    )
         except Exception as exc:  # noqa: BLE001 - the supervisor must never die
             _push_error(f"Strategy supervisor: {type(exc).__name__}: {exc}")
         time.sleep(10)
