@@ -118,6 +118,27 @@ class UpDownConfig:
     # - and the entry is refused. Kraken/Bitstamp, keyless, degrade to no-op.
     venue_guard_enabled: bool = True
     venue_guard_max_usd: float = 60.0
+    # IMPLIED vs MEASURED volatility (the hedged-vol trade's core read).
+    # Kalshi's price inverted through the diffusion is the market's implied
+    # sigma; RealizedVol measures the tape. When implied is RICH vs realized
+    # the binary overcharges for movement and entries demand extra edge;
+    # when implied is CHEAP the entry is already getting paid for vol.
+    # The Hyperliquid perp hedge that flattens direction is planned on every
+    # entry and marked against the keyless public BTC mid; ORDERING on HL
+    # stays off until the operator sets HL_HEDGE_ENABLED=1 with creds.
+    vol_edge_enabled: bool = True
+    vol_rich_ratio: float = 1.25
+    vol_rich_extra_edge: float = 0.02
+    vol_cheap_ratio: float = 0.80
+    vol_cheap_edge_credit: float = 0.01
+    # POLYMARKET guard/arb: Polymarket runs the same 15-minute BTC window on
+    # the same clock (verified). When the two venues disagree beyond this
+    # threshold on the same event, entries are refused; when the combined
+    # cost of both sides across venues undercuts $1 by more than the fee
+    # budget, the arb is logged on the signal (Poly leg = logged intent
+    # until a CLOB executor exists).
+    poly_guard_enabled: bool = True
+    poly_guard_threshold: float = 0.10
 
     def __post_init__(self) -> None:
         import os as _os
@@ -138,6 +159,10 @@ class UpDownConfig:
             self.dry_maker_entry = False
         if _os.environ.get("VENUE_GUARD", "1") != "1":
             self.venue_guard_enabled = False
+        if _os.environ.get("POLY_GUARD", "1") != "1":
+            self.poly_guard_enabled = False
+        if _os.environ.get("VOL_EDGE", "1") != "1":
+            self.vol_edge_enabled = False
         _vg = _os.environ.get("VENUE_GUARD_MAX_USD", "")
         if _vg:
             try:
@@ -207,6 +232,7 @@ class UpDownBook:
     skipped_ai_veto: int = 0
     skipped_sentinel: int = 0
     skipped_venue_guard: int = 0
+    skipped_poly_divergence: int = 0
     last_error: str = ""
     dry: bool = True
 
@@ -229,6 +255,7 @@ class UpDownBook:
             "skipped_ai_veto": self.skipped_ai_veto,
             "skipped_sentinel": self.skipped_sentinel,
             "skipped_venue_guard": self.skipped_venue_guard,
+            "skipped_poly_divergence": self.skipped_poly_divergence,
             "last_error": self.last_error,
             "dry": self.dry,
         }
@@ -302,7 +329,16 @@ class UpDownTrader:
         self.venue_guard = VenueDislocation(
             max_dislocation_usd=self.config.venue_guard_max_usd
         )
+        # Polymarket same-window scanner + Hyperliquid mark (both keyless).
+        from src.jobs.cross_venue_poly import PolyScanner
+        from src.jobs.vol_edge import HyperliquidMark
+
+        self.poly = PolyScanner()
+        self.hl = HyperliquidMark()
+        self.poly_arb_last: Optional[Dict[str, Any]] = None
+        self._vol_adj: float = 0.0
         self._sigma_used: Optional[float] = None
+        self._impl_sigma: Optional[float] = None
         self.book = UpDownBook(max_open_notional=self.config.max_open_notional)
 
     def evaluate(
@@ -415,6 +451,42 @@ class UpDownTrader:
                     )
             except Exception:  # noqa: BLE001 - the guard never blocks on its own failure
                 pass
+        # Polymarket runs the SAME 15-minute window on the same clock. A hard
+        # disagreement on the identical event is information - refuse the
+        # entry rather than argue with a second real-money venue.
+        if self.config.poly_guard_enabled:
+            try:
+                from src.jobs.cross_venue_poly import bucket_to_utc
+
+                _end = bucket_to_utc(market.bucket)
+                _pdiv = (
+                    self.poly.diverges_from(
+                        _end, market.up_price, self.config.poly_guard_threshold
+                    )
+                    if _end is not None
+                    else None
+                )
+                if _pdiv:
+                    self.book.skipped_poly_divergence += 1
+                    return UpDownSignal(
+                        ticker=market.ticker,
+                        bucket=market.bucket,
+                        side="",
+                        target=target,
+                        spot=spot,
+                        spot_vs_target=delta,
+                        fair=0.5,
+                        kalshi_price=market.up_price,
+                        edge=0.0,
+                        ask=None,
+                        contracts=0,
+                        notional=0.0,
+                        seconds_left=round(market.seconds_left or 0.0, 1),
+                        reason=f"poly divergence: {_pdiv} - same event, other venue disagrees",
+                        truth=truth_kind,
+                    )
+            except Exception:  # noqa: BLE001 - guard failure never blocks
+                pass
         # Hard deadband. Settlement is the 60-second average of a composite
         # index, so inside this band spot carries no directional information at
         # all. Without an explicit refusal the logistic still produces a small
@@ -450,6 +522,26 @@ class UpDownTrader:
         self._sigma_used = self.rv.sigma_dollars(
             horizon_seconds=seconds_left, last_price=spot
         )
+        # IMPLIED sigma: Kalshi's own price inverted through the diffusion.
+        # Rich implied vs realized -> the binary overcharges for movement and
+        # entries demand extra edge; cheap implied -> the entry is already
+        # getting paid to carry vol.
+        self._impl_sigma: Optional[float] = None
+        self._vol_adj = 0.0
+        if self.config.vol_edge_enabled and self._sigma_used:
+            try:
+                from src.jobs.vol_edge import implied_sigma
+
+                self._impl_sigma = implied_sigma(
+                    market.up_price, spot, target, seconds_left
+                )
+                if self._impl_sigma is not None:
+                    if self._impl_sigma > self._sigma_used * self.config.vol_rich_ratio:
+                        self._vol_adj = self.config.vol_rich_extra_edge
+                    elif self._impl_sigma < self._sigma_used * self.config.vol_cheap_ratio:
+                        self._vol_adj = -self.config.vol_cheap_edge_credit
+            except Exception:  # noqa: BLE001 - vol read never blocks scoring
+                self._impl_sigma = None
         fair = fair_up_probability(
             spot, target, self.config.noise_usd, seconds_left, self._sigma_used
         )
@@ -478,9 +570,9 @@ class UpDownTrader:
         # P&L matches what LIVE actually pays.
         def _required(fill_price: Optional[float]) -> float:
             if not live and not self.config.dry_fee_enabled:
-                return self.config.min_edge
+                return max(self.config.min_edge + self._vol_adj, 0.0)
             kalshi_fee = 0.07 * (1.0 - float(fill_price or 0.5))
-            return self.config.min_edge + kalshi_fee
+            return max(self.config.min_edge + kalshi_fee + self._vol_adj, 0.0)
 
         up_fill = up_ask if up_ask is not None else None
         down_fill = down_ask if down_ask is not None else None
@@ -539,6 +631,8 @@ class UpDownTrader:
             )
             if self._sigma_used:
                 reason += f" | rv-sigma ${self._sigma_used:,.0f}"
+            if self._impl_sigma:
+                reason += f" | impl-sigma ${self._impl_sigma:,.0f}"
 
         # Size on the price the order will actually fill at: the side's own ask.
         # UP fills at yes_ask, DOWN fills at no_ask. An earlier revision filled
@@ -548,6 +642,36 @@ class UpDownTrader:
         # NO line. Both sides fill at their own ask now.
         fill_price = ask if side else 0.0
         contracts = self._size(fill_price, clip_usd=clip_usd) if side else 0
+        if side and contracts > 0:
+            # The Hyperliquid perp hedge that flattens this clip's direction,
+            # sized from the binary delta and marked against the public BTC
+            # mid. Planned and logged on every entry in both books; orders on
+            # HL fire only when the operator arms them (HL_HEDGE_ENABLED).
+            if self.config.vol_edge_enabled and self._sigma_used:
+                try:
+                    from src.jobs.vol_edge import hedge_btc_qty
+
+                    _hq, _hd = hedge_btc_qty(
+                        side, contracts, delta, spot, self._sigma_used, seconds_left
+                    )
+                    if _hq > 0:
+                        _mark = f" @ ~{self.hl.mid:,.0f}" if self.hl.mid else ""
+                        reason += f" | hl-hedge: {_hd} {_hq} BTC{_mark}"
+                except Exception:  # noqa: BLE001 - annotation only
+                    pass
+            # Same-event arb across venues (Poly leg = logged intent until a
+            # CLOB executor exists).
+            try:
+                from src.jobs.cross_venue_poly import bucket_to_utc
+
+                _end = bucket_to_utc(market.bucket)
+                _arb = self.poly.arb_vs_kalshi(_end, market.up_price) if _end else None
+                if _arb:
+                    self.poly_arb_last = _arb
+                    if _arb["edge"] >= 0.02:
+                        reason += f" | poly arb +{_arb['edge']:.2f} ({_arb['legs']})"
+            except Exception:  # noqa: BLE001 - annotation only
+                pass
         signal = UpDownSignal(
             ticker=market.ticker,
             bucket=market.bucket,
@@ -910,6 +1034,15 @@ class UpDownTrader:
                 await self.venue_guard.refresh()
             except Exception:  # noqa: BLE001
                 pass
+        if self.config.poly_guard_enabled:
+            try:
+                await self.poly.refresh()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            await self.hl.refresh()
+        except Exception:  # noqa: BLE001
+            pass
 
         # This trader used to only ever OPEN positions. Closing them was someone
         # else's job: `run_tracking` lives inside BeastModeBot, so in DRY the
