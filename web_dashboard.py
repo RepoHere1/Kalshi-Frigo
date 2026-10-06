@@ -78,7 +78,7 @@ HEAVY_API_ABUSERS = {
 # Every strategy is wanted from boot. The operator stops lanes by hand; the app
 # does not decide that a strategy it could not start once is better off down.
 # A strategy only stays down when Stop was pressed, which clears `desired`.
-AUTO_START_ALL = True
+AUTO_START_ALL = False  # DISABLED: No auto-start. Only button pushes control strategies.
 # Stop reasons that mean the operator said stop. Only these keep a lane down
 # across a restart; anything else was a crash, a redeploy or a lost record and
 # the strategy comes back up.
@@ -6413,13 +6413,16 @@ async function startAll() {
 
 async function stopAll() {
   const names = (SNAPSHOT.strategy_cards || []).filter(c => c.running).map(c => c.name);
-  const stopAllButtons = document.querySelectorAll('button:nth-child(2)'); // Find Stop all buttons by position
-  const killLiveBtn = Array.from(document.querySelectorAll('button')).find(b => b.textContent === 'Kill all LIVE');
   
-  // Apply yellow spinner to Stop all button
-  if (killLiveBtn && killLiveBtn.previousElementSibling) {
-    killLiveBtn.previousElementSibling.classList.add('loading');
-    killLiveBtn.previousElementSibling.classList.add('yellow');
+  // Find the "Stop all" button (not Kill all LIVE) - it says "Stop all" onclick
+  const stopAllBtn = Array.from(document.querySelectorAll('button')).find(b => 
+    b.textContent.trim() === 'Stop all' && b.onclick.toString().includes('stopAll')
+  );
+  
+  // Apply yellow spinner to STOP ALL button
+  if (stopAllBtn) {
+    stopAllBtn.classList.add('loading');
+    stopAllBtn.classList.add('yellow');
   }
   
   try {
@@ -6444,9 +6447,9 @@ async function stopAll() {
       } catch (e) {}
     }
   } finally {
-    if (killLiveBtn && killLiveBtn.previousElementSibling) {
-      killLiveBtn.previousElementSibling.classList.remove('loading');
-      killLiveBtn.previousElementSibling.classList.remove('yellow');
+    if (stopAllBtn) {
+      stopAllBtn.classList.remove('loading');
+      stopAllBtn.classList.remove('yellow');
     }
   }
 }
