@@ -1827,7 +1827,17 @@ def _strategy_cards(
         card["win_rate"] = (
             round(100.0 * card["wins"] / card["trades"], 1) if card["trades"] else 0.0
         )
-    return list(cards.values())
+    # REORDER: Put btc_updown first (BTC 15-min), then ai_directional (LLM), then the rest
+    ordered = []
+    priority_order = ["btc_updown", "ai_directional", "beast_mode", "safe_compounder", "market_making", "quick_flip"]
+    for name in priority_order:
+        if name in cards:
+            ordered.append(cards[name])
+    # Add any strategies not in the priority list (future additions)
+    for card in cards.values():
+        if card["name"] not in priority_order:
+            ordered.append(card)
+    return ordered
 
 
 def _resolve_book(value: Optional[str]) -> str:
