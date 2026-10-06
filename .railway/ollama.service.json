@@ -1,0 +1,26 @@
+[
+  {
+    "name": "ollama",
+    "image": "ollama/ollama:latest",
+    "ports": [
+      {
+        "containerPort": 11434,
+        "internal": true
+      }
+    ],
+    "environment": [
+      {
+        "name": "OLLAMA_MODELS",
+        "value": "mistral:7b-instruct-q4_K_M"
+      }
+    ],
+    "volumes": [
+      {
+        "path": "/root/.ollama",
+        "size": "8GB"
+      }
+    ],
+    "memoryLimit": "8GB",
+    "cpuLimit": "2"
+  }
+]

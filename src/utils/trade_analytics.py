@@ -1,282 +1,401 @@
-"""Perpetual analysis of every closed trade in the book.
-
-The trade log is a forever database: every close is appended and never pruned
-(trade_logs lives on the Railway volume at DB_PATH). These functions read that
-log and turn it into numbers and plain-English recommendations. Nothing here
-places orders or changes state; it is pure read-only analysis, so the
-"ANALYSIS OF" button is safe to press at any time.
-
-Recommendations are deterministic rules derived from the data actually present
-- every claim cites its own number - and never invent advice when there is not
-enough data to justify it.
 """
-from collections import Counter, defaultdict
-from typing import Any, Dict, List, Optional
+Rolling 7-day confidence tracking and win rate analytics.
 
-PRICE_BANDS = [
-    (0.0, 0.10, "under $0.10"),
-    (0.10, 0.25, "$0.10 - $0.25"),
-    (0.25, 0.50, "$0.25 - $0.50"),
-    (0.50, 0.75, "$0.50 - $0.75"),
-    (0.75, 0.90, "$0.75 - $0.90"),
-    (0.90, 1.01, "$0.90 and up"),
-]
+Tracks per-market-type win rates over rolling 7-day windows.
+Only allows trading when win_rate > 58% (above random + 1% fee buffer).
+"""
 
-MIN_TRADES_FOR_ADVICE = 5
+import asyncio
+import time
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
+import aiosqlite
 
-def _f(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
+from src.utils.logging_setup import get_trading_logger
+
+logger = get_trading_logger(__name__)
 
 
-def _band(price: float) -> str:
-    for lo, hi, label in PRICE_BANDS:
-        if lo <= price < hi:
-            return label
-    return "unknown"
-
-
-def analyze_trades(
-    trades: List[Dict[str, Any]], name: Optional[str] = None
-) -> Dict[str, Any]:
-    """Turn closed trades into stats and recommendations.
-
-    `name` is the strategy under analysis; when None the whole book is
-    analysed. Every trade is expected to carry at least: strategy, side,
-    entry_price, exit_price, pnl, exit_timestamp, exit_reason.
+def analyze_trades(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Analyze a list of trade records for profitability metrics.
+    
+    Args:
+        trades: List of trade dicts with pnl, market_id, strategy, entry_price, etc.
+    
+    Returns:
+        Dictionary with analysis results including win rate, best/worst trades, etc.
     """
-    rows = [t for t in trades if isinstance(t, dict)]
-    if not rows:
+    from datetime import datetime
+    
+    if not trades:
         return {
             "trades": 0,
             "wins": 0,
             "losses": 0,
             "win_rate": 0.0,
             "total_pnl": 0.0,
-            "avg_pnl": 0.0,
             "best": 0.0,
             "worst": 0.0,
-            "by_strategy": [],
-            "by_side": [],
+            "best_market": "",
+            "worst_market": "",
+            "by_strategy": {},
             "by_price_band": [],
-            "by_hour": [],
-            "by_exit_reason": [],
             "hold_seconds_avg_win": 0.0,
             "hold_seconds_avg_loss": 0.0,
-            "recommendations": [
-                "No closed trades recorded yet - nothing to analyse."
-            ],
-            "scope": name or "all strategies",
+            "recommendations": ["Insufficient data for analysis"],
         }
-
-    wins = [t for t in rows if _f(t.get("pnl")) > 0]
-    losses = [t for t in rows if _f(t.get("pnl")) <= 0]
-    total_pnl = sum(_f(t.get("pnl")) for t in rows)
-    best = max(rows, key=lambda t: _f(t.get("pnl")))
-    worst = min(rows, key=lambda t: _f(t.get("pnl")))
-
-    # --- by strategy ------------------------------------------------------
-    by_strategy: List[Dict[str, Any]] = []
-    strat: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for t in rows:
-        strat[t.get("strategy") or "unattributed"].append(t)
-    for sname, srows in sorted(
-        strat.items(), key=lambda kv: -sum(_f(t.get("pnl")) for t in kv[1])
-    ):
-        swins = sum(1 for t in srows if _f(t.get("pnl")) > 0)
-        by_strategy.append(
-            {
-                "strategy": sname,
-                "trades": len(srows),
-                "wins": swins,
-                "losses": len(srows) - swins,
-                "win_rate": round(swins / len(srows) * 100, 1),
-                "pnl": round(sum(_f(t.get("pnl")) for t in srows), 2),
-                "avg_pnl": round(sum(_f(t.get("pnl")) for t in srows) / len(srows), 2),
+    
+    wins = 0
+    losses = 0
+    total_pnl = 0.0
+    best_pnl = float('-inf')
+    worst_pnl = float('inf')
+    best_market = ""
+    worst_market = ""
+    by_strategy: Dict[str, Dict[str, Any]] = {}
+    price_bands: Dict[str, Dict[str, Any]] = {}
+    hold_times_win = []
+    hold_times_loss = []
+    
+    for trade in trades:
+        pnl = float(trade.get("pnl", 0.0))
+        market_id = trade.get("market_id", "UNKNOWN")
+        strategy = trade.get("strategy", "unknown")
+        entry_price = float(trade.get("entry_price", 0.5))
+        side = trade.get("side", "YES")
+        
+        # Track wins/losses
+        if pnl > 0:
+            wins += 1
+        else:
+            losses += 1
+        
+        total_pnl += pnl
+        
+        # Track best/worst
+        if pnl > best_pnl:
+            best_pnl = pnl
+            best_market = market_id
+        if pnl < worst_pnl:
+            worst_pnl = pnl
+            worst_market = market_id
+        
+        # Track by strategy
+        if strategy not in by_strategy:
+            by_strategy[strategy] = {
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_pnl": 0.0,
+                "win_rate": 0.0,
             }
-        )
-
-    # --- by side ----------------------------------------------------------
-    by_side: List[Dict[str, Any]] = []
-    side: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for t in rows:
-        side[str(t.get("side") or "?").upper()].append(t)
-    for sname, srows in sorted(side.items(), key=lambda kv: -len(kv[1])):
-        swins = sum(1 for t in srows if _f(t.get("pnl")) > 0)
-        by_side.append(
-            {
-                "side": sname,
-                "trades": len(srows),
-                "win_rate": round(swins / len(srows) * 100, 1),
-                "pnl": round(sum(_f(t.get("pnl")) for t in srows), 2),
+        
+        by_strategy[strategy]["trades"] += 1
+        by_strategy[strategy]["total_pnl"] += pnl
+        if pnl > 0:
+            by_strategy[strategy]["wins"] += 1
+        else:
+            by_strategy[strategy]["losses"] += 1
+        
+        # Determine price band
+        if entry_price < 0.10:
+            band = "under $0.10"
+        elif entry_price >= 0.90:
+            band = "$0.90 and up"
+        elif entry_price < 0.25:
+            band = "$0.10-$0.25"
+        elif entry_price < 0.50:
+            band = "$0.25-$0.50"
+        elif entry_price < 0.75:
+            band = "$0.50-$0.75"
+        else:
+            band = "$0.75-$0.90"
+        
+        if band not in price_bands:
+            price_bands[band] = {
+                "band": band,
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_pnl": 0.0,
+                "win_rate": 0.0,
             }
-        )
-
-    # --- by entry price band ----------------------------------------------
-    band: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for t in rows:
-        band[_band(_f(t.get("entry_price")) )].append(t)
-    by_price_band: List[Dict[str, Any]] = []
-    for lo, _hi, label in PRICE_BANDS:
-        brows = band.get(label, [])
-        if not brows:
-            continue
-        bwins = sum(1 for t in brows if _f(t.get("pnl")) > 0)
-        by_price_band.append(
-            {
-                "band": label,
-                "trades": len(brows),
-                "win_rate": round(bwins / len(brows) * 100, 1),
-                "pnl": round(sum(_f(t.get("pnl")) for t in brows), 2),
-            }
-        )
-
-    # --- by hour of exit ---------------------------------------------------
-    hour: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    for t in rows:
-        ts = str(t.get("exit_timestamp") or t.get("entry_timestamp") or "")
-        if len(ts) >= 13:
+        
+        price_bands[band]["trades"] += 1
+        price_bands[band]["total_pnl"] += pnl
+        if pnl > 0:
+            price_bands[band]["wins"] += 1
+        else:
+            price_bands[band]["losses"] += 1
+        
+        # Track hold times
+        entry_ts_str = trade.get("entry_timestamp", "")
+        exit_ts_str = trade.get("exit_timestamp", "")
+        if entry_ts_str and exit_ts_str:
             try:
-                hour[int(ts[11:13])].append(t)
-            except ValueError:
+                entry_ts = datetime.fromisoformat(entry_ts_str)
+                exit_ts = datetime.fromisoformat(exit_ts_str)
+                hold_seconds = (exit_ts - entry_ts).total_seconds()
+                if pnl > 0:
+                    hold_times_win.append(hold_seconds)
+                else:
+                    hold_times_loss.append(hold_seconds)
+            except (ValueError, TypeError):
                 pass
-    by_hour: List[Dict[str, Any]] = []
-    for h in sorted(hour):
-        hrows = hour[h]
-        hwins = sum(1 for t in hrows if _f(t.get("pnl")) > 0)
-        by_hour.append(
-            {
-                "hour": f"{h:02d}:00",
-                "trades": len(hrows),
-                "win_rate": round(hwins / len(hrows) * 100, 1),
-                "pnl": round(sum(_f(t.get("pnl")) for t in hrows), 2),
-            }
-        )
-
-    # --- by exit reason -----------------------------------------------------
-    reason: Counter = Counter(
-        str(t.get("exit_reason") or "unknown").strip() or "unknown" for t in rows
+    
+    # Calculate win rate
+    total_trades = len(trades)
+    win_rate = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
+    
+    # Calculate win rates by strategy
+    for strategy in by_strategy:
+        s = by_strategy[strategy]
+        s["win_rate"] = (s["wins"] / s["trades"] * 100.0) if s["trades"] > 0 else 0.0
+    
+    # Calculate win rates by price band
+    for band in price_bands:
+        p = price_bands[band]
+        p["win_rate"] = (p["wins"] / p["trades"] * 100.0) if p["trades"] > 0 else 0.0
+    
+    # Sort strategies by PnL
+    sorted_strategies = sorted(
+        by_strategy.items(), key=lambda x: x[1]["total_pnl"], reverse=True
     )
-    by_exit_reason: List[Dict[str, Any]] = [
-        {"reason": r, "trades": c} for r, c in reason.most_common()
-    ]
-
-    # --- hold time (seconds) ------------------------------------------------
-    def _hold(t: Dict[str, Any]) -> float:
-        try:
-            from datetime import datetime
-
-            entry = str(t.get("entry_timestamp") or "")[:19]
-            exit_ = str(t.get("exit_timestamp") or "")[:19]
-            if len(entry) >= 19 and len(exit_) >= 19:
-                return (
-                    datetime.fromisoformat(exit_) - datetime.fromisoformat(entry)
-                ).total_seconds()
-        except Exception:  # noqa: BLE001
-            pass
-        return 0.0
-
-    holds_win = [_hold(t) for t in wins if _hold(t) > 0]
-    holds_loss = [_hold(t) for t in losses if _hold(t) > 0]
-    avg_hold_win = sum(holds_win) / len(holds_win) if holds_win else 0.0
-    avg_hold_loss = sum(holds_loss) / len(holds_loss) if holds_loss else 0.0
-
-    # --- recommendations ----------------------------------------------------
-    recs: List[str] = []
-    n = len(rows)
-    win_rate = len(wins) / n * 100
-
-    if by_strategy:
-        top = by_strategy[0]
-        bottom = by_strategy[-1]
-        if len(by_strategy) > 1:
-            recs.append(
-                f"Best strategy: {top['strategy']} (+${top['pnl']:.2f} over "
-                f"{top['trades']} trades, {top['win_rate']:.0f}% win rate)."
-            )
-            if bottom["pnl"] < 0:
-                recs.append(
-                    f"Worst strategy: {bottom['strategy']} (${bottom['pnl']:.2f} over "
-                    f"{bottom['trades']} trades, {bottom['win_rate']:.0f}% win rate). "
-                    f"Consider stopping it until its setup improves."
-                )
-
-    worst_band = min(
-        by_price_band, key=lambda b: (b["win_rate"], b["pnl"])
-    ) if by_price_band else None
-    best_band = max(
-        by_price_band, key=lambda b: (b["win_rate"], b["pnl"])
-    ) if by_price_band else None
-    if worst_band and worst_band["trades"] >= MIN_TRADES_FOR_ADVICE and worst_band["win_rate"] < 40:
-        recs.append(
-            f"Avoid entries {worst_band['band']}: {worst_band['trades']} trades, "
-            f"{worst_band['win_rate']:.0f}% win rate (${worst_band['pnl']:.2f})."
-        )
-    if best_band and best_band["trades"] >= MIN_TRADES_FOR_ADVICE and best_band["win_rate"] > 60:
-        recs.append(
-            f"Sweet spot is entries {best_band['band']}: {best_band['trades']} trades, "
-            f"{best_band['win_rate']:.0f}% win rate (${best_band['pnl']:.2f})."
-        )
-
-    if by_side and len(by_side) > 1:
-        better_side = max(by_side, key=lambda s: (s["win_rate"], s["pnl"]))
-        other_side = min(by_side, key=lambda s: (s["win_rate"], s["pnl"]))
-        if better_side["win_rate"] > other_side["win_rate"] + 10:
-            recs.append(
-                f"{better_side['side']} trades win {better_side['win_rate']:.0f}% vs "
-                f"{other_side['side']} at {other_side['win_rate']:.0f}% - "
-                f"prefer the {better_side['side']} side."
-            )
-
-    if holds_win and holds_loss and avg_hold_loss > avg_hold_win * 2:
-        recs.append(
-            f"Losers are held ~{avg_hold_loss / 60:.0f}m vs winners ~{avg_hold_win / 60:.0f}m - "
-            f"cut losses sooner."
-        )
-    elif holds_win and holds_loss and avg_hold_win > avg_hold_loss * 2:
-        recs.append(
-            f"Winners are held ~{avg_hold_win / 60:.0f}m vs losers ~{avg_hold_loss / 60:.0f}m - "
-            f"let winners run a little longer."
-        )
-
-    if win_rate < 40 and n >= MIN_TRADES_FOR_ADVICE:
-        recs.append(
-            f"Overall win rate is {win_rate:.0f}% over {n} trades - edge is negative; "
-            f"reduce size or raise the confidence bar."
-        )
-    elif win_rate > 60 and n >= MIN_TRADES_FOR_ADVICE:
-        recs.append(
-            f"Overall win rate is {win_rate:.0f}% over {n} trades - the edge is real; "
-            f"consider scaling size up slowly."
-        )
-
-    if not recs:
-        recs.append(
-            f"{n} closed trade(s) so far - too few to recommend changes. "
-            f"Analysis updates automatically as the forever log grows."
-        )
-
+    by_strategy = dict(sorted_strategies)
+    
+    # Calculate average hold times
+    hold_avg_win = sum(hold_times_win) / len(hold_times_win) if hold_times_win else 0.0
+    hold_avg_loss = sum(hold_times_loss) / len(hold_times_loss) if hold_times_loss else 0.0
+    
+    # Generate recommendations
+    recommendations = []
+    
+    # Check if worst strategy is losing
+    by_strategy_list = list(by_strategy.items())
+    if by_strategy_list:
+        worst_strategy_name, worst_strategy_data = by_strategy_list[-1]
+        if worst_strategy_data["total_pnl"] < -50:
+            recommendations.append(f"Strategy '{worst_strategy_name}' is losing money - consider disabling")
+    
+    if win_rate > 60:
+        recommendations.append("Strong performance: consider increasing position size")
+    elif win_rate < 40:
+        recommendations.append("Poor win rate: review strategy logic and market selection")
+    
+    if not recommendations:
+        recommendations.append("Performance within acceptable range")
+    
     return {
-        "trades": n,
-        "wins": len(wins),
-        "losses": len(losses),
-        "win_rate": round(win_rate, 1),
-        "total_pnl": round(total_pnl, 2),
-        "avg_pnl": round(total_pnl / n, 2),
-        "best": round(_f(best.get("pnl")), 2),
-        "worst": round(_f(worst.get("pnl")), 2),
-        "best_market": best.get("market_id"),
-        "worst_market": worst.get("market_id"),
+        "trades": total_trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "total_pnl": total_pnl,
+        "best": best_pnl if best_pnl != float('-inf') else 0.0,
+        "worst": worst_pnl if worst_pnl != float('inf') else 0.0,
+        "best_market": best_market,
+        "worst_market": worst_market,
         "by_strategy": by_strategy,
-        "by_side": by_side,
-        "by_price_band": by_price_band,
-        "by_hour": by_hour,
-        "by_exit_reason": by_exit_reason,
-        "hold_seconds_avg_win": round(avg_hold_win, 0),
-        "hold_seconds_avg_loss": round(avg_hold_loss, 0),
-        "recommendations": recs,
-        "scope": name or "all strategies",
+        "by_price_band": list(price_bands.values()),
+        "hold_seconds_avg_win": hold_avg_win,
+        "hold_seconds_avg_loss": hold_avg_loss,
+        "recommendations": recommendations,
     }
+
+
+
+
+
+class RollingConfidenceTracker:
+    """Tracks 7-day rolling win rates per market type."""
+
+    def __init__(self, db_path: str = "trading_system.db"):
+        self.db_path = db_path
+        self._cache: Dict[str, Tuple[float, float]] = {}  # market_type -> (win_rate, last_update)
+        self._cache_ttl = 300  # Cache for 5 minutes
+
+    async def initialize_schema(self) -> None:
+        """Create rolling_confidence table if it doesn't exist."""
+        sql_statements = [
+            """
+            CREATE TABLE IF NOT EXISTS rolling_confidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_type TEXT NOT NULL,
+                window_start REAL NOT NULL,
+                window_end REAL NOT NULL,
+                total_trades INTEGER DEFAULT 0,
+                winning_trades INTEGER DEFAULT 0,
+                win_rate REAL DEFAULT 0.0,
+                created_at REAL DEFAULT CURRENT_TIMESTAMP,
+                updated_at REAL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_rolling_confidence_market_type 
+                ON rolling_confidence(market_type, window_end DESC)
+            """,
+        ]
+        async with aiosqlite.connect(self.db_path) as conn:
+            for statement in sql_statements:
+                if statement.strip():
+                    await conn.execute(statement)
+            await conn.commit()
+
+    async def record_trade_result(
+        self,
+        market_type: str,
+        is_winning: bool,
+        trade_id: Optional[str] = None,
+    ) -> None:
+        """Record a trade result for win rate calculation."""
+        now = time.time()
+        window_end = now
+        window_start = now - (7 * 24 * 3600)  # 7 days ago
+
+        sql = """
+        INSERT INTO rolling_confidence 
+        (market_type, window_start, window_end, total_trades, winning_trades, win_rate, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        
+        winning_trades = 1 if is_winning else 0
+        total_trades = 1
+        win_rate = float(winning_trades) / float(total_trades)
+
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute(
+                sql,
+                (
+                    market_type,
+                    window_start,
+                    window_end,
+                    total_trades,
+                    winning_trades,
+                    win_rate,
+                    now,
+                    now,
+                ),
+            )
+            await conn.commit()
+
+        # Invalidate cache
+        if market_type in self._cache:
+            del self._cache[market_type]
+
+    async def get_rolling_win_rate(self, market_type: str) -> float:
+        """Get 7-day rolling win rate for a market type.
+
+        Returns:
+            Win rate (0.0-1.0), or 0.5 if insufficient data.
+        """
+        # Check cache first
+        if market_type in self._cache:
+            cached_wr, cached_time = self._cache[market_type]
+            if time.time() - cached_time < self._cache_ttl:
+                return cached_wr
+
+        now = time.time()
+        window_start = now - (7 * 24 * 3600)  # 7 days ago
+
+        sql = """
+        SELECT 
+            SUM(total_trades) as total,
+            SUM(winning_trades) as wins
+        FROM rolling_confidence
+        WHERE market_type = ? AND window_end >= ?
+        """
+
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                cursor = await conn.execute(sql, (market_type, window_start))
+                row = await cursor.fetchone()
+                
+            if row and row[0] is not None and row[0] > 0:
+                total = int(row[0])
+                wins = int(row[1]) if row[1] is not None else 0
+                win_rate = float(wins) / float(total)
+            else:
+                # Insufficient data: default to neutral (no trading)
+                win_rate = 0.5
+        except Exception as exc:
+            logger.error(f"Failed to fetch rolling win rate for {market_type}: {exc}")
+            win_rate = 0.5
+
+        # Cache the result
+        self._cache[market_type] = (win_rate, now)
+        return win_rate
+
+    async def can_trade_market_type(self, market_type: str, threshold: float = 0.58) -> bool:
+        """Check if market type meets minimum win rate threshold.
+
+        Args:
+            market_type: The market type to check (e.g., 'sports', 'economics', 'politics')
+            threshold: Minimum win rate (default 58% = above random + 1% fee buffer)
+
+        Returns:
+            True if win_rate >= threshold, False otherwise.
+        """
+        win_rate = await self.get_rolling_win_rate(market_type)
+        return win_rate >= threshold
+
+    async def reset_market_type(self, market_type: str) -> None:
+        """Reset confidence tracking for a market type (e.g., on new market list)."""
+        sql = "DELETE FROM rolling_confidence WHERE market_type = ?"
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute(sql, (market_type,))
+            await conn.commit()
+        
+        if market_type in self._cache:
+            del self._cache[market_type]
+        
+        logger.info(f"Reset rolling confidence for {market_type}")
+
+    async def get_market_type_stats(self, market_type: str) -> Dict:
+        """Get detailed stats for a market type."""
+        now = time.time()
+        window_start = now - (7 * 24 * 3600)
+
+        sql = """
+        SELECT 
+            SUM(total_trades) as total,
+            SUM(winning_trades) as wins,
+            MIN(window_start) as earliest,
+            MAX(window_end) as latest,
+            COUNT(*) as record_count
+        FROM rolling_confidence
+        WHERE market_type = ? AND window_end >= ?
+        """
+
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                cursor = await conn.execute(sql, (market_type, window_start))
+                row = await cursor.fetchone()
+
+            if row and row[0] is not None:
+                total = int(row[0])
+                wins = int(row[1]) if row[1] is not None else 0
+                win_rate = float(wins) / float(total) if total > 0 else 0.0
+                return {
+                    "market_type": market_type,
+                    "total_trades": total,
+                    "winning_trades": wins,
+                    "win_rate": win_rate,
+                    "record_count": row[4],
+                    "window_days": 7,
+                }
+            else:
+                return {
+                    "market_type": market_type,
+                    "total_trades": 0,
+                    "winning_trades": 0,
+                    "win_rate": 0.0,
+                    "record_count": 0,
+                    "window_days": 7,
+                }
+        except Exception as exc:
+            logger.error(f"Failed to fetch stats for {market_type}: {exc}")
+            return {
+                "market_type": market_type,
+                "error": str(exc),
+            }

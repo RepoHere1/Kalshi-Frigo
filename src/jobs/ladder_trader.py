@@ -97,7 +97,7 @@ class UpDownConfig:
     # sizer: clips grow as the book grows and shrink into drawdowns, which is
     # the only way $10 compounds into something instead of flatlining.
     kelly_sizing: bool = True
-    kelly_scale: float = 0.5   # half Kelly
+    kelly_scale: float = 0.25  # REDUCED: Quarter-Kelly for profitability (was 0.5, now 0.25)
     kelly_cap: float = 0.35    # never more than 35% of the book in one clip
     # High-probability convergence entries: a resting maker bid at $0.60-$0.85
     # pays a quarter fee and, with the diffusion fair value demanding real
@@ -157,6 +157,9 @@ class UpDownConfig:
     # until a CLOB executor exists).
     poly_guard_enabled: bool = True
     poly_guard_threshold: float = 0.10
+    # MAKER-ONLY ORDERS: Post limit orders only, never cross spread for liquidity
+    maker_only_mode: bool = True  # NEW: Only place limit orders at bid/ask
+    maker_wait_seconds: float = 5.0  # Wait time for maker order to fill
 
     def __post_init__(self) -> None:
         import os as _os
