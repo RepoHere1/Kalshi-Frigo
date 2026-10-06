@@ -3525,6 +3525,31 @@ def api_strategy_analysis(name):
     return jsonify(analyze_trades(rows, name=name))
 
 
+@app.route("/api/equity-report", methods=["GET"])
+def api_equity_report():
+    """DRY vs LIVE equity curves and divergence alerts.
+    
+    Recommendation #10: Real-time equity tracking across both books with
+    divergence detection. Returns equity history, current balances, and alerts.
+    """
+    try:
+        from src.jobs.equity_tracker import EquityTracker
+        
+        tracker = EquityTracker(_db_conn())
+        dry_equity = tracker.get_equity_curve("DRY")
+        live_equity = tracker.get_equity_curve("LIVE")
+        alerts = tracker.get_divergence_alerts()
+        
+        return jsonify({
+            "dry_curve": dry_equity,
+            "live_curve": live_equity,
+            "alerts": alerts,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "alert": "Equity tracker not yet initialized"}), 200
+
+
 @app.route("/api/strategy/<name>", methods=["GET"])
 def api_strategy_detail(name):
     """Everything known about one strategy: its card, its book, its own closes.
