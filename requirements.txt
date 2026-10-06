@@ -24,4 +24,3 @@ uvicorn
 gunicorn
 flask
 json-repair
-websockets>=14,<16

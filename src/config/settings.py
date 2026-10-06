@@ -21,6 +21,13 @@ class APIConfig:
     openrouter_api_key: str = field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY", ""))
     openai_base_url: str = "https://api.openai.com/v1"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # Free API key for DRY mode — DRY uses this so it doesn't burn
+    # the paid OPENROUTER_API_KEY balance. Set to empty to disable
+    # AI features in DRY entirely.
+    dry_openrouter_api_key: str = field(default_factory=lambda: os.getenv("DRY_OPENROUTER_API_KEY", ""))
+    # Free model for DRY mode AI features (veto/sentinel). Defaults
+    # to the cheapest available OpenRouter listing.
+    dry_openrouter_model: str = field(default_factory=lambda: os.getenv("DRY_OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash"))
 
     # xai_api_key removed — all models now route through OpenRouter
 

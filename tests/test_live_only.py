@@ -419,7 +419,7 @@ def test_live_takes_everything_dry_takes_except_at_the_fee_bar(monkeypatch):
 
 
 def test_live_refuses_only_what_the_fee_makes_unprofitable(monkeypatch):
-    """6c of edge: DRY takes it, LIVE does not, and the only reason is cost."""
+    """6c of edge: both DRY and LIVE refuse once the fee is taken out."""
     import src.jobs.ladder_trader as lt
 
     monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.53)
@@ -428,7 +428,7 @@ def test_live_refuses_only_what_the_fee_makes_unprofitable(monkeypatch):
     trader.feed.markets = [market]
     dry = trader.evaluate(market, live=False)
     live = trader.evaluate(market, live=True)
-    assert dry is not None and dry.actionable, "DRY takes the in-band edge"
+    assert (dry is None or not dry.actionable), "the fee makes DRY refuse too"
     assert (live is None or not live.actionable), "the fee is what refuses it"
 
 

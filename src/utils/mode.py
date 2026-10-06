@@ -449,14 +449,18 @@ class TradingMode:
         quantity: float,
         price: float,
         note: str = "",
+        fee: float = 0.0,
     ) -> Dict[str, Any]:
         """Debit/credit simulated cash for a simulated fill and log it.
 
         `action` is 'buy' or 'sell'. Buying spends cash, selling returns it.
+        `fee` is an additional deduction (e.g. Kalshi's taker fee) that
+        makes DRY P&L realistic by mirroring what LIVE actually pays.
         """
         quantity = float(quantity)
         price = float(price)
         amount = round(quantity * price, 2)
+        fee = float(fee)
 
         async with self._conn() as conn:
             # Take the write lock BEFORE reading the balance. Under WAL two
@@ -476,15 +480,18 @@ class TradingMode:
             starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
             cash_f = float(cash) if cash is not None else starting_f
 
+            total_debit = amount + fee
             if action == "buy":
-                if amount > cash_f:
+                if total_debit > cash_f:
                     raise ModeError(
-                        f"Insufficient simulated funds: ${amount:.2f} needed, "
+                        f"Insufficient simulated funds: ${total_debit:.2f} needed, "
                         f"${cash_f:.2f} available."
                     )
-                cash_f -= amount
+                cash_f -= total_debit
             elif action == "sell":
                 cash_f += amount
+                if fee > 0:
+                    cash_f -= fee
             else:
                 raise ModeError("action must be 'buy' or 'sell'")
 

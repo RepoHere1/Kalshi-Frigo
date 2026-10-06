@@ -285,14 +285,18 @@ def test_an_entry_under_min_win_prob_is_refused():
 
 
 def test_the_notional_cap_stops_accumulation():
+    """max_open_notional is LIVE-only; DRY is uncapped."""
     trader = UpDownTrader(SpotFeed(), Btc15mFeed())
     held = [
         {"ticker": "KXBTC15M-26OCT011715-15", "side": "YES", "notional": 12.0},
         {"ticker": "KXBTC15M-26OCT011715-15", "side": "YES", "notional": 12.0},
     ]
     clip = _signal("KXBTC15M-26OCT011715-15", side="up", ask=0.5, contracts=8)
-    blocked = trader._entry_block(clip, held)
+    # LIVE mode: the cap blocks.
+    blocked = trader._entry_block(clip, held, live=True)
     assert "exceed" in blocked and "$25.00" in blocked
+    # DRY mode: no cap, so it passes.
+    assert trader._entry_block(clip, held, live=False) == ""
 
 
 def test_under_the_notional_cap_repeated_clips_pass():
@@ -324,14 +328,14 @@ def _scorer(spot_price=84900.0):
 
 
 def test_live_requires_the_fee_on_top_of_the_edge(monkeypatch):
-    """A 6c edge clears DRY but not LIVE once the fee is taken out."""
+    """Both DRY and LIVE now require the fee on top of the edge."""
     import src.jobs.ladder_trader as lt
 
     monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.53)
     trader = _scorer()
     market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0)
     dry = trader.evaluate(market, live=False)
-    assert dry is not None and dry.actionable, "DRY takes the 8c in-band edge"
+    assert (dry is None or not dry.actionable), "DRY must also refuse an edge under fee+min"
     trader.book.skipped_no_edge = 0
     live = trader.evaluate(market, live=True)
     assert (live is None or not live.actionable), "LIVE must refuse an edge under fee+min"
@@ -372,8 +376,8 @@ def test_out_of_band_entries_need_extra_edge(monkeypatch):
     out = trader.evaluate(market, live=False)
     assert out is None or not out.actionable
 
-    # 13c of edge at 0.55 (0.09 base + 0.04 out-of-band penalty): now it works.
-    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.68)
+    # 14c of edge at 0.55 (0.0915 base+fee + 0.04 out-of-band penalty): now it works.
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.69)
     trader.book.skipped_no_edge = 0
     out2 = trader.evaluate(market, live=False)
     assert out2 is not None and out2.actionable
@@ -383,15 +387,15 @@ def test_the_no_side_is_preferred_when_edges_are_close(monkeypatch):
     """NO wins 83% vs YES at 67% - prefer NO unless YES is clearly better."""
     import src.jobs.ladder_trader as lt
 
-    # Tied edges: NO is chosen.
-    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.44)
+    # Tied edges after fee: NO is chosen (fair=0.40 gives down_edge=0.10 >= req=0.095).
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.40)
     trader = _scorer()
     market = _quoted_market(yes_ask=0.38, no_ask=0.50, target=84000.0)
     out = trader.evaluate(market, live=False)
     assert out is not None and out.side == "down"
 
     # YES clearly better (by more than the override margin): YES is chosen.
-    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.44)
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.46)
     trader.book.skipped_no_edge = 0
     market2 = _quoted_market(yes_ask=0.35, no_ask=0.50, target=84000.0)
     out2 = trader.evaluate(market2, live=False)

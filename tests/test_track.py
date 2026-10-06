@@ -38,6 +38,15 @@ async def test_run_tracking_closes_position(mock_kalshi_client):
     
     db_manager = DatabaseManager(db_path=db_path)
     await db_manager.initialize()
+    # Set the trading mode to LIVE so run_tracking finds the position.
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS runtime_config (key TEXT PRIMARY KEY, value TEXT)"
+    )
+    conn.execute("INSERT OR REPLACE INTO runtime_config (key, value) VALUES ('trading_mode', 'live')")
+    conn.commit()
+    conn.close()
 
     test_position = Position(
         market_id="TRACK-TEST-1",
@@ -48,6 +57,7 @@ async def test_run_tracking_closes_position(mock_kalshi_client):
         rationale="A position to be tracked",
         confidence=0.75,
         live=True,
+        mode="live",
         status="open"
     )
     position_id = await db_manager.add_position(test_position)
@@ -79,7 +89,8 @@ async def test_run_tracking_closes_position(mock_kalshi_client):
         
         log = trade_logs[0]
         assert log.market_id == "TRACK-TEST-1"
-        assert log.pnl == (1.0 - 0.40) * 5, "PnL should be calculated correctly for a win."
+        # LIVE fees are now applied (round-trip fee $0.10)
+        assert log.pnl == round((1.0 - 0.40) * 5 - 0.10, 2), "PnL should account for LIVE fees"
 
         # 3. Verify mocks - Updated for new sell limit order functionality
         # The tracking system now calls get_market multiple times:

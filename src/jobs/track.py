@@ -699,40 +699,44 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
 
                     # Calculate PnL
                     pnl = (exit_price - position.entry_price) * position.quantity
-                    # LIVE-ONLY fee-net accounting: estimate the round-trip
-                    # Kalshi fee (taker entry + maker-or-taker exit) and net it
-                    # out so LIVE trade_logs show what the account kept. DRY
-                    # keeps gross PnL with fee 0 -- its historic numbers are
-                    # untouched. Per-position book check: only rows stamped
-                    # mode='live' (which every LIVE insert writes) take this
-                    # branch. Legacy/test rows with no mode stay gross.
+                    # Fee-net accounting: estimate the round-trip
+                    # Kalshi fee (taker entry + maker-or-taker exit)
+                    # and net it out so trade_logs show what the
+                    # account kept. Both LIVE and DRY (when
+                    # DRY_FAKE_FEES=1) pay the same fee so the
+                    # simulated P&L matches reality.
                     fee_paid = 0.0
-                    _fee_is_live = str(position.mode or "").lower() == "live"
-                    if _fee_is_live:
+                    _mode_str = str(position.mode or "").lower()
+                    _fee_is_live = _mode_str == "live"
+                    _fee_is_dry = _mode_str == "dry"
+                    if _fee_is_live or _fee_is_dry:
                         try:
                             from src.jobs import live_fees as _live_fees2
+                            import os as _os
 
-                            _maker_exit = not is_resolution
-                            fee_paid = float(
-                                _live_fees2.roundtrip_fee_dollars(
-                                    position.entry_price,
-                                    exit_price,
-                                    int(position.quantity or 0),
-                                    maker_exit=_maker_exit,
-                                )
+                            _dry_fee_enabled = (
+                                _fee_is_live
+                                or _os.environ.get("DRY_FAKE_FEES", "1") == "1"
                             )
-                            pnl = round(pnl - fee_paid, 2)
+                            if _dry_fee_enabled:
+                                _maker_exit = not is_resolution
+                                fee_paid = float(
+                                    _live_fees2.roundtrip_fee_dollars(
+                                        position.entry_price,
+                                        exit_price,
+                                        int(position.quantity or 0),
+                                        maker_exit=_maker_exit,
+                                    )
+                                )
+                                pnl = round(pnl - fee_paid, 2)
                         except Exception:  # noqa: BLE001 - fees never block a close
                             fee_paid = 0.0
 
                     # Create trade log.
-                    # strategy / exit_reason / mode were all omitted, so every
-                    # close landed with strategy NULL (making per-strategy P&L
-                    # permanently "unattributed") and with no record of why it
-                    # exited or which book it belonged to.
                     _rationale = f"{position.rationale} | EXIT: {exit_reason}"
                     if fee_paid > 0:
-                        _rationale += f" | LIVE fees est ${fee_paid:.2f} (net PnL)"
+                        _fee_label = "LIVE" if _fee_is_live else "DRY"
+                        _rationale += f" | {_fee_label} fees est ${fee_paid:.2f} (net PnL)"
                     trade_log = TradeLog(
                         market_id=position.market_id,
                         side=position.side,

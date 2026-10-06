@@ -146,11 +146,11 @@ def build_order_request(
             f"is outside Kalshi's valid range {MIN_PRICE_CENTS}-{MAX_PRICE_CENTS}c"
         )
 
-    # Guard 3: never send an order the funding source cannot cover. This is
-    # checked BEFORE the size floor so a bump past the minimum can still fail
-    # here rather than being submitted and rejected by the exchange.
     notional_cents = price_cents * int(quantity)
-    if notional_cents > int(available_cents):
+
+    # Guard 3: never send a buy the funding source cannot cover.
+    # Sells return cash, so they are never blocked by available balance.
+    if action == "buy" and notional_cents > int(available_cents):
         return None, (
             f"{market_id}: needs {notional_cents}c "
             f"({quantity} @ {price_cents}c) but only {int(available_cents)}c available"
@@ -243,6 +243,15 @@ class DryBroker:
     async def submit(self, req: OrderRequest) -> Dict[str, Any]:
         from src.utils.mode import ModeError
 
+        # DRY fakes Kalshi's taker fee (0.07 * price * (1-price))
+        # so the simulated P&L matches what LIVE actually pays.
+        _fee = 0.0
+        try:
+            _fee = round(
+                0.07 * req.fill_price * (1.0 - req.fill_price) * req.count, 2
+            )
+        except Exception:  # noqa: BLE001
+            pass
         try:
             result = await self._mode.record_fill(
                 market_id=req.ticker,
@@ -251,6 +260,7 @@ class DryBroker:
                 quantity=req.count,
                 price=req.fill_price,
                 note=f"dry {req.type_} order {req.client_order_id[:8]}",
+                fee=_fee,
             )
         except ModeError as exc:
             # Affordability can move between validation and booking.
@@ -258,6 +268,7 @@ class DryBroker:
         logger.info(
             f"DRY fill: {req.action} {req.count} {req.side.upper()} @ "
             f"{req.fill_price:.3f} on {req.ticker} - cash now ${result['cash']:.2f}"
+            + (f" (fee ${_fee:.4f})" if _fee > 0 else "")
         )
         return _simulated_response(req)
 

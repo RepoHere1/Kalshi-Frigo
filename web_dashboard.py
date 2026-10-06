@@ -160,7 +160,7 @@ STRATEGY_COMMANDS: Dict[str, List[str]] = {
         "180",
     ],
     "quick_flip": ["cli.py", "run", "--quick-flip", "--paper", "--loop", "--interval", "120"],
-    "btc_updown": ["cli.py", "run", "--btc-updown", "--live", "--loop", "--interval", "0"],
+    "btc_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
 }
 
 # `trade_logs.strategy` and `positions.strategy` are written by the strategies

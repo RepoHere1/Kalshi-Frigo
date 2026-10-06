@@ -1,9 +1,9 @@
-"""LIVE-only helpers: fees, session filter, maker exits, 429 backoff.
+"""LIVE and DRY fee helpers: fees, session filter, maker exits, 429 backoff.
 
-DRY must never import behaviour from here on its decision path. Every helper
-in this module is called exclusively from `live=True` / `live_mode=True`
-branches. DRY keeps the raw 0.06 edge, instant mid fills, aggressive polling
-and gross PnL exactly as before -- that book is the untouched reference.
+Both DRY and LIVE now pay Kalshi's actual taker fee (0.07 * price * (1-price))
+so the simulated P&L matches reality. DRY_FAKE_FEES=1 (default) enables
+this. DRY keeps the raw min_edge for decision count; the fee is added
+on top.
 
 LIVE differences, all in one place so they can be audited together:
   1. Fee math (Kalshi taker 0.07, maker ~0.0175, per-contract, rounded up).
