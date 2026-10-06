@@ -79,10 +79,24 @@ def cmd_run(args: argparse.Namespace) -> None:
     # --btc-updown mode: live spot vs Kalshi's own 15-minute up/down quotes
     if getattr(args, "btc_updown", False):
         from src.jobs.ladder_trader import UpDownConfig, run_updown_trader
+        from src.utils.mode import TradingMode
+        from src.utils.database import DatabaseManager
 
         print("📈 BTC 15-MIN UP/DOWN MODE")
         print("   KXBTC15M | live spot vs Kalshi's own quote")
         print("   $5 per clip | fee-aware in LIVE | no trade inside the noise band")
+        # Initialize database and set mode based on --live/--paper.
+        # should_trade_live() requires BOTH the LIVE_TRADING_ENABLED env var
+        # AND the persisted database mode to be "live".
+        db_path = os.environ.get("DB_PATH", "trading_system.db")
+
+        async def _init_mode():
+            await DatabaseManager(db_path=db_path).initialize()
+            await TradingMode(db_path=db_path).set(
+                "live" if live_mode else "paper", confirmed=True
+            )
+
+        asyncio.run(_init_mode())
         # The inner loop is already immortal; this outer loop is belt-and-braces
         # so even an unexpected asyncio.run failure cannot end the process. Only
         # SIGTERM/SIGKILL (operator Stop / container kill) takes it down.

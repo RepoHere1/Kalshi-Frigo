@@ -1,0 +1,6 @@
+[build]
+builder = "pip"
+
+[env]
+LIVE_TRADING_ENABLED = "true"
+DB_PATH = "trading_system.db"
