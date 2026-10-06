@@ -99,25 +99,60 @@ def test_backoff_has_a_ceiling():
 # ---------------------------------------------------------------------------
 # Arming policy
 # ---------------------------------------------------------------------------
-def test_a_restart_re_arms_every_lane_in_either_book():
-    """A redeploy must not silently stop the book.
+def test_a_restart_re_arms_every_dry_lane_and_only_pushed_live_lanes():
+    """A redeploy must not silently stop the DRY book - and must never ARM live.
 
-    The seed used to be gated on `AUTO_START_ALL and _current_book_mode() !=
-    "live"`, so every LIVE lane stayed down across a restart and the account
-    quietly stopped trading until somebody noticed and pressed Start on six
-    buttons. Gating it that way made the DRY/LIVE distinction a reason to stop
-    working rather than a reason to be careful about money.
-
-    Arming is now the same in both books. The mode switch itself still starts
-    nothing - that is a separate endpoint - so switching to LIVE does not place
-    an order; the seed only runs on the supervisor's boot pass.
+    THE LAW: the operator's button pushes are the only facts. AUTO-START is a
+    DRY-book convenience because DRY cannot lose money; the LIVE book trades
+    real money, so a LIVE lane may come into being ONLY by an explicit push in
+    the LIVE book. Pushed LIVE lanes are still honoured across restarts - the
+    supervisor's resume path reads `desired(mode='live')` rows - but booting
+    while the book reads LIVE seeds nothing by itself.
     """
     src = inspect.getsource(wd._strategy_supervisor_loop)
-    assert "if AUTO_START_ALL:" in src
-    assert '_current_book_mode() != "live"' not in src
+    # AUTO-START is gated to the DRY book only.
+    assert 'if AUTO_START_ALL and book_mode == "dry":' in src
     # The book in force still decides which book a lane is armed into.
     assert "book_mode = _runtime_mode()" in src
     assert '_spawn_strategy(name, "paper")' not in src
+
+
+def test_the_supervisor_never_spawns_on_an_unreadable_book():
+    """A guessed book armed the wrong book once; None means NO book.
+
+    `_current_book_mode` failing open to 'dry' let one worker answer 'dry'
+    while another read 'live' during boot contention, and strategy processes
+    got armed in a book the operator never pushed. The supervisor must skip
+    its cycle entirely when the book cannot be read.
+    """
+    src = inspect.getsource(wd._strategy_supervisor_loop)
+    assert "if book_mode is None:" in src
+    assert "continue" in src
+
+
+def test_the_toggle_refuses_to_act_on_an_unreadable_book():
+    """Start/Stop must never guess which book they are for."""
+    src = inspect.getsource(wd.api_strategy_toggle)
+    assert "Trading book is unknown right now" in src
+    assert "503" in src
+
+
+def test_book_mode_fails_closed_not_open():
+    """No mode read means None - never a silent 'dry' a write could trust."""
+    src = inspect.getsource(wd._current_book_mode)
+    assert "return None" in src
+    assert 'return "dry"' not in src
+
+
+def test_bots_payload_reports_only_this_books_lanes():
+    """The other book's lanes must not render as running on this page.
+
+    Listing LIVE lanes while the page was in DRY is exactly what made a DRY
+    Start look like it had switched the LIVE LLM strategy on.
+    """
+    src = inspect.getsource(wd._bots_payload)
+    assert "_runtime_store().snapshot(mode=book)" in src
+    assert "THIS BOOK" in src
 
 
 def test_an_operator_stop_is_permanent_across_instances():

@@ -1401,15 +1401,29 @@ def _strategy_supervisor_loop():
             # runtime rows; the supervisor manages whichever book the page is
             # in and never touches the other one. Stopping a strategy in LIVE
             # therefore leaves DRY's own state exactly as it was.
+            # An unreadable book means NO book: spawn nothing rather than
+            # guess, because a guessed book is how LIVE lanes got armed
+            # without a single operator push.
             book_mode = _runtime_mode()
+            if book_mode is None:
+                time.sleep(10)
+                continue
             wanted = _run_async(store.desired(mode=book_mode))
-            # Every lane is wanted from boot. Stopping a lane clears
+            # Every DRY lane is wanted from boot. Stopping a lane clears
             # its `desired` flag and it stays down; nothing else takes
             # a strategy out of service. That inverts the old failure
-            # mode, where a strategy that died once - or was never
-            # recorded - simply stayed down and the book quietly ran
-            # on whatever happened to still be alive.
-            if AUTO_START_ALL:
+            # mode, where a strategy that died once - or was never recorded -
+            # simply stayed down and the book quietly ran on
+            # whatever happened to still be alive.
+            #
+            # THE LAW: AUTO-START is a DRY-book convenience only. The LIVE
+            # book trades real money, so a LIVE lane may come into being
+            # ONLY by an explicit operator push in the LIVE book (which
+            # persists desired=1 and is thereafter resumed by the supervisor).
+            # Booting while the book reads LIVE must never arm anything by
+            # itself - this exact path is what turned the LIVE LLM strategy
+            # on behind a DRY button push.
+            if AUTO_START_ALL and book_mode == "dry":
                 recorded = _run_async(store.snapshot(mode=book_mode))
 
                 for name in strategy_state:
@@ -1591,19 +1605,41 @@ def _log_tail_loop():
 # Snapshot
 # ---------------------------------------------------------------------------
 def _bots_payload() -> List[Dict[str, Any]]:
-    return [
-        {
-            "name": name,
-            "running": bool(st.get("running")),
-            "pid": st.get("pid"),
-            "mode": st.get("mode", "paper"),
-            "label": STRATEGY_DOCS.get(name, ("", ""))[0],
-            "description": STRATEGY_DOCS.get(name, ("", ""))[1],
-            "started_at": st.get("started_at"),
-            "stop_reason": st.get("stop_reason") or "",
-        }
-        for name, st in strategy_state.items()
-    ]
+    """The bot list for the page - THIS BOOK's lanes only.
+
+    THE LAW: the operator's button pushes are facts about the book the page
+    is in. Listing the other book's lanes (its pids, its running pills) made
+    a DRY Start look like it had switched LIVE strategies on. Each book's
+    truth comes from its own runtime rows; the other book is not rendered.
+    """
+    book = _runtime_mode()
+    rows: Dict[str, Dict[str, Any]] = {}
+    if book is not None:
+        from src.utils.strategy_runtime import key
+
+        try:
+            rows = _run_async(_runtime_store().snapshot(mode=book))
+        except Exception:  # noqa: BLE001 - render the page even if the store hiccups
+            rows = {}
+    payload: List[Dict[str, Any]] = []
+    for name, st in strategy_state.items():
+        row = rows.get(key(name, book)) if book is not None else None
+        row = row or {}
+        pid = row.get("pid") or st.get("pid")
+        running = bool(pid) and _pid_alive(pid, row or st)
+        payload.append(
+            {
+                "name": name,
+                "running": running,
+                "pid": pid,
+                "mode": book or st.get("mode", "paper"),
+                "label": STRATEGY_DOCS.get(name, ("", ""))[0],
+                "description": STRATEGY_DOCS.get(name, ("", ""))[1],
+                "started_at": row.get("started_at") or st.get("started_at"),
+                "stop_reason": row.get("stop_reason") or st.get("stop_reason") or "",
+            }
+        )
+    return payload
 
 
 def _strategy_bucket(name: Optional[str]) -> str:
@@ -1612,14 +1648,24 @@ def _strategy_bucket(name: Optional[str]) -> str:
     return STRATEGY_ALIASES.get(key, key or "unattributed")
 
 
-def _current_book_mode() -> str:
-    """Which book's numbers the page is showing: 'dry' or 'live'."""
+def _current_book_mode() -> Optional[str]:
+    """Which book's numbers the page is showing: 'dry' or 'live'.
+
+    THE LAW: a button push in one book is a fact about THAT book only. What
+    broke the law was a guessed book - this read used to fail open to 'dry',
+    so during a boot-time database blip one worker answered 'dry' while
+    another read the persisted 'live', and strategy processes got armed in a
+    book the operator never pushed. A read failure therefore returns None,
+    and every mutating caller (toggle, supervisor, reconciler) REFUSES to act
+    on an unknown book. Display may degrade; writes may not guess.
+    """
     try:
         from src.utils.mode import run
 
-        return str(run(_mode_manager().current()))
+        mode = str(run(_mode_manager().current())).strip().lower()
+        return mode if mode in ("dry", "live") else None
     except Exception:
-        return "dry"
+        return None
 
 
 def _strategy_cards(
@@ -3266,21 +3312,26 @@ def _runtime_store():
     return StrategyRuntime(db_path=str(DB_PATH))
 
 
-def _runtime_mode() -> str:
+def _runtime_mode() -> Optional[str]:
     """The runtime store's mode word for the book currently in force.
 
     DRY and LIVE are separate books with separate runtime rows. Every read and
     write against strategy_runtime names ONE book: 'paper' while the page
     reads DRY, 'live' while it reads LIVE. This is what makes Stop on the LIVE
     page touch only the LIVE row - the DRY book keeps its own state.
+    None means the book could not be read; callers must not act on a guess.
     """
-    return "live" if _current_book_mode() == "live" else "paper"
+    book = _current_book_mode()
+    if book is None:
+        return None
+    return "live" if book == "live" else "paper"
 
 
-def _runtime_key(name: str) -> str:
+def _runtime_key(name: str) -> Optional[str]:
     from src.utils.strategy_runtime import key as _rt_key
 
-    return _rt_key(name, _runtime_mode())
+    mode = _runtime_mode()
+    return None if mode is None else _rt_key(name, mode)
 
 
 def _recorded_state() -> Dict[str, Dict[str, Any]]:
@@ -3328,9 +3379,13 @@ def _recorded_state() -> Dict[str, Dict[str, Any]]:
                 reason = "stopped by app restart"
             else:
                 reason = "exited on its own"
-            _run_async(
-                _runtime_store().record_stop(name, reason, _runtime_mode(), clear_desired=False)
-            )
+            # A stop is a WRITE into one book's row; an unknown book is never
+            # written. Skip this pass rather than guess.
+            _book = _runtime_mode()
+            if _book is not None:
+                _run_async(
+                    _runtime_store().record_stop(name, reason, _book, clear_desired=False)
+                )
             st["pid"] = None
             st["running"] = False
             st["stuck"] = False
@@ -3595,6 +3650,22 @@ def api_strategy_toggle(name):
     # mismatch - which is why no strategy would ever start on the DRY page.
     # Both sides are therefore normalised onto the runtime vocabulary first.
     book_mode = _current_book_mode()
+    if book_mode is None:
+        # THE LAW: never act on a guessed book. A failed mode read used to
+        # fall back to 'dry' - or worse, race the real value - and a start
+        # meant for one book could arm the other. Refuse instead.
+        return (
+            jsonify(
+                {
+                    "error": (
+                        "Trading book is unknown right now (mode read failed). "
+                        "Refusing to start/stop so the wrong book can never be "
+                        "armed - retry in a moment."
+                    )
+                }
+            ),
+            503,
+        )
     runtime_mode = "live" if book_mode == "live" else "paper"
 
     raw_requested = (request.json or {}).get("mode")

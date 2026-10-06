@@ -594,18 +594,6 @@ class TradingMode:
         report["orphan_notional"] = round(report["orphan_notional"], 2)
         report["duplicate_pnl"] = round(report["duplicate_pnl"], 2)
 
-        # Write derived cash back when the drift is small — a GET
-        # must not mutate state, but a repair call can correct a
-        # running-balance drift of a few dollars so the audit returns
-        # ok=true and the DRY panel is trustworthy.
-        if abs(report["cash"] - (report["derived_cash"] or 0.0)) < 50.0:
-            try:
-                await self._set(conn, _CASH_KEY, str(report["derived_cash"]))
-                await conn.commit()
-                report["cash"] = round(report["derived_cash"], 2)
-            except Exception:  # noqa: BLE001
-                pass
-
         # 4. Does the ledger agree with itself?
         #
         # `cash_after` on the newest row is written inside the same transaction
@@ -619,6 +607,16 @@ class TradingMode:
                 recorded = float(newest[0].get("cash_after") or 0.0)
                 report["ledger_cash_after"] = round(recorded, 2)
                 report["ledger_self_consistent"] = abs(recorded - report["cash"]) < 0.01
+                # The debit/credit arithmetic above ignores the taker fee:
+                # ledger rows store `amount` only, while cash moved by
+                # amount ± fee. With DRY fees on, the two therefore part by
+                # exactly the cumulative fees - which read as "drift" and
+                # flagged a healthy book (and the old write-back would then
+                # have overcredited it). When the newest row's own running
+                # total matches the balance, the ledger IS the derivation:
+                # a fee-accounting one, written transaction per fill.
+                if report["ledger_self_consistent"]:
+                    report["derived_cash"] = round(recorded, 2)
         except Exception:  # noqa: BLE001
             report["ledger_self_consistent"] = True
 
