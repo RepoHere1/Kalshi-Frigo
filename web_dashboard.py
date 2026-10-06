@@ -3876,6 +3876,7 @@ def api_strategy_toggle(name):
 
     try:
         result = _spawn_strategy(name, mode)
+        print(f"[api_strategy_toggle] {name} spawned successfully in {mode} mode (PID {result['pid']})", flush=True)
         # PERMANENT ASSERTION: The book we read must match the mode we spawned.
         # If they differ, it means a guessed/stale book mode snuck through and the
         # wrong strategy is now running. This is THE BUG the operator complained about.
@@ -3981,14 +3982,18 @@ def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
     # So: retry briefly, and if it still cannot be recorded, kill the child. An
     # untracked trading process is worse than no process.
     last_error: Optional[Exception] = None
-    for attempt in range(4):
+    for attempt in range(8):  # Increased from 4 to 8 attempts
         try:
             _run_async(store.record_start(name, proc.pid, mode, " ".join(cmd[1:]), desired=True))
             last_error = None
+            print(f"[strategy_spawn] {name} (PID {proc.pid}) recorded successfully on attempt {attempt + 1}", flush=True)
             break
         except Exception as exc:  # noqa: BLE001
             last_error = exc
-            time.sleep(0.4 * (attempt + 1))
+            # Increased backoff: 0.2s, 0.5s, 1.2s, 2.8s, 6.4s, 14.6s, 33.2s, 75.2s
+            backoff = 0.2 * (2.4 ** attempt)
+            print(f"[strategy_spawn] {name} (PID {proc.pid}) record_start attempt {attempt + 1} failed ({exc}), retrying in {backoff:.1f}s", flush=True)
+            time.sleep(backoff)
     if last_error is not None:
         _child_procs.pop(proc.pid, None)
         try:
@@ -3999,6 +4004,7 @@ def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
                 proc.kill()
             except Exception:  # noqa: BLE001
                 pass
+        print(f"[strategy_spawn] {name} failed to record after 8 attempts: {last_error}", flush=True)
         raise RuntimeError(
             f"started {name} but could not record it ({last_error}); "
             f"the process was stopped rather than left untracked"
