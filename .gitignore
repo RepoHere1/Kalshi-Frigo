@@ -219,5 +219,8 @@ backups/
 *.bak_*
 !env.template
 
-# runtime artifact written by the LIVE reaper
-live_reaper_summary.json
+# Codewhale agent runtime state
+.codewhale/
+
+# Archive artifacts
+archive-RUePI3/
