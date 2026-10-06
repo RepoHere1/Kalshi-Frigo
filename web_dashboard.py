@@ -3960,14 +3960,41 @@ def api_diagnostics():
             "db_path": os.environ.get("DB_PATH", "not set"),
             "live_trading_enabled": os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower(),
             "openrouter_api_key": os.environ.get("OPENROUTER_API_KEY", "not set")[:10] + "..." if os.environ.get("OPENROUTER_API_KEY") else None,
+            "kalshi_api_key_id": os.environ.get("KALSHI_API_KEY_ID", "not set")[:10] + "..." if os.environ.get("KALSHI_API_KEY_ID") else None,
+            "kalshi_demo_api_key_id": os.environ.get("KALSHI_DEMO_API_KEY_ID", "not set")[:10] + "..." if os.environ.get("KALSHI_DEMO_API_KEY_ID") else None,
         },
         "strategy_state": {},
         "database": {},
         "process": {
             "pid": os.getpid(),
             "parent_pid": os.getppid() if hasattr(os, 'getppid') else None,
-        }
+        },
+        "missing_requirements": [
+            var for var in ["KALSHI_API_KEY", "KALSHI_PRIVATE_KEY", "KALSHI_PRIVATE_KEY_PATH"] 
+            if not os.environ.get(var)
+        ]
     }
+    
+    # Add strategy state details
+    for name, st in strategy_state.items():
+        diagnostics["strategy_state"][name] = {
+            "running": st.get("running"),
+            "pid": st.get("pid"),
+            "mode": st.get("mode"),
+            "stop_reason": st.get("stop_reason"),
+        }
+    
+    # Check database connectivity
+    try:
+        db = DatabaseManager(db_path=DB_PATH)
+        _run_async(db.initialize())
+        diagnostics["database"]["connected"] = True
+        diagnostics["database"]["tables"] = db.get_table_names()
+    except Exception as e:
+        diagnostics["database"]["connected"] = False
+        diagnostics["database"]["error"] = str(e)
+    
+    return jsonify(diagnostics)
     
     # Add strategy state details
     for name, st in strategy_state.items():
