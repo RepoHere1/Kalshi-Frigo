@@ -261,7 +261,7 @@ def test_dry_submit_debits_simulated_cash(mode_manager):
     assert response["simulated"] is True
     assert response["order"]["status"] == "filled"
     assert response["order"]["order_id"].startswith("dry-")
-    assert run(mode_manager.dry_account())["cash"] == pytest.approx(295.63)
+    assert run(mode_manager.dry_account())["cash"] == pytest.approx(295.62)
 
 
 def test_dry_available_cents_comes_from_the_simulated_book(mode_manager):
@@ -408,7 +408,7 @@ def test_execute_dry_does_not_promote_the_position(monkeypatch, tmp_path):
     client.place_order.assert_not_called(), "DRY must never transmit"
     # The simulated ledger recorded the real notional.
     mgr = TradingMode(db_path=str(tmp_path / "m.db"))
-    assert run(mgr.dry_account())["cash"] == pytest.approx(295.63)
+    assert run(mgr.dry_account())["cash"] == pytest.approx(295.62)
 
 
 def test_execute_live_promotes_the_position(monkeypatch, tmp_path):

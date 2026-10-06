@@ -709,8 +709,11 @@ class UpDownTrader:
         if target_notional <= 0:
             return 0
         contracts = int(target_notional / price)
+        # Exchange minimum is $1 NOTIONAL: ceil, never round. int(round(1/0.45))
+        # = 2 -> $0.90 - an order Kalshi rejects and the broker would have to
+        # re-float anyway. Tiny accounts live exactly at this edge.
         if contracts * price < self.config.min_order_usd:
-            contracts = int(round(self.config.min_order_usd / price, 0))
+            contracts = int(math.ceil(self.config.min_order_usd / price - 1e-9))
         return max(contracts, 0)
 
     # ------------------------------------------------------------------
@@ -1124,7 +1127,19 @@ class UpDownTrader:
                     self._client = KalshiClient()
                 bal = await self._client.get_balance()
                 cents = float((bal or {}).get("balance") or 0.0)
-                live_budget = round(cents / 100.0 * self.config.live_cash_fraction, 2)
+                # Below the $1 order minimum no clip can exist: say so once,
+                # plainly, instead of sizing up and getting refused at the
+                # broker every cycle.
+                if cents < 100:
+                    self.book.last_error = (
+                        f"LIVE balance ${cents / 100.0:.2f} is below Kalshi's "
+                        f"$1.00 order minimum - sitting out until funded"
+                    )
+                    live_budget = None
+                else:
+                    live_budget = round(
+                        cents / 100.0 * self.config.live_cash_fraction, 2
+                    )
             except Exception as exc:  # noqa: BLE001
                 self.book.last_error = f"LIVE balance read: {type(exc).__name__}: {exc}"
             # LIVE-ONLY variance-commensurate sizing: the bigger Kalshi's lie

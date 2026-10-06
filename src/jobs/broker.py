@@ -300,13 +300,14 @@ class DryBroker:
                 else:
                     req.no_price = int(round(req.fill_price * 100))
 
-        # DRY fakes Kalshi's taker fee (0.07 * price * (1-price))
-        # so the simulated P&L matches what LIVE actually pays.
+        # DRY fakes Kalshi's taker fee (0.07 * price * (1-price)), rounded UP
+        # to the cent the way Kalshi charges it. On a tiny account the round
+        # vs ceil difference is a real slice of every clip.
         _fee = 0.0
         try:
-            _fee = round(
-                0.07 * req.fill_price * (1.0 - req.fill_price) * req.count, 2
-            )
+            _fee = math.ceil(
+                0.07 * req.fill_price * (1.0 - req.fill_price) * req.count * 100.0
+            ) / 100.0
         except Exception:  # noqa: BLE001
             pass
         try:
