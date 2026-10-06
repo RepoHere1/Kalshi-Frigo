@@ -4644,6 +4644,32 @@ pre{
 .cfoot button{padding:3px 9px;font-size:11px}
 code{background:var(--bg);border:1px solid var(--line2);border-radius:5px;padding:1px 5px;font-size:11px;font-family:ui-monospace,monospace}
 footer{margin-top:22px;text-align:center;color:var(--faint);font-size:11px}
+
+/* Strategy button loading animation: silvery circular effect */
+@keyframes borderSpin {
+  0% { border-image: conic-gradient(from 0deg, #c0c0c0 0deg, #e8e8e8 90deg, #c0c0c0 180deg, #a0a0a0 270deg, #c0c0c0 360deg) 1; }
+  100% { border-image: conic-gradient(from 360deg, #c0c0c0 0deg, #e8e8e8 90deg, #c0c0c0 180deg, #a0a0a0 270deg, #c0c0c0 360deg) 1; }
+}
+button.loading {
+  border: 2px solid;
+  border-image-source: conic-gradient(from 0deg, #c0c0c0, #e8e8e8, #c0c0c0, #a0a0a0, #c0c0c0);
+  border-image-slice: 1;
+  animation: borderSpin 1.2s linear infinite;
+  position: relative;
+}
+button.loading::after {
+  content: '';
+  position: absolute;
+  top: -2px;
+  left: -2px;
+  right: -2px;
+  bottom: -2px;
+  border-radius: 3px;
+  background: conic-gradient(from 0deg, rgba(192,192,192,0.3), rgba(232,232,232,0.6), transparent);
+  animation: borderSpin 1.2s linear infinite;
+  pointer-events: none;
+  z-index: -1;
+}
 </style>
 </head>
 <body data-mode="{{ s.mode.mode }}">
@@ -5772,31 +5798,41 @@ async function toggleStrategy(name, quiet) {
   // Start or stop based on the card's actual state, so a bulk "start all" can
   // never be turned into a bulk "stop all" by a stale button label.
   const card = (SNAPSHOT.strategy_cards || []).find(c => c.name === name);
+  const btn = document.getElementById('btn-' + name);
   const body = {}; // no mode: the server uses whatever the DRY/LIVE switch says
-  if (card && card.running) {
-    await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
-      method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
-    });
-    if (!quiet) note(name + ': stopped');
-  } else {
-    // HEAVY API ABUSER gate: quick_flip's Start is blocked with a popup so the
-    // #1 OpenRouter spender stays off, in both books. The popup is the
-    // reminder - it says exactly why the button does nothing.
-    if (card && card.heavy_api_abuser) {
-      if (!quiet) {
-        alert('HEAVY API ABUSER\n\n' + (card.heavy_api_abuser_reason || '') +
-          '\n\nThis strategy stays OFF. Not started.');
+  
+  // Add loading animation to button
+  if (btn) btn.classList.add('loading');
+  
+  try {
+    if (card && card.running) {
+      await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
+        method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
+      });
+      if (!quiet) note(name + ': stopped');
+    } else {
+      // HEAVY API ABUSER gate: quick_flip's Start is blocked with a popup so the
+      // #1 OpenRouter spender stays off, in both books. The popup is the
+      // reminder - it says exactly why the button does nothing.
+      if (card && card.heavy_api_abuser) {
+        if (!quiet) {
+          alert('HEAVY API ABUSER\n\n' + (card.heavy_api_abuser_reason || '') +
+            '\n\nThis strategy stays OFF. Not started.');
+        }
+        note(name + ': left off (HEAVY API ABUSER)');
+        return;
       }
-      note(name + ': left off (HEAVY API ABUSER)');
-      return;
+      const r = await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
+        method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!quiet) note(d.error ? name + ': ' + d.error : name + ': ' + (d.running ? 'started' : 'stopped'));
     }
-    const r = await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
-      method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
-    });
-    const d = await r.json().catch(() => ({}));
-    if (!quiet) note(d.error ? name + ': ' + d.error : name + ': ' + (d.running ? 'started' : 'stopped'));
+  } finally {
+    // Remove loading animation after response returns
+    if (btn) btn.classList.remove('loading');
+    refresh();
   }
-  refresh();
 }
 async function killBot(name) {
   await fetch('/api/bot/' + encodeURIComponent(name) + '/kill',
@@ -6294,22 +6330,36 @@ async function showAnalysis(name) {
 
 async function startAll() {
   const names = (SNAPSHOT.strategy_cards || []).map(c => c.name);
-  if ((SNAPSHOT.mode && SNAPSHOT.mode.mode) === 'live') {
-    // Arming six real-money strategies is not a thing to do by muscle memory.
-    if (!confirm('LIVE MODE\n\nThis starts REAL-MONEY trading in all '
-      + names.length + ' strategies against your Kalshi account.\n\n'
-      + 'Prefer arming them one at a time. Continue?')) {
-      note('live bulk start cancelled');
-      return;
+  const btn = document.getElementById('startAllBtn');
+  if (btn) btn.classList.add('loading');
+  
+  try {
+    if ((SNAPSHOT.mode && SNAPSHOT.mode.mode) === 'live') {
+      // Arming six real-money strategies is not a thing to do by muscle memory.
+      if (!confirm('LIVE MODE\n\nThis starts REAL-MONEY trading in all '
+        + names.length + ' strategies against your Kalshi account.\n\n'
+        + 'Prefer arming them one at a time. Continue?')) {
+        note('live bulk start cancelled');
+        return;
+      }
     }
+    for (const n of names) await toggleStrategy(n, true);
+    note('started: ' + names.join(', '));
+  } finally {
+    if (btn) btn.classList.remove('loading');
   }
-  for (const n of names) await toggleStrategy(n, true);
-  note('started: ' + names.join(', '));
 }
 async function stopAll() {
   const names = (SNAPSHOT.strategy_cards || []).filter(c => c.running).map(c => c.name);
-  for (const n of names) await toggleStrategy(n, true);
-  note('stopped: ' + (names.join(', ') || 'nothing was running'));
+  const stopAllButtons = document.querySelectorAll('button:contains("Stop all")');
+  stopAllButtons.forEach(btn => btn.classList.add('loading'));
+  
+  try {
+    for (const n of names) await toggleStrategy(n, true);
+    note('stopped: ' + (names.join(', ') || 'nothing was running'));
+  } finally {
+    stopAllButtons.forEach(btn => btn.classList.remove('loading'));
+  }
 }
 
 // Collapse the live feed panel. It is tall and its numbers tick continuously,
