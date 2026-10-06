@@ -177,3 +177,111 @@ def test_vol_rich_never_raises_the_bar_only_annotates():
     )
     trader.evaluate(mkt, live=False)
     assert trader._vol_adj <= 0.0
+
+
+# ---------------------------------------------------------------------------
+# Fractional Kelly: the compounding engine
+# ---------------------------------------------------------------------------
+def test_kelly_scales_the_clip_with_the_edge():
+    """Half-Kelly on a real edge: $10 book, fair 0.75 at 0.55 ->
+    k* = 0.20/0.45 = 0.444, k = 0.222 -> clip $2.22 -> 4 contracts."""
+    import src.jobs.ladder_trader as lt
+
+    trader = _trader()
+    trader._live_balance = 10.0
+    monkeypatched = lt  # keep the namespace honest for the fair patch below
+    market = _mkt(
+        seconds_left=600, target=84000.0,
+        yes_bid=0.55, yes_ask=0.56, no_bid=0.44, no_ask=0.45,
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.75)
+        signal = trader.evaluate(market, live=True)
+    assert signal is not None and signal.side == "up"
+    assert signal.contracts == 4
+    assert signal.notional == pytest.approx(2.20, abs=0.01)
+
+
+def test_kelly_cap_bounds_a_single_clip():
+    """Fair 0.95 at 0.70: k* = 0.833 - the cap holds the clip at 35%."""
+    import src.jobs.ladder_trader as lt
+
+    trader = _trader()
+    trader._live_balance = 10.0
+    market = _mkt(
+        seconds_left=600, target=84000.0,
+        yes_bid=0.70, yes_ask=0.71, no_bid=0.29, no_ask=0.30,
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.95)
+        signal = trader.evaluate(market, live=True)
+    assert signal is not None and signal.side == "up"
+    # clip = 10 x 0.35 = $3.50 -> 5 contracts at the 0.70 bid.
+    assert signal.contracts == 5
+    assert signal.notional == pytest.approx(3.50, abs=0.01)
+
+
+def test_maker_entries_reach_85c_takers_stop_at_60c():
+    """High-probability convergence is the steadiest compounding trade - but
+    only at the quarter fee. The taker fee at 85c is a private tax."""
+    import src.jobs.ladder_trader as lt
+
+    trader = _trader()
+    trader._live_balance = 10.0
+
+    # Maker window (600s): 0.80 resting bid, fair 0.97 - edge 0.17 clears the
+    # out-of-band bar (0.06 + 0.0025 maker fee + 0.04).
+    mkt = _mkt(
+        seconds_left=600, target=84000.0,
+        yes_bid=0.80, yes_ask=0.82, no_bid=0.19, no_ask=0.20,
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.97)
+        signal = trader.evaluate(mkt, live=True)
+    assert signal is not None and signal.side == "up"
+
+    # Taker window (60s): the same 0.80 ask is above the 0.60 taker cap.
+    trader2 = _trader()
+    trader2._live_balance = 10.0
+    mkt2 = _mkt(
+        seconds_left=60, target=84000.0,
+        yes_bid=0.79, yes_ask=0.80, no_bid=0.19, no_ask=0.21,
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.97)
+        signal2 = trader2.evaluate(mkt2, live=True)
+    assert signal2 is None or signal2.side == ""
+
+
+def test_ninety_cents_hard_block_holds_for_makers_too():
+    """0.90+ entries won 4% forever. No fee schedule changes that."""
+    import src.jobs.ladder_trader as lt
+
+    trader = _trader()
+    trader._live_balance = 10.0
+    mkt = _mkt(
+        seconds_left=600, target=84000.0,
+        yes_bid=0.91, yes_ask=0.92, no_bid=0.07, no_ask=0.08,
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.99)
+        signal = trader.evaluate(mkt, live=True)
+    assert signal is None or signal.side == ""
+
+
+def test_dry_mirrors_kelly_on_its_own_cash():
+    """The law: the same sizing rule, on the DRY book's own money."""
+    import src.jobs.ladder_trader as lt
+
+    trader = _trader()
+    trader._dry_cash_cache = 300.0
+    market = _mkt(
+        seconds_left=600, target=84000.0,
+        yes_bid=0.55, yes_ask=0.56, no_bid=0.44, no_ask=0.45,
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.75)
+        signal = trader.evaluate(market, live=False)
+    assert signal is not None and signal.side == "up"
+    # clip = 300 x 0.222 = $66.60 -> 121 contracts at 0.55.
+    assert signal.contracts == 121

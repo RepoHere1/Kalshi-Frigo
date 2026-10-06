@@ -88,6 +88,24 @@ class UpDownConfig:
     # a coin flip, so LIVE sits the hour out. DRY never reads this flag and
     # still trades the hour.
     live_skip_losing_hour: bool = True
+    # FRACTIONAL KELLY SIZING - the compounding engine. The mathematically
+    # growth-optimal fraction of the book for a binary priced c with model
+    # probability f is k* = (f - c) / (1 - c); betting kelly_scale * k* gives
+    # most of the growth for a fraction of the drawdown. kelly_cap bounds a
+    # single clip no matter how wide the edge claims to be. This replaces the
+    # fixed live_cash_fraction as the primary LIVE (and, by the law, DRY)
+    # sizer: clips grow as the book grows and shrink into drawdowns, which is
+    # the only way $10 compounds into something instead of flatlining.
+    kelly_sizing: bool = True
+    kelly_scale: float = 0.5   # half Kelly
+    kelly_cap: float = 0.35    # never more than 35% of the book in one clip
+    # High-probability convergence entries: a resting maker bid at $0.60-$0.85
+    # pays a quarter fee and, with the diffusion fair value demanding real
+    # edge over it, is the steadiest compounding trade this book has. Taker
+    # entries stay capped at max_entry_price - the taker fee at 85c is 6% of
+    # the clip, poison at this scale. The $0.90+ hard block stands: entries
+    # there won 4% forever, fee schedule irrelevant.
+    max_entry_price_maker: float = 0.85
     # AI advisory stack. All default OFF: with every flag off the ladder is
     # byte-identical math, and the ai_* modules are never even imported on
     # the trading path. Env overrides let Railway enable one lane at a time
@@ -163,6 +181,16 @@ class UpDownConfig:
             self.poly_guard_enabled = False
         if _os.environ.get("VOL_EDGE", "1") != "1":
             self.vol_edge_enabled = False
+        if _os.environ.get("KELLY_SIZING", "1") != "1":
+            self.kelly_sizing = False
+        try:
+            self.kelly_scale = float(_os.environ.get("KELLY_SCALE", self.kelly_scale))
+            self.kelly_cap = float(_os.environ.get("KELLY_CAP", self.kelly_cap))
+            self.max_entry_price_maker = float(
+                _os.environ.get("MAX_ENTRY_MAKER", self.max_entry_price_maker)
+            )
+        except ValueError:
+            pass
         _vg = _os.environ.get("VENUE_GUARD_MAX_USD", "")
         if _vg:
             try:
@@ -339,6 +367,11 @@ class UpDownTrader:
         self._vol_adj: float = 0.0
         self._sigma_used: Optional[float] = None
         self._impl_sigma: Optional[float] = None
+        # Per-pass book balances, for the Kelly sizer. DRY caches its own
+        # simulated cash so both books size by the SAME rule on their OWN
+        # money - the law.
+        self._live_balance: Optional[float] = None
+        self._dry_cash_cache: Optional[float] = None
         self.book = UpDownBook(max_open_notional=self.config.max_open_notional)
 
     def evaluate(
@@ -620,11 +653,22 @@ class UpDownTrader:
         up_fill = _up_ref if up_ask is not None else None
         down_fill = _down_ref if down_ask is not None else None
 
-        def _side_ok(edge: float, fill_price: Optional[float], req: float) -> bool:
+        def _side_ok(
+            edge: float, fill_price: Optional[float], req: float, maker: bool = False
+        ) -> bool:
             if fill_price is None or fill_price <= 0.0:
                 return False
-            # Hard block from the log: $0.90+ entries won 4% of the time.
-            if fill_price >= self.config.max_entry_price:
+            # Hard block from the log, both schedules: $0.90+ entries won 4%
+            # of the time. No fee schedule changes that.
+            if fill_price >= 0.90:
+                return False
+            # Makers may reach 0.85 (quarter fee, real edge required over the
+            # resting bid); takers stop at the classic 0.60 - the taker fee up
+            # there is a private tax on a tiny account.
+            _cap = (
+                self.config.max_entry_price_maker if maker else self.config.max_entry_price
+            )
+            if fill_price > _cap:
                 return False
             r = req
             # The sweet band wins 100%; outside it, demand more edge.
@@ -632,8 +676,10 @@ class UpDownTrader:
                 r += self.config.out_of_band_extra_edge
             return edge >= r
 
-        up_ok = _side_ok(up_edge, up_fill, _required(up_fill, _up_maker))
-        down_ok = _side_ok(down_edge, down_fill, _required(down_fill, _down_maker))
+        up_ok = _side_ok(up_edge, up_fill, _required(up_fill, _up_maker), _up_maker)
+        down_ok = _side_ok(
+            down_edge, down_fill, _required(down_fill, _down_maker), _down_maker
+        )
 
         side = ""
         ask: Optional[float] = None
@@ -693,7 +739,31 @@ class UpDownTrader:
         # Size on the price the entry actually pays - the maker bid when the
         # clip will rest, else the taker ask.
         fill_price = (_up_ref if side == "up" else _down_ref) if side else 0.0
-        contracts = self._size(fill_price, clip_usd=clip_usd) if side else 0
+        contracts = 0
+        if side:
+            _clip = clip_usd
+            # FRACTIONAL KELLY: clip = balance x clip(scale x k*), k* =
+            # (f - c) / (1 - c). The clip compounds with the book and widens
+            # with the edge; kelly_cap bounds any single bet. This is what
+            # turns $10 into something: growth-optimal sizing on every edge,
+            # not a flat $5 til the account dies of fee drag.
+            if (
+                self.config.kelly_sizing
+                and 0.0 < fill_price < 1.0
+            ):
+                _bal = self._live_balance if live else self._dry_cash_cache
+                if _bal and _bal > 0.0:
+                    _win = fair if side == "up" else (1.0 - fair)
+                    _kelly = (_win - fill_price) / (1.0 - fill_price)
+                    _k = max(
+                        0.0,
+                        min(
+                            self.config.kelly_cap,
+                            self.config.kelly_scale * _kelly,
+                        ),
+                    )
+                    _clip = round(_bal * _k, 2)
+            contracts = self._size(fill_price, clip_usd=_clip)
         if side and contracts > 0:
             # The Hyperliquid perp hedge that flattens this clip's direction,
             # sized from the binary delta and marked against the public BTC
@@ -1088,6 +1158,14 @@ class UpDownTrader:
         # Awaited directly: mode.run() builds a fresh event loop, which raises
         # from inside this coroutine.
         mode = await TradingMode(db_path=self._db_path()).current()
+        if not live:
+            # The DRY book's own cash, for the Kelly sizer - same rule as
+            # LIVE, on its own money.
+            try:
+                _acct = await TradingMode(db_path=self._db_path()).dry_account()
+                self._dry_cash_cache = float((_acct or {}).get("cash") or 0.0)
+            except Exception:  # noqa: BLE001 - fallback clip covers it
+                self._dry_cash_cache = None
 
         # Refresh the cross-venue consensus once per pass; the (sync) scorer
         # only ever reads the cached snapshot. Failures degrade to no guard.
@@ -1199,6 +1277,8 @@ class UpDownTrader:
                     live_budget = round(
                         cents / 100.0 * self.config.live_cash_fraction, 2
                     )
+                    # Raw balance for the Kelly sizer in evaluate().
+                    self._live_balance = cents / 100.0
             except Exception as exc:  # noqa: BLE001
                 self.book.last_error = f"LIVE balance read: {type(exc).__name__}: {exc}"
             # LIVE-ONLY variance-commensurate sizing: the bigger Kalshi's lie
