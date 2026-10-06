@@ -3941,6 +3941,55 @@ def api_strategy_toggle(name):
     return jsonify(result)
 
 
+@app.route("/api/diagnostics")
+def api_diagnostics():
+    """Return detailed diagnostic information about the environment and strategy health."""
+    import os
+    import sys
+    from src.utils.database import DatabaseManager
+    
+    diagnostics = {
+        "environment": {
+            "python_version": sys.version,
+            "working_directory": os.getcwd(),
+            "railway": os.environ.get("RAILWAY", "not set"),
+            "project": os.environ.get("RAILWAY_PROJECT_ID", "not set"),
+            "service": os.environ.get("RAILWAY_SERVICE_ID", "not set"),
+            "kalshi_api_key": "present" if os.environ.get("KALSHI_API_KEY") else "MISSING",
+            "kalshi_private_key": "present" if os.environ.get("KALSHI_PRIVATE_KEY") or os.environ.get("KALSHI_PRIVATE_KEY_PATH") else "MISSING",
+            "db_path": os.environ.get("DB_PATH", "not set"),
+            "live_trading_enabled": os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower(),
+            "openrouter_api_key": os.environ.get("OPENROUTER_API_KEY", "not set")[:10] + "..." if os.environ.get("OPENROUTER_API_KEY") else None,
+        },
+        "strategy_state": {},
+        "database": {},
+        "process": {
+            "pid": os.getpid(),
+            "parent_pid": os.getppid() if hasattr(os, 'getppid') else None,
+        }
+    }
+    
+    # Add strategy state details
+    for name, st in strategy_state.items():
+        diagnostics["strategy_state"][name] = {
+            "running": st.get("running"),
+            "pid": st.get("pid"),
+            "mode": st.get("mode"),
+            "stop_reason": st.get("stop_reason"),
+        }
+    
+    # Check database connectivity
+    try:
+        db = DatabaseManager(db_path=DB_PATH)
+        _run_async(db.initialize())
+        diagnostics["database"]["connected"] = True
+        diagnostics["database"]["tables"] = db.get_table_names()
+    except Exception as e:
+        diagnostics["database"]["connected"] = False
+        diagnostics["database"]["error"] = str(e)
+    
+    return jsonify(diagnostics)
+
 def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
     """Launch one strategy process and record it. Raises on failure.
 
