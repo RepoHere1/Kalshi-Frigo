@@ -92,8 +92,14 @@ def cmd_run(args: argparse.Namespace) -> None:
 
         async def _init_mode():
             await DatabaseManager(db_path=db_path).initialize()
+            # should_trade_live() requires BOTH the LIVE_TRADING_ENABLED env
+            # var AND the persisted database mode to be "live". Check the
+            # env var directly rather than relying on the CLI --live flag,
+            # so the mode is correct even when the dashboard starts the
+            # strategy as a subprocess without passing --live.
+            live = os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
             await TradingMode(db_path=db_path).set(
-                "live" if live_mode else "paper", confirmed=True
+                "live" if live else "paper", confirmed=True
             )
 
         asyncio.run(_init_mode())
