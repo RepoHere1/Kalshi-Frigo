@@ -4677,6 +4677,21 @@ button.loading::after {
   pointer-events: none;
   z-index: -1;
 }
+/* Yellow variant for bulk operations (START ALL, STOP ALL) */
+@keyframes borderSpinYellow {
+  0% { border-image: conic-gradient(from 0deg, #FFD700 0deg, #FFED4E 90deg, #FFD700 180deg, #FFC700 270deg, #FFD700 360deg) 1; }
+  100% { border-image: conic-gradient(from 360deg, #FFD700 0deg, #FFED4E 90deg, #FFD700 180deg, #FFC700 270deg, #FFD700 360deg) 1; }
+}
+button.loading.yellow {
+  border: 2px solid;
+  border-image-source: conic-gradient(from 0deg, #FFD700, #FFED4E, #FFD700, #FFC700, #FFD700);
+  border-image-slice: 1;
+  animation: borderSpinYellow 1.2s linear infinite;
+}
+button.loading.yellow::after {
+  background: conic-gradient(from 0deg, rgba(255,215,0,0.3), rgba(255,237,78,0.6), transparent);
+  animation: borderSpinYellow 1.2s linear infinite;
+}
 </style>
 </head>
 <body data-mode="{{ s.mode.mode }}">
@@ -6352,11 +6367,13 @@ async function showAnalysis(name) {
 async function startAll() {
   const names = (SNAPSHOT.strategy_cards || []).map(c => c.name);
   const btn = document.getElementById('startAllBtn');
-  if (btn) btn.classList.add('loading');
+  if (btn) {
+    btn.classList.add('loading');
+    btn.classList.add('yellow');
+  }
   
   try {
     if ((SNAPSHOT.mode && SNAPSHOT.mode.mode) === 'live') {
-      // Arming six real-money strategies is not a thing to do by muscle memory.
       if (!confirm('LIVE MODE\n\nThis starts REAL-MONEY trading in all '
         + names.length + ' strategies against your Kalshi account.\n\n'
         + 'Prefer arming them one at a time. Continue?')) {
@@ -6364,22 +6381,73 @@ async function startAll() {
         return;
       }
     }
+    
+    // Start all strategies
     for (const n of names) await toggleStrategy(n, true);
-    note('started: ' + names.join(', '));
+    
+    // Poll until all are actually running
+    let maxWait = 120; // 60 seconds
+    let pollCount = 0;
+    while (pollCount < maxWait) {
+      await new Promise(r => setTimeout(r, 500));
+      pollCount++;
+      
+      try {
+        const strategiesResp = await fetch('/api/strategies', { headers: authHeaders() });
+        const strategiesData = await strategiesResp.json().catch(() => ({}));
+        const allRunning = names.every(n => strategiesData[n] && strategiesData[n].running);
+        
+        if (allRunning) {
+          note('started: ' + names.join(', '));
+          break;
+        }
+      } catch (e) {}
+    }
   } finally {
-    if (btn) btn.classList.remove('loading');
+    if (btn) {
+      btn.classList.remove('loading');
+      btn.classList.remove('yellow');
+    }
   }
 }
+
 async function stopAll() {
   const names = (SNAPSHOT.strategy_cards || []).filter(c => c.running).map(c => c.name);
-  const stopAllButtons = document.querySelectorAll('button:contains("Stop all")');
-  stopAllButtons.forEach(btn => btn.classList.add('loading'));
+  const stopAllButtons = document.querySelectorAll('button:nth-child(2)'); // Find Stop all buttons by position
+  const killLiveBtn = Array.from(document.querySelectorAll('button')).find(b => b.textContent === 'Kill all LIVE');
+  
+  // Apply yellow spinner to Stop all button
+  if (killLiveBtn && killLiveBtn.previousElementSibling) {
+    killLiveBtn.previousElementSibling.classList.add('loading');
+    killLiveBtn.previousElementSibling.classList.add('yellow');
+  }
   
   try {
     for (const n of names) await toggleStrategy(n, true);
-    note('stopped: ' + (names.join(', ') || 'nothing was running'));
+    
+    // Poll until all are actually stopped
+    let maxWait = 120;
+    let pollCount = 0;
+    while (pollCount < maxWait) {
+      await new Promise(r => setTimeout(r, 500));
+      pollCount++;
+      
+      try {
+        const strategiesResp = await fetch('/api/strategies', { headers: authHeaders() });
+        const strategiesData = await strategiesResp.json().catch(() => ({}));
+        const allStopped = names.every(n => strategiesData[n] && !strategiesData[n].running);
+        
+        if (allStopped) {
+          note('stopped: ' + (names.join(', ') || 'nothing was running'));
+          break;
+        }
+      } catch (e) {}
+    }
   } finally {
-    stopAllButtons.forEach(btn => btn.classList.remove('loading'));
+    if (killLiveBtn && killLiveBtn.previousElementSibling) {
+      killLiveBtn.previousElementSibling.classList.remove('loading');
+      killLiveBtn.previousElementSibling.classList.remove('yellow');
+    }
   }
 }
 
@@ -6467,12 +6535,13 @@ def start_background_workers():
         return
     _workers_started = True
     for target in (
-        _monitor_loop,
-        _log_tail_loop,
-        _backup_loop,
-        _market_data_loop,
-        _strategy_supervisor_loop,
-    ):
+         _monitor_loop,
+         _log_tail_loop,
+         _backup_loop,
+         _market_data_loop,
+         # SUPERVISOR PERMANENTLY DISABLED - User demands button-only control
+         # _strategy_supervisor_loop,  # DEAD - no auto-management of strategies
+     ):
         threading.Thread(target=target, daemon=True).start()
 
 
