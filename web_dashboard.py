@@ -1471,10 +1471,16 @@ def _strategy_supervisor_loop():
                 if row_pid and _pid_alive(row_pid, row):
                     # A pid that exists is not proof of life. A strategy that
                     # has stopped stamping heartbeats is wedged - its process is
-                    # up but its loop is not running - so kill it and fall into
-                    # the respawn path below. Without this, a hung strategy sat
-                    # at "running" forever while trading nothing, which is
-                    # exactly the lie the page must never tell.
+                    # up but its loop is not running. HOWEVER: do NOT kill it
+                    # just because of a stale heartbeat. The old code killed +
+                    # respawned on stale heartbeat, which crossed into the wrong
+                    # mode if the book changed during respawn. The operator's
+                    # button is LAW: once they click START in a mode, that mode
+                    # is permanent until they click STOP. No supervisor respawn
+                    # may cross-contaminate the book by guessing a different mode.
+                    #
+                    # So: monitor the heartbeat and alert, but ONLY STOP on
+                    # explicit operator click. Never auto-kill a strategy.
                     hb = row.get("heartbeat_at")
                     if hb:
                         try:
@@ -1482,12 +1488,14 @@ def _strategy_supervisor_loop():
                                 datetime.now() - datetime.fromisoformat(str(hb))
                             ).total_seconds()
                             if hb_age > _HEARTBEAT_STALE_SECONDS:
+                                # Alert the operator, but do NOT kill the process.
+                                # The button is the only kill switch.
                                 _push_error(
-                                    f"{name} heartbeat is {hb_age:.0f}s old; "
-                                    f"killing the wedged process and respawning."
+                                    f"WARNING: {name} heartbeat is {hb_age:.0f}s old "
+                                    f"(process may be hung). Press STOP and START to restart, "
+                                    f"or contact support."
                                 )
-                                _stop_child({"pid": row_pid, "running": True})
-                                continue
+                                # Do NOT kill; the operator's button is the only stop.
                         except Exception:  # noqa: BLE001 - malformed stamp: ignore
                             pass
                     # A process that survives a settling period is a genuine
@@ -1560,18 +1568,17 @@ def _strategy_supervisor_loop():
                     if current_book and recorded_mode:
                         expected_book = "live" if recorded_mode == "live" else "dry"
                         if current_book != expected_book:
-                            # Book changed! Refuse to respawn in the wrong book.
-                            _push_error(
-                                f"BOOK MODE GUARD: {name} was recorded in {expected_book} "
-                                f"but the current book is {current_book}. Refusing respawn "
-                                f"to prevent cross-contamination. Press Start in the correct book."
-                            )
-                            _run_async(
-                                store.record_stop(
-                                    name, "book mode changed during respawn", recorded_mode, clear_desired=True
-                                )
-                            )
-                            continue  # Skip this strategy; don't spawn it
+                             # Book changed! Refuse to respawn in the wrong book.
+                             _push_error(
+                                 f"BOOK MODE GUARD: {name} was recorded in {expected_book} "
+                                 f"but the current book is {current_book}. Refusing respawn "
+                                 f"to prevent cross-contamination. It is still DESIRED=ON in its "
+                                 f"original book - press Start in {expected_book} to resume it."
+                             )
+                             # DO NOT clear_desired here! The operator's intent is permanent.
+                             # They clicked START in {expected_book}, so that switch must survive
+                             # until they manually click STOP in that book. Never auto-off a strategy.
+                             continue  # Skip this strategy; don't spawn it
 
                 try:
                     started = _spawn_strategy(name, mode)
