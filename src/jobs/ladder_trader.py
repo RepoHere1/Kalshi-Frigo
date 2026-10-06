@@ -67,12 +67,13 @@ class UpDownConfig:
     out_of_band_extra_edge: float = 0.04  # RAISED: Now out-of-band is 0.50-0.60, needs +4c edge
     prefer_side: str = "down"
     up_override_margin: float = 0.02
-    # LIVE only: buy-side fee per fill, as a fraction of notional. Kalshi
-    # charges on every fill, so a 6c edge that clears DRY is only a ~3c edge
-    # LIVE once the fee is taken out. LIVE therefore requires
-    # edge >= min_edge + live_fee_rate; DRY keeps the raw min_edge so the two
-    # books stay comparable in decision count. Estimated from the account's own
-    # fill history (fees against notional across hundreds of fills).
+    # LIVE only: buy-side fee per fill. Kalshi charges
+    # 0.07 * price * (1-price) per contract on every fill, so a 6c edge
+    # that clears DRY is only a ~3c edge LIVE once the fee is taken out.
+    # LIVE therefore requires edge >= min_edge + 0.07*(1-price);
+    # DRY keeps the raw min_edge so the two books stay comparable in
+    # decision count. The actual fee is computed from the fill price
+    # at decision time, not this placeholder.
     live_fee_rate: float = 0.03
     # LIVE only: the largest fraction of the available balance one clip may
     # spend. A fixed $5 clip empties a small account in a trade or two and it
@@ -196,16 +197,20 @@ class UpDownBook:
         }
 
 
-def fair_up_probability(spot: float, target: float, noise_usd: float = 15.0) -> float:
+def fair_up_probability(spot: float, target: float, noise_usd: float = 15.0, seconds_left: float = 900.0) -> float:
     """P(the next window settles at or above the target), from live spot.
 
-    A logistic in the distance past the target, in units of the noise band. At
-    the target it is exactly 0.5, which is the right prior for a market that has
-    not moved yet; far past it, it saturates near 1.
+    A logistic in the distance past the target, in units of the noise band.
+    The noise band is scaled by remaining time: with less time left, the
+    same spot-vs-target distance is more decisive; with more time, more
+    uncertainty. At the target it is exactly 0.5, which is the right prior
+    for a market that has not moved yet; far past it, it saturates near 1.
     """
     if noise_usd <= 0:
         return 0.5
-    z = max(-6.0, min(6.0, (spot - target) / noise_usd))
+    time_scale = math.sqrt(max(seconds_left, 1.0) / 900.0)
+    effective_noise = noise_usd * time_scale
+    z = max(-6.0, min(6.0, (spot - target) / effective_noise))
     return float(1.0 / (1.0 + math.exp(-z)))
 
 
@@ -241,8 +246,9 @@ class UpDownTrader:
     ) -> Optional[UpDownSignal]:
         """Score the next contract. Read-only: no orders here.
 
-        `live` raises the edge bar by `live_fee_rate`: DRY pays no fee, LIVE
-        does, and an edge that clears DRY but not the fee is a losing trade with
+        `live` raises the edge bar by Kalshi's actual taker fee
+        (0.07 * price * (1-price)): DRY pays no fee, LIVE does, and an
+        edge that clears DRY but not the fee is a losing trade with
         real money. `clip_usd` overrides the fixed clip size (used in LIVE to
         size down against the available balance).
         """
@@ -280,20 +286,16 @@ class UpDownTrader:
             if not getattr(self.feed, "markets", None) or _quote_age > QUOTE_MAX_AGE_SEC:
                 self.book.skipped_stale += 1
                 return None
-        # Truth selection: LIVE uses real Coinbase spot (2-5s lead on Kalshi's repricing).
-        # DRY uses Kalshi's BRTI (settlement family). This is the key lever: real spot
-        # detects edges before Kalshi reprices.
+        # Truth selection: both books use real Coinbase spot so they
+        # score the same signal. DRY keeps BRTI as a fallback for
+        # dashboard observability, but the trading decision uses spot
+        # — the same leading indicator LIVE trades against.
         truth_price = 0.0
         truth_kind = ""
-        if live:
-            # LIVE: always use real spot for edge detection (NO side wins 83%)
-            if self.spot.price <= 0 or self.spot.age > self.config.max_spot_age:
-                self.book.skipped_stale += 1
-                return None
+        if self.spot.price > 0 and self.spot.age <= self.config.max_spot_age:
             truth_price = self.spot.price
             truth_kind = f"coinbase-{self.spot.source or 'spot'}"
         else:
-            # DRY: try BRTI first (settlement), fall back to spot
             try:
                 _brti = self.brti
                 if _brti is not None and bool(getattr(_brti, "fresh", False)):
@@ -301,13 +303,10 @@ class UpDownTrader:
                     if truth_price > 0:
                         truth_kind = f"kalshi-brti-{_brti.estimate_kind()}"
             except Exception:  # noqa: BLE001 - truth selection never blocks
-                truth_price, truth_kind = 0.0, ""
-            if truth_price <= 0:
-                if self.spot.price <= 0 or self.spot.age > self.config.max_spot_age:
-                    self.book.skipped_stale += 1
-                    return None
-                truth_price = self.spot.price
-                truth_kind = f"coinbase-{self.spot.source or 'spot'}"
+                pass
+        if truth_price <= 0:
+            self.book.skipped_stale += 1
+            return None
         spot = truth_price
         # No entries inside the no-entry window (both books): the settlement
         # window is the final 60 seconds, and a fill in there is a coin toss
@@ -349,7 +348,7 @@ class UpDownTrader:
             self.book.signals = [signal]
             return signal
 
-        fair = fair_up_probability(spot, target, self.config.noise_usd)
+        fair = fair_up_probability(spot, target, self.config.noise_usd, market.seconds_left or 900.0)
 
         up_ask = market.up_price
         down_ask = market.down_price
@@ -365,30 +364,36 @@ class UpDownTrader:
         up_edge = (fair - up_ask) if up_ask is not None else 0.0
         down_edge = ((1.0 - fair) - down_ask) if down_ask is not None else 0.0
 
-        # ONE decision rule for both books: DRY's min_edge. LIVE adds exactly
-        # what costs real money - the exchange fee - and nothing else. No hour
-        # bans, no LIVE-only bands, no refusal DRY does not also have: if DRY
-        # would take the trade, LIVE takes it. The edge that built DRY's ledger
-        # is the edge LIVE trades on now.
-        required = self.config.min_edge + (self.config.live_fee_rate if live else 0.0)
+        # ONE decision rule for both books: DRY's min_edge. LIVE adds
+        # exactly what costs real money - Kalshi's actual taker fee
+        # (0.07 * price * (1-price) per contract, as a fraction of
+        # notional: 0.07 * (1-price)) - and nothing else. No hour
+        # bans, no LIVE-only bands, no refusal DRY does not also have:
+        # if DRY would take the trade, LIVE takes it. The edge that
+        # built DRY's ledger is the edge LIVE trades on now.
+        def _required(fill_price: Optional[float]) -> float:
+            if not live:
+                return self.config.min_edge
+            kalshi_fee = 0.07 * (1.0 - float(fill_price or 0.5))
+            return self.config.min_edge + kalshi_fee
 
         up_fill = up_ask if up_ask is not None else None
         down_fill = down_ask if down_ask is not None else None
 
-        def _side_ok(edge: float, fill_price: Optional[float]) -> bool:
+        def _side_ok(edge: float, fill_price: Optional[float], req: float) -> bool:
             if fill_price is None or fill_price <= 0.0:
                 return False
             # Hard block from the log: $0.90+ entries won 4% of the time.
             if fill_price >= self.config.max_entry_price:
                 return False
-            r = required
+            r = req
             # The sweet band wins 100%; outside it, demand more edge.
             if not (self.config.sweet_band_low <= fill_price <= self.config.sweet_band_high):
                 r += self.config.out_of_band_extra_edge
             return edge >= r
 
-        up_ok = _side_ok(up_edge, up_fill)
-        down_ok = _side_ok(down_edge, down_fill)
+        up_ok = _side_ok(up_edge, up_fill, _required(up_fill))
+        down_ok = _side_ok(down_edge, down_fill, _required(down_fill))
 
         side = ""
         ask: Optional[float] = None
@@ -408,12 +413,13 @@ class UpDownTrader:
 
         if not side:
             self.book.skipped_no_edge += 1
+            _req = (self.config.min_edge + 0.07 * (1.0 - float(up_fill or 0.5))) if live else self.config.min_edge
             reason = (
                 f"{truth_kind} {spot:,.0f} vs target {target:,.0f} ({delta:+,.0f}): "
                 f"fair {fair:.2f}, Kalshi up "
                 f"{('%.2f' % up_ask) if up_ask is not None else '--'} / down "
                 f"{('%.2f' % down_ask) if down_ask is not None else '--'} - "
-                f"best edge {max(up_edge, down_edge):+.3f} under {required:.3f}"
+                f"best edge {max(up_edge, down_edge):+.3f} under {_req:.3f}"
                 + (" (fee-aware)" if live else "")
             )
             if (up_fill is not None and up_fill >= self.config.max_entry_price) or (
@@ -556,9 +562,10 @@ class UpDownTrader:
                     self.book.skipped_sentinel += 1
                     return f"sentinel halt: {_reason}"[:200]
                 if _state == "caution":
+                    _kalshi_fee = 0.07 * (1.0 - float(signal.ask or 0.5)) if live else 0.0
                     _r = (
                         self.config.min_edge
-                        + (self.config.live_fee_rate if live else 0.0)
+                        + _kalshi_fee
                         + self.config.sentinel_caution_extra_edge
                     )
                     _fill = float(signal.ask or 0.0)
@@ -595,7 +602,7 @@ class UpDownTrader:
                     "streak": _streak,
                     "vol_pct": 0.0,
                     "headlines": "none",
-                    "required": self.config.min_edge + (self.config.live_fee_rate if live else 0.0),
+                    "required": 0.07 * (1.0 - float(signal.ask or 0.5)) if live else self.config.min_edge,
                 }
                 _veto = await _ai_veto.check_veto(self._ai_client, _clip, _venue_state)
                 if _veto:
@@ -1048,7 +1055,7 @@ class UpDownTrader:
                 "brti_state": _brti_state,
                 "required_edge": round(
                     self.config.min_edge
-                    + (self.config.live_fee_rate if live else 0.0)
+                    + (0.07 * (1.0 - float(signal.ask or 0.5)) if live else 0.0)
                     + _session_bump,
                     4,
                 ),

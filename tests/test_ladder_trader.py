@@ -327,7 +327,7 @@ def test_live_requires_the_fee_on_top_of_the_edge(monkeypatch):
     """A 6c edge clears DRY but not LIVE once the fee is taken out."""
     import src.jobs.ladder_trader as lt
 
-    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.53)
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.53)
     trader = _scorer()
     market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0)
     dry = trader.evaluate(market, live=False)
@@ -366,14 +366,14 @@ def test_out_of_band_entries_need_extra_edge(monkeypatch):
     import src.jobs.ladder_trader as lt
 
     # 9c of edge at a 0.55 fill (out-of-band, 0.50-0.60): not enough, needs 0.04 extra.
-    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.64)
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.64)
     trader = _scorer()
     market = _quoted_market(yes_ask=0.55, no_ask=0.45, target=84000.0)
     out = trader.evaluate(market, live=False)
     assert out is None or not out.actionable
 
     # 13c of edge at 0.55 (0.09 base + 0.04 out-of-band penalty): now it works.
-    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.68)
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.68)
     trader.book.skipped_no_edge = 0
     out2 = trader.evaluate(market, live=False)
     assert out2 is not None and out2.actionable
@@ -384,14 +384,14 @@ def test_the_no_side_is_preferred_when_edges_are_close(monkeypatch):
     import src.jobs.ladder_trader as lt
 
     # Tied edges: NO is chosen.
-    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.44)
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.44)
     trader = _scorer()
     market = _quoted_market(yes_ask=0.38, no_ask=0.50, target=84000.0)
     out = trader.evaluate(market, live=False)
     assert out is not None and out.side == "down"
 
     # YES clearly better (by more than the override margin): YES is chosen.
-    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n: 0.44)
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0: 0.44)
     trader.book.skipped_no_edge = 0
     market2 = _quoted_market(yes_ask=0.35, no_ask=0.50, target=84000.0)
     out2 = trader.evaluate(market2, live=False)

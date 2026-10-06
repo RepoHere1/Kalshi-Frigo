@@ -2658,21 +2658,35 @@ def api_dry_ledger():
 
 @app.route("/api/trades")
 def api_trades():
-    """Recent closed trades for veto replay harness (limit 500)."""
+    """Recent closed trades for veto replay harness (limit 500).
+
+    Each row includes the book mode (dry/live), the strategy name, and
+    the rationale string so the two books can be compared side-by-side.
+    Pass ?mode=dry or ?mode=live to filter to one book; omit for all.
+    """
     try:
         import aiosqlite
         import asyncio
         
+        mode_filter = request.args.get("mode", "").strip().lower()
+        if mode_filter in ("dry", "live"):
+            where = f"COALESCE(NULLIF(mode, ''), 'dry') = '{mode_filter}'"
+        else:
+            where = "1=1"
+        
         async def _fetch():
             async with aiosqlite.connect(DB_PATH) as db:
                 async with db.execute(
-                    "SELECT market_id, side, entry_price, pnl, quantity, exit_timestamp "
+                    "SELECT market_id, side, entry_price, pnl, quantity, "
+                    "exit_timestamp, mode, strategy, rationale, exit_reason "
                     "FROM trade_logs WHERE exit_timestamp IS NOT NULL "
+                    f"AND {where} "
                     "ORDER BY exit_timestamp DESC LIMIT 500"
                 ) as cur:
                     rows = await cur.fetchall()
             trades = []
-            for market_id, side, entry_price, pnl, quantity, exit_ts in rows:
+            for (market_id, side, entry_price, pnl, quantity, exit_ts,
+                 mode, strategy, rationale, exit_reason) in rows:
                 trades.append({
                     "market_id": market_id,
                     "side": side,
@@ -2680,8 +2694,12 @@ def api_trades():
                     "pnl": pnl,
                     "quantity": quantity,
                     "exit_timestamp": exit_ts,
+                    "mode": mode or "dry",
+                    "strategy": strategy or "",
+                    "rationale": rationale or "",
+                    "exit_reason": exit_reason or "",
                 })
-            return {"trades": trades}
+            return {"trades": trades, "mode_filter": mode_filter or "all"}
         
         return jsonify(asyncio.run(_fetch()))
     except Exception as e:
