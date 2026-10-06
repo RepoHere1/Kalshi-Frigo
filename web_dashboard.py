@@ -121,12 +121,14 @@ dashboard_state = {
 
 # Strategy control state
 strategy_state = {
+    "btc_updown": {"running": False, "pid": None, "mode": "paper"},
+    "btc_updown_copy": {"running": False, "pid": None, "mode": "paper"},
+    "btc_1h_updown": {"running": False, "pid": None, "mode": "paper"},
     "ai_directional": {"running": False, "pid": None, "mode": "paper"},
     "safe_compounder": {"running": False, "pid": None, "mode": "paper"},
     "beast_mode": {"running": False, "pid": None, "mode": "paper"},
     "market_making": {"running": False, "pid": None, "mode": "paper"},
     "quick_flip": {"running": False, "pid": None, "mode": "paper"},
-    "btc_updown": {"running": False, "pid": None, "mode": "live"},
 }
 
 # The command each strategy is actually run with. Every one is a distinct
@@ -139,6 +141,9 @@ strategy_state = {
 # that was already gone. `--loop` is what makes a strategy continuous, so it is
 # now part of the command rather than an afterthought.
 STRATEGY_COMMANDS: Dict[str, List[str]] = {
+    "btc_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
+    "btc_updown_copy": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
+    "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
     "ai_directional": ["cli.py", "run", "--paper", "--loop", "--interval", "300"],
     "safe_compounder": [
         "cli.py",
@@ -160,13 +165,15 @@ STRATEGY_COMMANDS: Dict[str, List[str]] = {
         "180",
     ],
     "quick_flip": ["cli.py", "run", "--quick-flip", "--paper", "--loop", "--interval", "120"],
-    "btc_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
 }
 
 # `trade_logs.strategy` and `positions.strategy` are written by the strategies
 # themselves and are not consistent with the dashboard's button names. Without
 # this map every card would read "unattributed" except ai_directional.
 STRATEGY_ALIASES = {
+    "btc_updown": "btc_updown",
+    "btc_updown_copy": "btc_updown_copy",
+    "btc_1h_updown": "btc_1h_updown",
     "ai_directional": "ai_directional",
     "ai directional": "ai_directional",
     "directional_trading": "ai_directional",
@@ -189,7 +196,6 @@ STRATEGY_ALIASES = {
     "quick_flip_scalping": "quick_flip",
     "quick flip": "quick_flip",
     "quick_flip_scalping_strategy": "quick_flip",
-    "btc_updown": "btc_updown",
 }
 
 # Alert webhooks
@@ -847,6 +853,22 @@ def _trading_setting(name: str, default: Any = None) -> Any:
 # Descriptions of what each runnable strategy actually does. Shown on the page so
 # the dashboard documents the system it is monitoring.
 STRATEGY_DOCS = {
+    "btc_updown": (
+        "BTC 15-min up/down",
+        'Reads Kalshi\'s own KXBTC15M contract - "BTC price up in next 15 mins?" - '
+        "and compares its Up/Down price against live Coinbase spot. Takes one $5 "
+        "clip only when the two disagree by more than the configured edge.",
+    ),
+    "btc_updown_copy": (
+        "BTC 15-min up/down #2",
+        'Identical to BTC 15-min: Reads Kalshi\'s KXBTC15M contract "BTC price up in next 15 mins?" - '
+        "and compares against live Coinbase spot.",
+    ),
+    "btc_1h_updown": (
+        "BTC 1-hour up/down",
+        'Reads Kalshi\'s BTC 1-hour up/down contract and compares its Up/Down price against '
+        "live Coinbase spot. Takes one $5 clip when profitable edge detected.",
+    ),
     "ai_directional": (
         "LLM directional",
         "Ingests Kalshi markets, scores each one with an LLM decision pass, then "
@@ -870,15 +892,6 @@ STRATEGY_DOCS = {
     "quick_flip": (
         "Quick flip scalping",
         "Short-horizon strategy that enters on momentum and exits on a small " "favourable move.",
-    ),
-    "btc_updown": (
-        "BTC 15-min up/down",
-        'Reads Kalshi\'s own KXBTC15M contract - "BTC price up in next 15 mins?" - '
-        "and compares its Up/Down price against live Coinbase spot. Takes one $5 "
-        "clip only when the two disagree by more than the configured edge, never "
-        "inside the noise band around the target, and never inside the 60-second "
-        "settlement window. Settlement is CF Benchmarks BRTI, so spot is a proxy "
-        "for it.",
     ),
 }
 
@@ -1827,9 +1840,9 @@ def _strategy_cards(
         card["win_rate"] = (
             round(100.0 * card["wins"] / card["trades"], 1) if card["trades"] else 0.0
         )
-    # REORDER: Put btc_updown first (BTC 15-min), then ai_directional (LLM), then the rest
+    # REORDER: Priority: btc_updown #1, btc_updown_copy #2, btc_1h_updown #3, then ai_directional, rest
     ordered = []
-    priority_order = ["btc_updown", "ai_directional", "beast_mode", "safe_compounder", "market_making", "quick_flip"]
+    priority_order = ["btc_updown", "btc_updown_copy", "btc_1h_updown", "ai_directional", "beast_mode", "safe_compounder", "market_making", "quick_flip"]
     for name in priority_order:
         if name in cards:
             ordered.append(cards[name])
