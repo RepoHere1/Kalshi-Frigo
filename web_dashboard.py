@@ -1780,13 +1780,6 @@ def _btc_keepalive_loop():
                 # "BOOK MODE GUARD" refusal and left the lane down forever.
                 spawn_mode = book_mode
                 _run_async(store.set_desired(name, True, spawn_mode))
-                # Clear the OTHER book's stale desired flag so the main
-                # supervisor stops seeing a LIVE desired=1 row while the page
-                # reads DRY and firing the BOOK MODE GUARD every pass. The
-                # always-on intent now lives on the current book's row alone.
-                for _other in ("paper", "live"):
-                    if _other != spawn_mode:
-                        _run_async(store.set_desired(name, False, _other))
                 try:
                     started = _spawn_strategy(name, spawn_mode)
                     _push_error(
@@ -4058,8 +4051,11 @@ def api_strategy_toggle(name):
     if db_running:
         print(f"[api_strategy_toggle] {name} is RUNNING (PID {db_pid}), executing STOP", flush=True)
         code = _stop_child({"pid": db_pid, "running": True})
-        _run_async(store.record_stop(name, "stopped by operator", mode))
-        _run_async(store.set_desired(name, False, mode))
+        # LAW: a Stop is GLOBAL permanent truth. The operator pressed one
+        # button; BOTH books remember it forever, so a stale desired=1 in the
+        # other book cannot resurrect the lane on a keep-alive pass or redeploy.
+        for _mb in ("paper", "live"):
+            _run_async(store.disarm(name, _mb, "stopped by operator"))
         _recorded_state()
         _broadcast("strategy", {"name": name, "action": "stopped"})
         print(f"[api_strategy_toggle] {name} STOPPED successfully", flush=True)
@@ -4147,6 +4143,13 @@ def api_strategy_toggle(name):
         print(f"[api_strategy_toggle] {name} SPAWN FAILED: {type(e).__name__}: {e}", flush=True)
         _push_error(f"Strategy start ({name}): {e}")
         return jsonify({"error": f"Failed to start: {e}"}), 500
+
+    # LAW: a Start is GLOBAL permanent truth too. Spawn only started the CURRENT
+    # book; arm the OTHER book's intent so a book switch or redeploy keeps the
+    # lane on, and clear any operator-stop the other book still remembered.
+    for _mb in ("paper", "live"):
+        if _mb != mode:
+            _run_async(store.arm(name, _mb))
 
     _broadcast("strategy", {"name": name, "action": "started", "pid": result["pid"]})
     return jsonify(result)
@@ -5552,7 +5555,7 @@ button.loading.yellow::after {
           <td><span class="tag">{{ p.side }}</span></td>
           <td class="num">{{ '%.3f'|format(p.entry_price) if p.entry_price is not none else '-' }}</td>
           <td class="num">{{ p.quantity }}</td>
-          <td class="num">{{ '%.2f'|format(p.cost_basis) if p.cost_basis is not none else '-' }}</td>
+          <td class="num">{{ '%.2f'|format(p.cost_basis) if p.cost_basis else '-' }}</td>
           <td><span class="tag">{{ p.strategy }}</span></td>
           <td class="num">{{ p.stop_loss if p.stop_loss is not none else '-' }}</td>
           <td class="num">{{ p.take_profit if p.take_profit is not none else '-' }}</td>

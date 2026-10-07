@@ -1011,12 +1011,12 @@ def test_toggle_refuses_when_only_api_key_present(client, auth, monkeypatch):
 
 
 def test_stopping_one_book_never_stops_the_other(client, auth, monkeypatch, tmp_path):
-    """DRY and LIVE are factually separate books.
+    """DRY and LIVE are factually separate books, but one button push is LAW.
 
-    One runtime row per strategy meant Stop in LIVE cleared the only record,
-    so DRY stopped too - the exact complaint. Each book now has its own row,
-    its own pid and its own desired flag; a Stop scoped to the current book
-    leaves the other book's row untouched.
+    Each book keeps its own row (its own pid), so a lane can run in both or
+    either. But the operator's Stop is GLOBAL permanent truth: pressing Stop
+    disarms the lane in BOTH books, so a stale desired=1 in the other book can
+    never resurrect it on a keep-alive pass or redeploy.
     """
     import asyncio
     import subprocess as sp
@@ -1033,7 +1033,7 @@ def test_stopping_one_book_never_stops_the_other(client, auth, monkeypatch, tmp_
         asyncio.run(
             store.record_start("btc_updown", proc.pid, "paper", "cli.py run --btc-updown")
         )
-        # The book is DRY (default). Stop must hit ONLY the DRY row.
+        # The book is DRY (default). Stop must disarm the lane in BOTH books.
         r = client.post("/api/strategy/btc_updown/toggle", json={}, headers=auth)
         assert r.status_code == 200
         body = r.get_json()
@@ -1043,9 +1043,10 @@ def test_stopping_one_book_never_stops_the_other(client, auth, monkeypatch, tmp_
         snap = asyncio.run(store.snapshot())
         assert snap[rt_key("btc_updown", "paper")]["pid"] is None
         assert snap[rt_key("btc_updown", "paper")]["stop_reason"] == "stopped by operator"
-        # The LIVE row is untouched: pid intact, still desired.
-        assert snap[rt_key("btc_updown", "live")]["pid"] == proc.pid
-        assert rt_key("btc_updown", "live") in asyncio.run(store.desired())
+        # The LIVE row is disarmed too: the operator's Stop is global LAW.
+        assert snap[rt_key("btc_updown", "live")]["pid"] is None
+        assert snap[rt_key("btc_updown", "live")]["stop_reason"] == "stopped by operator"
+        assert rt_key("btc_updown", "live") not in asyncio.run(store.desired())
     finally:
         proc.kill()
         try:

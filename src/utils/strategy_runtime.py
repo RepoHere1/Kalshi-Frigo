@@ -346,6 +346,34 @@ class StrategyRuntime:
             )
             await conn.commit()
 
+    async def arm(self, name: str, mode: str) -> None:
+        """Arm a lane for one book: desired=1 AND an explicit-operator-stop is
+        cleared, so a previous Stop never haunts this book's future starts. The
+        pid is left untouched here; the spawn path records it separately.
+        """
+        async with _conn(self.db_path) as conn:
+            await conn.execute(
+                "UPDATE strategy_runtime SET desired=1, stop_reason=NULL"
+                " WHERE name=? AND mode=?",
+                (name, mode),
+            )
+            await conn.commit()
+
+    async def disarm(self, name: str, mode: str, reason: str = "stopped by operator") -> None:
+        """Stop a lane for one book: desired=0 with an explicit operator reason.
+
+        This is the permanent-off signal that every supervisor must honour; a
+        disarm cannot be silently undone by a crash-resume or keep-alive.
+        """
+        async with _conn(self.db_path) as conn:
+            await conn.execute(
+                "UPDATE strategy_runtime SET desired=0, pid=NULL, stop_reason=?,"
+                " stopped_at=?"
+                " WHERE name=? AND mode=?",
+                (reason, _now(), name, mode),
+            )
+            await conn.commit()
+
     async def desired(self, mode: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
         """Every (strategy, book) pair the operator asked to keep running.
 
