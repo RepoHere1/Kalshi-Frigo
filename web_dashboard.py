@@ -3420,8 +3420,15 @@ def _recorded_state() -> Dict[str, Dict[str, Any]]:
     from src.utils.strategy_runtime import INSTANCE, owns_process
 
     recorded = _run_async(_runtime_store().snapshot())
+    book = _runtime_mode()
     for name, st in strategy_state.items():
         row = recorded.get(_runtime_key(name)) or {}
+        # The page renders ONE book, but strategy_state is
+        # reinitialised to its 'paper' defaults on every boot, so
+        # after a redeploy the LIVE page rendered its lanes as
+        # 'paper'. Re-stamp the mode word from the book in force.
+        if book is not None:
+            st["mode"] = book
         # Constant live proof: a heartbeat is stamped by the strategy process
         # itself every cycle. "running" is not a pid that exists - a recycled
         # pid, or a zombie, has a pid - it is a process whose own loop executed
@@ -3993,9 +4000,21 @@ def api_diagnostics():
     except Exception as e:
         diagnostics["database"]["connected"] = False
         diagnostics["database"]["error"] = str(e)
-    
+
+    # Raw strategy_runtime rows, both books: the ground truth
+    # behind the Start/Stop pills (pid, instance, desired,
+    # stop reason) for debugging button persistence.
+    try:
+        rows = _run_async(_runtime_store().snapshot())
+        diagnostics["strategy_runtime"] = {
+            k: {kk: vv for kk, vv in v.items() if kk != "start_ticks"}
+            for k, v in rows.items()
+        }
+    except Exception as e:  # noqa: BLE001 - diagnostics must never 500
+        diagnostics["strategy_runtime"] = {"error": str(e)}
+
     return jsonify(diagnostics)
-    
+
     # Add strategy state details
     for name, st in strategy_state.items():
         diagnostics["strategy_state"][name] = {
@@ -6668,9 +6687,17 @@ def start_background_workers():
          _log_tail_loop,
          _backup_loop,
          _market_data_loop,
-         # SUPERVISOR PERMANENTLY DISABLED - User demands button-only control
-         # _strategy_supervisor_loop,  # DEAD - no auto-management of strategies
-     ):
+         # Button-only control, with restart persistence. AUTO_START_ALL
+         # is False, so this loop NEVER starts an unpushed lane and
+         # NEVER kills anything (a stale heartbeat only alerts). What
+         # it does is honour the operator's own pushes across a
+         # redeploy: a lane with desired=1 whose process died with the
+         # container is resumed. With the loop disabled, every deploy
+         # silently stopped the whole book - the "strategies turn
+         # themselves off" the operator reported. The operator's Stop
+         # stays welded: desired=0 lanes are not touched.
+         _strategy_supervisor_loop,
+    ):
         threading.Thread(target=target, daemon=True).start()
 
 
