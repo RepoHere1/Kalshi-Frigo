@@ -1944,7 +1944,7 @@ def test_every_strategy_runs_its_own_command(client):
     'strategies' ended up being one bot.
 
     The UP/DOWN lanes are the deliberate exception: btc_updown,
-    btc_updown_copy and btc_1h_updown are separate operator-pushed
+    doge_updown and btc_1h_updown are separate operator-pushed
     lanes of the same --btc-updown trader.
     """
     _seed_cards(client)
@@ -1957,7 +1957,7 @@ def test_every_strategy_runs_its_own_command(client):
         if list(commands.values()).count(cmd) > 1
     }
     # Only the UP/DOWN family may share, and only on the updown trader.
-    assert set(shared) <= {"btc_updown", "btc_updown_copy", "btc_1h_updown"}
+    assert set(shared) <= {"btc_updown", "doge_updown", "btc_1h_updown"}
     for cmd in shared.values():
         assert "--btc-updown" in cmd
 
@@ -2010,7 +2010,7 @@ def test_card_reports_its_own_command(client):
         for name, cmd in commands.items()
         if list(commands.values()).count(cmd) > 1
     }
-    assert set(shared) <= {"btc_updown", "btc_updown_copy", "btc_1h_updown"}
+    assert set(shared) <= {"btc_updown", "doge_updown", "btc_1h_updown"}
     assert "--market-making" in commands["market_making"]
     assert "--quick-flip" in commands["quick_flip"]
     # A strategy that runs once and exits must not report itself as running.

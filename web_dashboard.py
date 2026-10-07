@@ -122,7 +122,7 @@ dashboard_state = {
 # Strategy control state
 strategy_state = {
     "btc_updown": {"running": False, "pid": None, "mode": "paper"},
-    "btc_updown_copy": {"running": False, "pid": None, "mode": "paper"},
+    "doge_updown": {"running": False, "pid": None, "mode": "paper"},
     "btc_1h_updown": {"running": False, "pid": None, "mode": "paper"},
     "ai_directional": {"running": False, "pid": None, "mode": "paper"},
     "safe_compounder": {"running": False, "pid": None, "mode": "paper"},
@@ -142,7 +142,7 @@ strategy_state = {
 # now part of the command rather than an afterthought.
 STRATEGY_COMMANDS: Dict[str, List[str]] = {
     "btc_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
-    "btc_updown_copy": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
+    "doge_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
     "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
     "ai_directional": ["cli.py", "run", "--paper", "--loop", "--interval", "300"],
     "safe_compounder": [
@@ -172,7 +172,7 @@ STRATEGY_COMMANDS: Dict[str, List[str]] = {
 # this map every card would read "unattributed" except ai_directional.
 STRATEGY_ALIASES = {
     "btc_updown": "btc_updown",
-    "btc_updown_copy": "btc_updown_copy",
+    "doge_updown": "doge_updown",
     "btc_1h_updown": "btc_1h_updown",
     "ai_directional": "ai_directional",
     "ai directional": "ai_directional",
@@ -867,10 +867,11 @@ STRATEGY_DOCS = {
         "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
         "the current book every second of every day.",
     ),
-    "btc_updown_copy": (
-        "BTC 15-min up/down #2",
-        'Identical to BTC 15-min: Reads Kalshi\'s KXBTC15M contract "BTC price up in next 15 mins?" - '
-        "and compares against live Coinbase spot. "
+    "doge_updown": (
+        "DOGE 15-min up/down",
+        'Reads Kalshi\'s DOGE 15-min up/down contract and compares its Up/Down price '
+        "against live Coinbase spot. Takes one $5 clip only when the two disagree "
+        "by more than the configured edge. "
         "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
         "the current book every second of every day.",
     ),
@@ -1656,7 +1657,7 @@ def _strategy_supervisor_loop():
 # explicit exception - the operator's instruction is that they run
 # always, in DRY and in LIVE, and this loop is the only thing
 # allowed to arm a lane without a fresh button push.
-BTC_ALWAYS_ON = ("btc_updown", "btc_updown_copy", "btc_1h_updown")
+BTC_ALWAYS_ON = ("btc_updown", "doge_updown", "btc_1h_updown")
 
 
 def _btc_keepalive_loop():
@@ -1997,9 +1998,9 @@ def _strategy_cards(
         card["win_rate"] = (
             round(100.0 * card["wins"] / card["trades"], 1) if card["trades"] else 0.0
         )
-    # REORDER: Priority: btc_updown #1, btc_updown_copy #2, btc_1h_updown #3, then ai_directional, rest
+    # REORDER: Priority: btc_updown #1, doge_updown #2, btc_1h_updown #3, then ai_directional, rest
     ordered = []
-    priority_order = ["btc_updown", "btc_updown_copy", "btc_1h_updown", "ai_directional", "beast_mode", "safe_compounder", "market_making", "quick_flip"]
+    priority_order = ["btc_updown", "doge_updown", "btc_1h_updown", "ai_directional", "beast_mode", "safe_compounder", "market_making", "quick_flip"]
     for name in priority_order:
         if name in cards:
             ordered.append(cards[name])
@@ -3529,47 +3530,6 @@ def _stop_child(st):
     return code
 
 
-def _kill_child(st):
-    """Hard-kill a strategy process immediately: SIGKILL, no graceful wait.
-
-    This is the Kill-all path: unlike _stop_child (SIGTERM, then SIGKILL
-    only if the process lingers 10s), a hard kill takes the process down
-    now, mid-cycle if it has to. Returns the exit code when the OS reports
-    it, so the page can say what happened.
-    """
-    pid = st.get("pid")
-    if not pid:
-        return None
-    proc = _child_procs.get(pid)
-    code: Optional[int] = None
-    if proc is not None:
-        # Preferred path: the Popen object works identically on every platform.
-        try:
-            proc.kill()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:  # noqa: BLE001 - already SIGKILLed
-                pass
-            code = getattr(proc, "returncode", None)
-        except (OSError, ValueError):
-            pass
-        _child_procs.pop(pid, None)
-    else:
-        # No Popen reference (started by another worker, or the dashboard
-        # restarted). Fall back to a direct signal. SIGKILL does not exist
-        # on Windows, and on Windows signalling anything but CTRL_* terminates
-        # the target outright - which is what we want here anyway.
-        import signal
-
-        try:
-            os.kill(pid, getattr(signal, "SIGKILL", 9))
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    st["running"] = False
-    st["pid"] = None
-    return code
-
-
 def _runtime_store():
     from src.utils.strategy_runtime import StrategyRuntime
 
@@ -4144,57 +4104,6 @@ def api_strategy_toggle(name):
 
     _broadcast("strategy", {"name": name, "action": "started", "pid": result["pid"]})
     return jsonify(result)
-
-
-@app.route("/api/strategies/kill", methods=["POST"])
-def api_strategies_kill():
-    """Kill all: immediately hard-kill every running strategy in the
-    current book and record an operator stop so they stay down.
-
-    This is the emergency button. Unlike a Stop (a graceful SIGTERM
-    that lets a cycle finish), a kill takes each process down now.
-    The kill is scoped to the book the page is in, and every kill is
-    recorded as an operator stop (desired=0), so neither the main
-    supervisor nor the BTC keep-alive resurrects a killed lane - the
-    button is law, and a killed lane stays down until Start is
-    pressed in this book again.
-    """
-    denied = require_token()
-    if denied is not None:
-        return denied
-    book_mode = _current_book_mode()
-    if book_mode is None:
-        # THE LAW: never act on a guessed book. A kill is the most
-        # destructive button on the page; refusing is the only safe
-        # answer when the book cannot be read.
-        return (
-            jsonify(
-                {
-                    "error": (
-                        "Trading book is unknown right now (mode read failed). "
-                        "Refusing to kill so the wrong book is never touched - "
-                        "retry in a moment."
-                    )
-                }
-            ),
-            503,
-        )
-    runtime_mode = "live" if book_mode == "live" else "paper"
-    store = _runtime_store()
-    snapshot = _run_async(store.snapshot(mode=runtime_mode))
-    killed = []
-    for name in strategy_state:
-        row = snapshot.get(_runtime_key(name)) or {}
-        pid = row.get("pid")
-        if pid and _pid_alive(pid, row):
-            code = _kill_child({"pid": pid, "running": True})
-            _run_async(
-                store.record_stop(name, "stopped by operator", runtime_mode)
-            )
-            killed.append({"name": name, "pid": pid, "exit_code": code})
-    _recorded_state()
-    _broadcast("strategy", {"name": "*", "action": "killed"})
-    return jsonify({"killed": killed, "book": book_mode})
 
 
 @app.route("/api/diagnostics")
@@ -5283,9 +5192,6 @@ button.loading.yellow::after {
     <span class="bar">
       <button id="startAllBtn" onclick="startAll()">{{ 'Start all in LIVE' if s.mode.mode == 'live' else 'Start all in DRY' }}</button>
       <button onclick="stopAll()">Stop all</button>
-      {%- if s.mode.mode == 'live' %}
-      <button class="danger" onclick="killAll()">Kill all LIVE</button>
-      {%- endif %}
     </span>
   </div>
   {%- if s.mode.mode == 'live' %}
@@ -6888,26 +6794,6 @@ async function stopAll() {
 // records an operator stop so neither supervisor resurrects a
 // killed lane. The button is law: killed lanes stay down until
 // Start is pressed here again.
-async function killAll() {
-  const book = (SNAPSHOT.mode && SNAPSHOT.mode.mode) === 'live' ? 'LIVE' : 'DRY';
-  const names = (SNAPSHOT.strategy_cards || []).filter(c => c.running).map(c => c.name);
-  if (!names.length) {
-    note('kill all: nothing was running in ' + book);
-    return;
-  }
-  if (!confirm('KILL ALL ' + book + '\n\nImmediately hard-kill '
-    + names.length + ' running strategies. They stay stopped until you press Start. Continue?')) {
-    note('kill all cancelled');
-    return;
-  }
-  try {
-    const r = await fetch('/api/strategies/kill', { method: 'POST', headers: authHeaders() });
-    const d = await r.json().catch(() => ({}));
-    if (d.error) { note('kill failed: ' + d.error); return; }
-    note('killed: ' + ((d.killed || []).map(k => k.name).join(', ') || 'nothing'));
-  } catch (e) { note('kill failed: ' + e); }
-}
-
 // Collapse the live feed panel. It is tall and its numbers tick continuously,
 // so it earns the right to be folded away once you have read it.
 function toggleFeeds() {
