@@ -5578,7 +5578,7 @@ button.loading.yellow::after {
     <div class="ph"><h2>Recent closed trades</h2><span class="note">{{ s.recent_trades|length }} most recent &middot; every close is kept forever</span><span class="bar"><button onclick="showAnalysis()">ANALYSIS OF</button></span></div>
     {%- if s.recent_trades %}
     <div class="scroll">
-    <table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Qty</th><th class="num">USD</th><th class="num">P&amp;L</th><th>Strategy</th><th>Exited</th></tr></thead><tbody>
+    <table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Qty</th><th class="num">BUY AMT $$$</th><th class="num">P&amp;L</th><th>Strategy</th><th>Exited</th></tr></thead><tbody>
     {%- for t in s.recent_trades %}
       <tr>
         <td class="mono" title="{{ t.market_id }}">{{ t.market_id[:24] }}</td>
