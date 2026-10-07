@@ -1,5 +1,12 @@
 # AGENTS.md — Agent Guide for Kalshi-Frigo
 
+> Always communicate with the user in English, including plans, explanations, questions, summaries, and help responses. Preserve code identifiers and existing file languages unless explicitly asked to translate them.
+
+## Assistant Communication Rules
+
+- Respond in English only, including explanations, questions, plans, summaries, and help responses.
+- Do not change code identifiers or translate existing files unless asked.
+
 ## Project Overview
 
 AI-automated trading toolkit for [Kalshi](https://kalshi.com) prediction markets. Python 3.12+ async codebase with LLM-driven decision making (OpenRouter), SQLite telemetry, and a Streamlit dashboard.

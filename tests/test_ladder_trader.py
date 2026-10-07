@@ -279,12 +279,23 @@ def test_the_opposite_side_of_the_same_contract_is_still_blocked():
 
 def test_an_entry_under_min_win_prob_is_refused():
     trader = UpDownTrader(SpotFeed(), Btc15mFeed())
-    # fair=0.89 for up -> win_prob 0.89 passes; a DOWN clip on fair 0.89 has
-    # win_prob 0.11, which is below min_win_prob 0.60.
+    # fair=0.89 for up -> a DOWN clip has win_prob 0.11, below min_win_prob 0.60.
+    # A MARGINAL edge (under the 0.25 override) is still refused by the floor;
+    # only a large genuine dislocation overrides it.
     down = _signal("KXBTC15M-26OCT011715-15", side="down", ask=0.5, contracts=8)
+    down.edge = 0.10
     blocked = trader._entry_block(down, [])
     assert "win probability" in blocked
     assert trader.book.skipped_low_prob == 1
+
+
+def test_a_large_edge_overrides_min_win_prob():
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed())
+    # Same sub-0.60 win_prob (0.11 on down), but a big edge is a genuine
+    # dislocation and must NOT be refused - Kelly exists for exactly this.
+    down = _signal("KXBTC15M-26OCT011715-15", side="down", ask=0.5, contracts=8)
+    down.edge = 0.40
+    assert trader._entry_block(down, []) == ""
 
 
 def test_the_notional_cap_stops_accumulation():

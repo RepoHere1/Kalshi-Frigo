@@ -65,28 +65,31 @@ MAX_CLIPS_PER_TICKER = 1
 # never to reopen the $0.90+ "4%-win" band (that hard block stays global).
 ASSET_TUNING: Dict[str, Dict[str, float]] = {
     "DOGE-USD": {
-        "noise_pct": 0.005,           # ~0.5% of price (~$0.00045) vs BTC's 0.02%
+        "noise_pct": 0.0005,          # ~0.05% of price (~$0.00004): DOGE's real
+                                      # 15-min move is tiny; 0.5% parked it all day
         "max_entry_price": 0.70,
         "max_entry_price_maker": 0.88,
         "sweet_band_low": 0.20,
         "sweet_band_high": 0.65,
     },
     "HYPE-USD": {
-        "noise_pct": 0.002,           # ~0.2% of price (~$0.18) vs BTC's 0.02%
+        "noise_pct": 0.001,           # ~0.1% of price (~$0.09): HYPE moves more,
+                                      # but 0.2% only ever sat inside the band
         "max_entry_price": 0.70,
         "max_entry_price_maker": 0.88,
         "sweet_band_low": 0.20,
         "sweet_band_high": 0.70,
     },
     "ETH-USD": {
-        "noise_pct": 0.001,
+        "noise_pct": 0.0002,          # ~0.02% of price (~$0.51): ETH is a large
+                                      # asset like BTC; 0.1% was far too wide
         "max_entry_price": 0.60,
         "max_entry_price_maker": 0.85,
         "sweet_band_low": 0.20,
         "sweet_band_high": 0.50,
     },
     "SOL-USD": {
-        "noise_pct": 0.003,
+        "noise_pct": 0.0006,          # ~0.06% of price: tightened, still above BTC
         "max_entry_price": 0.65,
         "max_entry_price_maker": 0.88,
         "sweet_band_low": 0.20,
@@ -253,6 +256,11 @@ class UpDownConfig:
     # anti-churn rule - repeated buys of the same contract are allowed, but only
     # while the contract is still more likely than not to pay.
     min_win_prob: float = 0.60
+    # A sufficiently large edge overrides the min_win_prob floor: a genuine
+    # mispricing is the trade Kelly exists for, even when the model's absolute
+    # probability on the chosen side sits under 0.60 (common on short-odds
+    # DOWN legs). Below this edge, the floor still blocks coin-flip churn.
+    min_win_prob_edge_override: float = 0.25
     # SURVIVAL / HYPER-CAUTION: when the real balance is at or below
     # `survival_floor_usd`, the book is one losing clip from being unable to
     # trade at all (no outside funding will ever arrive). So it raises the bar
@@ -1007,7 +1015,12 @@ class UpDownTrader:
             )
 
         win_prob = signal.fair if signal.side == "up" else 1.0 - signal.fair
-        if win_prob < self.config.min_win_prob:
+        # min_win_prob stops coin-flip churn, but it must never refuse a large
+        # genuine dislocation: a +0.25+ edge means the market is dramatically
+        # mispriced, and the model's absolute probability (which can be 0.4x for
+        # a short-odds DOWN contract) is not the decision - the edge is. Apply
+        # the floor only to marginal edges, not to the trades Kelly exists for.
+        if win_prob < self.config.min_win_prob and signal.edge < self.config.min_win_prob_edge_override:
             self.book.skipped_low_prob += 1
             return (
                 f"win probability {win_prob:.2f} below "

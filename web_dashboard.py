@@ -1718,16 +1718,30 @@ def _btc_keepalive_loop():
                 # is currently viewing.
                 row = None
                 from src.utils.strategy_runtime import key as _rt_key
-                for mode_word in ("paper", "live"):
-                    lookup = snapshot.get(_rt_key(name, mode_word))
-                    if lookup and lookup.get("desired", 0) == 1:
-                        row = lookup
-                        break
-                    if lookup and lookup.get("desired", 0) == 0 and (lookup.get("stop_reason") or "") in _OPERATOR_STOP_REASONS:
-                        row = lookup
-                        break
+                # The always-on lanes run in WHICHEVER book the page is in. A
+                # stale child armed under the OTHER book (before a switch) must
+                # be killed or it keeps scoring as DRY while the page reads LIVE
+                # - the exact duplicate-process mess. So: kill any child whose
+                # book word disagrees with the current book, then arm ONLY the
+                # current book.
+                other_word = "paper" if book_mode == "live" else "live"
+                other_row = snapshot.get(_rt_key(name, other_word))
+                if other_row and other_row.get("pid") and _pid_alive(other_row["pid"], other_row):
+                    try:
+                        _stop_child({"pid": other_row["pid"], "running": True})
+                        _run_async(store.disarm(name, other_word, "book switch"))
+                        _push_error(
+                            f"BTC keep-alive: killed stale {other_word.upper()} "
+                            f"child of {name} (book is now {book_mode.upper()})."
+                        )
+                    except Exception:  # noqa: BLE001 - a dead pid is fine
+                        pass
+                row = snapshot.get(_rt_key(name, book_mode))
                 if row is None:
-                    continue
+                    # No current-book row yet. The always-on lanes are wanted
+                    # unless the operator explicitly stopped them in the other
+                    # book; arm the current book so they come up here too.
+                    row = {}
                 if (row.get("desired") == 0) and (
                     (row.get("stop_reason") or "") in _OPERATOR_STOP_REASONS
                 ):
