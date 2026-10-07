@@ -219,7 +219,13 @@ def _now():
 
 def _push_error(message):
     """Record an error, keeping the buffer bounded so long-lived
-    containers don't accumulate memory."""
+    containers don't accumulate memory.
+
+    Also printed to stdout: the in-memory buffer is invisible to
+    `railway logs`, which is how a supervisor crashing every 10
+    seconds went unnoticed for a full deploy cycle.
+    """
+    print(f"[error] {message}", flush=True)
     dashboard_state["errors"].append({"time": _now(), "error": message})
     if len(dashboard_state["errors"]) > MAX_ERRORS:
         del dashboard_state["errors"][: len(dashboard_state["errors"]) - MAX_ERRORS]
@@ -1537,6 +1543,12 @@ def _strategy_supervisor_loop():
                 # by definition, not a crash.
                 from src.utils.strategy_runtime import INSTANCE
 
+                # Bound here, not only in the alive-path above: the
+                # respawn guard below reads it, and an unbound read
+                # raised UnboundLocalError every cycle - which killed
+                # the whole resume pass silently (the error only went
+                # to the in-memory feed, never to the logs).
+                started = row.get("started_at")
                 stale_instance = bool(row_pid) and (row.get("instance") or "") != INSTANCE
                 if stale_instance:
                     # "Run until I say otherwise" has to survive a
