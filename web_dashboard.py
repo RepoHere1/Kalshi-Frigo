@@ -1422,18 +1422,22 @@ def _strategy_supervisor_loop():
             if AUTO_START_ALL and not _creds_present():
                 time.sleep(10)
                 continue
-            # THIS BOOK ONLY. DRY and LIVE are separate books with separate
-            # runtime rows; the supervisor manages whichever book the page is
-            # in and never touches the other one. Stopping a strategy in LIVE
-            # therefore leaves DRY's own state exactly as it was.
-            # An unreadable book means NO book: spawn nothing rather than
-            # guess, because a guessed book is how LIVE lanes got armed
-            # without a single operator push.
+            # ALL BOOKS — the operator's button is permanent law.
+            # Stopping a strategy in LIVE must never affect DRY, and
+            # vice versa. The supervisor must manage BOTH books so
+            # that a button push is respected regardless of which
+            # book the page is currently viewing. If the page reads
+            # LIVE and the operator pressed Stop, the LIVE lane stays
+            # off even if the page is viewing DRIED.
+            #
+            # An unreadable book means NO book: spawn nothing rather
+            # than guess, because a guessed book is how LIVE lanes got
+            # armed without a single operator push.
             book_mode = _runtime_mode()
             if book_mode is None:
                 time.sleep(10)
                 continue
-            wanted = _run_async(store.desired(mode=book_mode))
+            wanted = _run_async(store.desired())
             # Every DRY lane is wanted from boot. Stopping a lane clears
             # its `desired` flag and it stays down; nothing else takes
             # a strategy out of service. That inverts the old failure
@@ -1449,12 +1453,20 @@ def _strategy_supervisor_loop():
             # itself - this exact path is what turned the LIVE LLM strategy
             # on behind a DRY button push.
             if AUTO_START_ALL and book_mode == "dry":
-                recorded = _run_async(store.snapshot(mode=book_mode))
+                recorded = _run_async(store.snapshot())
 
                 for name in strategy_state:
-                    if _runtime_key(name) in wanted:
+                    # Check if this strategy is wanted in ANY book.
+                    is_wanted = any(
+                        v.get("desired", 0) == 1
+                        for v in wanted.values()
+                    )
+                    if is_wanted:
                         continue
-                    row = recorded.get(_runtime_key(name))
+                    # Look up the row for the CURRENT book only
+                    # (AUTO_START is a DRIED convenience).
+                    this_key = _runtime_key(name)
+                    row = recorded.get(this_key) if this_key else None
                     # LAW + cost guard: heavy API abusers (quick_flip) are never
                     # auto-started onto a book with no record. The operator left
                     # them OFF on purpose; AUTO_START_ALL must not resurrect
@@ -1568,7 +1580,7 @@ def _strategy_supervisor_loop():
                 if not _creds_present():
                     continue  # nothing to start with; wait for configuration
 
-                mode = book_mode
+                mode = row.get("mode", book_mode)
                 backoff = failures.get(name, 0.0)
                 
                 # IRONCLAD PERMANENT FIX: NEVER GIVE UP ON desired=True
@@ -1675,18 +1687,31 @@ def _btc_keepalive_loop():
                 time.sleep(1)
                 continue
             store = _runtime_store()
-            snapshot = _run_async(store.snapshot(mode=book_mode))
+            snapshot = _run_async(store.snapshot())
             for name in BTC_ALWAYS_ON:
-                row = snapshot.get(_runtime_key(name)) or {}
                 # THE BUTTON IS LAW. An operator Stop is
                 # permanent truth, even for these three.
                 # The keep-alive keeps a lane ON only while
                 # the operator wants it on: a lane stopped by
-                # hand in this book stays down until Start is
+                # hand in THIS BOOK stays down until Start is
                 # pressed here again - this loop never changes
                 # a pushed button. A crash (desired still 1)
                 # or a lane never pushed is not a decision, so
                 # those come back up.
+                # Check BOTH books — the button state must be
+                # respected regardless of which book the page
+                # is currently viewing.
+                row = None
+                for mode_word in ("paper", "live"):
+                    lookup = snapshot.get(_rt_key(name, mode_word))
+                    if lookup and lookup.get("desired", 0) == 1:
+                        row = lookup
+                        break
+                    if lookup and lookup.get("desired", 0) == 0 and (lookup.get("stop_reason") or "") in _OPERATOR_STOP_REASONS:
+                        row = lookup
+                        break
+                if row is None:
+                    continue
                 if (row.get("desired") == 0) and (
                     (row.get("stop_reason") or "") in _OPERATOR_STOP_REASONS
                 ):
@@ -1731,11 +1756,12 @@ def _btc_keepalive_loop():
                         except Exception:  # noqa: BLE001 - malformed stamp
                             pass
                 # Not running (or just killed): arm it and start it.
-                _run_async(store.set_desired(name, True, book_mode))
+                spawn_mode = row.get("mode", book_mode)
+                _run_async(store.set_desired(name, True, spawn_mode))
                 try:
-                    started = _spawn_strategy(name, book_mode)
+                    started = _spawn_strategy(name, spawn_mode)
                     _push_error(
-                        f"BTC keep-alive: {name} ON in {book_mode.upper()} "
+                        f"BTC keep-alive: {name} ON in {spawn_mode.upper()} "
                         f"(pid {started['pid']})."
                     )
                 except Exception as exc:  # noqa: BLE001 - retry next pass
