@@ -2085,7 +2085,7 @@ _SQL_STRATEGY = (
 )
 _SQL_RECENT = (
     "SELECT market_id, side, entry_price, exit_price, quantity, pnl,"
-    " exit_timestamp, rationale, strategy FROM trade_logs WHERE {book}"
+    " entry_price * quantity AS cost_basis, exit_timestamp, rationale, strategy FROM trade_logs WHERE {book}"
     " ORDER BY exit_timestamp DESC LIMIT 25"
 )
 _SQL_EQUITY = (
@@ -2217,12 +2217,15 @@ def _row_breakdown(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _row_positions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out = []
     for r in rows:
+        _qty = float(r.get("quantity") or 0)
+        _entry = float(r.get("entry_price") or 0.0)
         out.append(
             {
                 "market_id": r.get("market_id"),
                 "side": r.get("side"),
                 "entry_price": r.get("entry_price"),
                 "quantity": r.get("quantity"),
+                "cost_basis": round(_qty * _entry, 2) if _qty and _entry else 0.0,
                 "strategy": r.get("strategy") or "unknown",
                 "stop_loss": r.get("stop_loss_price"),
                 "take_profit": r.get("take_profit_price"),
@@ -2251,12 +2254,15 @@ def _truth_positions_for_live(
     for r in account.get("markets", []):
         if r["ticker"] in seen:
             continue
+        _qty = float(r.get("shares") or 0)
+        _entry = 0.0
         out.append(
             {
                 "market_id": r["ticker"],
                 "side": "long" if r["shares"] > 0 else "short",
                 "entry_price": None,
                 "quantity": r["shares"],
+                "cost_basis": round(_qty * _entry, 2),
                 "strategy": "kalshi_api",
                 "stop_loss": None,
                 "take_profit": None,
@@ -2477,6 +2483,7 @@ def build_snapshot() -> Dict[str, Any]:
     recent = []
     for r in recent_r:
         r["pnl"] = round(float(r.get("pnl") or 0.0), 2)
+        r["cost_basis"] = round(float(r.get("cost_basis") or 0.0), 2)
         r["strategy"] = r.get("strategy") or "unattributed"
         recent.append(r)
 
@@ -2948,7 +2955,8 @@ def api_trades():
             async with aiosqlite.connect(DB_PATH) as db:
                 async with db.execute(
                     "SELECT market_id, side, entry_price, pnl, quantity, "
-                    "exit_timestamp, mode, strategy, rationale, exit_reason "
+                    "exit_timestamp, mode, strategy, rationale, exit_reason, "
+                    "entry_price * quantity AS cost_basis "
                     "FROM trade_logs WHERE exit_timestamp IS NOT NULL "
                     f"AND {where} "
                     "ORDER BY exit_timestamp DESC LIMIT 500"
@@ -2956,13 +2964,14 @@ def api_trades():
                     rows = await cur.fetchall()
             trades = []
             for (market_id, side, entry_price, pnl, quantity, exit_ts,
-                 mode, strategy, rationale, exit_reason) in rows:
+                 mode, strategy, rationale, exit_reason, cost_basis) in rows:
                 trades.append({
                     "market_id": market_id,
                     "side": side,
                     "entry_price": entry_price,
                     "pnl": pnl,
                     "quantity": quantity,
+                    "cost_basis": round(float(cost_basis or 0.0), 2),
                     "exit_timestamp": exit_ts,
                     "mode": mode or "dry",
                     "strategy": strategy or "",
@@ -3300,6 +3309,7 @@ def api_positions():
         for p in positions:
             result.append(
                 {
+                    "cost_basis": round(float(p.quantity or 0) * float(p.entry_price or 0), 2),
                     "id": p.id,
                     "market_id": p.market_id,
                     "side": p.side,
@@ -5515,7 +5525,7 @@ button.loading.yellow::after {
     <div class="ph"><h2>Open positions</h2><span class="note">{{ s.positions|length }} row{{ '' if s.positions|length == 1 else 's' }}{% if live and s.stale_live_rows %} &middot; {{ s.stale_live_rows }} stale local row{{ '' if s.stale_live_rows == 1 else 's' }} settled on Kalshi, not shown{% endif %}</span></div>
     <div class="scroll">
       {%- if s.positions %}
-      <table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th class="num">Entry</th><th class="num">Qty</th><th>Strategy</th><th class="num">SL</th><th class="num">TP</th></tr></thead><tbody id="posBody">
+      <table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th class="num">Entry</th><th class="num">Qty</th><th class="num">USD</th><th>Strategy</th><th class="num">SL</th><th class="num">TP</th></tr></thead><tbody id="posBody">
       {%- for p in s.positions %}
         <tr>
           <td class="mono" title="{{ p.market_id }}">{{ p.market_id[:26] }}</td>
@@ -5523,6 +5533,7 @@ button.loading.yellow::after {
           <td><span class="tag">{{ p.side }}</span></td>
           <td class="num">{{ '%.3f'|format(p.entry_price) if p.entry_price is not none else '-' }}</td>
           <td class="num">{{ p.quantity }}</td>
+          <td class="num">{{ '%.2f'|format(p.cost_basis) if p.cost_basis is not none else '-' }}</td>
           <td><span class="tag">{{ p.strategy }}</span></td>
           <td class="num">{{ p.stop_loss if p.stop_loss is not none else '-' }}</td>
           <td class="num">{{ p.take_profit if p.take_profit is not none else '-' }}</td>
@@ -5567,7 +5578,7 @@ button.loading.yellow::after {
     <div class="ph"><h2>Recent closed trades</h2><span class="note">{{ s.recent_trades|length }} most recent &middot; every close is kept forever</span><span class="bar"><button onclick="showAnalysis()">ANALYSIS OF</button></span></div>
     {%- if s.recent_trades %}
     <div class="scroll">
-    <table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Qty</th><th class="num">P&amp;L</th><th>Strategy</th><th>Exited</th></tr></thead><tbody>
+    <table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Qty</th><th class="num">USD</th><th class="num">P&amp;L</th><th>Strategy</th><th>Exited</th></tr></thead><tbody>
     {%- for t in s.recent_trades %}
       <tr>
         <td class="mono" title="{{ t.market_id }}">{{ t.market_id[:24] }}</td>
@@ -5576,6 +5587,7 @@ button.loading.yellow::after {
         <td class="num">{{ '%.3f'|format(t.entry_price) }}</td>
         <td class="num">{{ '%.3f'|format(t.exit_price) }}</td>
         <td class="num">{{ t.quantity }}</td>
+        <td class="num">{{ '%.2f'|format(t.get('cost_basis', 0)) if t.get('cost_basis') is not none else '-' }}</td>
         <td class="num {{ 'up' if t.pnl > 0 else ('down' if t.pnl < 0 else 'flat') }}">{{ t.pnl }}</td>
         <td><span class="tag">{{ t.strategy }}</span></td>
         <td class="mono" style="color:var(--faint)">{{ (t.exit_timestamp or '')[:16] }}</td>

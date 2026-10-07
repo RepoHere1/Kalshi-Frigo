@@ -528,6 +528,8 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                 logger.error(f"LIVE settlement reconciliation failed: {exc}")
 
         # Step 2: Continue with existing position tracking (market resolution, etc.)
+        # Use get_open_live_positions() which resolves the current book mode
+        # from the DB path, matching the mode computed above.
         open_positions = await db_manager.get_open_live_positions()
 
         if not open_positions:

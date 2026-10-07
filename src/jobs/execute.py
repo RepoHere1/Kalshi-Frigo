@@ -624,8 +624,11 @@ async def place_profit_taking_orders(
     results = {"orders_placed": 0, "positions_processed": 0}
 
     try:
-        # Get all open live positions
-        positions = await db_manager.get_open_live_positions()
+        # Get all open positions in the book currently being traded.
+        # Use get_open_live_positions(mode=) which resolves the correct
+        # book_clause for the mode (dry matches NULL too).
+        mode = MODE_LIVE if live_mode else MODE_DRY
+        positions = await db_manager.get_open_live_positions(mode=mode)
 
         if not positions:
             logger.info("No open positions to process for profit taking")
@@ -784,8 +787,11 @@ async def place_stop_loss_orders(
     results = {"orders_placed": 0, "positions_processed": 0}
 
     try:
-        # Get all open live positions
-        positions = await db_manager.get_open_live_positions()
+        # Get all open positions in the book currently being traded.
+        # Use get_open_live_positions(mode=) which resolves the correct
+        # book_clause for the mode.
+        mode = MODE_LIVE if live_mode else MODE_DRY
+        positions = await db_manager.get_open_live_positions(mode=mode)
 
         if not positions:
             logger.info("No open positions to process for stop-loss orders")

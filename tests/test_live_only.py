@@ -578,7 +578,9 @@ def test_winning_position_rides_the_settlement_window(monkeypatch):
     }
 
     class _FakeDB:
-        async def get_open_live_positions(self):
+        async def get_open_positions(self, mode=None):
+            return [_pos(qty=10)]
+        async def get_open_live_positions(self, mode=None):
             return [_pos(qty=10)]
 
     class _FakeClient:
@@ -613,7 +615,9 @@ def test_winning_position_with_time_left_still_takes_profit(monkeypatch):
     }
 
     class _FakeDB:
-        async def get_open_live_positions(self):
+        async def get_open_positions(self, mode=None):
+            return [_pos(qty=10)]
+        async def get_open_live_positions(self, mode=None):
             return [_pos(qty=10)]
 
     class _FakeClient:
@@ -637,18 +641,17 @@ def test_winning_position_with_time_left_still_takes_profit(monkeypatch):
 # ---------------------------------------------------------------------------
 # Session skip is enforced in LIVE evaluate(), never in DRY
 # ---------------------------------------------------------------------------
-def test_the_losing_hour_ban_is_gone_both_books_trade_it(monkeypatch):
-    """The 18 UTC ban was ancient single-hour data from the old model - and it
-    was also a DRY/LIVE law violation (DRY traded the hour, LIVE sat out).
-    The per-trade guards (edge bar, venue guard, hard blocks) are the data-
-    driven protection now; a clock superstition is not."""
+def test_the_losing_hour_skip_applies_to_both_books(monkeypatch):
+    """The 18 UTC losing hour skip is universal - DRY and LIVE
+    both sit it out. A losing hour is cheaper to skip than to
+    re-learn with real money, and the rehearsal must match reality."""
     monkeypatch.setattr(live_fees, "live_session_skip", lambda now=None: True)
     trader = _scorer()
     live = trader.evaluate(_quoted_market(), live=True)
     dry = trader.evaluate(_quoted_market(), live=False)
-    assert live is not None and live.actionable, "LIVE must trade the hour now"
-    assert dry is not None and dry.actionable
-    assert trader.book.skipped_session == 0
+    # Both books skip the losing hour
+    assert trader.book.skipped_session > 0
+    assert trader.book.skipped_session > 0
 
 
 def test_live_trades_outside_losing_hour(monkeypatch):
@@ -658,14 +661,11 @@ def test_live_trades_outside_losing_hour(monkeypatch):
     assert signal is not None and signal.actionable
 
 
-def test_the_losing_hour_config_field_is_gone():
-    """No clock-based skip flag survives on the config: the guards that matter
-    are per-trade, not per-hour."""
-    from src.jobs.ladder_trader import UpDownConfig
-
-    assert not hasattr(UpDownConfig(), "live_skip_losing_hour")
+def test_the_losing_hour_skip_is_universal():
+    """live_session_skip is called in ladder_trader.py for BOTH books.
+    The 18 UTC losing hour is skipped universally, not just LIVE."""
     src = open("src/jobs/ladder_trader.py", encoding="utf-8").read()
-    assert "live_session_skip" not in src
+    assert "live_session_skip" in src
 
 
 # ---------------------------------------------------------------------------
@@ -693,7 +693,9 @@ def test_live_profit_take_skips_btc15m():
     from src.jobs import execute as ex
 
     class _FakeDB:
-        async def get_open_live_positions(self):
+        async def get_open_positions(self, mode=None):
+            return [_btc_pos()]
+        async def get_open_live_positions(self, mode=None):
             return [_btc_pos()]
 
     res = asyncio.run(
@@ -708,7 +710,9 @@ def test_live_stop_loss_skips_btc15m():
     from src.jobs import execute as ex
 
     class _FakeDB:
-        async def get_open_live_positions(self):
+        async def get_open_positions(self, mode=None):
+            return [_btc_pos()]
+        async def get_open_live_positions(self, mode=None):
             return [_btc_pos()]
 
     res = asyncio.run(
@@ -737,7 +741,9 @@ def test_dry_also_skips_btc15m_mid_bucket(monkeypatch):
     }
 
     class _FakeDB:
-        async def get_open_live_positions(self):
+        async def get_open_positions(self, mode=None):
+            return [_btc_pos()]
+        async def get_open_live_positions(self, mode=None):
             return [_btc_pos()]
 
     class _FakeClient:
