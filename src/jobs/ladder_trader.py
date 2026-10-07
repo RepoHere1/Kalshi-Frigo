@@ -454,11 +454,17 @@ class UpDownTrader:
         config: Optional[UpDownConfig] = None,
         db_manager: Any = None,
         brti: Any = None,
+        lane: str = "btc_updown",
     ):
         self.spot = spot
         self.feed = feed
         self.config = config or UpDownConfig()
         self.db_manager = db_manager
+        # This process's own lane identity. Each crypto (BTC/DOGE/ETH/HYPE) is a
+        # SEPARATE book and must attribute its positions and veto streaks to its
+        # own lane, never to a shared "btc_updown" bucket - otherwise the four
+        # lanes fight over one position table and one guard.
+        self.lane = lane
         # BRTI truth feed (Kalshi's own CF Benchmarks index). None means
         # Coinbase spot only -- every existing caller keeps working.
         self.brti = brti
@@ -1113,9 +1119,9 @@ class UpDownTrader:
             db_path = getattr(self.db_manager, "db_path", None) or self._db_path()
             async with aiosqlite.connect(db_path) as conn:
                 cur = await conn.execute(
-                    "SELECT side, pnl FROM trade_logs WHERE strategy='btc_updown'"
+                    "SELECT side, pnl FROM trade_logs WHERE strategy=?"
                     " ORDER BY rowid DESC LIMIT ?",
-                    (limit,),
+                    (self.lane, limit),
                 )
                 rows = await cur.fetchall()
         except Exception:  # noqa: BLE001
@@ -1201,12 +1207,12 @@ class UpDownTrader:
             quantity=signal.contracts,
             timestamp=_utcnow(),
             rationale=(
-                f"BTC 15M UP/DOWN {signal.reason} | {signal.contracts} @ ${price:.3f} | "
+                f"{self.lane.upper()} UP/DOWN {signal.reason} | {signal.contracts} @ ${price:.3f} | "
                 f"{signal.seconds_left}s left"
             ),
             confidence=abs(signal.edge),
             live=live,
-            strategy="btc_updown",
+            strategy=self.lane,
             mode="live" if live else "dry",
         )
         # Persist BEFORE executing. `execute_position` needs a row id to record the
@@ -1437,12 +1443,15 @@ class UpDownTrader:
         if survival:
             self.config.min_edge = max(self.config.min_edge, self.config.survival_min_edge)
             self.config.min_win_prob = max(self.config.min_win_prob, self.config.survival_min_win_prob)
-            # Cap the clip (and the Kelly base) to a tenth of the book so a
-            # single loss cannot end the account; the whole point is to keep
-            # firing tiny wins until a buffer exists.
+            # Hyper-caution: require a near-certain win, but do NOT flat-cap the
+            # bet to a fixed 10%. The Kelly engine already sizes the clip by the
+            # edge (near-certain -> bigger), so a flat cap just shrinks the exact
+            # winners we want to size up on. Only guard against a single clip
+            # ending the account: never more than the survival fraction, but still
+            # proportional to the balance so a genuine edge earns real money.
             _surv_cap = max(self._live_balance * self.config.survival_clip_fraction, 0.01)
             if live_budget is not None:
-                live_budget = min(live_budget, _surv_cap)
+                live_budget = min(live_budget, self._live_balance)
             self._live_balance = min(self._live_balance, _surv_cap)
         signal = self.evaluate(market, live=live, clip_usd=live_budget if live else None)
         # Clear stale errors, but never wipe the explanation of a failed LIVE
@@ -1505,7 +1514,7 @@ class UpDownTrader:
             try:
                 book_mode = "live" if live else "dry"
                 for p in await self.db_manager.get_open_positions(mode=book_mode):
-                    if (p.strategy or "") != "btc_updown":
+                    if (p.strategy or "") != self.lane:
                         continue
                     # A 15-minute contract that is not the current one has rolled:
                     # it is settled, and nothing can be done about it here. Left to
@@ -1634,6 +1643,21 @@ def _utcnow():
     return datetime.now(timezone.utc)
 
 
+def _lane_name() -> str:
+    """This process's own strategy identity.
+
+    The dashboard stamps STRATEGY_NAME on every spawned child (btc_updown,
+    doge_updown, btc_1h_updown, hyperliquid_updown). The four lanes run the same
+    trader but each must attribute its positions, its veto streaks and its
+    heartbeat to its OWN row - a hardcoded "btc_updown" made every crypto lane
+    share one position table, which is why DOGE/ETH/HYPE never showed their own
+    trades. A manual run without the stamp falls back to btc_updown.
+    """
+    import os
+
+    return os.environ.get("STRATEGY_NAME", "").strip() or "btc_updown"
+
+
 async def run_updown_trader(
     config: Optional[UpDownConfig] = None,
     loop: bool = False,
@@ -1663,7 +1687,13 @@ async def run_updown_trader(
     except Exception as exc:  # noqa: BLE001
         print(f"{series}: BRTI feed unavailable ({exc}); coinbase-spot only", flush=True)
         brti = None
-    trader = UpDownTrader(hub.spot, hub.feed, config, brti=brti)
+    trader = UpDownTrader(
+        hub.spot,
+        hub.feed,
+        config,
+        brti=brti,
+        lane=_lane_name(),
+    )
     sleep_for = interval or config.poll_seconds or 4.0
     started = False
     backoff = 1.0
@@ -1729,7 +1759,7 @@ async def run_updown_trader(
                 # runtime vocabulary ("paper"/"live") the row was
                 # recorded under; a manual run has no stamp and
                 # falls back to the live switch.
-                lane = os.environ.get("STRATEGY_NAME", "").strip() or "btc_updown"
+                lane = getattr(trader, "lane", None) or _lane_name()
                 book_word = os.environ.get("STRATEGY_BOOK_MODE", "").strip().lower()
                 if book_word not in ("paper", "live"):
                     from src.jobs.broker import should_trade_live

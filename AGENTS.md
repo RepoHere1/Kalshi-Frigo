@@ -31,6 +31,50 @@ railway deploy
 # For troubleshooting & automation: See RAILWAY_DEPLOY_AI_CLI_GUIDE.md
 ```
 
+## Known Truths (do not re-invent; read these first)
+
+### Kalshi has NO $1.00 minimum order — that was a fabricated lie
+The V2 order endpoint (`POST /trade-api/v2/portfolio/events/orders`) takes a
+**whole-contract count** (`"count": "N.00"`) and has **no dollar-notional
+floor**. A single 1-cent contract is a valid **$0.01 order**. The old
+`MIN_ORDER_CENTS = 100` ($1.00) constant was invented in our own code and
+silently zeroed every clip on a tiny account — the account sat out forever
+because of a floor the exchange never imposed. The exchange minimum is **one
+contract**, not one dollar. (See `src/jobs/broker.py` `MIN_ORDER_CONTRACTS`.)
+
+### Where the real keys live: `D:\master.env`
+All credentials are in **`D:\master.env`** (NOT the repo). Do not hard-code
+secrets into source or the repo `.env`. Notable entries:
+- `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY_PATH=D:\...\kalshi_prod_key_2.pem`
+- `OPENROUTER_API_KEY`, `GITHUB_API_KEY` / `GH_TOKEN` / `GH_TOKEN_ADMIN`
+- `RAILWAY_TOKEN` and `RAILWAY_PROJECT_TOKEN`
+- `DASHBOARD_TOKEN` (the web dashboard write token)
+Copy the needed values into Railway variables (or the container env) at deploy
+time; never push the file.
+
+### DRY is a fixed $300 simulated book, NOT a mirror of LIVE
+The DRY account seeds at **$300** (`DEFAULT_DRY_STARTING_BALANCE` in
+`src/utils/mode.py`). It is deliberately independent of the real LIVE balance:
+a rehearsal needs a stable, funded baseline it can compound, regardless of what
+the real account happens to hold. (An earlier "mirror LIVE into DRY" behaviour
+was removed — it made DRY inherit a $15.41 balance and read as broken.)
+
+### Railway deploy, the reliable way
+The `railway` binary reads `~/.railway/config.json` for auth; the `npx
+@railway/cli` wrapper ignores it and re-prompts. Working sequence (from repo
+root, with no `RAILWAY_TOKEN` env var set — an invalid exported token overrides
+the good stored session):
+```bash
+unset RAILWAY_TOKEN
+railway whoami                 # must print the account, not "Unauthorized"
+railway link                   # pick workspace -> Kalshi-Frigo -> production
+railway up                     # uploads the working tree (does NOT need GitHub)
+railway status                 # expect: Online
+```
+`railway up` pushes the local tree directly, so a GitHub push outage does not
+block deployment. The valid Railway token also lives in `D:\master.env`
+(`RAILWAY_TOKEN`). See `RAILWAY_DEPLOY_AI_CLI_GUIDE.md` for the full playbook.
+
 ## Architecture
 
 ```

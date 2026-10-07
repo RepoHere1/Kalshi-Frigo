@@ -468,9 +468,10 @@ class TradingMode:
             cash = await self._get(conn, _CASH_KEY)
             rows = int(await self._scalar(conn, "SELECT COUNT(*) FROM dry_ledger") or 0)
             if cash is None and rows == 0:
-                mirror = await self._live_balance()
-                if mirror is not None and mirror >= MIN_MIRROR_BALANCE:
-                    starting_f = round(mirror, 2)
+                # DRY is always a fixed $300 simulated book, independent of the
+                # real LIVE balance - the rehearsal needs a stable, funded
+                # starting figure it can compound, not a mirror of whatever the
+                # real account happens to hold this minute.
                 await self._set(conn, _START_KEY, str(round(starting_f, 2)))
                 await self._set(conn, _CASH_KEY, str(round(starting_f, 2)))
                 await conn.commit()
@@ -494,13 +495,15 @@ class TradingMode:
         perfect mirror of LIVE". An unreachable or unfunded live account
         keeps the existing starting figure.
         """
-        mirror = await self._live_balance()
+        # DRY reset always restores the fixed $300 simulated figure - it does not
+        # mirror the real LIVE balance, because the rehearsal needs a stable,
+        # funded starting point regardless of what the real account holds.
         async with self._conn() as conn:
             starting = await self._get(conn, _START_KEY)
             starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
-            if mirror is not None and mirror >= MIN_MIRROR_BALANCE:
-                starting_f = round(mirror, 2)
-                await self._set(conn, _START_KEY, str(starting_f))
+            if starting_f != DEFAULT_DRY_STARTING_BALANCE:
+                starting_f = DEFAULT_DRY_STARTING_BALANCE
+                await self._set(conn, _START_KEY, str(round(starting_f, 2)))
             await self._set(conn, _CASH_KEY, str(round(starting_f, 2)))
             await conn.execute("DELETE FROM dry_ledger")
             # Positions and closes are the rest of the simulated book.

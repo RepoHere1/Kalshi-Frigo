@@ -189,17 +189,17 @@ def _mirror_env(monkeypatch, balance: float):
     monkeypatch.setattr(TradingMode, "funding", fake_funding)
 
 
-async def test_ensure_seeds_a_fresh_book_from_the_live_balance(tmp_path, monkeypatch):
-    """A fresh DRY book opens as a mirror of the live account."""
+async def test_ensure_seeds_a_fresh_book_at_the_default(tmp_path, monkeypatch):
+    """A fresh DRY book opens at the fixed $300 figure, live balance ignored."""
     _mirror_env(monkeypatch, 1234.56)
     mgr = TradingMode(db_path=str(tmp_path / "mirror.db"))
     account = await mgr.ensure_dry_account()
-    assert account["starting_balance"] == pytest.approx(1234.56, abs=0.01)
-    assert account["cash"] == pytest.approx(1234.56, abs=0.01)
+    assert account["starting_balance"] == pytest.approx(300.0, abs=0.01)
+    assert account["cash"] == pytest.approx(300.0, abs=0.01)
 
 
 async def test_ensure_keeps_the_default_when_live_is_unfundable(tmp_path, monkeypatch):
-    """A live balance that cannot buy even one 1-cent contract cannot seed."""
+    """A tiny live balance still yields the $300 DRY start."""
     _mirror_env(monkeypatch, 0.004)
     mgr = TradingMode(db_path=str(tmp_path / "poor.db"))
     account = await mgr.ensure_dry_account()
@@ -215,7 +215,7 @@ async def test_ensure_keeps_the_default_when_no_credentials(tmp_path, monkeypatc
 
 
 async def test_ensure_never_reseeds_a_book_that_exists(tmp_path, monkeypatch):
-    """The mirror only applies at creation; history is never re-seeded."""
+    """The fixed start only applies at creation; history is never re-seeded."""
     _mirror_env(monkeypatch, 9999.0)
     db = await _db(tmp_path, name="existing.db")
     mgr = TradingMode(db_path=db.db_path)
@@ -226,8 +226,8 @@ async def test_ensure_never_reseeds_a_book_that_exists(tmp_path, monkeypatch):
     assert account["starting_balance"] == pytest.approx(300.0, abs=0.01)
 
 
-async def test_reset_reseeds_from_the_live_balance(tmp_path, monkeypatch):
-    """'Start over' reopens as a fresh mirror of the live account."""
+async def test_reset_reseeds_at_the_fixed_default(tmp_path, monkeypatch):
+    """'Start over' restores the $300 figure, independent of the live balance."""
     _mirror_env(monkeypatch, 500.0)
     db = await _db(tmp_path, name="wipe.db")
     mgr = TradingMode(db_path=db.db_path)
@@ -237,8 +237,8 @@ async def test_reset_reseeds_from_the_live_balance(tmp_path, monkeypatch):
 
     account = await mgr.reset_dry_account()
 
-    assert account["starting_balance"] == pytest.approx(500.0, abs=0.01)
-    assert account["cash"] == pytest.approx(500.0, abs=0.01)
+    assert account["starting_balance"] == pytest.approx(300.0, abs=0.01)
+    assert account["cash"] == pytest.approx(300.0, abs=0.01)
     assert account["open_positions"] == 0
     assert account["closed_trades"] == 0
 
