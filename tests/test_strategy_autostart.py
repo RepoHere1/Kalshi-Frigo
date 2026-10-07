@@ -250,3 +250,62 @@ def test_stopping_still_works_and_is_sticky():
 def test_every_command_is_pinned_to_paper(name):
     """AUTO_START_ALL starts things without asking; they must not be live."""
     assert "--paper" in wd.STRATEGY_COMMANDS[name]
+
+
+# ---------------------------------------------------------------------------
+# The BTC keep-alive obeys the button
+# ---------------------------------------------------------------------------
+def test_btc_keepalive_never_overrides_an_operator_stop():
+    """The button is law, even for the always-on BTC lanes.
+
+    The keep-alive keeps the three UP/DOWN lanes on, but a lane
+    the operator stopped in this book stays down until Start is
+    pressed here again. Only a crash (desired still 1) or a lane
+    never pushed comes back up - those are not decisions.
+    """
+    src = inspect.getsource(wd._btc_keepalive_loop)
+    # It reads the operator-stop reasons and the desired flag...
+    assert "_OPERATOR_STOP_REASONS" in src
+    assert 'row.get("desired") == 0' in src
+    # ...and skips the lane before it can re-arm it.
+    assert "continue" in src
+    # A crashed lane (desired still 1) is still re-armed.
+    assert "set_desired(name, True, book_mode)" in src
+
+
+def test_start_all_only_starts_stopped_strategies():
+    """Start all must not stop running strategies.
+
+    toggleStrategy TOGGLES, so feeding it every card would STOP
+    the running ones - the exact opposite of "Start all". It must
+    only start the stopped ones and leave running lanes alone.
+    """
+    html = wd._TEMPLATE
+    assert "filter(c => !c.running)" in html
+
+
+def test_kill_all_is_a_distinct_immediate_kill():
+    """Kill all is not Stop all.
+
+    Kill all hard-kills every running process in the current book
+    right now (no graceful SIGTERM wait) and records an operator
+    stop so neither supervisor resurrects a killed lane.
+    """
+    html = wd._TEMPLATE
+    assert "async function killAll()" in html
+    assert 'onclick="killAll()"' in html
+    kill_src = inspect.getsource(wd.api_strategies_kill)
+    # Book-scoped, fail-safe on an unreadable book.
+    assert "_current_book_mode()" in kill_src
+    # Hard kill, not a graceful stop.
+    assert "_kill_child" in kill_src
+    # Recorded as an operator stop so it stays down.
+    assert "record_stop" in kill_src
+    assert "stopped by operator" in kill_src
+
+
+def test_hard_kill_takes_a_process_down_now():
+    """_kill_child SIGKILLs immediately, unlike _stop_child's grace."""
+    src = inspect.getsource(wd._kill_child)
+    assert "proc.kill()" in src
+    assert "SIGKILL" in src

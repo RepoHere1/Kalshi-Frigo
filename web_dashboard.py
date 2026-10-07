@@ -1678,6 +1678,19 @@ def _btc_keepalive_loop():
             snapshot = _run_async(store.snapshot(mode=book_mode))
             for name in BTC_ALWAYS_ON:
                 row = snapshot.get(_runtime_key(name)) or {}
+                # THE BUTTON IS LAW. An operator Stop is
+                # permanent truth, even for these three.
+                # The keep-alive keeps a lane ON only while
+                # the operator wants it on: a lane stopped by
+                # hand in this book stays down until Start is
+                # pressed here again - this loop never changes
+                # a pushed button. A crash (desired still 1)
+                # or a lane never pushed is not a decision, so
+                # those come back up.
+                if (row.get("desired") == 0) and (
+                    (row.get("stop_reason") or "") in _OPERATOR_STOP_REASONS
+                ):
+                    continue
                 pid = row.get("pid")
                 if pid and _pid_alive(pid, row):
                     hb = row.get("heartbeat_at")
@@ -3490,6 +3503,47 @@ def _stop_child(st):
     return code
 
 
+def _kill_child(st):
+    """Hard-kill a strategy process immediately: SIGKILL, no graceful wait.
+
+    This is the Kill-all path: unlike _stop_child (SIGTERM, then SIGKILL
+    only if the process lingers 10s), a hard kill takes the process down
+    now, mid-cycle if it has to. Returns the exit code when the OS reports
+    it, so the page can say what happened.
+    """
+    pid = st.get("pid")
+    if not pid:
+        return None
+    proc = _child_procs.get(pid)
+    code: Optional[int] = None
+    if proc is not None:
+        # Preferred path: the Popen object works identically on every platform.
+        try:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:  # noqa: BLE001 - already SIGKILLed
+                pass
+            code = getattr(proc, "returncode", None)
+        except (OSError, ValueError):
+            pass
+        _child_procs.pop(pid, None)
+    else:
+        # No Popen reference (started by another worker, or the dashboard
+        # restarted). Fall back to a direct signal. SIGKILL does not exist
+        # on Windows, and on Windows signalling anything but CTRL_* terminates
+        # the target outright - which is what we want here anyway.
+        import signal
+
+        try:
+            os.kill(pid, getattr(signal, "SIGKILL", 9))
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    st["running"] = False
+    st["pid"] = None
+    return code
+
+
 def _runtime_store():
     from src.utils.strategy_runtime import StrategyRuntime
 
@@ -4064,6 +4118,57 @@ def api_strategy_toggle(name):
 
     _broadcast("strategy", {"name": name, "action": "started", "pid": result["pid"]})
     return jsonify(result)
+
+
+@app.route("/api/strategies/kill", methods=["POST"])
+def api_strategies_kill():
+    """Kill all: immediately hard-kill every running strategy in the
+    current book and record an operator stop so they stay down.
+
+    This is the emergency button. Unlike a Stop (a graceful SIGTERM
+    that lets a cycle finish), a kill takes each process down now.
+    The kill is scoped to the book the page is in, and every kill is
+    recorded as an operator stop (desired=0), so neither the main
+    supervisor nor the BTC keep-alive resurrects a killed lane - the
+    button is law, and a killed lane stays down until Start is
+    pressed in this book again.
+    """
+    denied = require_token()
+    if denied is not None:
+        return denied
+    book_mode = _current_book_mode()
+    if book_mode is None:
+        # THE LAW: never act on a guessed book. A kill is the most
+        # destructive button on the page; refusing is the only safe
+        # answer when the book cannot be read.
+        return (
+            jsonify(
+                {
+                    "error": (
+                        "Trading book is unknown right now (mode read failed). "
+                        "Refusing to kill so the wrong book is never touched - "
+                        "retry in a moment."
+                    )
+                }
+            ),
+            503,
+        )
+    runtime_mode = "live" if book_mode == "live" else "paper"
+    store = _runtime_store()
+    snapshot = _run_async(store.snapshot(mode=runtime_mode))
+    killed = []
+    for name in strategy_state:
+        row = snapshot.get(_runtime_key(name)) or {}
+        pid = row.get("pid")
+        if pid and _pid_alive(pid, row):
+            code = _kill_child({"pid": pid, "running": True})
+            _run_async(
+                store.record_stop(name, "stopped by operator", runtime_mode)
+            )
+            killed.append({"name": name, "pid": pid, "exit_code": code})
+    _recorded_state()
+    _broadcast("strategy", {"name": "*", "action": "killed"})
+    return jsonify({"killed": killed, "book": book_mode})
 
 
 @app.route("/api/diagnostics")
@@ -5153,7 +5258,7 @@ button.loading.yellow::after {
       <button id="startAllBtn" onclick="startAll()">{{ 'Start all in LIVE' if s.mode.mode == 'live' else 'Start all in DRY' }}</button>
       <button onclick="stopAll()">Stop all</button>
       {%- if s.mode.mode == 'live' %}
-      <button class="danger" onclick="stopAll()">Kill all LIVE</button>
+      <button class="danger" onclick="killAll()">Kill all LIVE</button>
       {%- endif %}
     </span>
   </div>
@@ -6655,7 +6760,10 @@ async function showAnalysis(name) {
 }
 
 async function startAll() {
-  const names = (SNAPSHOT.strategy_cards || []).map(c => c.name);
+  // Start only what is STOPPED. toggleStrategy TOGGLES, so
+  // feeding it a running strategy would STOP it - the exact
+  // opposite of "Start all". Running lanes are left alone.
+  const names = (SNAPSHOT.strategy_cards || []).filter(c => !c.running).map(c => c.name);
   const btn = document.getElementById('startAllBtn');
   if (btn) {
     btn.classList.add('loading');
@@ -6663,16 +6771,20 @@ async function startAll() {
   }
   
   try {
+    if (!names.length) {
+      note('start all: everything is already running');
+      return;
+    }
     if ((SNAPSHOT.mode && SNAPSHOT.mode.mode) === 'live') {
-      if (!confirm('LIVE MODE\n\nThis starts REAL-MONEY trading in all '
-        + names.length + ' strategies against your Kalshi account.\n\n'
+      if (!confirm('LIVE MODE\n\nThis starts REAL-MONEY trading in '
+        + names.length + ' stopped strategies against your Kalshi account.\n\n'
         + 'Prefer arming them one at a time. Continue?')) {
         note('live bulk start cancelled');
         return;
       }
     }
     
-    // Start all strategies
+    // Start the stopped strategies
     for (const n of names) await toggleStrategy(n, true);
     
     // Poll until all are actually running
@@ -6742,6 +6854,32 @@ async function stopAll() {
       stopAllBtn.classList.remove('yellow');
     }
   }
+}
+
+// Kill all: the emergency button. Unlike Stop all (a graceful
+// SIGTERM that lets a cycle finish), Kill all hard-kills every
+// running process in the book the page is in, right now, and
+// records an operator stop so neither supervisor resurrects a
+// killed lane. The button is law: killed lanes stay down until
+// Start is pressed here again.
+async function killAll() {
+  const book = (SNAPSHOT.mode && SNAPSHOT.mode.mode) === 'live' ? 'LIVE' : 'DRY';
+  const names = (SNAPSHOT.strategy_cards || []).filter(c => c.running).map(c => c.name);
+  if (!names.length) {
+    note('kill all: nothing was running in ' + book);
+    return;
+  }
+  if (!confirm('KILL ALL ' + book + '\n\nImmediately hard-kill '
+    + names.length + ' running strategies. They stay stopped until you press Start. Continue?')) {
+    note('kill all cancelled');
+    return;
+  }
+  try {
+    const r = await fetch('/api/strategies/kill', { method: 'POST', headers: authHeaders() });
+    const d = await r.json().catch(() => ({}));
+    if (d.error) { note('kill failed: ' + d.error); return; }
+    note('killed: ' + ((d.killed || []).map(k => k.name).join(', ') || 'nothing'));
+  } catch (e) { note('kill failed: ' + e); }
 }
 
 // Collapse the live feed panel. It is tall and its numbers tick continuously,
