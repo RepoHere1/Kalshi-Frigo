@@ -3054,29 +3054,36 @@ def api_live_flatten():
                     m = {}
                 mdict = (m or {}).get("market", m or {}) if isinstance(m, dict) else {}
                 yes_bid, yes_ask, no_bid, no_ask = get_market_prices(mdict or {})
-                # A positive position is long; which side it is long is the
-                # `position` field. Selling means hitting the bid on that side.
-                side = str(row.get("position") or "yes").lower()
-                bid = yes_bid if side == "yes" else no_bid
-                ask = yes_ask if side == "yes" else no_ask
+                # position_fp is signed: positive = long YES, negative = short
+                # YES (net NO). To flatten, sell what you are long and buy back
+                # what you are short. The side reported is the YES side; the
+                # action flips for a short so a -4.91 short is covered by a buy.
+                long_yes = shares >= 0
+                side = "yes"
+                bid = yes_bid
+                ask = yes_ask
+                action = "sell" if long_yes else "buy"
+                # A short covers by buying YES; a long closes by selling YES.
+                limit_side = "yes"
                 entry = float(row.get("cost_basis") or 0.0) / max(abs(shares), 1)
-                proceeds = bid * abs(shares)
+                proceeds = (bid if long_yes else ask) * abs(shares)
                 cost = entry * abs(shares)
                 placed = None
-                if confirm and abs(shares) >= 1:
-                    # Marketable limit at the bid, rounded down a cent: a
+                if confirm and abs(shares) >= 1 or (confirm and abs(shares) < 1):
+                    # Marketable limit at the bid/ask, rounded down a cent: a
                     # market order on a thin book can fill far below this.
-                    limit = max(int(bid * 100) - 1, 1)
+                    ref = bid if action == "sell" else ask
+                    limit = max(int(ref * 100) - 1, 1)
                     try:
                         placed = await client.place_order(
                             ticker=ticker,
                             client_order_id=str(uuid.uuid4()),
                             side=side,
-                            action="sell",
-                            count=int(abs(shares)),
+                            action=action,
+                            count=max(int(round(abs(shares))), 1),
                             type_="limit",
-                            yes_price=limit if side == "yes" else None,
-                            no_price=limit if side == "no" else None,
+                            yes_price=limit if limit_side == "yes" else None,
+                            no_price=limit if limit_side == "no" else None,
                         )
                     except Exception as exc:  # noqa: BLE001
                         placed = {"error": f"{type(exc).__name__}: {exc}"}
@@ -3084,7 +3091,7 @@ def api_live_flatten():
                     {
                         "ticker": ticker,
                         "title": _market_title(ticker),
-                        "side": side,
+                        "side": "yes" if long_yes else "no",
                         "shares": shares,
                         "entry": round(entry, 4),
                         "bid": bid,
