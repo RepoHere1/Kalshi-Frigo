@@ -144,7 +144,7 @@ strategy_state = {
 STRATEGY_COMMANDS: Dict[str, List[str]] = {
     "btc_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
     "doge_updown": ["cli.py", "run", "--btc-updown", "--series", "KXDOGE15M", "--spot-product", "DOGE-USD", "--paper", "--loop", "--interval", "0"],
-    "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTC1H", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
+    "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETH15M", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
     "hyperliquid_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPE15M", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
     "ai_directional": ["cli.py", "run", "--paper", "--loop", "--interval", "300"],
     "safe_compounder": [
@@ -881,9 +881,10 @@ STRATEGY_DOCS = {
         "the current book every second of every day.",
     ),
     "btc_1h_updown": (
-        "BTC 1-hour up/down",
-        'Reads Kalshi\'s BTC 1-hour up/down contract and compares its Up/Down price against '
-        "live Coinbase spot. Takes one $5 clip when profitable edge detected. "
+        "ETH 15-min up/down",
+        'Reads Kalshi\'s ETH 15-min up/down contract (KXETH15M) and compares its Up/Down '
+        "price against live Coinbase ETH-USD spot. Takes one $5 clip when profitable "
+        "edge detected. "
         "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
         "the current book every second of every day.",
     ),

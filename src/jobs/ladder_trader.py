@@ -54,6 +54,46 @@ MAX_CLIPS_PER_TICKER = 1
 # LIVE to 52 skips and 0 trades an hour. Both books now share the sweet-band
 # surcharge in UpDownConfig; LIVE adds only the real fee.
 
+# Per-asset tuning. BTC's class defaults were derived from BTC's market
+# microstructure: a ~$84,000 asset whose "sweet band" sits at 0.20-0.50 and
+# whose 15-minute sigma is ~$17 (0.02% of price). Sub-dollar and mid-cap
+# assets move far more, relative to price, and their market makers quote the
+# near-certain side at 0.64-0.88, so BTC's deadband and entry caps refuse the
+# very trades those lanes exist to take. Keyed on the Coinbase spot product.
+# Values are deliberately conservative: noise widened to a fraction of each
+# asset's own realized move, and entry caps lifted only to admit a real edge,
+# never to reopen the $0.90+ "4%-win" band (that hard block stays global).
+ASSET_TUNING: Dict[str, Dict[str, float]] = {
+    "DOGE-USD": {
+        "noise_pct": 0.005,           # ~0.5% of price (~$0.00045) vs BTC's 0.02%
+        "max_entry_price": 0.70,
+        "max_entry_price_maker": 0.88,
+        "sweet_band_low": 0.20,
+        "sweet_band_high": 0.65,
+    },
+    "HYPE-USD": {
+        "noise_pct": 0.002,           # ~0.2% of price (~$0.18) vs BTC's 0.02%
+        "max_entry_price": 0.70,
+        "max_entry_price_maker": 0.88,
+        "sweet_band_low": 0.20,
+        "sweet_band_high": 0.70,
+    },
+    "ETH-USD": {
+        "noise_pct": 0.001,
+        "max_entry_price": 0.60,
+        "max_entry_price_maker": 0.85,
+        "sweet_band_low": 0.20,
+        "sweet_band_high": 0.50,
+    },
+    "SOL-USD": {
+        "noise_pct": 0.003,
+        "max_entry_price": 0.65,
+        "max_entry_price_maker": 0.88,
+        "sweet_band_low": 0.20,
+        "sweet_band_high": 0.65,
+    },
+}
+
 
 @dataclass
 class UpDownConfig:
@@ -232,6 +272,22 @@ class UpDownConfig:
     poll_seconds: float = 4.0
     max_spot_age: float = 5.0
 
+    def apply_asset(self, spot_product: Optional[str]) -> None:
+        """Apply per-asset deadband and entry-band overrides.
+
+        Called once by the runner with the lane's Coinbase pair so a sub-dollar
+        asset (DOGE) or a mid-cap (HYPE/SOL) is not graded against BTC's
+        microstructure defaults. Unknown products keep BTC defaults unchanged.
+        """
+        tuning = ASSET_TUNING.get((spot_product or "").strip().upper())
+        if not tuning:
+            return
+        self.noise_pct = tuning["noise_pct"]
+        self.max_entry_price = tuning["max_entry_price"]
+        self.max_entry_price_maker = tuning.get("max_entry_price_maker", self.max_entry_price_maker)
+        self.sweet_band_low = tuning.get("sweet_band_low", self.sweet_band_low)
+        self.sweet_band_high = tuning.get("sweet_band_high", self.sweet_band_high)
+
 
 @dataclass
 class UpDownSignal:
@@ -300,6 +356,29 @@ class UpDownBook:
             "last_error": self.last_error,
             "dry": self.dry,
         }
+
+
+def _money(value: Any) -> str:
+    """Format a price/delta with decimals that suit its magnitude.
+
+    The old `:,.0f` rendered a $0.09 DOGE print as "0" and a $0.0099 move as
+    "-0", which is why the DOGE lane's logs looked empty even while it scored.
+    Sub-$1 assets need sub-cent precision; large assets want thousands separators.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    a = abs(v)
+    if a == 0:
+        return "0"
+    if a < 1:
+        return f"{v:.6f}".rstrip("0").rstrip(".")
+    if a < 100:
+        return f"{v:.4f}".rstrip("0").rstrip(".")
+    if a < 10_000:
+        return f"{v:,.2f}"
+    return f"{v:,.0f}"
 
 
 def fair_up_probability(
@@ -461,7 +540,11 @@ class UpDownTrader:
             return None
 
         target = float(market.target)
-        delta = round(spot - target, 2)
+        # Full float precision. A fixed round(..., 2) flattened sub-dollar
+        # assets (DOGE at $0.09, HYPE at $90 with cent moves) to exactly 0,
+        # so every pass read "spot == target" and landed in skipped_no_edge
+        # forever. Keep all digits; format only for display.
+        delta = spot - target
         # One-venue dislocation guard: Kalshi settles on the multi-venue BRTI
         # composite, not on Coinbase. If the other major venues sit on the
         # OPPOSITE side of the target by more than the budget, this "lead"
@@ -551,8 +634,9 @@ class UpDownTrader:
                 notional=0.0,
                 seconds_left=round(market.seconds_left or 0.0, 1),
                 reason=(
-                    f"{truth_kind} {spot:,.0f} is {delta:+,.0f} from target {target:,.0f} - "
-                    f"inside the ${noise_usd:,.4f} noise band, no trade"
+                    f"{truth_kind} {_money(spot)} is {_money(delta)} from target "
+                    f"{_money(target)} - "
+                    f"inside the ${_money(noise_usd)} noise band, no trade"
                 ),
                 truth=truth_kind,
             )
@@ -712,7 +796,8 @@ class UpDownTrader:
                 else "taker-bar (fee-aware)"
             )
             reason = (
-                f"{truth_kind} {spot:,.0f} vs target {target:,.0f} ({delta:+,.0f}): "
+                f"{truth_kind} {_money(spot)} vs target {_money(target)} "
+                f"({_money(delta)}): "
                 f"fair {fair:.2f}, Kalshi up "
                 f"{('%.2f' % up_ask) if up_ask is not None else '--'} / down "
                 f"{('%.2f' % down_ask) if down_ask is not None else '--'} - "
@@ -724,7 +809,8 @@ class UpDownTrader:
                 reason += " - entry price in the blocked $0.90+ band"
         else:
             reason = (
-                f"{truth_kind} {spot:,.0f} vs target {target:,.0f} ({delta:+,.0f}): "
+                f"{truth_kind} {_money(spot)} vs target {_money(target)} "
+                f"({_money(delta)}): "
                 f"fair {('%.2f' % (fair if side == 'up' else 1.0 - fair))} vs Kalshi "
                 f"{float(kalshi or 0.0):.2f} on {side.upper()} - edge {edge:+.3f}"
             )
@@ -1511,11 +1597,14 @@ async def run_updown_trader(
 ) -> None:
     """Run the up/down trader, optionally on a loop until interrupted.
 
-    `series` is the Kalshi series ticker (e.g. KXBTC15M, KXDOGE15M, KXBTC1H).
+    `series` is the Kalshi series ticker (e.g. KXBTC15M, KXDOGE15M, KXETH15M).
     `spot_product` is the Coinbase pair (e.g. BTC-USD, DOGE-USD).
     """
     from src.jobs.market_data import MarketDataHub
 
+    config = config or UpDownConfig()
+    # Grade each lane against its own asset, not BTC's defaults.
+    config.apply_asset(spot_product)
     hub = MarketDataHub(spot_product=spot_product, series=series)
     # BRTI truth: Kalshi's own settlement index over its own socket. Starts
     # degraded without keys and the trader falls back to Coinbase; never fatal.
@@ -1529,7 +1618,7 @@ async def run_updown_trader(
         print(f"{series}: BRTI feed unavailable ({exc}); coinbase-spot only", flush=True)
         brti = None
     trader = UpDownTrader(hub.spot, hub.feed, config, brti=brti)
-    sleep_for = interval or (config and config.poll_seconds) or 4.0
+    sleep_for = interval or config.poll_seconds or 4.0
     started = False
     backoff = 1.0
     # LIVE-only; created on the first due pass so DRY never builds one.
