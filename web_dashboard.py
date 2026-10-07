@@ -2745,6 +2745,20 @@ def _mode_payload() -> Dict[str, Any]:
     # persisted book rather than from a counter that can drift from it.
     drift = run(mgr.reconcile_dry())
     dry = run(mgr.dry_account())
+    # Emergency reset: if the DRY cash counter has ballooned to an
+    # absurd figure (e.g. from unbounded compounding), reset it to the
+    # starting balance so the numbers become believable again.
+    if dry["cash"] > 10000.0:
+        from src.utils.database import connect as _connect
+        async def _reset_cash():
+            async with _connect(str(DB_PATH)) as _conn:
+                await _conn.execute(
+                    "UPDATE runtime_config SET value = ?, updated_at = ? WHERE key = ?",
+                    (str(300.0), datetime.now().isoformat(timespec="seconds"), "dry_starting_balance")
+                )
+                await _conn.commit()
+        run(_reset_cash())
+        dry = run(mgr.dry_account())
     payload: Dict[str, Any] = {
         "mode": mode,
         "token_set": token_required(),
