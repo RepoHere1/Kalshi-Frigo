@@ -294,11 +294,11 @@ class Btc15mFeed:
         parts = (ticker or "").split("-")
         if len(parts) != 3 or not parts[0].startswith(prefix or "KX"):
             return None, None, 0
-        event_ticker = f"{parts[0]}-{parts[1]}"
         try:
             horizon = int(parts[2])
         except ValueError:
-            horizon = 0
+            return None, None, 0
+        event_ticker = f"{parts[0]}-{parts[1]}"
         return event_ticker, _parse_bucket(parts[1], parts[0]), horizon
 
     async def fetch(self, session: Optional[aiohttp.ClientSession] = None) -> List[UpDownMarket]:
