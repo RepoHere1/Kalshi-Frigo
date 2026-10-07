@@ -178,9 +178,6 @@ def live_exit_limit_price(
     return round(px * 0.98, 4)
 
 
-def dry_exit_limit_price(current_price: float) -> float:
-    """The historic DRY exit price. Unchanged, kept here for test parity."""
-    return round(max(float(current_price or 0.0), 0.01) * 0.98, 4)
 
 
 def is_settled_market(market_data: dict) -> bool:

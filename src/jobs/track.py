@@ -486,6 +486,13 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
         logger.info("🎯 Checking for profit-taking opportunities...")
         mode = _current_mode()
         is_live = mode == MODE_LIVE
+        # live_session_skip() applies to BOTH books: the 18 UTC hour
+        # is a losing hour regardless of mode. DRY should not trade
+        # through it either, so the rehearsal is realistic.
+        from src.jobs import live_fees as _lf
+        if _lf.live_session_skip():
+            logger.info(f"Skipping 18 UTC losing hour in {mode} mode")
+            return
         profit_results = await place_profit_taking_orders(
             db_manager=db_manager,
             kalshi_client=kalshi_client,
@@ -611,7 +618,9 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                     # Per-position book check (not the global mode): legacy and
                     # test rows with no mode set stay on the DRY path.
                     _pos_is_live = str(position.mode or "").lower() == "live"
-                    if not is_resolution and _pos_is_live:
+                    # is_settled_market() check applies to BOTH books:
+                    # a closed/rolled book cannot be sold in DRY either.
+                    if not is_resolution and (_pos_is_live or str(position.mode or "").lower() == "dry"):
                         try:
                             from src.jobs import live_fees as _live_fees
 

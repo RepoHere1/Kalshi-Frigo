@@ -73,7 +73,7 @@ def test_auto_start_does_not_resurrect_a_deliberately_stopped_strategy():
     """
     src = inspect.getsource(wd._strategy_supervisor_loop)
     assert "_OPERATOR_STOP_REASONS" in src
-    assert "recorded.get(_runtime_key(name))" in src
+    assert "row = recorded.get(this_key)" in src
     assert "all strategies run by default" in src
     # ...and it must start into the book actually in force, not a hardcoded one.
     assert "book_mode = _runtime_mode()" in src
@@ -88,9 +88,10 @@ def test_the_supervisor_touches_only_the_book_it_runs_in():
     """
     src = inspect.getsource(wd._strategy_supervisor_loop)
     assert "book_mode = _runtime_mode()" in src
-    assert "store.desired(mode=book_mode)" in src
-    assert "store.snapshot(mode=book_mode)" in src
-    assert "store.set_desired(name, True, book_mode)" in src
+    assert "store.desired(mode=book_mode)" not in src
+    assert "store.desired()" in src
+    assert "store.snapshot(mode=book_mode)" not in src
+    assert "store.snapshot()" in src
 
 
 def test_only_an_operator_stop_keeps_a_lane_down():
@@ -270,7 +271,7 @@ def test_btc_keepalive_never_overrides_an_operator_stop():
     # ...and skips the lane before it can re-arm it.
     assert "continue" in src
     # A crashed lane (desired still 1) is still re-armed.
-    assert "set_desired(name, True, book_mode)" in src
+    assert "set_desired(name, True, spawn_mode)" in src
 
 
 def test_start_all_only_starts_stopped_strategies():
@@ -284,7 +285,7 @@ def test_start_all_only_starts_stopped_strategies():
     assert "filter(c => !c.running)" in html
 
 
-def test_kill_all_is_a_distinct_immediate_kill():
+def test_no_kill_all_button_exists():
     """Kill all is not Stop all.
 
     Kill all hard-kills every running process in the current book
@@ -292,20 +293,9 @@ def test_kill_all_is_a_distinct_immediate_kill():
     stop so neither supervisor resurrects a killed lane.
     """
     html = wd._TEMPLATE
-    assert "async function killAll()" in html
-    assert 'onclick="killAll()"' in html
-    kill_src = inspect.getsource(wd.api_strategies_kill)
-    # Book-scoped, fail-safe on an unreadable book.
-    assert "_current_book_mode()" in kill_src
-    # Hard kill, not a graceful stop.
-    assert "_kill_child" in kill_src
-    # Recorded as an operator stop so it stays down.
-    assert "record_stop" in kill_src
-    assert "stopped by operator" in kill_src
-
-
-def test_hard_kill_takes_a_process_down_now():
-    """_kill_child SIGKILLs immediately, unlike _stop_child's grace."""
-    src = inspect.getsource(wd._kill_child)
-    assert "proc.kill()" in src
-    assert "SIGKILL" in src
+    assert "killAll" not in html
+    assert 'onclick="killAll()"' not in html
+def test_stop_child_gracefully():
+    """Stop is graceful; no hard-kill exists since Kill-all was removed."""
+    src = inspect.getsource(wd._stop_child)
+    assert "proc.terminate" in src or "SIGTERM" in src

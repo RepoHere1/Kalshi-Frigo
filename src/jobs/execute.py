@@ -634,11 +634,12 @@ async def place_profit_taking_orders(
         logger.info(f"📊 Checking {len(positions)} positions for profit-taking opportunities")
 
         for position in positions:
-            # LIVE-ONLY ride-to-settlement: 15-minute binaries ride to the
+            # Ride-to-settlement: 15-minute binaries ride to the
             # $1.00/$0.00 settlement. A 20% profit-take exits mid-bucket and
             # pays the spread plus a second fee for nothing; tracking closes
-            # these at resolution instead. DRY keeps the exits untouched.
-            if live_mode and (
+            # these at resolution instead. Applied to BOTH books so DRY
+            # rehearses exactly what LIVE does.
+            if (
                 str(getattr(position, "strategy", "") or "") == "btc_updown"
                 or str(position.market_id or "").startswith("KXBTC15M")
             ):
@@ -681,54 +682,48 @@ async def place_profit_taking_orders(
 
                     # Check if we should place a profit-taking sell order
                     if profit_pct >= profit_threshold:
-                        # DRY keeps the historic 2% discount (taker-style, fast
-                        # fill, simulated anyway). LIVE rests at the quote when
-                        # time allows (maker fee, ~1/4 the cost) and only takes
-                        # when urgent. DRY behaviour is byte-identical.
-                        if live_mode:
-                            try:
-                                from src.jobs import live_fees as _live_fees
+                        # Exit price: same maker/taker logic for
+                        # BOTH books. When time is patient (>120s to
+                        # settlement) the exit rests at the quote
+                        # (maker fee, ~1/4 the cost); when urgent it
+                        # takes at 2% below mid. DRY and LIVE use
+                        # identical exit pricing.
+                        from src.jobs import live_fees as _live_fees
 
-                                _secs = None
-                                try:
-                                    _close_ts = market_data.get("close_time")
-                                    if _close_ts:
-                                        from datetime import datetime, timezone
+                        _secs = None
+                        try:
+                            _close_ts = market_data.get("close_time")
+                            if _close_ts:
+                                from datetime import datetime, timezone
 
-                                        _ct = datetime.fromisoformat(
-                                            str(_close_ts).replace("Z", "+00:00")
-                                        )
-                                        if _ct.tzinfo is None:
-                                            _ct = _ct.replace(tzinfo=timezone.utc)
-                                        _secs = (_ct - datetime.now(timezone.utc)).total_seconds()
-                                except Exception:  # noqa: BLE001
-                                    _secs = None
-                                # Item 4b: a winning position inside the
-                                # settlement window rides to the $1.00 print
-                                # instead of scalping out for a few cents and
-                                # paying a second fee. Losing positions keep
-                                # every exit they had.
-                                if (
-                                    _secs is not None
-                                    and 0 < _secs <= _live_fees.SETTLEMENT_WINDOW_SECONDS
-                                    and current_price > float(position.entry_price or 0.0)
-                                ):
-                                    logger.info(
-                                        f"🏆 Riding {position.market_id} to settlement: "
-                                        f"{_secs:.0f}s left, in profit at "
-                                        f"{current_price:.3f} vs entry "
-                                        f"{position.entry_price:.3f} - no scalp"
-                                    )
-                                    continue
-                                sell_price = _live_fees.live_exit_limit_price(
-                                    position.side, current_price, _secs
+                                _ct = datetime.fromisoformat(
+                                    str(_close_ts).replace("Z", "+00:00")
                                 )
-                            except Exception:  # noqa: BLE001
-                                sell_price = current_price * 0.98
-                        else:
-                            sell_price = (
-                                current_price * 0.98
-                            )  # 2% below current price for quick execution
+                                if _ct.tzinfo is None:
+                                    _ct = _ct.replace(tzinfo=timezone.utc)
+                                _secs = (_ct - datetime.now(timezone.utc)).total_seconds()
+                        except Exception:  # noqa: BLE001
+                            _secs = None
+                        # Item 4b: a winning position inside the
+                        # settlement window rides to the $1.00 print
+                        # instead of scalping out for a few cents and
+                        # paying a second fee. Losing positions keep
+                        # every exit they had.
+                        if (
+                            _secs is not None
+                            and 0 < _secs <= _live_fees.SETTLEMENT_WINDOW_SECONDS
+                            and current_price > float(position.entry_price or 0.0)
+                        ):
+                            logger.info(
+                                f"🎆 Riding {position.market_id} to settlement: "
+                                f"{_secs:.0f}s left, in profit at "
+                                f"{current_price:.3f} vs entry "
+                                f"{position.entry_price:.3f} - no scalp"
+                            )
+                            continue
+                        sell_price = _live_fees.live_exit_limit_price(
+                            position.side, current_price, _secs
+                        )
 
                         logger.info(
                             f"💰 PROFIT TARGET HIT: {position.market_id} - {profit_pct:.1%} profit (${unrealized_pnl:.2f})"
@@ -799,11 +794,12 @@ async def place_stop_loss_orders(
         logger.info(f"🛡️ Checking {len(positions)} positions for stop-loss protection")
 
         for position in positions:
-            # LIVE-ONLY ride-to-settlement: 15-minute binaries ride to the
+            # Ride-to-settlement: 15-minute binaries ride to the
             # $1.00/$0.00 settlement. A 15% stop exits mid-bucket and pays
             # the spread plus a second fee for nothing; tracking closes
-            # these at resolution instead. DRY keeps the exits untouched.
-            if live_mode and (
+            # these at resolution instead. Applied to BOTH books so DRY
+            # rehearses exactly what LIVE does.
+            if (
                 str(getattr(position, "strategy", "") or "") == "btc_updown"
                 or str(position.market_id or "").startswith("KXBTC15M")
             ):

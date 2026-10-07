@@ -107,8 +107,11 @@ def test_live_rests_patient_exits_and_takes_urgent_ones():
     assert live_fees.live_exit_limit_price("NO", 0.60, None) == 0.60
 
 
-def test_dry_exit_price_is_always_the_discount():
-    assert live_fees.dry_exit_limit_price(0.60) == round(0.60 * 0.98, 4)
+def test_exit_price_is_098_when_urgent():
+    # live_exit_limit_price with None seconds_left (unknown) defaults
+    # to maker (no discount), so we explicitly test with a short time
+    # to verify the 2% taker discount is applied when urgent.
+    assert live_fees.live_exit_limit_price("YES", 0.60, seconds_left=30.0) == round(0.60 * 0.98, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -714,7 +717,13 @@ def test_live_stop_loss_skips_btc15m():
     assert res == {"orders_placed": 0, "positions_processed": 0}
 
 
-def test_dry_still_exits_btc15m_mid_bucket(monkeypatch):
+def test_dry_also_skips_btc15m_mid_bucket(monkeypatch):
+    """DRY and LIVE both skip mid-bucket BTC profit-take.
+
+    The 15-minute BTC binary rides to settlement. Exiting mid-bucket
+    pays the spread plus a second fee for nothing. Applied to
+    BOTH books so DRY rehearses exactly what LIVE does.
+    """
     from src.jobs import execute as ex
 
     close_later = (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat()
@@ -745,5 +754,5 @@ def test_dry_still_exits_btc15m_mid_bucket(monkeypatch):
     res = asyncio.run(
         ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=False)
     )
-    assert res["orders_placed"] == 1
-    assert len(sells) == 1
+    assert res["orders_placed"] == 0
+    assert len(sells) == 0

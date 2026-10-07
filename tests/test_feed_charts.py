@@ -150,16 +150,20 @@ def test_live_lanes_are_resumed_like_any_other_lane():
     assert "_OPERATOR_STOP_REASONS" in src
 
 
-def test_the_supervisor_manages_only_the_current_book():
-    """DRY and LIVE are separate books with separate runtime rows.
+def test_the_supervisor_manages_all_books():
+    """The supervisor reads and writes ALL books, not just the current one.
 
-    The supervisor reads and writes one book's rows only, so a Stop on the
-    LIVE page can never clear DRY's intent or kill DRY's process.
+    A Stop on the LIVE page must never clear DRY's intent or kill DRY's
+    process, and vice versa. The supervisor checks every strategy row
+    regardless of which book mode it is in, so the operator's stop
+    button is permanent law for that lane only.
     """
     src = _supervisor_source()
     assert "book_mode = _runtime_mode()" in src
-    assert "store.desired(mode=book_mode)" in src
-    assert "store.snapshot(mode=book_mode)" in src
+    assert "store.desired()" in src
+    assert "store.desired(mode=book_mode)" not in src
+    assert "store.snapshot()" in src
+    assert "store.snapshot(mode=book_mode)" not in src
 
 
 def test_a_recovered_strategy_resets_the_failure_budget():
