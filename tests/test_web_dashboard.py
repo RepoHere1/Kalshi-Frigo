@@ -1486,7 +1486,8 @@ def test_page_carries_mode_in_body_attribute(client):
 def test_page_has_full_viewport_mode_frame(client):
     html = client.get("/").get_data(as_text=True)
     assert "position:fixed;inset:0;z-index:9999" in html
-    assert "@keyframes livepulse" in html, "LIVE needs an animation, not just a colour"
+    # LIVE shares DRY's green palette and instead rings every card in red.
+    assert "border:1px solid var(--down)" in html
 
 
 def test_page_shows_a_text_mode_flag(client):
@@ -1501,8 +1502,8 @@ def test_page_title_and_favicon_track_mode(client):
     html = client.get("/").get_data(as_text=True)
     assert "DRY Trading Dashboard" in html
     assert 'id="favicon"' in html
-    # Both colours are present: the template picks per mode.
-    assert "%232ee6a8" in html and "%23a30808" in html
+    # Both books share the green favicon; the letter distinguishes L vs D.
+    assert "%232ee6a8" in html
 
 
 def test_page_embeds_write_token_so_controls_do_not_prompt(client):

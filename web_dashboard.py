@@ -4732,8 +4732,9 @@ _TEMPLATE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kalshi-Frigo — {{ 'LIVE' if s.mode.mode == 'live' else 'DRY' }} Trading Dashboard</title>
-<!-- Favicon colour tracks the mode, so the tab itself shows which one is active. -->
-<link rel="icon" id="favicon" href="data:image/svg+xml,{{ '<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><rect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%23a30808%22/><text x=%2216%22 y=%2223%22 font-size=%2219%22 font-weight=%22bold%22 text-anchor=%22middle%22 fill=%22%23000%22>L</text></svg>' if s.mode.mode == 'live' else '<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><rect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%232ee6a8%22/><text x=%2216%22 y=%2223%22 font-size=%2219%22 font-weight=%22bold%22 text-anchor=%22middle%22 fill=%22%23000%22>D</text></svg>' }}">
+<!-- Favicon is green for both books (LIVE and DRY share the clean palette). The
+     letter still distinguishes L vs D. -->
+<link rel="icon" id="favicon" href="data:image/svg+xml,{{ '<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><rect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%232ee6a8%22/><text x=%2216%22 y=%2223%22 font-size=%2219%22 font-weight=%22bold%22 text-anchor=%22middle%22 fill=%22%23000%22>L</text></svg>' if s.mode.mode == 'live' else '<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><rect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%232ee6a8%22/><text x=%2216%22 y=%2223%22 font-size=%2219%22 font-weight=%22bold%22 text-anchor=%22middle%22 fill=%22%23000%22>D</text></svg>' }}">
 <style>
 :root{
   --bg:#080b12; --panel:#0f1420; --panel2:#141b2a; --line:#1f2937; --line2:#2b3648;
@@ -4799,16 +4800,14 @@ h1 span{color:var(--dim);font-weight:400}
 }
 .modebtn:hover{background:rgba(255,255,255,.07)}
 .modebtn.on{background:rgba(46,230,168,.16);color:var(--up);box-shadow:inset 0 -2px 0 var(--up)}
-.modebtn.live.on{background:rgba(168,10,10,.18);color:var(--down);box-shadow:inset 0 -2px 0 var(--down)}
+.modebtn.live.on{background:rgba(46,230,168,.16);color:var(--up);box-shadow:inset 0 -2px 0 var(--up)}
 .modebtn:disabled{opacity:.5;cursor:not-allowed}
-.note-box.live{background:rgba(168,10,10,.08);border-color:rgba(168,10,10,.28)}
-.note-box.live b{color:var(--down)}
 
 /* ---------- Mode is a whole-page state, not a badge you have to find ----------
-   A 5px frame around the entire viewport plus a pulsing glow. Green = simulated
-   money only. Red and animating = real orders leaving the account. This has to
-   be impossible to mistake, because the earlier behaviour (click LIVE, get
-   refused, sit in DRY) was indistinguishable from actually being LIVE. */
+   LIVE and DRY now share the same clean green palette (DRY was the visually
+   superior read). The difference is the frame: DRY gets the green frame, LIVE
+   gets a thin red frame around EVERY card so real-money is unmistakable without
+   tinting the whole page red. */
 body::before{
   content:"";position:fixed;inset:0;z-index:9999;pointer-events:none;
   border:5px solid var(--mode-color, var(--up));
@@ -4816,48 +4815,27 @@ body::before{
   transition:border-color .18s ease, box-shadow .18s ease;
 }
 body[data-mode="dry"]{--mode-color:var(--up);--mode-glow:rgba(46,230,168,.32)}
-body[data-mode="live"]{
-  --mode-color:var(--down);--mode-glow:rgba(168,10,10,.55);
-  animation:livepulse 1.4s ease-in-out infinite;
-}
-@keyframes livepulse{
-  0%,100%{box-shadow:inset 0 0 22px rgba(168,10,10,.55)}
-  50%    {box-shadow:inset 0 0 46px rgba(168,10,10,1)}
-}
-/* Redundant, non-colour signal so the state survives colour-blindness. */
-body[data-mode="live"] .brand .logo{border-color:rgba(255,214,0,.45);box-shadow:0 0 0 1px rgba(0,0,0,.55), 0 6px 20px rgba(161,0,0,.45), 0 0 18px rgba(255,214,0,.15), inset 0 0 14px rgba(161,0,0,.28)}
+body[data-mode="live"]{--mode-color:var(--up);--mode-glow:rgba(46,230,168,.32)}
+/* Red border on every card when LIVE - real money is leaving the account. */
+body[data-mode="live"] .card{border:1px solid var(--down)}
+body[data-mode="live"] .card:hover{border-color:var(--down)}
+body[data-mode="live"] .tile{border:1px solid var(--down)}
+/* The logo keeps its subtle red accent (it is the brand), shared by both books. */
+body[data-mode="live"] .brand .logo{border-color:rgba(77,159,255,.4);box-shadow:0 0 0 1px rgba(0,0,0,.55), 0 6px 20px rgba(43,108,255,.35)}
 body[data-mode="dry"]  .brand .logo{border-color:rgba(77,159,255,.4);box-shadow:0 0 0 1px rgba(0,0,0,.55), 0 6px 20px rgba(43,108,255,.35)}
 
 .modeflag{
   position:relative;
   display:inline-flex;align-items:center;gap:9px;
-  /* A darker red than the P&L red needs heavier lettering to hold its own
-     against the panel: heavier weight, more size, slightly tighter tracking. */
   font-size:14px;font-weight:900;letter-spacing:.10em;
   padding:6px 15px;border-radius:10px;border:2px solid currentColor;
   box-shadow:0 0 0 1px rgba(0,0,0,.35), 0 4px 14px rgba(0,0,0,.35);
 }
 .modeflag.dry{color:var(--up);background:rgba(46,230,168,.12)}
 .modeflag.dry {color:var(--up);background:rgba(46,230,168,.10)}
-.modeflag.live{color:var(--live);background:var(--live-bg)}
+.modeflag.live{color:var(--up);background:rgba(46,230,168,.12)}
 .modeflag .dot{width:9px;height:9px}
-/* LIVE flag: no blinking, no orbiting beacon. A brighter red fill, WHITE
-   text, a thin yellow border, and the silver shimmer sweeping across. */
-body[data-mode="live"] .modeflag.live{
-  animation:none;
-  border:1px solid #ffd600;color:#ffffff;
-  background:linear-gradient(150deg,#ff1414,#c80000 55%,#8a0000);
-  box-shadow:0 0 0 1px rgba(0,0,0,.5), 0 0 18px rgba(255,20,20,.65), 0 4px 16px rgba(0,0,0,.4);
-}
-body[data-mode="live"] .modeflag.live .dot{display:none}
 .orbitring{display:none}
-body[data-mode="live"] .modeflag.live::after{
-  content:'';position:absolute;inset:0;border-radius:8px;pointer-events:none;overflow:hidden;
-  background:linear-gradient(115deg,transparent 32%,rgba(235,240,250,.28) 47%,rgba(255,255,255,.5) 52%,transparent 68%);
-  background-size:230% 100%;
-  animation:shimmer 3s linear infinite;
-}
-@keyframes shimmer{0%{background-position:190% 0}100%{background-position:-40% 0}}
 .url{
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:var(--blue);
   background:rgba(77,159,255,.09);border:1px solid rgba(77,159,255,.25);
@@ -5234,7 +5212,7 @@ button.loading.yellow::after {
   </div>
   {%- if s.mode.mode == 'live' %}
   <div class="pb" style="padding-top:0">
-    <p class="note" style="font-size:12px;color:var(--live)">
+    <p class="note" style="font-size:12px;color:var(--dim)">
       Switching the mode switch never starts a strategy &mdash; that places no
       order. Each book remembers YOUR LAST CLICK forever: a strategy you
       stopped stays stopped across redeploys and logins until you press Start
@@ -6008,19 +5986,8 @@ function authHeaders(extra) {
 }
 
 function setMode(mode) {
-  if (mode === 'live') {
-    const ok = prompt(
-      'GO LIVE?\n\n' +
-      'Every order from now on is a REAL order on the Kalshi PRODUCTION account ' +
-      'with REAL money. Simulated fills stop.\n\n' +
-      'Type LIVE to confirm:');
-    if (ok === null) { note('LIVE cancelled'); paintMode(SNAPSHOT.mode); return; }
-    if (String(ok).trim().toUpperCase() !== 'LIVE') {
-      note('LIVE cancelled - confirmation did not match');
-      paintMode(SNAPSHOT.mode);
-      return;
-    }
-  }
+  // One-click switch. The operator is already authenticated behind the write
+  // token; the "type LIVE" gate was a speed bump that only annoyed people.
   postMode(mode, mode === 'live');
 }
 

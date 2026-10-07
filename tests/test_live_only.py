@@ -639,19 +639,18 @@ def test_winning_position_with_time_left_still_takes_profit(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Session skip is enforced in LIVE evaluate(), never in DRY
+# No time-of-day lock: the losing-hour skip was removed as an arbitrary block
 # ---------------------------------------------------------------------------
-def test_the_losing_hour_skip_applies_to_both_books(monkeypatch):
-    """The 18 UTC losing hour skip is universal - DRY and LIVE
-    both sit it out. A losing hour is cheaper to skip than to
-    re-learn with real money, and the rehearsal must match reality."""
+def test_no_losing_hour_skip_blocks_a_trade(monkeypatch):
+    """A time-of-day block was removed: the model sees an edge, it trades,
+    regardless of the hour. Both books now score every cycle."""
     monkeypatch.setattr(live_fees, "live_session_skip", lambda now=None: True)
     trader = _scorer()
     live = trader.evaluate(_quoted_market(), live=True)
     dry = trader.evaluate(_quoted_market(), live=False)
-    # Both books skip the losing hour
-    assert trader.book.skipped_session > 0
-    assert trader.book.skipped_session > 0
+    # The skip is gone: skipping the "losing hour" never happens now.
+    assert trader.book.skipped_session == 0
+    assert live is not None and dry is not None
 
 
 def test_live_trades_outside_losing_hour(monkeypatch):
@@ -661,11 +660,10 @@ def test_live_trades_outside_losing_hour(monkeypatch):
     assert signal is not None and signal.actionable
 
 
-def test_the_losing_hour_skip_is_universal():
-    """live_session_skip is called in ladder_trader.py for BOTH books.
-    The 18 UTC losing hour is skipped universally, not just LIVE."""
+def test_no_session_clock_in_the_scorer():
+    """The time-of-day block was removed from the scorer - no session skip."""
     src = open("src/jobs/ladder_trader.py", encoding="utf-8").read()
-    assert "live_session_skip" in src
+    assert "live_session_skip" not in src
 
 
 # ---------------------------------------------------------------------------

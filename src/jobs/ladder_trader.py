@@ -510,13 +510,9 @@ class UpDownTrader:
         fixed clip size (used in LIVE to size down against the
         available balance).
         """
-        # Losing-hour skip: the 18 UTC hour lost money in the forever log,
-        # so BOTH books sit it out. A losing hour is cheaper to skip
-        # than to re-learn with real money. Applied identically to DRY.
-        from src.jobs import live_fees as _lf_skip
-        if _lf_skip.live_session_skip():
-            self.book.skipped_session += 1
-            return None
+        # The old 18-UTC "losing hour" skip was removed: a time-of-day block is an
+        # arbitrary impediment - the trade the model sees now is what matters, and
+        # sitting out a whole hour both books was a guaranteed way to miss edge.
         if market is None:
             self.book.skipped_unquoted += 1
             return None
@@ -1574,14 +1570,9 @@ class UpDownTrader:
                 }
 
         # One flat summary: the book counters plus this cycle's reading.
-        # Session bump applies to BOTH books so DRY sees the same edge bar.
+        # No time-of-day session bump: a "losing hour" edge surcharge is an
+        # arbitrary lock that a minute later is just an impediment.
         _session_bump = 0.0
-        try:
-            from src.jobs import live_fees as _live_fees_rep
-
-            _session_bump = float(_live_fees_rep.live_session_extra_edge())
-        except Exception:  # noqa: BLE001
-            _session_bump = 0.0
         # BRTI observability: why the score used retail spot instead of the
         # index (degraded reason, staleness) -- read from the cycle print.
         try:

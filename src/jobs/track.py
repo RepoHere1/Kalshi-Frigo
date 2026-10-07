@@ -486,13 +486,7 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
         logger.info("🎯 Checking for profit-taking opportunities...")
         mode = _current_mode()
         is_live = mode == MODE_LIVE
-        # live_session_skip() applies to BOTH books: the 18 UTC hour
-        # is a losing hour regardless of mode. DRY should not trade
-        # through it either, so the rehearsal is realistic.
-        from src.jobs import live_fees as _lf
-        if _lf.live_session_skip():
-            logger.info(f"Skipping 18 UTC losing hour in {mode} mode")
-            return
+        # No time-of-day lock: an exit is taken when the book says take it.
         profit_results = await place_profit_taking_orders(
             db_manager=db_manager,
             kalshi_client=kalshi_client,
