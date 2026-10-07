@@ -68,7 +68,7 @@ ASSET_TUNING: Dict[str, Dict[str, float]] = {
         "noise_pct": 0.0005,          # ~0.05% of price (~$0.00004): DOGE's real
                                       # 15-min move is tiny; 0.5% parked it all day
         "max_entry_price": 0.70,
-        "max_entry_price_maker": 0.88,
+        "max_entry_price_maker": 0.75,
         "sweet_band_low": 0.20,
         "sweet_band_high": 0.65,
     },
@@ -76,7 +76,7 @@ ASSET_TUNING: Dict[str, Dict[str, float]] = {
         "noise_pct": 0.001,           # ~0.1% of price (~$0.09): HYPE moves more,
                                       # but 0.2% only ever sat inside the band
         "max_entry_price": 0.70,
-        "max_entry_price_maker": 0.88,
+        "max_entry_price_maker": 0.75,
         "sweet_band_low": 0.20,
         "sweet_band_high": 0.70,
     },
@@ -84,14 +84,14 @@ ASSET_TUNING: Dict[str, Dict[str, float]] = {
         "noise_pct": 0.0002,          # ~0.02% of price (~$0.51): ETH is a large
                                       # asset like BTC; 0.1% was far too wide
         "max_entry_price": 0.60,
-        "max_entry_price_maker": 0.85,
+        "max_entry_price_maker": 0.75,
         "sweet_band_low": 0.20,
         "sweet_band_high": 0.50,
     },
     "SOL-USD": {
         "noise_pct": 0.0006,          # ~0.06% of price: tightened, still above BTC
         "max_entry_price": 0.65,
-        "max_entry_price_maker": 0.88,
+        "max_entry_price_maker": 0.75,
         "sweet_band_low": 0.20,
         "sweet_band_high": 0.65,
     },
@@ -112,6 +112,9 @@ class UpDownConfig:
     #   - NO trades win 83% vs YES at 67%: the NO side is preferred unless YES
     #     is clearly better
     max_entry_price: float = 0.60  # REDUCED: 11% win above 0.65, stop the bleeding
+    # LIVE log showed entries at 0.80-0.85 YES resolve to zero almost every time
+    # (the $0.90+ "4% win" band bleeding lower). Cap maker entries below that.
+    yes_extra_edge: float = 0.03   # YES/UP must beat its bar by +0.03 (NO wins more)
     sweet_band_low: float = 0.20
     sweet_band_high: float = 0.50
     out_of_band_extra_edge: float = 0.04  # RAISED: Now out-of-band is 0.50-0.60, needs +4c edge
@@ -148,7 +151,7 @@ class UpDownConfig:
     # entries stay capped at max_entry_price - the taker fee at 85c is 6% of
     # the clip, poison at this scale. The $0.90+ hard block stands: entries
     # there won 4% forever, fee schedule irrelevant.
-    max_entry_price_maker: float = 0.85
+    max_entry_price_maker: float = 0.75
     # AI advisory stack. All default OFF: with every flag off the ladder is
     # byte-identical math, and the ai_* modules are never even imported on
     # the trading path. Env overrides let Railway enable one lane at a time
@@ -807,6 +810,14 @@ class UpDownTrader:
         down_ok = _side_ok(
             down_edge, down_fill, _required(down_fill, _down_maker), _down_maker
         )
+
+        # LIVE trade-log truth: YES loses net (40 losses vs 27 for NO) while NO
+        # wins more (83% vs 67% forever-log). YES must therefore clear a HIGHER
+        # edge bar than NO before it is worth taking - the asymmetry is real
+        # money, not a tie-breaker. This is the single highest-leverage lever
+        # on the win rate: stop the marginal YES entries that bleed.
+        if self.config.yes_extra_edge > 0 and up_ok:
+            up_ok = up_edge >= (_required(up_fill, _up_maker) + self.config.yes_extra_edge)
 
         side = ""
         ask: Optional[float] = None

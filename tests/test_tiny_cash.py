@@ -142,11 +142,12 @@ def test_maker_bar_takes_what_the_taker_bar_refuses(monkeypatch):
     import src.jobs.ladder_trader as lt
 
     monkeypatch.setattr(
-        lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.52
+        lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.55
     )
     trader = _trader()
 
-    # Maker window (600s > 120s patience): bid 0.44, edge 0.08 >= 0.06 bar.
+    # Maker window (600s > 120s patience): resting bid 0.44 clears the maker bar
+    # (quarter fee) + the YES surcharge, where the taker ask would not.
     mkt = _mkt(
         seconds_left=600, yes_bid=0.44, yes_ask=0.45, no_bid=0.55, no_ask=0.56
     )
@@ -154,7 +155,7 @@ def test_maker_bar_takes_what_the_taker_bar_refuses(monkeypatch):
     assert signal is not None and signal.side == "up"
     assert "maker-bar" in signal.reason
 
-    # Taker window (60s): ask 0.45, edge 0.07 < 0.06 + 0.0385 fee -> refused.
+    # Taker window (60s): ask 0.45, edge 0.10 < taker fee + YES surcharge -> refused.
     trader2 = _trader()
     mkt2 = _mkt(
         seconds_left=60, yes_bid=0.44, yes_ask=0.45, no_bid=0.55, no_ask=0.56
@@ -226,16 +227,15 @@ def test_kelly_cap_bounds_a_single_clip():
     assert signal.notional == pytest.approx(1.40, abs=0.01)
 
 
-def test_maker_entries_reach_85c_takers_stop_at_60c():
-    """High-probability convergence is the steadiest compounding trade - but
-    only at the quarter fee. The taker fee at 85c is a private tax."""
+def test_maker_entries_stop_at_75c_takers_stop_at_60c():
+    """The 0.80-0.85 YES band resolves to zero almost every time (the $0.90+
+    '4% win' curse bleeding lower). Maker cap is now 0.75, taker 0.60."""
     import src.jobs.ladder_trader as lt
 
     trader = _trader()
     trader._live_balance = 10.0
 
-    # Maker window (600s): 0.80 resting bid, fair 0.97 - edge 0.17 clears the
-    # out-of-band bar (0.06 + 0.0025 maker fee + 0.04).
+    # Maker window (600s): 0.80 resting bid is ABOVE the 0.75 maker cap -> blocked.
     mkt = _mkt(
         seconds_left=600, target=84000.0,
         yes_bid=0.80, yes_ask=0.82, no_bid=0.19, no_ask=0.20,
@@ -243,7 +243,19 @@ def test_maker_entries_reach_85c_takers_stop_at_60c():
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.97)
         signal = trader.evaluate(mkt, live=True)
-    assert signal is not None and signal.side == "up"
+    assert signal is None or signal.side == ""
+
+    # A 0.70 maker entry (under the 0.75 cap, real edge) still goes.
+    trader3 = _trader()
+    trader3._live_balance = 10.0
+    mkt3 = _mkt(
+        seconds_left=600, target=84000.0,
+        yes_bid=0.70, yes_ask=0.72, no_bid=0.29, no_ask=0.31,
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.97)
+        signal3 = trader3.evaluate(mkt3, live=True)
+    assert signal3 is not None and signal3.side == "up"
 
     # Taker window (60s): the same 0.80 ask is above the 0.60 taker cap.
     trader2 = _trader()

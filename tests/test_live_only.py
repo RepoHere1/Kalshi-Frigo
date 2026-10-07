@@ -432,9 +432,9 @@ def test_live_refuses_only_what_the_fee_makes_unprofitable(monkeypatch):
     resting bid pays a quarter of the fee and fills a cent better."""
     import src.jobs.ladder_trader as lt
 
-    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.53)
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.55)
 
-    # Taker window (60s < maker patience): the fee refuses both books.
+    # Taker window (60s < maker patience): the fee + YES surcharge refuse both books.
     market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0, seconds_left=60)
     trader = _scorer()
     trader.feed.markets = [market]

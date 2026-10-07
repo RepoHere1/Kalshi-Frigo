@@ -410,8 +410,8 @@ def test_the_no_side_is_preferred_when_edges_are_close(monkeypatch):
     out = trader.evaluate(market, live=False)
     assert out is not None and out.side == "down"
 
-    # YES clearly better (by more than the override margin): YES is chosen.
-    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.46)
+    # YES clearly better (edge clears the YES surcharge): YES is chosen.
+    monkeypatch.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.52)
     trader.book.skipped_no_edge = 0
     market2 = _quoted_market(yes_ask=0.35, no_ask=0.50, target=84000.0)
     out2 = trader.evaluate(market2, live=False)
