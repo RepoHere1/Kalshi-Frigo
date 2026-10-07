@@ -124,6 +124,7 @@ strategy_state = {
     "btc_updown": {"running": False, "pid": None, "mode": "paper"},
     "doge_updown": {"running": False, "pid": None, "mode": "paper"},
     "btc_1h_updown": {"running": False, "pid": None, "mode": "paper"},
+    "hyperliquid_updown": {"running": False, "pid": None, "mode": "paper"},
     "ai_directional": {"running": False, "pid": None, "mode": "paper"},
     "safe_compounder": {"running": False, "pid": None, "mode": "paper"},
     "beast_mode": {"running": False, "pid": None, "mode": "paper"},
@@ -142,8 +143,9 @@ strategy_state = {
 # now part of the command rather than an afterthought.
 STRATEGY_COMMANDS: Dict[str, List[str]] = {
     "btc_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
-    "doge_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
-    "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
+    "doge_updown": ["cli.py", "run", "--btc-updown", "--series", "KXDOGE15M", "--spot-product", "DOGE-USD", "--paper", "--loop", "--interval", "0"],
+    "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTC1H", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
+    "hyperliquid_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPE15M", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
     "ai_directional": ["cli.py", "run", "--paper", "--loop", "--interval", "300"],
     "safe_compounder": [
         "cli.py",
@@ -174,6 +176,7 @@ STRATEGY_ALIASES = {
     "btc_updown": "btc_updown",
     "doge_updown": "doge_updown",
     "btc_1h_updown": "btc_1h_updown",
+    "hyperliquid_updown": "hyperliquid_updown",
     "ai_directional": "ai_directional",
     "ai directional": "ai_directional",
     "directional_trading": "ai_directional",
@@ -196,6 +199,8 @@ STRATEGY_ALIASES = {
     "quick_flip_scalping": "quick_flip",
     "quick flip": "quick_flip",
     "quick_flip_scalping_strategy": "quick_flip",
+    "hyperliquid": "hyperliquid_updown",
+    "hyperliquid_15m": "hyperliquid_updown",
 }
 
 # Alert webhooks
@@ -879,6 +884,14 @@ STRATEGY_DOCS = {
         "BTC 1-hour up/down",
         'Reads Kalshi\'s BTC 1-hour up/down contract and compares its Up/Down price against '
         "live Coinbase spot. Takes one $5 clip when profitable edge detected. "
+        "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
+        "the current book every second of every day.",
+    ),
+    "hyperliquid_updown": (
+        "Hyperliquid 15-min up/down",
+        'Reads Kalshi\'s Hyperliquid 15-min up/down contract (KXHYPE15M) and compares its '
+        "Up/Down price against live Coinbase HYPE-USD spot. Takes one $5 clip when "
+        "profitable edge detected. "
         "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
         "the current book every second of every day.",
     ),
@@ -1651,19 +1664,19 @@ def _strategy_supervisor_loop():
         time.sleep(10)
 
 
-# The three UP/DOWN lanes the operator wants ON every second of
+# The four UP/DOWN lanes the operator wants ON every second of
 # every day, in whichever book the page is in. Everything else
-# stays under the button-only law: these three are the standing,
+# stays under the button-only law: these four are the standing,
 # explicit exception - the operator's instruction is that they run
 # always, in DRY and in LIVE, and this loop is the only thing
 # allowed to arm a lane without a fresh button push.
-BTC_ALWAYS_ON = ("btc_updown", "doge_updown", "btc_1h_updown")
+BTC_ALWAYS_ON = ("btc_updown", "doge_updown", "btc_1h_updown", "hyperliquid_updown")
 
 
 def _btc_keepalive_loop():
-    """The three BTC supervisors: those lanes are ALWAYS ON.
+    """The four UP/DOWN lane supervisors: those lanes are ALWAYS ON.
 
-    One pass per second over the three UP/DOWN lanes, in the book
+    One pass per second over the four UP/DOWN lanes, in the book
     the page is actually in:
 
     - a lane with no live pid is armed (desired=1) and started,
@@ -1998,9 +2011,9 @@ def _strategy_cards(
         card["win_rate"] = (
             round(100.0 * card["wins"] / card["trades"], 1) if card["trades"] else 0.0
         )
-    # REORDER: Priority: btc_updown #1, doge_updown #2, btc_1h_updown #3, then ai_directional, rest
+    # REORDER: Priority: btc_updown #1, doge_updown #2, hyperliquid_updown #3, btc_1h_updown #4, then ai_directional, rest
     ordered = []
-    priority_order = ["btc_updown", "doge_updown", "btc_1h_updown", "ai_directional", "beast_mode", "safe_compounder", "market_making", "quick_flip"]
+    priority_order = ["btc_updown", "doge_updown", "hyperliquid_updown", "btc_1h_updown", "ai_directional", "beast_mode", "safe_compounder", "market_making", "quick_flip"]
     for name in priority_order:
         if name in cards:
             ordered.append(cards[name])
@@ -4240,7 +4253,7 @@ def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
     child_env.pop("LIVE_TRADING_ENABLED", None)
     # Set explicit mode for this process (redundant but belt-and-suspenders)
     child_env["STRATEGY_BOOK_MODE"] = mode
-    # The child's own lane name. The three UP/DOWN lanes run the same
+    # The child's own lane name. The four UP/DOWN lanes run the same
     # trader, and a hardcoded name in that trader's heartbeat put every
     # lane's proof of life on the first lane's row - the other two cards
     # read "stopped" while their processes traded. The child stamps its
@@ -5212,7 +5225,7 @@ button.loading.yellow::after {
       stopped stays stopped across redeploys and logins until you press Start
       here again, and a strategy you started keeps coming back from crashes
       automatically. Start/Stop is welded to your buttons, per book, for good.
-      The three BTC UP/DOWN lanes are the one exception: a supervisor keeps
+      The four BTC UP/DOWN lanes are the one exception: a supervisor keeps
       them on every second, in whichever book the page is in.
     </p>
   </div>
@@ -6904,7 +6917,7 @@ def start_background_workers():
          # themselves off" the operator reported. The operator's Stop
           # stays welded: desired=0 lanes are not touched.
           _strategy_supervisor_loop,
-          # The three BTC UP/DOWN lanes are ALWAYS ON (the
+          # The four BTC UP/DOWN lanes are ALWAYS ON (the
           # operator's standing instruction): a dedicated
           # supervisor per lane arms and (re)starts them every
           # second, in whichever book the page is in.

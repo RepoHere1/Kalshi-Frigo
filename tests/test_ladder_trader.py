@@ -288,19 +288,20 @@ def test_an_entry_under_min_win_prob_is_refused():
 
 
 def test_the_notional_cap_stops_accumulation():
-    """max_open_notional is LIVE-only; DRY is uncapped. Held rows sit on
-    DIFFERENT tickers - the one-clip-per-flip rule is separate from this."""
+    """max_open_notional caps both books so DRY cannot accumulate
+    beyond the same limit LIVE faces. Held rows sit on DIFFERENT
+    tickers - the one-clip-per-flip rule is separate from this."""
     trader = UpDownTrader(SpotFeed(), Btc15mFeed())
     held = [
         {"ticker": "KXBTC15M-26OCT061200-00", "side": "YES", "notional": 12.0},
         {"ticker": "KXBTC15M-26OCT061215-15", "side": "YES", "notional": 12.0},
     ]
     clip = _signal("KXBTC15M-26OCT011715-15", side="up", ask=0.5, contracts=8)
-    # LIVE mode: the cap blocks.
-    blocked = trader._entry_block(clip, held, live=True)
-    assert "exceed" in blocked and "$25.00" in blocked
-    # DRY mode: no cap, so it passes.
-    assert trader._entry_block(clip, held, live=False) == ""
+    # BOTH books: the cap blocks.
+    blocked_live = trader._entry_block(clip, held, live=True)
+    assert "exceed" in blocked_live and "$25.00" in blocked_live
+    blocked_dry = trader._entry_block(clip, held, live=False)
+    assert "exceed" in blocked_dry and "$25.00" in blocked_dry
 
 
 def test_under_one_clip_per_window_a_repeat_is_refused():
@@ -448,8 +449,9 @@ async def test_a_cycle_crash_never_kills_the_process(tmp_path, monkeypatch):
     await store.record_start("btc_updown", os.getpid(), "paper", "cli.py run --btc-updown")
 
     class _Hub:
-        spot = None
-        feed = None
+        def __init__(self, **kwargs):
+            self.spot = None
+            self.feed = None
 
         async def start(self):
             return None

@@ -74,7 +74,7 @@ def _ws_messages(ws: Any):
     return ws
 
 
-def _parse_bucket(event_ticker: str) -> Optional[str]:
+def _parse_bucket(event_ticker: str, series_prefix: str = None) -> Optional[str]:
     """Return the `26OCT011715` quarter-hour stamp from a ticker or bare stamp.
 
     Accepts either form because the bucket appears in two places: on the event
@@ -87,7 +87,10 @@ def _parse_bucket(event_ticker: str) -> Optional[str]:
     raw = (event_ticker or "").strip()
     if "-" in raw:
         parts = raw.split("-")
-        if len(parts) != 2 or parts[0] != "KXBTC15M":
+        prefix = parts[0]
+        if series_prefix and not prefix.startswith(series_prefix):
+            return None
+        if len(parts) != 2:
             return None
         stamp = parts[1]
     else:
@@ -170,16 +173,19 @@ class UpDownMarket:
 
 
 class SpotFeed:
-    """Coinbase BTC-USD ticker over websocket, with a REST fallback.
+    """Coinbase spot ticker over websocket, with a REST fallback.
 
     The websocket is the point: it delivers in tens of milliseconds, so the spot
     side of the comparison is not itself the bottleneck. If the socket cannot be
     established the REST ticker keeps the charts alive at ~0.5 Hz and the feed
     reports itself as degraded, because a slow spot price must never be silently
     used as a leading indicator.
+
+    `product` is the Coinbase exchange pair, e.g. BTC-USD, DOGE-USD.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, product: str = "BTC-USD") -> None:
+        self.product = product
         self.price: float = 0.0
         self.ts: float = 0.0
         self.connected = False
@@ -221,7 +227,7 @@ class SpotFeed:
                             json.dumps(
                                 {
                                     "type": "subscribe",
-                                    "product_ids": ["BTC-USD"],
+                                    "product_ids": [self.product],
                                     "channels": ["ticker"],
                                 }
                             )
@@ -247,7 +253,7 @@ class SpotFeed:
                 await asyncio.sleep(3)
 
     async def _rest_loop(self) -> None:
-        url = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
+        url = f"https://api.exchange.coinbase.com/products/{self.product}/ticker"
         while not (self._stop and self._stop.is_set()):
             try:
                 timeout = aiohttp.ClientTimeout(total=10)
@@ -268,7 +274,7 @@ class SpotFeed:
 
 
 class Btc15mFeed:
-    """Kalshi's 15-minute BTC up/down markets, read over REST.
+    """Kalshi up/down markets for any series, read over REST.
 
     One request returns every open horizon in the series, so a poll is a single
     call regardless of how many 15-minute buckets are live.
@@ -276,23 +282,24 @@ class Btc15mFeed:
 
     def __init__(self, series: str = BTC15M_SERIES):
         self.series = series
+        self._prefix = series.split('-')[0] if series else "KXBTC15M"
         self.markets: List[UpDownMarket] = []
         self.ts: float = 0.0
         self.refreshes = 0
         self.last_error = ""
 
     @staticmethod
-    def _parse(ticker: str) -> Tuple[Optional[str], Optional[str], int]:
+    def _parse(ticker: str, prefix: str = None) -> Tuple[Optional[str], Optional[str], int]:
         """`KXBTC15M-26OCT011715-15` -> (event_ticker, bucket, horizon_minutes)."""
         parts = (ticker or "").split("-")
-        if len(parts) != 3 or parts[0] != "KXBTC15M":
+        if len(parts) != 3 or not parts[0].startswith(prefix or "KX"):
             return None, None, 0
         event_ticker = f"{parts[0]}-{parts[1]}"
         try:
             horizon = int(parts[2])
         except ValueError:
             horizon = 0
-        return event_ticker, _parse_bucket(parts[1]), horizon
+        return event_ticker, _parse_bucket(parts[1], parts[0]), horizon
 
     async def fetch(self, session: Optional[aiohttp.ClientSession] = None) -> List[UpDownMarket]:
         own = session is None
@@ -314,7 +321,7 @@ class Btc15mFeed:
         markets: List[UpDownMarket] = []
         for m in payload.get("markets", []):
             ticker = m.get("ticker", "")
-            event_ticker, bucket, horizon = self._parse(ticker)
+            event_ticker, bucket, horizon = self._parse(ticker, self._prefix)
             if event_ticker is None:
                 continue
             markets.append(
@@ -344,7 +351,7 @@ class Btc15mFeed:
         return markets
 
     def nearest(self) -> Optional[UpDownMarket]:
-        """The next contract to expire - the one a 15-minute strategy trades."""
+        """The next contract to expire - the one a strategy trades."""
         tradable = [m for m in self.markets if m.tradable]
         if not tradable:
             return None
@@ -428,9 +435,9 @@ class LeadEstimator:
 class MarketDataHub:
     """Everything the dashboard's market row needs, on one background task."""
 
-    def __init__(self) -> None:
-        self.spot = SpotFeed()
-        self.feed = Btc15mFeed()
+    def __init__(self, spot_product: str = "BTC-USD", series: str = BTC15M_SERIES) -> None:
+        self.spot = SpotFeed(product=spot_product)
+        self.feed = Btc15mFeed(series=series)
         self.lead = LeadEstimator()
         self._task: Optional[asyncio.Task[Any]] = None
         self._stop: Optional[asyncio.Event] = None

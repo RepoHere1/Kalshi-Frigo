@@ -76,14 +76,16 @@ def cmd_run(args: argparse.Namespace) -> None:
         )
         return
 
-    # --btc-updown mode: live spot vs Kalshi's own 15-minute up/down quotes
+    # --btc-updown mode: live spot vs Kalshi's own up/down quotes
     if getattr(args, "btc_updown", False):
         from src.jobs.ladder_trader import UpDownConfig, run_updown_trader
         from src.utils.mode import TradingMode
         from src.utils.database import DatabaseManager
 
-        print("📈 BTC 15-MIN UP/DOWN MODE")
-        print("   KXBTC15M | live spot vs Kalshi's own quote")
+        series = getattr(args, "series", "KXBTC15M")
+        spot_product = getattr(args, "spot_product", "BTC-USD")
+        print(f"📈 {series.replace('KX','').upper()} UP/DOWN MODE")
+        print(f"   {series} | live spot ({spot_product}) vs Kalshi's own quote")
         print("   $5 per clip | fee-aware in LIVE | no trade inside the noise band")
         # Initialize the database and arm this process's book.
         #
@@ -127,13 +129,15 @@ def cmd_run(args: argparse.Namespace) -> None:
                         UpDownConfig(),
                         loop=getattr(args, "loop", True),
                         interval=float(getattr(args, "interval", 0) or 0),
+                        series=series,
+                        spot_product=spot_product,
                     )
                 )
             except KeyboardInterrupt:
-                print("\nBTC up/down trader stopped by user.")
+                print(f"\n{series} up/down trader stopped by user.")
                 raise
             except Exception as exc:  # noqa: BLE001 - restart, never exit
-                print(f"BTC up/down trader crashed ({type(exc).__name__}: {exc}); restarting in 5s.", flush=True)
+                print(f"{series} up/down trader crashed ({type(exc).__name__}: {exc}); restarting in 5s.", flush=True)
                 _time.sleep(5)
         return
 
@@ -884,8 +888,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--btc-updown",
         action="store_true",
         dest="btc_updown",
-        help="BTC 15-minute up/down: trade only when live spot and Kalshi's own "
-        "KXBTC15M quote disagree",
+        help="Up/down market: trade when live spot and Kalshi's quote disagree. "
+        "Use --series and --spot-product to select the market.",
+    )
+    p_run.add_argument(
+        "--series",
+        type=str,
+        default="KXBTC15M",
+        help="Kalshi series ticker (e.g. KXBTC15M, KXDOGE15M, KXBTC1H) for --btc-updown",
+    )
+    p_run.add_argument(
+        "--spot-product",
+        type=str,
+        default="BTC-USD",
+        help="Coinbase spot product (e.g. BTC-USD, DOGE-USD) for --btc-updown",
     )
     p_run.add_argument(
         "--loop",

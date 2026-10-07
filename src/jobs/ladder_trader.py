@@ -81,7 +81,7 @@ class UpDownConfig:
     # reality. The actual fee is computed from the fill price at
     # decision time, not this placeholder.
     live_fee_rate: float = 0.03
-    # LIVE only: the largest fraction of the available balance one clip may
+    # The largest fraction of the available balance one clip may
     # spend. A fixed $5 clip empties a small account in a trade or two and it
     # then sits idle all night - sizing down against the balance keeps the book
     # firing on every real edge instead of going dark after one buy. Raised to
@@ -393,9 +393,13 @@ class UpDownTrader:
         fixed clip size (used in LIVE to size down against the
         available balance).
         """
-        # LIVE-ONLY losing-hour skip: the 18 UTC hour lost money in the
-        # forever log, so LIVE sits it out. A losing hour is cheaper to skip
-        # than to re-learn with real money. DRY never enters this branch.
+        # Losing-hour skip: the 18 UTC hour lost money in the forever log,
+        # so BOTH books sit it out. A losing hour is cheaper to skip
+        # than to re-learn with real money. Applied identically to DRY.
+        from src.jobs import live_fees as _lf_skip
+        if _lf_skip.live_session_skip():
+            self.book.skipped_session += 1
+            return None
         if market is None:
             self.book.skipped_unquoted += 1
             return None
@@ -633,11 +637,7 @@ class UpDownTrader:
         # DRY also fakes the fee (dry_fee_enabled) so the simulated
         # P&L matches what LIVE actually pays.
         def _required(fill_price: Optional[float], maker: bool = False) -> float:
-            if not live and not self.config.dry_fee_enabled:
-                return max(self.config.min_edge + self._vol_adj, 0.0)
-            # Maker entries rest at the bid and pay a QUARTER of the taker fee
-            # (live_fees.maker_fee_dollars models Kalshi's schedule). The bar
-            # drops by the other three quarters when the clock allows a rest.
+            # Same fee math for BOTH books so DRIED edge bar matches LIVE exactly.
             _fee_rate = 0.07 * (1.0 - float(fill_price or 0.5))
             kalshi_fee = 0.25 * _fee_rate if maker else _fee_rate
             return max(self.config.min_edge + kalshi_fee + self._vol_adj, 0.0)
@@ -745,6 +745,8 @@ class UpDownTrader:
                 self.config.kelly_sizing
                 and 0.0 < fill_price < 1.0
             ):
+                # Both books use the same balance source:
+                # DRIED uses the simulated cash cache, LIVE uses the real balance.
                 _bal = self._live_balance if live else self._dry_cash_cache
                 if _bal and _bal > 0.0:
                     _win = fair if side == "up" else (1.0 - fair)
@@ -887,7 +889,7 @@ class UpDownTrader:
             )
 
         open_notional = sum(float(p.get("notional") or 0.0) for p in held)
-        if live and open_notional + signal.notional > self.config.max_open_notional:
+        if open_notional + signal.notional > self.config.max_open_notional:
             return (
                 f"${open_notional:.2f} already deployed; adding "
                 f"${signal.notional:.2f} would exceed the "
@@ -912,7 +914,7 @@ class UpDownTrader:
                     self.book.skipped_sentinel += 1
                     return f"sentinel halt: {_reason}"[:200]
                 if _state == "caution":
-                    _kalshi_fee = 0.07 * (1.0 - float(signal.ask or 0.5)) if (live or self.config.dry_fee_enabled) else 0.0
+                    _kalshi_fee = 0.07 * (1.0 - float(signal.ask or 0.5))
                     _r = (
                         self.config.min_edge
                         + _kalshi_fee
@@ -971,9 +973,7 @@ class UpDownTrader:
                     "streak": _streak,
                     "vol_pct": 0.0,
                     "headlines": "none",
-                    "required": 0.07 * (1.0 - float(signal.ask or 0.5))
-                    if (live or self.config.dry_fee_enabled)
-                    else self.config.min_edge,
+                    "required": 0.07 * (1.0 - float(signal.ask or 0.5)),
                 }
                 _veto = await _ai_veto.check_veto(self._ai_client, _clip, _venue_state)
                 if _veto:
@@ -1050,7 +1050,8 @@ class UpDownTrader:
         # only books the fill if the book actually crosses the resting price,
         # so the rehearsal carries the fill risk too.
         _maker_wait = 0.0
-        if live or self.config.dry_maker_entry:
+        from src.jobs import live_fees as _lf_mk
+        if _lf_mk.should_use_maker_entry(signal.seconds_left):
             try:
                 from src.jobs import live_fees as _live_fees_mk
                 from src.utils.market_prices import get_market_prices as _gmp
@@ -1084,7 +1085,7 @@ class UpDownTrader:
                 f"{signal.seconds_left}s left"
             ),
             confidence=abs(signal.edge),
-            live=False,
+            live=live,
             strategy="btc_updown",
             mode="live" if live else "dry",
         )
@@ -1199,35 +1200,33 @@ class UpDownTrader:
             self.book.last_error = f"position tracking: {type(exc).__name__}: {exc}"
 
         try:
-            # LIVE-ONLY fetch throttle: far from expiry the book barely moves,
+            # Fetch throttle: far from expiry the book barely moves,
             # so reuse a fresh cache instead of hammering /markets into 429s.
-            # DRY always fetches (aggressive rehearsal); LIVE reuses a cache
-            # younger than 15s when more than 180s remain.
+            # Applied identically to BOTH books.
             _use_cache = False
-            if live:
-                try:
-                    import time as _time
+            try:
+                import time as _time
 
-                    _age = _time.time() - float(getattr(self.feed, "ts", 0.0) or 0.0)
-                    _nearest_cached = self.feed.nearest()
-                    _left = (
-                        float(_nearest_cached.seconds_left or 0.0)
-                        if _nearest_cached is not None
-                        else 0.0
-                    )
-                    if _nearest_cached is not None and _age < 15.0 and _left > 180.0:
-                        _use_cache = True
-                except Exception:  # noqa: BLE001 - fall through to fetch
-                    _use_cache = False
+                _age = _time.time() - float(getattr(self.feed, "ts", 0.0) or 0.0)
+                _nearest_cached = self.feed.nearest()
+                _left = (
+                    float(_nearest_cached.seconds_left or 0.0)
+                    if _nearest_cached is not None
+                    else 0.0
+                )
+                if _nearest_cached is not None and _age < 15.0 and _left > 180.0:
+                    _use_cache = True
+            except Exception:  # noqa: BLE001 - fall through to fetch
+                _use_cache = False
             if not _use_cache:
                 await self.feed.fetch()
         except Exception as exc:  # noqa: BLE001
-            # LIVE-ONLY 429 resilience: on rate-limit, reuse the last good
+            # 429 resilience: on rate-limit, reuse the last good
             # cache with jittered backoff instead of blanking the cycle.
-            # DRY keeps the old fail-fast behaviour untouched.
+            # Applied identically to BOTH books.
             _msg = f"{type(exc).__name__}: {exc}"
             _is_429 = "429" in _msg or "Too Many Requests" in _msg
-            if live and _is_429 and getattr(self.feed, "markets", None):
+            if _is_429 and getattr(self.feed, "markets", None):
                 try:
                     import asyncio as _asyncio
 
@@ -1236,75 +1235,74 @@ class UpDownTrader:
                     await _asyncio.sleep(_live_fees.backoff_delay_seconds(1))
                 except Exception:  # noqa: BLE001
                     pass
-                self.book.last_error = f"series fetch 429 (LIVE cache reused): {_msg[:120]}"
+                self.book.last_error = f"series fetch 429 (cache reused): {_msg[:120]}"
             else:
                 self.book.last_error = f"series fetch: {_msg}"
                 return self.book.summary()
 
         market = self.feed.nearest()
 
-        # LIVE sizes the clip against the real balance, so the account keeps
+        # Sizes the clip against the real balance, so the account keeps
         # trading on every edge instead of spending itself dark in one or two
         # clips. A read failure must not stop the cycle - it falls back to the
         # fixed clip and lets execute_position's own fail-closed balance check
         # refuse if the account genuinely cannot pay.
         live_budget: Optional[float] = None
         variance_mult: float = 1.0
-        if live:
+        try:
+            if self._client is None:
+                from src.clients.kalshi_client import KalshiClient
+
+                self._client = KalshiClient()
+            bal = await self._client.get_balance()
+            cents = float((bal or {}).get("balance") or 0.0)
+            # Below the $1 order minimum no clip can exist: say so once,
+            # plainly, instead of sizing up and getting refused at the
+            # broker every cycle.
+            if cents < 100:
+                self.book.last_error = (
+                    f"balance ${cents / 100.0:.2f} is below Kalshi's "
+                    f"$1.00 order minimum - sitting out until funded"
+                )
+                live_budget = None
+            else:
+                live_budget = round(
+                    cents / 100.0 * self.config.live_cash_fraction, 2
+                )
+                # Raw balance for the Kelly sizer in evaluate().
+                self._live_balance = cents / 100.0
+                self._dry_cash_cache = cents / 100.0
+        except Exception as exc:  # noqa: BLE001
+            self.book.last_error = f"balance read: {type(exc).__name__}: {exc}"
+        # Variance-commensurate sizing: the bigger Kalshi's lie
+        # (spot far from target with minutes to close), the bigger the clip
+        # -- up to 2.5x -- because convergence is proportionally more
+        # certain. Bounded by the balance fraction, the $1 minimum order
+        # floor and max_open_notional downstream. Applied to BOTH books.
+        if live_budget is not None and market is not None:
             try:
-                if self._client is None:
-                    from src.clients.kalshi_client import KalshiClient
+                from src.jobs import live_fees as _live_fees_var
 
-                    self._client = KalshiClient()
-                bal = await self._client.get_balance()
-                cents = float((bal or {}).get("balance") or 0.0)
-                # Below the $1 order minimum no clip can exist: say so once,
-                # plainly, instead of sizing up and getting refused at the
-                # broker every cycle.
-                if cents < 100:
-                    self.book.last_error = (
-                        f"LIVE balance ${cents / 100.0:.2f} is below Kalshi's "
-                        f"$1.00 order minimum - sitting out until funded"
-                    )
-                    live_budget = None
-                else:
-                    live_budget = round(
-                        cents / 100.0 * self.config.live_cash_fraction, 2
-                    )
-                    # Raw balance for the Kelly sizer in evaluate().
-                    self._live_balance = cents / 100.0
-            except Exception as exc:  # noqa: BLE001
-                self.book.last_error = f"LIVE balance read: {type(exc).__name__}: {exc}"
-            # LIVE-ONLY variance-commensurate sizing: the bigger Kalshi's lie
-            # (spot far from target with minutes to close), the bigger the clip
-            # -- up to 2.5x -- because convergence is proportionally more
-            # certain. Bounded by the balance fraction, the $1 minimum order
-            # floor and max_open_notional downstream. DRY keeps its fixed $5.
-            if live_budget is not None and market is not None:
+                _tgt = market.target
+                # Variance is measured on the same truth the score uses:
+                # BRTI estimate when fresh, else retail spot.
+                _ref = 0.0
                 try:
-                    from src.jobs import live_fees as _live_fees_var
-
-                    _tgt = market.target
-                    # Variance is measured on the same truth the score uses:
-                    # BRTI estimate when fresh, else retail spot.
+                    _b = getattr(self, "brti", None)
+                    if _b is not None and bool(getattr(_b, "fresh", False)):
+                        _ref = float(_b.estimate() or 0.0)
+                except Exception:  # noqa: BLE001
                     _ref = 0.0
-                    try:
-                        _b = getattr(self, "brti", None)
-                        if _b is not None and bool(getattr(_b, "fresh", False)):
-                            _ref = float(_b.estimate() or 0.0)
-                    except Exception:  # noqa: BLE001
-                        _ref = 0.0
-                    if _ref <= 0:
-                        _ref = self.spot.price
-                    if _tgt is not None and _ref > 0:
-                        variance_mult = _live_fees_var.variance_clip_multiplier(
-                            _ref - float(_tgt),
-                            self.config.noise_usd,
-                        )
-                        live_budget = round(live_budget * variance_mult, 2)
-                except Exception:  # noqa: BLE001 - sizing never blocks entry
-                    variance_mult = 1.0
-
+                if _ref <= 0:
+                    _ref = self.spot.price
+                if _tgt is not None and _ref > 0:
+                    variance_mult = _live_fees_var.variance_clip_multiplier(
+                        _ref - float(_tgt),
+                        self.config.noise_usd,
+                    )
+                    live_budget = round(live_budget * variance_mult, 2)
+            except Exception:  # noqa: BLE001 - sizing never blocks entry
+                variance_mult = 1.0
         signal = self.evaluate(market, live=live, clip_usd=live_budget if live else None)
         # Clear stale errors, but never wipe the explanation of a failed LIVE
         # balance read - that is the difference between "no edge" and "cannot
@@ -1427,15 +1425,14 @@ class UpDownTrader:
                 }
 
         # One flat summary: the book counters plus this cycle's reading.
-        # LIVE-ONLY session bump is reported truthfully; DRY reports the raw bar.
+        # Session bump applies to BOTH books so DRY sees the same edge bar.
         _session_bump = 0.0
-        if live:
-            try:
-                from src.jobs import live_fees as _live_fees_rep
+        try:
+            from src.jobs import live_fees as _live_fees_rep
 
-                _session_bump = float(_live_fees_rep.live_session_extra_edge())
-            except Exception:  # noqa: BLE001
-                _session_bump = 0.0
+            _session_bump = float(_live_fees_rep.live_session_extra_edge())
+        except Exception:  # noqa: BLE001
+            _session_bump = 0.0
         # BRTI observability: why the score used retail spot instead of the
         # index (degraded reason, staleness) -- read from the cycle print.
         try:
@@ -1497,20 +1494,17 @@ async def run_updown_trader(
     config: Optional[UpDownConfig] = None,
     loop: bool = False,
     interval: float = 0.0,
+    series: str = "KXBTC15M",
+    spot_product: str = "BTC-USD",
 ) -> None:
-    """Run the 15-minute up/down trader, optionally on a loop until interrupted.
+    """Run the up/down trader, optionally on a loop until interrupted.
 
-    THE PROCESS IS IMMORTAL. This used to let any exception in `cycle()` - or
-    in `hub.start()` before the try block - escape, exit the process, and wait
-    for the supervisor to notice and respawn it. Between the crash and the
-    respawn the card read "stopped", and under a crash loop it read "stopped"
-    more often than not. That is what "it never stays on" was. Nothing except
-    SIGTERM/SIGKILL (the operator's Stop, or a container kill) ends this loop
-    now: every pass is wrapped, failures are printed and retried with backoff.
+    `series` is the Kalshi series ticker (e.g. KXBTC15M, KXDOGE15M, KXBTC1H).
+    `spot_product` is the Coinbase pair (e.g. BTC-USD, DOGE-USD).
     """
     from src.jobs.market_data import MarketDataHub
 
-    hub = MarketDataHub()
+    hub = MarketDataHub(spot_product=spot_product, series=series)
     # BRTI truth: Kalshi's own settlement index over its own socket. Starts
     # degraded without keys and the trader falls back to Coinbase; never fatal.
     # DRY no longer uses BRTI — both books use Coinbase spot only.
@@ -1520,7 +1514,7 @@ async def run_updown_trader(
 
         brti = BrtiFeed()
     except Exception as exc:  # noqa: BLE001
-        print(f"BTC 15m: BRTI feed unavailable ({exc}); coinbase-spot only", flush=True)
+        print(f"{series}: BRTI feed unavailable ({exc}); coinbase-spot only", flush=True)
         brti = None
     trader = UpDownTrader(hub.spot, hub.feed, config, brti=brti)
     sleep_for = interval or (config and config.poll_seconds) or 4.0
@@ -1600,7 +1594,7 @@ async def run_updown_trader(
             except Exception as exc:  # noqa: BLE001 - proof must not kill the loop
                 print(f"BTC 15m: heartbeat write failed: {type(exc).__name__}: {exc}", flush=True)
 
-            # LIVE-ONLY book reaper: every 15 minutes, kill local rows Kalshi
+            # Book reaper: every 15 minutes, kill local rows Kalshi
             # holds nothing behind (freeing the strategy slot they occupied) and
             # liquidate Kalshi holdings no local row is tracking. Real money
             # moves here, so it only ever runs on the LIVE client.
