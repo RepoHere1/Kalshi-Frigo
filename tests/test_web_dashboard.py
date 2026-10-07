@@ -864,6 +864,23 @@ def test_logs_handles_bad_line_count(client):
     assert client.get("/api/logs?lines=99999999").status_code == 200
 
 
+def test_logs_reads_a_named_log_file(client, tmp_path):
+    """A crashing strategy's own log names the crash - it must be
+    readable, not just the newest file."""
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "strategy_btc_updown.log").write_text("boom\nTraceback\n")
+    body = client.get("/api/logs?file=strategy_btc_updown.log").get_json()
+    assert "boom" in body["lines"]
+
+
+def test_logs_reject_a_file_outside_the_log_dir(client, tmp_path):
+    """The name is validated against the directory listing, so no
+    path traversal and no file that does not exist."""
+    assert client.get("/api/logs?file=../secrets.env").status_code == 404
+    assert client.get("/api/logs?file=nope.log").status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # Config editor typing
 # ---------------------------------------------------------------------------

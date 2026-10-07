@@ -4468,11 +4468,30 @@ def api_config():
 # 7. Log viewer
 @app.route("/api/logs")
 def api_logs():
-    """Return recent log lines."""
+    """Return recent log lines.
+
+    `file` names a specific log in the log directory (e.g.
+    strategy_btc_updown.log); without it the newest file is
+    served. The name is validated against the directory
+    listing, so nothing outside LOG_DIR can be read. Like
+    every read endpoint this stays public - the token gates
+    writes only.
+    """
     try:
         n = max(1, min(2000, int(request.args.get("lines", "100"))))
     except ValueError:
         n = 100
+    name = (request.args.get("file") or "").strip()
+    if name:
+        if name != Path(name).name or (LOG_DIR / name) not in _log_files():
+            return jsonify({"error": "unknown log file"}), 404
+        try:
+            with open(LOG_DIR / name, "r", errors="replace") as f:
+                return jsonify(
+                    {"lines": [line.rstrip() for line in f.readlines()[-n:]], "source": "file"}
+                )
+        except OSError as e:
+            return jsonify({"error": str(e)}), 500
     lines = _read_log_tail(n)
     if lines is not None:
         return jsonify({"lines": lines, "source": "file"})
