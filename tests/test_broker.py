@@ -14,7 +14,7 @@ import pytest
 
 from src.jobs.broker import (
     MAX_PRICE_CENTS,
-    MIN_ORDER_CENTS,
+    MIN_ORDER_CONTRACTS,
     minimum_viable_quantity,
     DryBroker,
     LiveBroker,
@@ -150,18 +150,15 @@ def test_build_rejects_unaffordable_order():
 
 
 def test_size_floor_raises_a_sub_minimum_buy():
-    """Kalshi's floor is $1.00, so a too-small buy is rounded up, not dropped.
-
-    Rejecting it outright meant a percentage sizer could silently produce zero
-    trades - 3% of a $28 balance is $0.85, and that order never stood a chance.
-    """
+    """A fractional (sub-contract) buy is rounded up to one whole contract, the
+    exchange's only floor. There is no $1.00 notional minimum."""
     req, reason = build_order_request(
         market_id="KXTEST-26", side="YES", action="buy", quantity=1,
         market=NORMAL_MARKET, available_cents=300_00,
     )
     assert req is not None and reason == ""
-    assert req.count == 3, "1 @ 42c must become 3 to clear $1.00"
-    assert req.notional == pytest.approx(1.26)
+    assert req.count == 1, "one whole contract is the floor"
+    assert req.notional == pytest.approx(0.42)
 
 
 def test_size_floor_never_reduces_an_adequate_order():
@@ -173,13 +170,13 @@ def test_size_floor_never_reduces_an_adequate_order():
 
 
 def test_size_floor_still_respects_the_funding_source():
-    """The bump must not talk us into an order we cannot pay for."""
+    """The order must not exceed the available cash, even at one contract."""
     req, reason = build_order_request(
         market_id="KXTEST-26", side="YES", action="buy", quantity=1,
-        market=NORMAL_MARKET, available_cents=100,  # only $1.00
+        market=NORMAL_MARKET, available_cents=0,  # empty account
     )
     assert req is None
-    assert "minimum" in reason
+    assert "available" in reason
 
 
 def test_size_floor_does_not_apply_to_sells():
@@ -192,10 +189,11 @@ def test_size_floor_does_not_apply_to_sells():
 
 
 def test_minimum_viable_quantity_math():
-    assert minimum_viable_quantity(0.42) == 3   # ceil(1.00 / 0.42)
-    assert minimum_viable_quantity(0.99) == 2   # 1 x 0.99 is under $1.00
-    assert minimum_viable_quantity(0.50) == 2
-    assert minimum_viable_quantity(0.05) == 20
+    # The exchange minimum is one whole contract, regardless of dollar notional.
+    assert minimum_viable_quantity(0.42) == 1
+    assert minimum_viable_quantity(0.99) == 1
+    assert minimum_viable_quantity(0.50) == 1
+    assert minimum_viable_quantity(0.05) == 1
     assert minimum_viable_quantity(0) == 0
 
 

@@ -62,11 +62,11 @@ _MODE_KEY = "trading_mode"
 _START_KEY = "dry_starting_balance"
 _CASH_KEY = "dry_cash"
 
-# Kalshi's minimum order size in dollars. A live balance below this
-# cannot place an order, so a DRY book seeded from it would be unable
-# to simulate a single fill - the mirror only makes sense when the
-# account it mirrors can actually trade.
-MIN_MIRROR_BALANCE = 1.0
+# Minimum real balance worth mirroring into a fresh DRY book. The exchange
+# minimum is one contract (no dollar floor), so even a few cents can trade;
+# this is just the threshold below which mirroring a live account into a DRY
+# seed is pointless.
+MIN_MIRROR_BALANCE = 0.01
 
 
 def _materialize_private_key() -> Optional[str]:
@@ -766,16 +766,18 @@ class TradingMode:
                     pass
 
         balance = cents / 100.0
-        # Kalshi's minimum order is $1, so anything below that cannot be traded.
+        # Kalshi's minimum order is one contract, not any dollar figure: a
+        # 1-cent contract is a valid $0.01 order. A balance is "fundable" as
+        # long as it can pay for at least one whole contract.
         return {
             "connected": True,
             "balance": round(balance, 2),
             "balance_cents": cents,
-            "can_fund": balance >= 1.0,
+            "can_fund": balance >= 0.01,
             "reason": ""
-            if balance >= 1.0
+            if balance >= 0.01
             else (
-                f"balance ${balance:.2f} is below Kalshi's $1.00 minimum order size - "
+                f"balance ${balance:.4f} cannot buy even one 1-cent contract - "
                 "fund the account before going LIVE"
             ),
         }

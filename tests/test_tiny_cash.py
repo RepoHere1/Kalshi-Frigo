@@ -23,11 +23,12 @@ def _trader():
     return UpDownTrader(spot, Btc15mFeed(), UpDownConfig())
 
 
-def test_size_floors_with_ceil_not_round():
-    """round(1/0.45)=2 -> $0.90, an order Kalshi rejects. ceil gives 3 -> $1.35."""
+def test_size_floors_at_one_contract_not_a_dollar():
+    """The exchange minimum is one whole contract; a $0.60 budget at 0.45 still
+    submits one contract, never zero and never a fabricated $1 ceiling."""
     trader = _trader()
-    assert trader._size(0.45, clip_usd=0.60) == 3
-    assert trader._size(0.58, clip_usd=0.60) == 2  # 2 @ 0.58 = $1.16
+    assert trader._size(0.45, clip_usd=0.60) == 1
+    assert trader._size(0.58, clip_usd=0.60) == 1  # 1 @ 0.58 = $0.58
 
 
 def test_size_spends_the_budget_not_the_default_clip():
@@ -37,14 +38,15 @@ def test_size_spends_the_budget_not_the_default_clip():
     assert trader._size(0.41, clip_usd=2.01) == 4  # 4 @ 0.41 = $1.64
 
 
-def test_minimum_viable_quantity_never_drops_below_a_dollar():
-    assert minimum_viable_quantity(0.45) == 3   # 3 x 0.45 = $1.35 >= 1
-    assert minimum_viable_quantity(0.10) == 10  # 10 x 0.10 = $1.00
-    assert minimum_viable_quantity(0.05) == 20  # 20 x 0.05 = $1.00
+def test_minimum_viable_quantity_is_one_contract():
+    assert minimum_viable_quantity(0.45) == 1
+    assert minimum_viable_quantity(0.10) == 1
+    assert minimum_viable_quantity(0.05) == 1
+    assert minimum_viable_quantity(0) == 0
 
 
-def test_broker_refloor_meets_the_minimum(tmp_path):
-    """Whatever _size says, the broker's floor lands at or above $1 notional."""
+def test_broker_refloor_meets_one_contract(tmp_path):
+    """A fractional clip rounds up to one whole contract, never a $1 notional."""
     from src.utils.database import DatabaseManager
 
     db = DatabaseManager(db_path=str(tmp_path / "t.db"))
@@ -55,16 +57,16 @@ def test_broker_refloor_meets_the_minimum(tmp_path):
         market_id="KXTEST-26",
         side="YES",
         action="buy",
-        quantity=1,  # 1 @ 0.45 = $0.45 - under the floor
+        quantity=1,  # 1 @ 0.45 = $0.45 - a valid whole-contract order
         market={
             "yes_bid_dollars": 0.44, "yes_ask_dollars": 0.45,
             "no_bid_dollars": 0.54, "no_ask_dollars": 0.55,
             "status": "open",
         },
-        available_cents=1_000,  # $10.00 - can afford the refloor
+        available_cents=1_000,  # $10.00
     )
     assert req is not None
-    assert req.notional >= 1.0
+    assert req.count == 1
 
 
 def test_fee_is_ceiled_to_the_cent_like_kalshi():
@@ -103,14 +105,15 @@ async def test_dry_ledger_books_the_ceiled_fee(tmp_path):
     assert ledger[0]["cash_after"] == pytest.approx(298.20)
 
 
-def test_balance_below_minimum_sets_a_plain_error():
+def test_balance_below_one_cent_sets_a_plain_error():
     """The cycle must say WHY it is sitting out, in words a human can act on."""
     import inspect
 
     from src.jobs.ladder_trader import UpDownTrader as T
 
     src = inspect.getsource(T.cycle)
-    assert "order minimum - sitting out until funded" in src
+    assert "empty - nothing can be" in src
+    assert "at least one cent" in src
 
 
 # ---------------------------------------------------------------------------

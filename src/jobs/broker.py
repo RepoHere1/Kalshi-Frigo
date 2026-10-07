@@ -29,8 +29,13 @@ logger = get_trading_logger("broker")
 
 MIN_PRICE_CENTS = 1
 MAX_PRICE_CENTS = 99
-# Kalshi's minimum order size. Anything smaller is rejected by the exchange.
-MIN_ORDER_CENTS = 100
+# Kalshi's minimum order size is ONE CONTRACT. The V2 order endpoint takes a
+# whole-contract `count` (``"count": "N.00"``) and has no dollar-notional floor:
+# a single 1-cent contract is a valid $0.01 order. The old ``$1.00`` notional
+# minimum was fabricated here and silently turned every sub-$1 clip into a
+# no-op, which is what left a tiny account sitting out forever. The exchange
+# minimum is expressed in contracts, not dollars.
+MIN_ORDER_CONTRACTS = 1
 
 
 @dataclass
@@ -73,17 +78,16 @@ class OrderRequest:
 def minimum_viable_quantity(price_dollars: float) -> int:
     """Smallest contract count Kalshi will accept at this price.
 
-    Kalshi rejects any order with a notional under $1.00. A percentage-based
-    sizer can easily produce less than that - 3% of a $28 balance is $0.85 -
-    which means the order is rejected by the exchange and the trade silently
-    never happens. This rounds up to the smallest count that clears the floor,
-    so sizing targets are achievable rather than nominal.
+    The exchange minimum is one contract, regardless of dollar notional (a
+    1-cent contract is a valid $0.01 order). A percentage-based sizer on a
+    tiny balance can produce a fraction of a contract; that rounds up to 1 so
+    the order is actually a whole contract rather than silently refused.
     """
     price = float(price_dollars)
     if price <= 0:
         return 0
-    raw = MIN_ORDER_CENTS / 100.0 / price
-    return max(1, int(math.ceil(raw - 1e-9)))
+    # One contract is always viable; nothing fractional exists on the wire.
+    return MIN_ORDER_CONTRACTS
 
 
 def apply_size_floor(quantity: int, price_dollars: float) -> int:
@@ -156,22 +160,22 @@ def build_order_request(
             f"({quantity} @ {price_cents}c) but only {int(available_cents)}c available"
         )
 
-    # Size floor: raise to the exchange minimum, but only if we can afford it.
-    # Applies to buys; a sell of a small remainder should be left alone so the
-    # position can actually be closed out.
+    # Size floor: raise to one whole contract (the exchange minimum), but only
+    # if we can afford it. Applies to buys; a sell of a small remainder should
+    # be left alone so the position can actually be closed out.
     if action == "buy":
         floored = apply_size_floor(int(quantity), price_dollars)
         if floored != int(quantity):
             if floored * price_cents > int(available_cents):
                 return None, (
-                    f"{market_id}: reaching Kalshi's $1.00 minimum needs "
+                    f"{market_id}: reaching Kalshi's 1-contract minimum needs "
                     f"{floored} @ {price_cents}c = {floored * price_cents}c, "
                     f"but only {int(available_cents)}c available"
                 )
             logger.info(
                 f"Rounding {quantity} -> {floored} contracts: {quantity} @ "
-                f"{price_cents}c is ${notional_cents / 100:.2f}, under Kalshi's "
-                f"$1.00 minimum order size"
+                f"{price_cents}c is a fractional contract, under Kalshi's "
+                f"1-contract minimum order size"
             )
             quantity = floored
             notional_cents = price_cents * quantity

@@ -199,8 +199,8 @@ async def test_ensure_seeds_a_fresh_book_from_the_live_balance(tmp_path, monkeyp
 
 
 async def test_ensure_keeps_the_default_when_live_is_unfundable(tmp_path, monkeypatch):
-    """A live balance below Kalshi's $1 minimum cannot seed a tradable book."""
-    _mirror_env(monkeypatch, 0.71)
+    """A live balance that cannot buy even one 1-cent contract cannot seed."""
+    _mirror_env(monkeypatch, 0.004)
     mgr = TradingMode(db_path=str(tmp_path / "poor.db"))
     account = await mgr.ensure_dry_account()
     assert account["cash"] == pytest.approx(300.0, abs=0.01)

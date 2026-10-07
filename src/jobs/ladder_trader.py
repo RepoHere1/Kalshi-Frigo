@@ -253,6 +253,18 @@ class UpDownConfig:
     # anti-churn rule - repeated buys of the same contract are allowed, but only
     # while the contract is still more likely than not to pay.
     min_win_prob: float = 0.60
+    # SURVIVAL / HYPER-CAUTION: when the real balance is at or below
+    # `survival_floor_usd`, the book is one losing clip from being unable to
+    # trade at all (no outside funding will ever arrive). So it raises the bar
+    # hard: a much higher edge, a much higher win probability, and a smaller
+    # clip, so the next few trades are overwhelmingly likely to win and grow
+    # the balance back to a buffer that can absorb a loss. This is temporary
+    # survivability, not the steady-state tuning.
+    survival_enabled: bool = True
+    survival_floor_usd: float = 20.0
+    survival_min_edge: float = 0.25        # only near-certain disagreements
+    survival_min_win_prob: float = 0.90    # 90%+ model probability
+    survival_clip_fraction: float = 0.10   # bet a tenth of the book, max
     # Total simulated/live notional the book may hold open across ALL clips,
     # including multiple clips of the same contract. This replaces the old
     # max_open_positions position COUNT, which forbade a second clip of the same
@@ -264,8 +276,10 @@ class UpDownConfig:
     # the asset price: BTC at $84,000 gets ~$17 noise, DOGE at $0.20 gets
     # ~$0.00004, HYPE at $20 gets ~$0.004.
     noise_pct: float = 0.0002
-    # Kalshi's minimum order is $1.00.
-    min_order_usd: float = 1.0
+    # Kalshi's minimum order is one contract. There is no dollar-notional
+    # floor: a 1-cent contract is a valid $0.01 order. The old $1.00 minimum
+    # made it impossible for a tiny account to ever place an order.
+    min_order_usd: float = 0.0
     # Stop opening new positions this close to expiry: the settlement window is
     # the 60 seconds before close, and a fill inside it is a coin toss.
     min_seconds_left: float = 45.0
@@ -379,6 +393,19 @@ def _money(value: Any) -> str:
     if a < 10_000:
         return f"{v:,.2f}"
     return f"{v:,.0f}"
+
+
+def _min_viable_notional(cents: float) -> float:
+    """The smallest dollar clip a balance of `cents` can still submit.
+
+    One contract at a 1-cent price is $0.01, so even a few cents of balance can
+    trade. Returns the floor we will not size a clip below so a tiny account
+    keeps firing a real (whole-contract) order rather than zeroing out.
+    """
+    # At minimum one contract at the worst-case ~99c price; in practice clips
+    # are bounded downstream by the actual fill price. This is just a sane
+    # dollar floor so a 2-cent balance still submits something concrete.
+    return max(0.01, round(cents / 100.0, 4))
 
 
 def fair_up_probability(
@@ -925,11 +952,10 @@ class UpDownTrader:
         if target_notional <= 0:
             return 0
         contracts = int(target_notional / price)
-        # Exchange minimum is $1 NOTIONAL: ceil, never round. int(round(1/0.45))
-        # = 2 -> $0.90 - an order Kalshi rejects and the broker would have to
-        # re-float anyway. Tiny accounts live exactly at this edge.
-        if contracts * price < self.config.min_order_usd:
-            contracts = int(math.ceil(self.config.min_order_usd / price - 1e-9))
+        # Exchange minimum is ONE CONTRACT, not any dollar figure. A sub-$1
+        # clip must still be a whole contract (a 1-cent contract is $0.01).
+        if contracts < 1:
+            contracts = 1
         return max(contracts, 0)
 
     # ------------------------------------------------------------------
@@ -1354,18 +1380,20 @@ class UpDownTrader:
                 self._client = KalshiClient()
             bal = await self._client.get_balance()
             cents = float((bal or {}).get("balance") or 0.0)
-            # Below the $1 order minimum no clip can exist: say so once,
-            # plainly, instead of sizing up and getting refused at the
-            # broker every cycle.
-            if cents < 100:
+            if cents < 1:
+                # Truly zero - one contract at any price costs at least a cent.
                 self.book.last_error = (
-                    f"balance ${cents / 100.0:.2f} is below Kalshi's "
-                    f"$1.00 order minimum - sitting out until funded"
+                    f"balance ${cents / 100.0:.4f} is empty - nothing can be "
+                    f"bought until the account holds at least one cent"
                 )
                 live_budget = None
             else:
-                live_budget = round(
-                    cents / 100.0 * self.config.live_cash_fraction, 2
+                # A tiny account still trades: clip = balance x fraction, but
+                # never smaller than one whole contract (downstream _size and
+                # broker enforce the 1-contract minimum).
+                live_budget = max(
+                    round(cents / 100.0 * self.config.live_cash_fraction, 2),
+                    _min_viable_notional(cents),
                 )
                 # Raw balance for the Kelly sizer in evaluate().
                 self._live_balance = cents / 100.0
@@ -1375,8 +1403,8 @@ class UpDownTrader:
         # Variance-commensurate sizing: the bigger Kalshi's lie
         # (spot far from target with minutes to close), the bigger the clip
         # -- up to 2.5x -- because convergence is proportionally more
-        # certain. Bounded by the balance fraction, the $1 minimum order
-        # floor and max_open_notional downstream. Applied to BOTH books.
+        # certain. Bounded by the balance fraction, the 1-contract minimum
+        # and max_open_notional downstream. Applied to BOTH books.
         if live_budget is not None and market is not None:
             try:
                 from src.jobs import live_fees as _live_fees_var
@@ -1401,6 +1429,25 @@ class UpDownTrader:
                     live_budget = round(live_budget * variance_mult, 2)
             except Exception:  # noqa: BLE001 - sizing never blocks entry
                 variance_mult = 1.0
+        # SURVIVAL / HYPER-CAUTION: below the floor the book is one loss from
+        # being unable to trade at all, so this cycle demands near-certain wins
+        # and sizes down. Applied to the LIVE book only (a DRIED book is
+        # expendable rehearsal cash, not the real account that must survive).
+        survival = live and self.config.survival_enabled and self._live_balance is not None and (
+            self._live_balance <= self.config.survival_floor_usd
+        )
+        _saved_edge = self.config.min_edge
+        _saved_win = self.config.min_win_prob
+        if survival:
+            self.config.min_edge = max(self.config.min_edge, self.config.survival_min_edge)
+            self.config.min_win_prob = max(self.config.min_win_prob, self.config.survival_min_win_prob)
+            # Cap the clip (and the Kelly base) to a tenth of the book so a
+            # single loss cannot end the account; the whole point is to keep
+            # firing tiny wins until a buffer exists.
+            _surv_cap = max(self._live_balance * self.config.survival_clip_fraction, 0.01)
+            if live_budget is not None:
+                live_budget = min(live_budget, _surv_cap)
+            self._live_balance = min(self._live_balance, _surv_cap)
         signal = self.evaluate(market, live=live, clip_usd=live_budget if live else None)
         # Clear stale errors, but never wipe the explanation of a failed LIVE
         # balance read - that is the difference between "no edge" and "cannot
@@ -1497,6 +1544,10 @@ class UpDownTrader:
         #     is still genuinely more likely than not to pay
         #   - total open notional across ALL clips stays under max_open_notional
         if signal is not None and signal.actionable:
+            # SURVIVAL bars must also govern the entry guard (min_win_prob lives
+            # there too), so re-raise them for the guard and restore after.
+            if survival:
+                self.config.min_win_prob = max(self.config.min_win_prob, self.config.survival_min_win_prob)
             blocked = self._entry_block(signal, held, live=live)
             if not blocked:
                 blocked = await self._ai_guards(signal, live)
@@ -1579,6 +1630,10 @@ class UpDownTrader:
                 "reason": (signal.reason if signal else refusal) or "no quotable contract",
             }
         )
+        # Restore the survival-adjusted bars so the next cycle starts clean.
+        if survival:
+            self.config.min_edge = _saved_edge
+            self.config.min_win_prob = _saved_win
         return result
 
 
