@@ -1780,6 +1780,13 @@ def _btc_keepalive_loop():
                 # "BOOK MODE GUARD" refusal and left the lane down forever.
                 spawn_mode = book_mode
                 _run_async(store.set_desired(name, True, spawn_mode))
+                # Clear the OTHER book's stale desired flag so the main
+                # supervisor stops seeing a LIVE desired=1 row while the page
+                # reads DRY and firing the BOOK MODE GUARD every pass. The
+                # always-on intent now lives on the current book's row alone.
+                for _other in ("paper", "live"):
+                    if _other != spawn_mode:
+                        _run_async(store.set_desired(name, False, _other))
                 try:
                     started = _spawn_strategy(name, spawn_mode)
                     _push_error(
