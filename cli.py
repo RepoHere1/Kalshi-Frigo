@@ -85,21 +85,33 @@ def cmd_run(args: argparse.Namespace) -> None:
         print("📈 BTC 15-MIN UP/DOWN MODE")
         print("   KXBTC15M | live spot vs Kalshi's own quote")
         print("   $5 per clip | fee-aware in LIVE | no trade inside the noise band")
-        # Initialize database and set mode based on --live/--paper.
-        # should_trade_live() requires BOTH the LIVE_TRADING_ENABLED env var
-        # AND the persisted database mode to be "live".
+        # Initialize the database and arm this process's book.
+        #
+        # A dashboard-spawned child arrives with STRATEGY_BOOK_MODE
+        # stamped and LIVE_TRADING_ENABLED scrubbed from its env (the
+        # spawner removes it so a stale parent value cannot arm a child
+        # into LIVE behind the operator's back). Such a child must NOT
+        # write the persisted mode: that row is the dashboard's book
+        # switch, and a child flipping it is how the books contaminated
+        # each other. should_trade_live() reads the stamp directly.
+        #
+        # A manual run (no stamp) keeps the old contract: the
+        # LIVE_TRADING_ENABLED env var is the operator's intent for the
+        # whole system, so it is persisted. The vocabulary is dry/live -
+        # "paper" is the CLI's word for the DRY book and is NOT a
+        # persisted mode; passing it raised ModeError and killed every
+        # dashboard-spawned BTC child at startup, which is why the cards
+        # read "exited on its own" in BOTH books.
         db_path = os.environ.get("DB_PATH", "trading_system.db")
 
         async def _init_mode():
             await DatabaseManager(db_path=db_path).initialize()
-            # should_trade_live() requires BOTH the LIVE_TRADING_ENABLED env
-            # var AND the persisted database mode to be "live". Check the
-            # env var directly rather than relying on the CLI --live flag,
-            # so the mode is correct even when the dashboard starts the
-            # strategy as a subprocess without passing --live.
+            book = os.environ.get("STRATEGY_BOOK_MODE", "").strip().lower()
+            if book in ("dry", "live", "paper"):
+                return
             live = os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
             await TradingMode(db_path=db_path).set(
-                "live" if live else "paper", confirmed=True
+                "live" if live else "dry", confirmed=True
             )
 
         asyncio.run(_init_mode())

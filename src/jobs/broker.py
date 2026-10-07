@@ -372,19 +372,32 @@ def should_trade_live() -> bool:
     safety came from an unrelated env var, and flipping the dashboard to LIVE
     would have left them in DRY while the page claimed otherwise.
 
-    Requiring both is fail-safe in the direction that matters - the dashboard
-    saying DRY always wins, so no env var mistake can start trading behind the
-    operator's back.
+    Two switches govern, in this order:
+
+    1. The dashboard's persisted mode. It is the operator's current
+       intent and always wins: if the page reads DRY, nothing anywhere
+       trades live, whatever this process was armed into.
+    2. The book this process was armed into. The dashboard stamps
+       STRATEGY_BOOK_MODE on every child it spawns and scrubs
+       LIVE_TRADING_ENABLED from the child env, so a spawned child must
+       not read that var - it was removed precisely so a stale parent
+       value could not arm a child into LIVE behind the operator's back.
+       The stamp is the child's own book.
+
+    A process with no stamp (a manual `python cli.py run --live`) falls
+    back to the env var, so both switches must still agree.
     """
     import os
 
     from src.utils.database import _resolve_current_mode
 
-    env_allows = os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
-    if not env_allows:
-        return False
     db_path = os.environ.get("DB_PATH", "trading_system.db")
-    return _resolve_current_mode(db_path) == "live"
+    if _resolve_current_mode(db_path) != "live":
+        return False
+    book = os.environ.get("STRATEGY_BOOK_MODE", "").strip().lower()
+    if book in ("dry", "live", "paper"):
+        return book == "live"
+    return os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
 
 
 def broker_for_mode(mode: str, *, kalshi_client: Any = None, mode_manager: Any = None) -> Any:

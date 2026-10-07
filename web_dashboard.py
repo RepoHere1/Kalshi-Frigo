@@ -863,17 +863,23 @@ STRATEGY_DOCS = {
         "BTC 15-min up/down",
         'Reads Kalshi\'s own KXBTC15M contract - "BTC price up in next 15 mins?" - '
         "and compares its Up/Down price against live Coinbase spot. Takes one $5 "
-        "clip only when the two disagree by more than the configured edge.",
+        "clip only when the two disagree by more than the configured edge. "
+        "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
+        "the current book every second of every day.",
     ),
     "btc_updown_copy": (
         "BTC 15-min up/down #2",
         'Identical to BTC 15-min: Reads Kalshi\'s KXBTC15M contract "BTC price up in next 15 mins?" - '
-        "and compares against live Coinbase spot.",
+        "and compares against live Coinbase spot. "
+        "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
+        "the current book every second of every day.",
     ),
     "btc_1h_updown": (
         "BTC 1-hour up/down",
         'Reads Kalshi\'s BTC 1-hour up/down contract and compares its Up/Down price against '
-        "live Coinbase spot. Takes one $5 clip when profitable edge detected.",
+        "live Coinbase spot. Takes one $5 clip when profitable edge detected. "
+        "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
+        "the current book every second of every day.",
     ),
     "ai_directional": (
         "LLM directional",
@@ -1630,6 +1636,106 @@ def _strategy_supervisor_loop():
         except Exception as exc:  # noqa: BLE001 - the supervisor must never die
             _push_error(f"Strategy supervisor: {type(exc).__name__}: {exc}")
         time.sleep(10)
+
+
+# The three UP/DOWN lanes the operator wants ON every second of
+# every day, in whichever book the page is in. Everything else
+# stays under the button-only law: these three are the standing,
+# explicit exception - the operator's instruction is that they run
+# always, in DRY and in LIVE, and this loop is the only thing
+# allowed to arm a lane without a fresh button push.
+BTC_ALWAYS_ON = ("btc_updown", "btc_updown_copy", "btc_1h_updown")
+
+
+def _btc_keepalive_loop():
+    """The three BTC supervisors: those lanes are ALWAYS ON.
+
+    One pass per second over the three UP/DOWN lanes, in the book
+    the page is actually in:
+
+    - a lane with no live pid is armed (desired=1) and started,
+    - a lane whose pid is alive but whose heartbeat went stale is
+      killed and started again - a wedged loop is not "on",
+    - a lane that is up and heartbeating is left alone.
+
+    The book is read fail-safe: an unreadable book arms nothing,
+    and no credentials means there is nothing to start with. Every
+    spawn goes through the same _spawn_strategy path as a button
+    press, so a BTC lane is recorded, book-scoped and stoppable
+    exactly like any other lane - the only difference is that this
+    loop re-arms it on the next pass, which is what "always on"
+    means. A boot already in flight (started seconds ago, pid not
+    up yet) is given time to come up before a second copy of the
+    same lane is spawned.
+    """
+    while True:
+        try:
+            book_mode = _runtime_mode()
+            if book_mode is None or not _creds_present():
+                time.sleep(1)
+                continue
+            store = _runtime_store()
+            snapshot = _run_async(store.snapshot(mode=book_mode))
+            for name in BTC_ALWAYS_ON:
+                row = snapshot.get(_runtime_key(name)) or {}
+                pid = row.get("pid")
+                if pid and _pid_alive(pid, row):
+                    hb = row.get("heartbeat_at")
+                    wedged = False
+                    if hb:
+                        try:
+                            hb_age = (
+                                datetime.now() - datetime.fromisoformat(str(hb))
+                            ).total_seconds()
+                            wedged = hb_age > _HEARTBEAT_STALE_SECONDS
+                        except Exception:  # noqa: BLE001 - malformed stamp: ignore
+                            pass
+                    if not wedged:
+                        continue
+                    # Alive but not trading: a wedged loop is not "on".
+                    _push_error(
+                        f"BTC keep-alive: {name} heartbeat is stale "
+                        f"(wedged); restarting in {book_mode.upper()}."
+                    )
+                    try:
+                        _stop_child({"pid": pid, "running": True})
+                    except Exception:  # noqa: BLE001 - a dead pid is fine
+                        pass
+                else:
+                    # Dead pid. A row born seconds ago means a boot is
+                    # already in flight - this loop or the main
+                    # supervisor spawned it - so give it time to come
+                    # up rather than spawning a second copy alongside.
+                    started_at = row.get("started_at")
+                    if started_at:
+                        try:
+                            age = (
+                                datetime.now()
+                                - datetime.fromisoformat(str(started_at))
+                            ).total_seconds()
+                            if 0 <= age < 10:
+                                continue
+                        except Exception:  # noqa: BLE001 - malformed stamp
+                            pass
+                # Not running (or just killed): arm it and start it.
+                _run_async(store.set_desired(name, True, book_mode))
+                try:
+                    started = _spawn_strategy(name, book_mode)
+                    _push_error(
+                        f"BTC keep-alive: {name} ON in {book_mode.upper()} "
+                        f"(pid {started['pid']})."
+                    )
+                except Exception as exc:  # noqa: BLE001 - retry next pass
+                    _push_error(
+                        f"BTC keep-alive: {name} start failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                # Stagger the three boots so they do not race for the
+                # SQLite write lock all at once.
+                time.sleep(2)
+        except Exception as exc:  # noqa: BLE001 - the supervisor must never die
+            _push_error(f"BTC keep-alive: {type(exc).__name__}: {exc}")
+        time.sleep(1)
 
 
 def _creds_present() -> bool:
@@ -4084,6 +4190,12 @@ def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
     child_env.pop("LIVE_TRADING_ENABLED", None)
     # Set explicit mode for this process (redundant but belt-and-suspenders)
     child_env["STRATEGY_BOOK_MODE"] = mode
+    # The child's own lane name. The three UP/DOWN lanes run the same
+    # trader, and a hardcoded name in that trader's heartbeat put every
+    # lane's proof of life on the first lane's row - the other two cards
+    # read "stopped" while their processes traded. The child stamps its
+    # own name, so each lane's heartbeat lands on its own row.
+    child_env["STRATEGY_NAME"] = name
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     out = open(LOG_DIR / f"strategy_{name}.log", "ab", buffering=0)
@@ -5053,6 +5165,8 @@ button.loading.yellow::after {
       stopped stays stopped across redeploys and logins until you press Start
       here again, and a strategy you started keeps coming back from crashes
       automatically. Start/Stop is welded to your buttons, per book, for good.
+      The three BTC UP/DOWN lanes are the one exception: a supervisor keeps
+      them on every second, in whichever book the page is in.
     </p>
   </div>
   {%- endif %}
@@ -6726,8 +6840,13 @@ def start_background_workers():
          # container is resumed. With the loop disabled, every deploy
          # silently stopped the whole book - the "strategies turn
          # themselves off" the operator reported. The operator's Stop
-         # stays welded: desired=0 lanes are not touched.
-         _strategy_supervisor_loop,
+          # stays welded: desired=0 lanes are not touched.
+          _strategy_supervisor_loop,
+          # The three BTC UP/DOWN lanes are ALWAYS ON (the
+          # operator's standing instruction): a dedicated
+          # supervisor per lane arms and (re)starts them every
+          # second, in whichever book the page is in.
+          _btc_keepalive_loop,
     ):
         threading.Thread(target=target, daemon=True).start()
 

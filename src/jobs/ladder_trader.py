@@ -1575,11 +1575,27 @@ async def run_updown_trader(
             # this process's own book: a DRY heartbeat never counts as a LIVE
             # proof of life or the other way around.
             try:
-                from src.jobs.broker import should_trade_live
+                import os
+
                 from src.utils.strategy_runtime import StrategyRuntime
 
+                # This process's own lane and book. The dashboard
+                # stamps both on every child it spawns: the three
+                # UP/DOWN lanes run the same trader, so a hardcoded
+                # name put every lane's heartbeat on the first
+                # lane's row and the other two cards read "stopped"
+                # while their processes traded. The book word is the
+                # runtime vocabulary ("paper"/"live") the row was
+                # recorded under; a manual run has no stamp and
+                # falls back to the live switch.
+                lane = os.environ.get("STRATEGY_NAME", "").strip() or "btc_updown"
+                book_word = os.environ.get("STRATEGY_BOOK_MODE", "").strip().lower()
+                if book_word not in ("paper", "live"):
+                    from src.jobs.broker import should_trade_live
+
+                    book_word = "live" if should_trade_live() else "paper"
                 await StrategyRuntime(db_path=trader._db_path()).record_heartbeat(
-                    "btc_updown", "live" if should_trade_live() else "paper"
+                    lane, book_word
                 )
             except Exception as exc:  # noqa: BLE001 - proof must not kill the loop
                 print(f"BTC 15m: heartbeat write failed: {type(exc).__name__}: {exc}", flush=True)
