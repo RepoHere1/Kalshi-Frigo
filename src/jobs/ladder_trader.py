@@ -135,7 +135,7 @@ class UpDownConfig:
     # than this budget, the move is one venue's order flow - not the market's
     # - and the entry is refused. Kraken/Bitstamp, keyless, degrade to no-op.
     venue_guard_enabled: bool = True
-    venue_guard_max_usd: float = 60.0
+    venue_guard_pct: float = 0.0007
     # IMPLIED vs MEASURED volatility (the hedged-vol trade's core read).
     # Kalshi's price inverted through the diffusion is the market's implied
     # sigma; RealizedVol measures the tape. When implied is RICH vs realized
@@ -168,6 +168,13 @@ class UpDownConfig:
             self.ai_veto_enabled = True
         if _os.environ.get("SENTINEL_ENABLED", "") == "1":
             self.sentinel_enabled = True
+        # Convert legacy env vars to the new percentage-based fields
+        if "NOISE_USD" in _os.environ:
+            old_noise = float(_os.environ["NOISE_USD"])
+            self.noise_pct = old_noise / 100.0  # backward compat
+        if "VENUE_GUARD_MAX_USD" in _os.environ:
+            old_guard = float(_os.environ["VENUE_GUARD_MAX_USD"])
+            self.venue_guard_pct = old_guard / 100.0
         _sp = _os.environ.get("SENTINEL_STATE_PATH", "")
         if _sp:
             self.sentinel_state_path = _sp
@@ -194,10 +201,10 @@ class UpDownConfig:
             )
         except ValueError:
             pass
-        _vg = _os.environ.get("VENUE_GUARD_MAX_USD", "")
+        _vg = _os.environ.get("VENUE_GUARD_PCT", "")
         if _vg:
             try:
-                self.venue_guard_max_usd = float(_vg)
+                self.venue_guard_pct = float(_vg)
             except ValueError:
                 pass
 
@@ -211,9 +218,12 @@ class UpDownConfig:
     # max_open_positions position COUNT, which forbade a second clip of the same
     # market even when the odds justified it.
     max_open_notional: float = 25.0
-    # Deadband around the target, in dollars. Settlement is a 60-second average
-    # of a composite index, so sub-noise moves are not information.
-    noise_usd: float = 15.0
+    # Deadband around the target, as a fraction of the target price.
+    # Settlement is a 60-second average of a composite index, so sub-noise
+    # moves are not information. The effective dollar noise scales with
+    # the asset price: BTC at $84,000 gets ~$17 noise, DOGE at $0.20 gets
+    # ~$0.00004, HYPE at $20 gets ~$0.004.
+    noise_pct: float = 0.0002
     # Kalshi's minimum order is $1.00.
     min_order_usd: float = 1.0
     # Stop opening new positions this close to expiry: the settlement window is
@@ -295,13 +305,14 @@ class UpDownBook:
 def fair_up_probability(
     spot: float,
     target: float,
-    noise_usd: float = 15.0,
+    noise: float = 15.0,
     seconds_left: float = 900.0,
     sigma_dollars: Optional[float] = None,
 ) -> float:
     """P(the next window settles at or above the target), from live spot.
 
-    Two models, chosen by what the data supports:
+    `noise` is the deadband in dollars (target * noise_pct).
+    The effective dollar noise scales with the target.
 
     - WITH a realized-vol estimate (`sigma_dollars` from RealizedVol): the
       honest diffusion probability `Phi((spot - target) / (sigma * sqrt(t)))`.
@@ -320,9 +331,9 @@ def fair_up_probability(
         effective = float(sigma_dollars) * time_scale
         z = max(-6.0, min(6.0, (spot - target) / effective))
         return float(0.5 * (1.0 + math.erf(z / math.sqrt(2.0))))
-    if noise_usd <= 0:
+    if noise <= 0:
         return 0.5
-    effective_noise = noise_usd * time_scale
+    effective_noise = noise * time_scale
     z = max(-6.0, min(6.0, (spot - target) / effective_noise))
     return float(1.0 / (1.0 + math.exp(-z)))
 
@@ -358,7 +369,7 @@ class UpDownTrader:
         from src.jobs.venue_dislocation import VenueDislocation
 
         self.venue_guard = VenueDislocation(
-            max_dislocation_usd=self.config.venue_guard_max_usd
+            max_dislocation_usd=0.0  # set dynamically per-market
         )
         # Polymarket same-window scanner + Hyperliquid mark (both keyless).
         from src.jobs.cross_venue_poly import PolyScanner
@@ -458,6 +469,8 @@ class UpDownTrader:
         # no-op when the extra feeds are unreachable.
         if self.config.venue_guard_enabled:
             try:
+                # venue_guard_pct scales with target price
+                self.venue_guard.max_dislocation_usd = target * self.config.venue_guard_pct
                 _veto, _vreason = self.venue_guard.vetoes(
                     "up" if delta > 0 else "down", delta, spot
                 )
@@ -518,11 +531,10 @@ class UpDownTrader:
                     )
             except Exception:  # noqa: BLE001 - guard failure never blocks
                 pass
-        # Hard deadband. Settlement is the 60-second average of a composite
-        # index, so inside this band spot carries no directional information at
-        # all. Without an explicit refusal the logistic still produces a small
-        # "edge" from pure noise, and the strategy pays the spread on nothing.
-        if abs(delta) <= self.config.noise_usd:
+        # Hard deadband.
+        # noise scales with target price so DOGE/HYPE/BTC all work.
+        noise_usd = target * self.config.noise_pct
+        if abs(delta) <= noise_usd:
             self.book.skipped_no_edge += 1
             signal = UpDownSignal(
                 ticker=market.ticker,
@@ -540,7 +552,7 @@ class UpDownTrader:
                 seconds_left=round(market.seconds_left or 0.0, 1),
                 reason=(
                     f"{truth_kind} {spot:,.0f} is {delta:+,.0f} from target {target:,.0f} - "
-                    f"inside the ${self.config.noise_usd:,.0f} noise band, no trade"
+                    f"inside the ${noise_usd:,.4f} noise band, no trade"
                 ),
                 truth=truth_kind,
             )
@@ -576,7 +588,7 @@ class UpDownTrader:
             except Exception:  # noqa: BLE001 - vol read never blocks scoring
                 self._impl_sigma = None
         fair = fair_up_probability(
-            spot, target, self.config.noise_usd, seconds_left, self._sigma_used
+            spot, target, target * self.config.noise_pct, seconds_left, self._sigma_used
         )
 
         up_ask = market.up_price
@@ -1298,7 +1310,7 @@ class UpDownTrader:
                 if _tgt is not None and _ref > 0:
                     variance_mult = _live_fees_var.variance_clip_multiplier(
                         _ref - float(_tgt),
-                        self.config.noise_usd,
+                        target * self.config.noise_pct,
                     )
                     live_budget = round(live_budget * variance_mult, 2)
             except Exception:  # noqa: BLE001 - sizing never blocks entry

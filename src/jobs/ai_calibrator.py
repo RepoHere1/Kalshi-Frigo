@@ -26,7 +26,7 @@ PROPOSAL_PATH = os.environ.get("CALIBRATOR_PATH", "calibrator_proposals.jsonl")
 # rejected before it is even written. The ladder's proven ranges, not the
 # model's imagination.
 NUMERIC_BOUNDS: Dict[str, Tuple[float, float]] = {
-    "noise_usd": (5.0, 50.0),
+    "noise_pct": (0.0001, 0.001),
     "min_edge": (0.03, 0.15),
     "up_override_margin": (0.0, 0.10),
     "out_of_band_extra_edge": (0.0, 0.06),
@@ -35,9 +35,9 @@ PREFER_SIDES = ("up", "down")
 
 CALIBRATE_PROMPT = """You tune a 15-minute Bitcoin binary scalper on Kalshi. Current config: {config}. Ledger stats (settled closes, fee-aware): {stats}. Recent closes (side, entry, pnl, hour UTC): {recent}.
 
-Propose parameters that maximize fee-net expectancy WITHOUT chasing noise: prefer fewer, better entries over more trades. Stay inside: noise_usd 5-50, min_edge 0.03-0.15, prefer_side up|down, up_override_margin 0-0.10, out_of_band_extra_edge 0-0.06. If the evidence does not support a change, propose the current values and say so.
+Propose parameters that maximize fee-net expectancy WITHOUT chasing noise: prefer fewer, better entries over more trades. Stay inside: noise_pct 0.0001-0.001 (as fraction of target price), min_edge 0.03-0.15, prefer_side up|down, up_override_margin 0-0.10, out_of_band_extra_edge 0-0.06. If the evidence does not support a change, propose the current values and say so.
 
-Reply with exactly this JSON and nothing else: {{"noise_usd": 15.0, "min_edge": 0.06, "prefer_side": "down", "up_override_margin": 0.02, "out_of_band_extra_edge": 0.02, "rationale": "...", "confidence": "low|medium|high"}}"""
+Reply with exactly this JSON and nothing else: {{"noise_pct": 0.0002, "min_edge": 0.06, "prefer_side": "down", "up_override_margin": 0.02, "out_of_band_extra_edge": 0.02, "rationale": "...", "confidence": "low|medium|high"}}"""
 
 
 def summarize_ledger(db_path: str, limit: int = 500) -> Dict[str, Any]:
@@ -107,14 +107,14 @@ def validate_proposal(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
     if not isinstance(data, dict):
         return None
     try:
-        noise = float(data["noise_usd"])
+        noise = float(data["noise_pct"])
         edge = float(data["min_edge"])
         side = str(data["prefer_side"]).lower()
         margin = float(data["up_override_margin"])
         extra = float(data.get("out_of_band_extra_edge", 0.02))
     except Exception:  # noqa: BLE001
         return None
-    if not (NUMERIC_BOUNDS["noise_usd"][0] <= noise <= NUMERIC_BOUNDS["noise_usd"][1]):
+    if not (NUMERIC_BOUNDS["noise_pct"][0] <= noise <= NUMERIC_BOUNDS["noise_pct"][1]):
         return None
     if not (NUMERIC_BOUNDS["min_edge"][0] <= edge <= NUMERIC_BOUNDS["min_edge"][1]):
         return None
@@ -130,7 +130,7 @@ def validate_proposal(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
     ):
         return None
     return {
-        "noise_usd": noise,
+        "noise_pct": noise,
         "min_edge": edge,
         "prefer_side": side,
         "up_override_margin": margin,
@@ -185,7 +185,7 @@ async def run_forever(interval_sec: float = 3600.0) -> None:
 
     cfg = UpDownConfig()
     current = {
-        "noise_usd": cfg.noise_usd,
+        "noise_pct": cfg.noise_pct,
         "min_edge": cfg.min_edge,
         "prefer_side": cfg.prefer_side,
         "up_override_margin": cfg.up_override_margin,

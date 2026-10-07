@@ -216,16 +216,16 @@ VARIANCE_UNIT_MULTIPLE = 2.0
 VARIANCE_MAX_MULTIPLE = 2.5
 
 
-def variance_clip_multiplier(delta: float, noise_usd: float = 15.0) -> float:
+def variance_clip_multiplier(delta: float, noise: float = 15.0) -> float:
     """Clip multiplier from the size of Kalshi's mispricing. LIVE-only."""
     try:
-        noise = float(noise_usd or 15.0)
+        noise_val = float(noise or 15.0)
     except (TypeError, ValueError):
-        noise = 15.0
-    if noise <= 0:
+        noise_val = 15.0
+    if noise_val <= 0:
         return 1.0
     try:
-        units = abs(float(delta or 0.0)) / noise
+        units = abs(float(delta or 0.0)) / noise_val
     except (TypeError, ValueError):
         return 1.0
     mult = units / VARIANCE_UNIT_MULTIPLE

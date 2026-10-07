@@ -116,7 +116,7 @@ def test_fair_probability_rises_above_the_target_and_falls_below():
 
 def test_noise_band_is_respected():
     """Inside the deadband, spot is treated as no information at all."""
-    c = UpDownConfig(noise_usd=15.0, min_edge=0.06)
+    c = UpDownConfig(noise_pct=0.0002, min_edge=0.06)
     trader = UpDownTrader(SpotFeed(), Btc15mFeed(), c)
     # $10 above target with Kalshi at an even 0.50/0.50: fair is barely above
     # 0.5, so there is no edge and nothing should be traded.
@@ -132,7 +132,7 @@ def test_noise_band_is_respected():
 
 
 def test_buys_up_when_spot_is_well_past_target_but_kalshi_is_even():
-    c = UpDownConfig(noise_usd=15.0, min_edge=0.06)
+    c = UpDownConfig(noise_pct=0.0002, min_edge=0.06)
     trader = UpDownTrader(SpotFeed(), Btc15mFeed(), c)
     spot = SpotFeed()
     spot.price = 84900.0
@@ -146,7 +146,7 @@ def test_buys_up_when_spot_is_well_past_target_but_kalshi_is_even():
 
 
 def test_buys_down_when_spot_is_below_target_but_kalshi_is_even():
-    c = UpDownConfig(noise_usd=15.0, min_edge=0.06)
+    c = UpDownConfig(noise_pct=0.0002, min_edge=0.06)
     trader = UpDownTrader(SpotFeed(), Btc15mFeed(), c)
     spot = SpotFeed()
     spot.price = 84300.0
@@ -162,7 +162,7 @@ def test_buys_down_when_spot_is_below_target_but_kalshi_is_even():
 
 
 def test_no_trade_when_kalshi_already_agrees_with_spot():
-    c = UpDownConfig(noise_usd=15.0, min_edge=0.06)
+    c = UpDownConfig(noise_pct=0.0002, min_edge=0.06)
     trader = UpDownTrader(SpotFeed(), Btc15mFeed(), c)
     spot = SpotFeed()
     spot.price = 84900.0

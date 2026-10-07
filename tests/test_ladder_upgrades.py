@@ -286,7 +286,7 @@ def test_dry_maker_entry_config_has_an_env_kill_switch(monkeypatch):
 
 def test_venue_guard_config_env_overrides(monkeypatch):
     monkeypatch.setenv("VENUE_GUARD", "0")
-    monkeypatch.setenv("VENUE_GUARD_MAX_USD", "25")
+    monkeypatch.setenv("VENUE_GUARD_PCT", "0.0003")
     cfg = UpDownConfig()
     assert cfg.venue_guard_enabled is False
-    assert cfg.venue_guard_max_usd == 25.0
+    assert cfg.venue_guard_pct == 0.0003

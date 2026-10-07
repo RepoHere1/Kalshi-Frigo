@@ -193,7 +193,7 @@ def test_flag_roundtrip_and_stale_means_trade(tmp_path):
 # ---------------------------------------------------------------------------
 def test_calibrator_rejects_out_of_bounds():
     good = {
-        "noise_usd": 18.0,
+        "noise_pct": 0.0002,
         "min_edge": 0.07,
         "prefer_side": "down",
         "up_override_margin": 0.02,
@@ -207,7 +207,7 @@ def test_calibrator_rejects_out_of_bounds():
     bad2 = dict(good, prefer_side="sideways")
     assert validate_proposal(bad2) is None
     assert validate_proposal(None) is None
-    assert validate_proposal({"noise_usd": 1}) is None
+    assert validate_proposal({"noise_pct": 0.0002}) is None
 
 
 def test_replay_stats_split_kept_and_vetoed():
