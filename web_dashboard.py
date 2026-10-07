@@ -1717,6 +1717,7 @@ def _btc_keepalive_loop():
                 # respected regardless of which book the page
                 # is currently viewing.
                 row = None
+                from src.utils.strategy_runtime import key as _rt_key
                 for mode_word in ("paper", "live"):
                     lookup = snapshot.get(_rt_key(name, mode_word))
                     if lookup and lookup.get("desired", 0) == 1:
@@ -1771,7 +1772,13 @@ def _btc_keepalive_loop():
                         except Exception:  # noqa: BLE001 - malformed stamp
                             pass
                 # Not running (or just killed): arm it and start it.
-                spawn_mode = row.get("mode", book_mode)
+                # The four UP/DOWN lanes are ALWAYS-ON in whichever book the
+                # page is currently in. A row recorded in one book but read
+                # from the other (a book switch) must be re-armed into the
+                # CURRENT book, not re-spawned under its stale book word -
+                # that stale word is exactly what fed the supervisor's
+                # "BOOK MODE GUARD" refusal and left the lane down forever.
+                spawn_mode = book_mode
                 _run_async(store.set_desired(name, True, spawn_mode))
                 try:
                     started = _spawn_strategy(name, spawn_mode)
