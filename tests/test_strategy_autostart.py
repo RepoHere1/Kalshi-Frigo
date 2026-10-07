@@ -33,26 +33,34 @@ def test_a_spawn_that_cannot_be_recorded_kills_its_own_child():
     src = _src()
     assert "record_start" in src
     # It retries rather than failing on the first locked write...
-    assert "for attempt in range(4)" in src
+    assert "for attempt in range(8)" in src
     # ...and if it still cannot record, the child is stopped.
     assert "proc.terminate()" in src
     assert "could not record it" in src
 
 
 def test_the_record_is_attempted_more_than_once():
-    assert "for attempt in range(4)" in _src()
-    assert "time.sleep(0.4 * (attempt + 1))" in _src()
+    assert "for attempt in range(8)" in _src()
+    # Exponential backoff between record attempts.
+    assert "backoff = 0.2 * (2.4 ** attempt)" in _src()
+    assert "time.sleep(backoff)" in _src()
 
 
-def test_every_strategy_is_wanted_from_boot():
-    assert wd.AUTO_START_ALL is True
+def test_nothing_is_wanted_from_boot_without_the_operator():
+    """The operator's button is the only arming authority.
+
+    AUTO_START_ALL was killed: no lane may come into being because
+    a process booted. Every running lane exists because the operator
+    pressed Start in that book.
+    """
+    assert wd.AUTO_START_ALL is False
 
 
 def test_the_supervisor_never_gives_up_permanently():
     src = inspect.getsource(wd._strategy_supervisor_loop)
-    # The operator-facing promise must be that it keeps trying, not that it
-    # stopped trying.
-    assert "still retrying every" in src
+    # The operator-facing promise must be that it keeps trying, not that
+    # it stopped trying.
+    assert "forever until STOP button pressed" in src
     assert "it will not" not in src
     assert wd._SUPERVISOR_MAX_BACKOFF > 0
 

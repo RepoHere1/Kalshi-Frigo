@@ -15,6 +15,7 @@ import pytest
 
 from src.utils.database import DatabaseManager, Position, TradeLog
 import web_dashboard as wd
+from src.utils import mode as mode_module
 from src.utils.mode import MODE_DRY, TradingMode
 
 
@@ -163,3 +164,93 @@ async def test_the_two_books_can_coexist(tmp_path):
     live_rows = await db.get_open_positions(mode="live")
     assert [p.market_id for p in dry_rows] == ["KXTEST-26"]
     assert [p.market_id for p in live_rows] == ["KXLIVE-26"]
+
+
+# ---------------------------------------------------------------------------
+# DRY mirrors LIVE: a fresh book is seeded with the real Kalshi balance
+# through the live credentials, so the only difference from LIVE is that
+# fills are simulated.
+# ---------------------------------------------------------------------------
+
+
+def _mirror_env(monkeypatch, balance: float):
+    """Pretend the live keys resolve and the Kalshi API answers `balance`."""
+    monkeypatch.setattr(mode_module, "_materialize_private_key", lambda: "/fake/key.pem")
+
+    async def fake_funding(self, private_key_path=None):
+        return {
+            "connected": True,
+            "balance": round(balance, 2),
+            "balance_cents": int(round(balance * 100)),
+            "can_fund": balance >= 1.0,
+            "reason": "",
+        }
+
+    monkeypatch.setattr(TradingMode, "funding", fake_funding)
+
+
+async def test_ensure_seeds_a_fresh_book_from_the_live_balance(tmp_path, monkeypatch):
+    """A fresh DRY book opens as a mirror of the live account."""
+    _mirror_env(monkeypatch, 1234.56)
+    mgr = TradingMode(db_path=str(tmp_path / "mirror.db"))
+    account = await mgr.ensure_dry_account()
+    assert account["starting_balance"] == pytest.approx(1234.56, abs=0.01)
+    assert account["cash"] == pytest.approx(1234.56, abs=0.01)
+
+
+async def test_ensure_keeps_the_default_when_live_is_unfundable(tmp_path, monkeypatch):
+    """A live balance below Kalshi's $1 minimum cannot seed a tradable book."""
+    _mirror_env(monkeypatch, 0.71)
+    mgr = TradingMode(db_path=str(tmp_path / "poor.db"))
+    account = await mgr.ensure_dry_account()
+    assert account["cash"] == pytest.approx(300.0, abs=0.01)
+
+
+async def test_ensure_keeps_the_default_when_no_credentials(tmp_path, monkeypatch):
+    """No key material means the live balance is unknowable - fall back."""
+    monkeypatch.setattr(mode_module, "_materialize_private_key", lambda: None)
+    mgr = TradingMode(db_path=str(tmp_path / "nocreds.db"))
+    account = await mgr.ensure_dry_account()
+    assert account["cash"] == pytest.approx(300.0, abs=0.01)
+
+
+async def test_ensure_never_reseeds_a_book_that_exists(tmp_path, monkeypatch):
+    """The mirror only applies at creation; history is never re-seeded."""
+    _mirror_env(monkeypatch, 9999.0)
+    db = await _db(tmp_path, name="existing.db")
+    mgr = TradingMode(db_path=db.db_path)
+    await mgr.record_fill(market_id="KXTEST-26", side="NO", action="buy", quantity=10, price=0.25)
+    before = await mgr.dry_account()
+    account = await mgr.ensure_dry_account()
+    assert account["cash"] == pytest.approx(before["cash"], abs=0.01)
+    assert account["starting_balance"] == pytest.approx(300.0, abs=0.01)
+
+
+async def test_reset_reseeds_from_the_live_balance(tmp_path, monkeypatch):
+    """'Start over' reopens as a fresh mirror of the live account."""
+    _mirror_env(monkeypatch, 500.0)
+    db = await _db(tmp_path, name="wipe.db")
+    mgr = TradingMode(db_path=db.db_path)
+    await mgr.record_fill(market_id="KXTEST-26", side="NO", action="buy", quantity=10, price=0.25)
+    await db.add_position(_position())
+    await db.add_trade_log(_trade())
+
+    account = await mgr.reset_dry_account()
+
+    assert account["starting_balance"] == pytest.approx(500.0, abs=0.01)
+    assert account["cash"] == pytest.approx(500.0, abs=0.01)
+    assert account["open_positions"] == 0
+    assert account["closed_trades"] == 0
+
+
+async def test_reset_keeps_the_starting_figure_when_live_is_unreachable(tmp_path, monkeypatch):
+    """An unreachable live account must not change the reset semantics."""
+    monkeypatch.setattr(mode_module, "_materialize_private_key", lambda: None)
+    db = await _db(tmp_path, name="wipe2.db")
+    mgr = TradingMode(db_path=db.db_path)
+    await mgr.record_fill(market_id="KXTEST-26", side="NO", action="buy", quantity=10, price=0.25)
+
+    account = await mgr.reset_dry_account()
+
+    assert account["cash"] == pytest.approx(300.0, abs=0.01)
+    assert account["open_positions"] == 0

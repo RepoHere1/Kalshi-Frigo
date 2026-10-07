@@ -6540,7 +6540,7 @@ async function startAll() {
 async function stopAll() {
   const names = (SNAPSHOT.strategy_cards || []).filter(c => c.running).map(c => c.name);
   
-  // Find the "Stop all" button (not Kill all LIVE) - it says "Stop all" onclick
+  // Find the "Stop all" button (not the LIVE kill button) - it says "Stop all" onclick
   const stopAllBtn = Array.from(document.querySelectorAll('button')).find(b => 
     b.textContent.trim() === 'Stop all' && b.onclick.toString().includes('stopAll')
   );

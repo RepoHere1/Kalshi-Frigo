@@ -1924,12 +1924,25 @@ def test_every_strategy_has_a_card(client):
 
 def test_every_strategy_runs_its_own_command(client):
     """No two buttons may run the same process - that was how two fake
-    'strategies' ended up being one bot."""
+    'strategies' ended up being one bot.
+
+    The UP/DOWN lanes are the deliberate exception: btc_updown,
+    btc_updown_copy and btc_1h_updown are separate operator-pushed
+    lanes of the same --btc-updown trader.
+    """
     _seed_cards(client)
     cards = _cards(client)
     assert set(cards) == set(wd.STRATEGY_COMMANDS), "a strategy has no command"
     commands = {c["name"]: c["command"] for c in cards.values()}
-    assert len(set(commands.values())) == len(commands), "two strategies share a command"
+    shared = {
+        name: cmd
+        for name, cmd in commands.items()
+        if list(commands.values()).count(cmd) > 1
+    }
+    # Only the UP/DOWN family may share, and only on the updown trader.
+    assert set(shared) <= {"btc_updown", "btc_updown_copy", "btc_1h_updown"}
+    for cmd in shared.values():
+        assert "--btc-updown" in cmd
 
 
 def test_cards_alias_strategy_names(client):
@@ -1971,9 +1984,16 @@ def test_card_counts_open_positions_per_strategy(client):
 def test_card_reports_its_own_command(client):
     _seed_cards(client)
     cards = _cards(client)
-    # Each strategy must run a distinct process, not fall back to one loop.
+    # Each strategy must run a distinct process, not fall back to one
+    # loop. The UP/DOWN lanes are separate operator-pushed lanes of the
+    # same --btc-updown trader, so they share that one command.
     commands = {c["name"]: c["command"] for c in cards.values()}
-    assert len(set(commands.values())) == len(commands), "two strategies share a command"
+    shared = {
+        name: cmd
+        for name, cmd in commands.items()
+        if list(commands.values()).count(cmd) > 1
+    }
+    assert set(shared) <= {"btc_updown", "btc_updown_copy", "btc_1h_updown"}
     assert "--market-making" in commands["market_making"]
     assert "--quick-flip" in commands["quick_flip"]
     # A strategy that runs once and exits must not report itself as running.

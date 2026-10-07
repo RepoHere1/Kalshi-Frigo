@@ -3,6 +3,12 @@
 DRY  - real market data, simulated fills. Orders are never sent to Kalshi; a
        local cash ledger is debited/credited at the real quoted price and every
        simulated trade is written to `trade_logs` so the charts fill in.
+       DRY rides the LIVE credentials - this codebase has exactly one Kalshi
+       credential path (KALSHI_API_KEY + KALSHI_PRIVATE_KEY) - so it sees
+       precisely what LIVE sees: same markets, same prices, same account.
+       A book created fresh is seeded with the real Kalshi balance, making
+       DRY a perfect mirror of the live account that differs only in that
+       its execution is simulated.
 LIVE - real orders against the Kalshi production account. Guarded by
        `arm_live()`, which refuses unless the caller has already authenticated
        and explicitly confirmed.
@@ -55,6 +61,45 @@ CREATE TABLE IF NOT EXISTS dry_ledger (
 _MODE_KEY = "trading_mode"
 _START_KEY = "dry_starting_balance"
 _CASH_KEY = "dry_cash"
+
+# Kalshi's minimum order size in dollars. A live balance below this
+# cannot place an order, so a DRY book seeded from it would be unable
+# to simulate a single fill - the mirror only makes sense when the
+# account it mirrors can actually trade.
+MIN_MIRROR_BALANCE = 1.0
+
+
+def _materialize_private_key() -> Optional[str]:
+    """Write the KALSHI_PRIVATE_KEY env var (PEM text) to a file.
+
+    KalshiClient loads its key from a *path* (KALSHI_PRIVATE_KEY_PATH,
+    default "kalshi_private_key.pem"), but Railway can only inject env
+    vars, so a deployment that carries the PEM as KALSHI_PRIVATE_KEY
+    text would otherwise fail with "Private key file not found". The
+    dashboard ships the same bridge; it is duplicated here so the DRY
+    book can read the live balance without importing the dashboard,
+    which would be a circular import.
+
+    Returns the path, or None if no key material is configured.
+    """
+    import os
+    import tempfile
+    from pathlib import Path
+
+    pem = os.environ.get("KALSHI_PRIVATE_KEY", "").strip()
+    if not pem:
+        return None
+    if "BEGIN" not in pem:
+        # Not PEM text - assume it is already a path.
+        return pem
+    key_path = Path(tempfile.gettempdir()) / "kalshi_private_key.pem"
+    if not key_path.exists() or key_path.read_text(errors="replace").strip() != pem:
+        key_path.write_text(pem if pem.endswith("\n") else pem + "\n")
+    try:
+        os.chmod(key_path, 0o600)
+    except OSError:
+        pass  # best effort; not all filesystems support chmod
+    return str(key_path)
 
 
 class ModeError(Exception):
@@ -383,6 +428,21 @@ class TradingMode:
             await self._set(conn, _CASH_KEY, str(round(float(amount), 2)))
             await conn.commit()
 
+    async def _live_balance(self) -> Optional[float]:
+        """The real Kalshi balance through the live keys, or None if unknown.
+
+        DRY rides the same credentials as LIVE, so the simulated book can
+        open as a perfect mirror of the live account. None means "cannot
+        know" (no credentials, API unreachable) - never a number.
+        """
+        key_path = _materialize_private_key()
+        if not key_path:
+            return None
+        funding = await self.funding(key_path)
+        if funding.get("connected"):
+            return float(funding.get("balance") or 0.0)
+        return None
+
     async def ensure_dry_account(self) -> Dict[str, Any]:
         """Make sure a funded DRY book exists - without destroying an existing one.
 
@@ -390,11 +450,17 @@ class TradingMode:
         wipe: it clears the ledger, the positions and the closes, and puts the
         balance back to the starting figure. Calling that on every mode-set meant
         any trip through the DRY switch - or a retried request - silently threw
-        away the whole simulated book, which is what kept resetting a profitable
-        account back to $300.
+        away the whole simulated book, which is what kept a profitable
+        account back to $300 with nothing to show for the difference.
 
         So this only ever *creates*: if there is no ledger and no balance, it
         seeds the starting figure. An existing book is returned untouched.
+
+        A book created here opens as a mirror of the live account: seeded with
+        the real Kalshi balance (same keys, same market data) so the only
+        difference from LIVE is that fills are simulated. An unreachable or
+        unfunded live account falls back to the default starting figure so the
+        simulated book stays tradable.
         """
         async with self._conn() as conn:
             starting = await self._get(conn, _START_KEY)
@@ -402,6 +468,9 @@ class TradingMode:
             cash = await self._get(conn, _CASH_KEY)
             rows = int(await self._scalar(conn, "SELECT COUNT(*) FROM dry_ledger") or 0)
             if cash is None and rows == 0:
+                mirror = await self._live_balance()
+                if mirror is not None and mirror >= MIN_MIRROR_BALANCE:
+                    starting_f = round(mirror, 2)
                 await self._set(conn, _START_KEY, str(round(starting_f, 2)))
                 await self._set(conn, _CASH_KEY, str(round(starting_f, 2)))
                 await conn.commit()
@@ -418,10 +487,20 @@ class TradingMode:
         that leaves the history behind is not a reset.
 
         Only the DRY book is touched; LIVE rows are never in scope here.
+
+        The wiped book reopens as a mirror of the live account: when the
+        real Kalshi balance is reachable and can fund an order, the starting
+        figure is re-seeded from it, so "start over" means "start over as a
+        perfect mirror of LIVE". An unreachable or unfunded live account
+        keeps the existing starting figure.
         """
+        mirror = await self._live_balance()
         async with self._conn() as conn:
             starting = await self._get(conn, _START_KEY)
             starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
+            if mirror is not None and mirror >= MIN_MIRROR_BALANCE:
+                starting_f = round(mirror, 2)
+                await self._set(conn, _START_KEY, str(starting_f))
             await self._set(conn, _CASH_KEY, str(round(starting_f, 2)))
             await conn.execute("DELETE FROM dry_ledger")
             # Positions and closes are the rest of the simulated book.
