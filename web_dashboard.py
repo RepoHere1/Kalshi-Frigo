@@ -2003,6 +2003,10 @@ def _strategy_cards(
         if card is None:
             continue  # a close from a strategy this build no longer exposes
         pnl = float(row.get("pnl") or 0.0)
+        # Phantom rows (entered but never filled on Kalshi) carry zero P&L and
+        # must not count as losses; they are noise, not a bet that lost.
+        if (row.get("exit_reason") or "") == "no_kalshi_position":
+            continue
         running[name] = running.get(name, 0.0) + pnl
         card["trades"] += 1
         card["wins"] += 1 if pnl > 0 else 0
@@ -2085,7 +2089,8 @@ _SQL_TRADES = (
     " COALESCE(SUM(pnl), 0.0) AS realized_pnl,"
     " COALESCE(AVG(pnl), 0.0) AS avg_pnl,"
     " COALESCE(MAX(pnl), 0.0) AS best_trade,"
-    " COALESCE(MIN(pnl), 0.0) AS worst_trade"
+    " COALESCE(MIN(pnl), 0.0) AS worst_trade,"
+    " SUM(CASE WHEN COALESCE(exit_reason,'') = 'no_kalshi_position' THEN 1 ELSE 0 END) AS phantom"
     " FROM trade_logs WHERE {book}"
 )
 _SQL_OPEN = (
@@ -2160,7 +2165,7 @@ _SQL_LLM_USAGE = (
 _SQL_STRATEGY_CURVE = (
     "SELECT COALESCE(NULLIF(strategy, ''), 'unattributed') AS strategy,"
     " COALESCE(NULLIF(mode, ''), 'dry') AS mode,"
-    " exit_timestamp, pnl, market_id FROM trade_logs"
+    " exit_timestamp, exit_reason, pnl, market_id FROM trade_logs"
     " ORDER BY COALESCE(exit_timestamp, entry_timestamp) ASC LIMIT 2000"
 )
 _SQL_POSITIONS = (
@@ -2183,21 +2188,25 @@ def _row_trades(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     row = rows[0] if rows else {}
     trades = int(row.get("trades") or 0)
     wins = int(row.get("wins") or 0)
+    losses = int(row.get("losses") or 0)
+    phantom = int(row.get("phantom") or 0)
     if wins > trades:
         wins = trades
+    if losses > trades:
+        losses = trades
+    # Phantom rows (entered but never filled on Kalshi) are not real trades;
+    # they pollute the win-rate denominator with breakeven zero-P&L noise.
     return {
         "trades": trades,
         "wins": wins,
-        # Derived, never trusted from SQL: a row whose pnl is exactly 0 was
-        # counted as neither win nor loss by the query, which once rendered
-        # "36.4% · 30W / 0L" on the same card - an impossibility that made
-        # every tally suspect. losses is BY DEFINITION trades minus wins.
-        "losses": trades - wins,
+        "losses": losses,
+        "phantom": phantom,
         "realized_pnl": round(float(row.get("realized_pnl") or 0.0), 2),
         "avg_pnl": round(float(row.get("avg_pnl") or 0.0), 2),
         "best_trade": round(float(row.get("best_trade") or 0.0), 2),
         "worst_trade": round(float(row.get("worst_trade") or 0.0), 2),
-        "win_rate": round(wins / trades * 100, 1) if trades else 0.0,
+        # Win rate over REAL trades only (wins + losses, phantom excluded).
+        "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) else 0.0,
     }
 
 

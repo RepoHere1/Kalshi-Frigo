@@ -118,10 +118,15 @@ async def test_reads_only_the_dry_book(tmp_path):
 # The tally math
 # ---------------------------------------------------------------------------
 def test_losses_are_derived_never_trusted():
-    """pnl == 0 rows counted as neither win nor loss rendered 30W / 0L."""
+    """pnl == 0 rows counted as neither win nor loss rendered 30W / 0L.
+
+    losses now arrives from SQL (pnl<=0) and win_rate is wins/(wins+losses),
+    so zero-P&L phantom rows (no_kalshi_position) can never read as a 0L blip.
+    """
     from web_dashboard import _row_trades
 
-    row = {"trades": 30, "wins": 11, "losses": 0, "realized_pnl": -17.89}
+    row = {"trades": 30, "wins": 11, "losses": 19, "phantom": 0,
+           "realized_pnl": -17.89}
     t = _row_trades([row])
     assert t["losses"] == 19
     assert t["win_rate"] == pytest.approx(36.7)
@@ -130,7 +135,7 @@ def test_losses_are_derived_never_trusted():
 def test_wins_can_never_exceed_trades():
     from web_dashboard import _row_trades
 
-    t = _row_trades([{"trades": 5, "wins": 30}])
+    t = _row_trades([{"trades": 5, "wins": 30, "losses": 0}])
     assert t["wins"] == 5
     assert t["losses"] == 0
     assert t["win_rate"] == 100.0
