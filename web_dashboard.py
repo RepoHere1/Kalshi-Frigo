@@ -3041,18 +3041,19 @@ def api_live_flatten():
         key_path = materialize_private_key()
         client = KalshiClient(private_key_path=key_path) if key_path else KalshiClient()
         try:
-            balance, positions = await _fetch_kalshi_data()
+            balance, positions = (await _fetch_kalshi_data())[:2]
             rows: List[Dict[str, Any]] = []
             for row in (positions or {}).get("market_positions") or []:
                 ticker = row.get("ticker") or ""
-                shares = float(row.get("position") or 0)
+                shares = float(row.get("position_fp") or row.get("position") or 0)
                 if not ticker or not shares:
                     continue
                 try:
                     m = await client.get_market(ticker)
                 except Exception:  # noqa: BLE001
                     m = {}
-                yes_bid, yes_ask, no_bid, no_ask = get_market_prices(m or {})
+                mdict = (m or {}).get("market", m or {}) if isinstance(m, dict) else {}
+                yes_bid, yes_ask, no_bid, no_ask = get_market_prices(mdict or {})
                 # A positive position is long; which side it is long is the
                 # `position` field. Selling means hitting the bid on that side.
                 side = str(row.get("position") or "yes").lower()
@@ -3092,8 +3093,8 @@ def api_live_flatten():
                         "est_proceeds": round(proceeds, 2),
                         "est_pnl": round(proceeds - cost, 2),
                         "spread": round(ask - bid, 4),
-                        "status": m.get("status") if isinstance(m, dict) else None,
-                        "close_time": m.get("close_time") if isinstance(m, dict) else None,
+                        "status": mdict.get("status") if isinstance(mdict, dict) else None,
+                        "close_time": mdict.get("close_time") if isinstance(mdict, dict) else None,
                         "order": placed,
                     }
                 )
@@ -4645,6 +4646,11 @@ def api_config():
             updated.append(key)
         if skipped:
             _push_error(f"Ignored unknown config keys: {', '.join(skipped)}")
+        # Bust the snapshot memo so the very next refresh re-reads the just-saved
+        # config. Without this the cache served the pre-save values, which is why
+        # "save + refresh" looked like the numbers reverted.
+        _SNAPSHOT_CACHE["payload"] = None
+        _SNAPSHOT_CACHE["at"] = 0.0
         _broadcast("config", {"action": "updated", "keys": updated})
         return jsonify({"ok": True, "updated": updated, "skipped": skipped})
 
@@ -5243,7 +5249,7 @@ button.loading.yellow::after {
           <div><b id="c-{{ c.name }}-open">{{ c.open_positions }}</b><span>open</span></div>
         </div>
          <div class="cfoot">
-           <span class="mono" style="color:var(--faint)">$<span id="c-{{ c.name }}-dep">{{ '%.2f'|format(c.deployed) }}</span> deployed{% if not c.running and c.stop_reason %} &middot; {{ c.stop_reason }}{% endif %}</span>
+           <span class="mono" style="color:var(--faint)">BUY AMT <span id="c-{{ c.name }}-dep">${{ '%.2f'|format(c.deployed) }}</span>{% if not c.running and c.stop_reason %} &middot; {{ c.stop_reason }}{% endif %}</span>
            <span class="bar" onclick="event.stopPropagation()">
              <button id="btn-{{ c.name }}" onclick="toggleStrategy('{{ c.name }}')">{% if c.running %}Stop{% else %}Start{% endif %}</button>
              <button onclick="showAnalysis('{{ c.name }}')">ANALYSIS OF</button>
@@ -5531,7 +5537,7 @@ button.loading.yellow::after {
     <div class="ph"><h2>Open positions</h2><span class="note">{{ s.positions|length }} row{{ '' if s.positions|length == 1 else 's' }}{% if live and s.stale_live_rows %} &middot; {{ s.stale_live_rows }} stale local row{{ '' if s.stale_live_rows == 1 else 's' }} settled on Kalshi, not shown{% endif %}</span></div>
     <div class="scroll">
       {%- if s.positions %}
-      <table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th class="num">Entry</th><th class="num">Qty</th><th class="num">USD</th><th>Strategy</th><th class="num">SL</th><th class="num">TP</th></tr></thead><tbody id="posBody">
+      <table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th class="num">Entry</th><th class="num">Qty</th><th class="num">BUY AMT $$$</th><th>Strategy</th><th class="num">SL</th><th class="num">TP</th></tr></thead><tbody id="posBody">
       {%- for p in s.positions %}
         <tr>
           <td class="mono" title="{{ p.market_id }}">{{ p.market_id[:26] }}</td>
@@ -6253,7 +6259,7 @@ function drawChart() {
   if (!ctx) return;
   if (typeof Chart === 'undefined') return;
   if (chart) chart.destroy();
-  const flat = !EQUITY.pn.length;
+  const flat = !(EQUITY.pnl && EQUITY.pnl.length);
   chart = new Chart(ctx, {
     type: 'line',
     data: {
