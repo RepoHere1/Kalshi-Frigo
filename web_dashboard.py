@@ -2745,12 +2745,13 @@ def _mode_payload() -> Dict[str, Any]:
     # persisted book rather than from a counter that can drift from it.
     drift = run(mgr.reconcile_dry())
     dry = run(mgr.dry_account())
-    # Emergency reset: if the DRY cash counter has ballooned to an
-    # absurd figure (e.g. from unbounded compounding), reset it to the
-    # starting balance so the numbers become believable again.
-    if dry["cash"] >= 10000.0 or dry["deployed"] >= 10000.0:
+    # One-time reset: if the DRIED cash counter has ballooned
+    # from unbounded compounding, reset it to the 00 starting balance
+    # so the numbers are grounded. The code then grows from there
+    # legitimately using real production API data.
+    if dry["cash"] >= 10000.0:
         from src.utils.database import connect as _connect
-        async def _reset_cash():
+        async def _reset_dry():
             async with _connect(str(DB_PATH)) as _conn:
                 await _conn.execute(
                     "UPDATE runtime_config SET value = ?, updated_at = ? WHERE key = ?",
@@ -2764,7 +2765,7 @@ def _mode_payload() -> Dict[str, Any]:
                     "DELETE FROM positions WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry' AND status = 'open'"
                 )
                 await _conn.commit()
-        run(_reset_cash())
+        run(_reset_dry())
         dry = run(mgr.dry_account())
     payload: Dict[str, Any] = {
         "mode": mode,

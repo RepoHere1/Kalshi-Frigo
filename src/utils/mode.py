@@ -385,19 +385,6 @@ class TradingMode:
                 else 0
             )
 
-        # Cap DRY cash at a realistic maximum. The DRY cash counter
-        # compounds with every profitable close, and without a cap it
-        # grows absurdly (e.g. $39M on a $300 start). The user needs
-        # to trust the numbers. Cap at $10,000 and report what would
-        # have been the real figure as a warning.
-        DRY_CASH_CAP = 10000.0
-        capped = cash_f > DRY_CASH_CAP
-        if capped:
-            cash_f = DRY_CASH_CAP
-        DEPLOYED_CAP = 10000.0
-        capped_deployed = deployed > DEPLOYED_CAP
-        if capped_deployed:
-            deployed = DEPLOYED_CAP
         equity = round(cash_f + deployed, 2)
         # total_pnl = cash - starting + realized counted every closed trade twice.
         #
@@ -415,8 +402,6 @@ class TradingMode:
             "book": mode,
             "starting_balance": round(starting_f, 2),
             "cash": round(cash_f, 2),
-            "cash_capped": capped,
-            "capped_deployed": capped_deployed,
             "deployed": round(deployed, 2),
             "open_positions": open_count,
             "equity": round(equity, 2),
