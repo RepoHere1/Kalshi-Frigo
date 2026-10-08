@@ -69,7 +69,7 @@ HEADLINE_WINDOW_SEC = 30 * 60
 PRICE_RING_MAX = 12  # 12 x 5min = one hour of context
 FLAG_TTL_SEC = 10 * 60
 
-CLASSIFY_PROMPT = """Classify these Bitcoin headlines (last 30 minutes) for a 15-minute binary options scalper. Reply with exactly this JSON and nothing else: {{"state": "trade", "reason": ""}}. state is halt when a macro decision or market shock lands inside the trading window, caution when uncertainty is elevated but unconfirmed, trade otherwise. Headlines: {headlines}"""
+CLASSIFY_PROMPT = """Classify these Bitcoin headlines (last 30 minutes) for a 15-minute binary options scalper. Reply with exactly this JSON and nothing else: {{"state": "trade", "reason": ""}}. state is halt when a macro decision or market shock lands inside the trading window, caution when uncertainty is elevated but unconfirmed, trade otherwise. Headlines: {headlines}{skills}"""
 
 
 def fetch_rss(url: str, timeout: float = 15.0) -> List[Dict[str, Any]]:
@@ -185,8 +185,15 @@ async def run_once(
     ai_state: Optional[str] = None
     if client is not None and headlines:
         try:
+            from src.utils.skills import skills_block
+
             reply = await complete_for_job(
-                client, "sentinel", CLASSIFY_PROMPT.format(headlines=" | ".join(headlines))
+                client,
+                "sentinel",
+                CLASSIFY_PROMPT.format(
+                    headlines=" | ".join(headlines),
+                    skills=skills_block("news-halt-rules"),
+                ),
             )
             data = parse_json_object(reply)
             if data and str(data.get("state", "")).lower() in ("trade", "caution", "halt"):

@@ -1256,6 +1256,7 @@ def test_healthcheck_is_fast_and_offline(client, monkeypatch):
 MUTATING_ROUTES = [
     ("/api/mode", {"mode": "dry"}),
     ("/api/dry/reset", {}),
+    ("/api/strategies/reset-state", {}),
     ("/api/strategy/ai_directional/toggle", {"mode": "paper"}),
     ("/api/bot/ai_directional/kill", {}),
     ("/api/config", {"max_positions": 5}),
@@ -3158,3 +3159,41 @@ def test_snapshot_carries_kalshi_age(monkeypatch, tmp_path):
         wd.app.config["TESTING"] = True
     assert payload["kalshi_at"] == "2026-10-05 13:00:00"
     assert 0 <= payload["kalshi_age_sec"] <= 30
+
+
+# ---------------------------------------------------------------------------
+# Latch reset: the surgical kill for stale volume state.
+# ---------------------------------------------------------------------------
+def test_reset_state_walls_every_lane_off_in_both_books(
+    client, auth, monkeypatch, tmp_path
+):
+    """Every recorded lane, both books, down - and only that is touched."""
+    from src.utils.strategy_runtime import StrategyRuntime, key
+
+    db = str(tmp_path / "reset_state.db")
+    monkeypatch.setattr(wd, "DB_PATH", db)
+    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
+    store = StrategyRuntime(db_path=db)
+
+    async def seed():
+        await store.record_start("btc_updown", 999101, "paper", "cli.py run")
+        await store.record_start("xrp_updown", 999102, "live", "cli.py run --live")
+        await store.record_start("hyperliquid_updown", 999103, "paper", "cli.py run")
+
+    asyncio.run(seed())
+
+    r = client.post("/api/strategies/reset-state", headers=auth)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    body = r.get_json()
+    assert body["ok"] is True
+    assert body["lanes_cleared"] >= 3
+
+    snap = asyncio.run(store.snapshot())
+    for lane, book in (
+        ("btc_updown", "paper"),
+        ("xrp_updown", "live"),
+        ("hyperliquid_updown", "paper"),
+    ):
+        row = snap[key(lane, book)]
+        assert row["desired"] == 0
+        assert (row["stop_reason"] or "") in wd._OPERATOR_STOP_REASONS

@@ -14,13 +14,14 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from src.jobs.ai_models import complete_for_job, parse_json_object
+from src.utils.skills import skills_block
 
 VETO_PROMPT = """You are the risk veto for a 15-minute Bitcoin binary scalper on Kalshi. You can only vote NO. Most clips are coin flips with fees; your job is killing negative-expectancy entries, not finding winners.
 
 Clip: {ticker} {side} @ ${ask:.3f}, model edge {edge:.3f} over required {required:.3f}, fair P({side}) {fair:.3f}, {seconds_left:.0f}s to close, same-side recent: {streak}, BTC 5-min move {vol_pct:+.2f}%, fresh headlines: {headlines}.
 
 Veto ONLY for: a scheduled macro event inside the window (FOMC/CPI/Powell/ETF decision), a volatility explosion (5-min move over 0.6%), chasing (3 or more same-side losses in a row), or stale/contradictory context. Otherwise approve.
-
+{skills}
 Reply with exactly this JSON and nothing else: {{"veto": false, "reason": ""}}"""
 
 
@@ -52,6 +53,7 @@ def build_prompt(clip: Dict[str, Any], venue: Optional[Dict[str, Any]] = None) -
         streak=str(clip.get("streak", "unknown")),
         vol_pct=float(clip.get("vol_pct") or 0.0),
         headlines=str(clip.get("headlines") or "none")[:800] + venue_txt,
+        skills=skills_block("crypto-15m-playbook", "kalshi-mechanics"),
     )
 
 

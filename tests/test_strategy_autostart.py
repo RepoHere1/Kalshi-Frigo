@@ -49,11 +49,13 @@ def test_the_record_is_attempted_more_than_once():
 def test_nothing_is_wanted_from_boot_without_the_operator():
     """The operator's button is the only arming authority.
 
-    AUTO_START_ALL was killed: no lane may come into being because
-    a process booted. Every running lane exists because the operator
-    pressed Start in that book.
+    AUTO_START is gone entirely: no constant, no branch, no seed path.
+    Together with the latch in _spawn_strategy (a spawn refuses a lane the
+    button left off), nothing but a Start press can bring a lane up.
     """
-    assert wd.AUTO_START_ALL is False
+    src = inspect.getsource(wd)
+    assert "AUTO_START_ALL" not in src
+    assert "all strategies run by default" not in src
 
 
 def test_the_supervisor_never_gives_up_permanently():
@@ -65,16 +67,17 @@ def test_the_supervisor_never_gives_up_permanently():
     assert wd._SUPERVISOR_MAX_BACKOFF > 0
 
 
-def test_auto_start_does_not_resurrect_a_deliberately_stopped_strategy():
-    """Seeding happens only for names with no row at all.
+def test_the_supervisor_only_resumes_what_the_button_armed():
+    """Seeding happens for nothing; only desired=1 rows resume.
 
-    Stop clears `desired` but leaves the row, so a stopped lane must not be
-    restarted on the next pass.
+    The AUTO-START seeder is gone. The supervisor's only start path is the
+    desired=1 resume loop, and _spawn_strategy itself refuses a lane whose
+    button is off - so a stopped lane can never come back on its own.
     """
     src = inspect.getsource(wd._strategy_supervisor_loop)
-    assert "_OPERATOR_STOP_REASONS" in src
-    assert "row = recorded.get(this_key)" in src
-    assert "all strategies run by default" in src
+    assert "store.desired()" in src
+    assert "row = recorded.get(this_key)" not in src
+    assert "all strategies run by default" not in src
     # ...and it must start into the book actually in force, not a hardcoded one.
     assert "book_mode = _runtime_mode()" in src
     assert '_spawn_strategy(name, "paper")' not in src
@@ -90,8 +93,7 @@ def test_the_supervisor_touches_only_the_book_it_runs_in():
     assert "book_mode = _runtime_mode()" in src
     assert "store.desired(mode=book_mode)" not in src
     assert "store.desired()" in src
-    assert "store.snapshot(mode=book_mode)" not in src
-    assert "store.snapshot()" in src
+    assert "store.snapshot(" not in src  # whole-store reads left with the seeder
 
 
 def test_only_an_operator_stop_keeps_a_lane_down():
@@ -108,19 +110,18 @@ def test_backoff_has_a_ceiling():
 # ---------------------------------------------------------------------------
 # Arming policy
 # ---------------------------------------------------------------------------
-def test_a_restart_re_arms_every_dry_lane_and_only_pushed_live_lanes():
-    """A redeploy must not silently stop the DRY book - and must never ARM live.
+def test_a_restart_resumes_only_what_the_button_armed():
+    """A redeploy must not silently stop an armed lane - and must never start
+    an unarmed one.
 
-    THE LAW: the operator's button pushes are the only facts. AUTO-START is a
-    DRY-book convenience because DRY cannot lose money; the LIVE book trades
-    real money, so a LIVE lane may come into being ONLY by an explicit push in
-    the LIVE book. Pushed LIVE lanes are still honoured across restarts - the
-    supervisor's resume path reads `desired(mode='live')` rows - but booting
-    while the book reads LIVE seeds nothing by itself.
+    Restart behaviour is uniform across books now: the supervisor reads
+    desired=1 rows and resumes exactly those, in the book that is active.
+    Nothing is seeded, in DRY or LIVE; a button press is the only author of
+    "wanted".
     """
     src = inspect.getsource(wd._strategy_supervisor_loop)
-    # AUTO-START is gated to the DRY book only.
-    assert 'if AUTO_START_ALL and book_mode == "dry":' in src
+    # No seeder at all: every lane is resumed from its own desired=1 row.
+    assert "AUTO_START_ALL" not in src
     # The book in force still decides which book a lane is armed into.
     assert "book_mode = _runtime_mode()" in src
     assert '_spawn_strategy(name, "paper")' not in src
@@ -175,7 +176,10 @@ def test_an_operator_stop_is_permanent_across_instances():
     from src.utils.strategy_runtime import StrategyRuntime
 
     supervisor = inspect.getsource(wd._strategy_supervisor_loop)
-    assert "_OPERATOR_STOP_REASONS" in supervisor
+    # Permanence is structural: the resume source is desired=1 rows only, so
+    # a stopped lane (desired=0) is never even fetched, let alone re-armed.
+    assert "store.desired()" in supervisor
+    assert "all strategies run by default" not in supervisor
     # No instance scoping on the operator-stop exemption any more.
     assert "_CUR_INSTANCE" not in supervisor
 
@@ -317,3 +321,61 @@ def test_stop_child_gracefully():
     """Stop is graceful; no hard-kill exists since Kill-all was removed."""
     src = inspect.getsource(wd._stop_child)
     assert "proc.terminate" in src or "SIGTERM" in src
+
+
+# ---------------------------------------------------------------------------
+# THE LATCH: only the Start press arms; nothing spawns an off lane.
+# ---------------------------------------------------------------------------
+def test_spawn_refuses_a_lane_the_button_left_off(monkeypatch, tmp_path):
+    """No spawn without a persisted operator ON in that exact book."""
+    monkeypatch.setattr(wd, "DB_PATH", str(tmp_path / "latch.db"))
+    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
+    with pytest.raises(RuntimeError) as exc:
+        wd._spawn_strategy("btc_updown", "paper")
+    assert "button law" in str(exc.value)
+
+
+def test_spawn_proceeds_once_the_button_armed(monkeypatch, tmp_path):
+    """A Start press (arm) is what unlocks the spawn; the record follows."""
+    import asyncio as _aio
+
+    from src.utils.strategy_runtime import StrategyRuntime, key as rk
+
+    db = str(tmp_path / "latch2.db")
+    monkeypatch.setattr(wd, "DB_PATH", db)
+    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(wd, "materialize_private_key", lambda: None)
+
+    class _FakeProc:
+        pid = 999001
+
+    monkeypatch.setattr(wd.subprocess, "Popen", lambda *a, **k: _FakeProc())
+
+    store = StrategyRuntime(db_path=db)
+    _aio.run(store.arm("btc_updown", "paper"))
+
+    out = wd._spawn_strategy("btc_updown", "paper")
+    assert out["pid"] == 999001
+    row = _aio.run(store.snapshot())[rk("btc_updown", "paper")]
+    assert row["desired"] == 1
+
+
+def test_the_toggle_arms_before_it_spawns():
+    src = inspect.getsource(wd.api_strategy_toggle)
+    assert "store.arm(" in src
+    assert src.index("store.arm(") < src.index("_spawn_strategy(")
+
+
+def test_only_the_button_writes_the_latch():
+    """One writer for intent: the toggle. Everything else must obey it."""
+    src = inspect.getsource(wd)
+    assert "set_desired(" not in src  # arm/disarm are the only latch writers
+    assert "AUTO_START_ALL" not in src
+
+
+def test_hyper_card_sits_right_of_eth(monkeypatch, tmp_path):
+    monkeypatch.setattr(wd, "DB_PATH", str(tmp_path / "cards.db"))
+    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
+    cards = wd._strategy_cards([], [], "dry")
+    names = [c["name"] for c in cards]
+    assert names.index("hyperliquid_updown") == names.index("btc_1h_updown") + 1

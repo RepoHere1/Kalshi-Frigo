@@ -147,7 +147,10 @@ def test_live_lanes_are_resumed_like_any_other_lane():
     """
     src = _supervisor_source()
     assert "was running LIVE before a restart and was not" not in src
-    assert "_OPERATOR_STOP_REASONS" in src
+    # Permanence is structural now: only desired=1 rows are ever fetched, and
+    # a Stop writes desired=0 - so a stopped lane cannot be resumed, any book.
+    assert "store.desired()" in src
+    assert "all strategies run by default" not in src
 
 
 def test_the_supervisor_manages_all_books():
@@ -162,8 +165,9 @@ def test_the_supervisor_manages_all_books():
     assert "book_mode = _runtime_mode()" in src
     assert "store.desired()" in src
     assert "store.desired(mode=book_mode)" not in src
-    assert "store.snapshot()" in src
-    assert "store.snapshot(mode=book_mode)" not in src
+    # Per-row scoping: a row recorded for the other book is skipped, never
+    # spawned or killed from here.
+    assert '(row.get("mode") or "") != book_mode' in src
 
 
 def test_a_recovered_strategy_resets_the_failure_budget():

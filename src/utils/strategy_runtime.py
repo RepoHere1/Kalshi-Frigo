@@ -350,11 +350,16 @@ class StrategyRuntime:
         """Arm a lane for one book: desired=1 AND an explicit-operator-stop is
         cleared, so a previous Stop never haunts this book's future starts. The
         pid is left untouched here; the spawn path records it separately.
+        Upserts: arming a lane that never had a row CREATES the row. That is
+        what lets the Start button arm before it spawns, and what makes the
+        latch in _spawn_strategy work for a lane's very first start.
         """
         async with _conn(self.db_path) as conn:
             await conn.execute(
-                "UPDATE strategy_runtime SET desired=1, stop_reason=NULL"
-                " WHERE name=? AND mode=?",
+                "INSERT INTO strategy_runtime (name, mode, desired, stop_reason)"
+                " VALUES (?, ?, 1, NULL)"
+                " ON CONFLICT(name, mode) DO UPDATE SET"
+                " desired=1, stop_reason=NULL",
                 (name, mode),
             )
             await conn.commit()

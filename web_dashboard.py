@@ -78,7 +78,8 @@ HEAVY_API_ABUSERS = {
 # Every strategy is wanted from boot. The operator stops lanes by hand; the app
 # does not decide that a strategy it could not start once is better off down.
 # A strategy only stays down when Stop was pressed, which clears `desired`.
-AUTO_START_ALL = False  # DISABLED: No auto-start. Only button pushes control strategies.
+# There is no auto-start, by operator order: only a Start press arms a lane,
+# and the latch in _spawn_strategy refuses any spawn the button did not arm.
 # Stop reasons that mean the operator said stop. Only these keep a lane down
 # across a restart; anything else was a crash, a redeploy or a lost record and
 # the strategy comes back up.
@@ -1431,11 +1432,10 @@ def _market_data_loop():
 def _strategy_supervisor_loop():
     """Keep every strategy the operator asked for actually running.
 
-    On boot, every strategy is wanted (AUTO_START_ALL). Stopping a lane clears
-    its `desired` flag and it stays down; nothing else takes a strategy out of
-    service. That inverts the old failure mode, where a strategy that died once
-    - or was never recorded - simply stayed down and the book quietly ran on
-    whatever happened to still be alive.
+    Only lanes the operator armed (desired=1) are wanted. A Start press arms
+    a lane and it is resumed across restarts; a Stop clears `desired` and the
+    lane stays down; nothing else takes a strategy out of service or brings
+    one back. There is no seeding: no lane comes into being without a press.
 
     A strategy process is a child, and children die: an unhandled exception in a
     trading cycle, an OOM kill, a transient API failure during boot, a locked
@@ -1452,9 +1452,6 @@ def _strategy_supervisor_loop():
     while True:
         try:
             store = _runtime_store()
-            if AUTO_START_ALL and not _creds_present():
-                time.sleep(10)
-                continue
             # ALL BOOKS — the operator's button is permanent law.
             # Stopping a strategy in LIVE must never affect DRY, and
             # vice versa. The supervisor must manage BOTH books so
@@ -1471,68 +1468,10 @@ def _strategy_supervisor_loop():
                 time.sleep(10)
                 continue
             wanted = _run_async(store.desired())
-            # Every DRY lane is wanted from boot. Stopping a lane clears
-            # its `desired` flag and it stays down; nothing else takes
-            # a strategy out of service. That inverts the old failure
-            # mode, where a strategy that died once - or was never recorded -
-            # simply stayed down and the book quietly ran on
-            # whatever happened to still be alive.
-            #
-            # THE LAW: AUTO-START is a DRY-book convenience only. The LIVE
-            # book trades real money, so a LIVE lane may come into being
-            # ONLY by an explicit operator push in the LIVE book (which
-            # persists desired=1 and is thereafter resumed by the supervisor).
-            # Booting while the book reads LIVE must never arm anything by
-            # itself - this exact path is what turned the LIVE LLM strategy
-            # on behind a DRY button push.
-            if AUTO_START_ALL and book_mode == "dry":
-                recorded = _run_async(store.snapshot())
-
-                for name in strategy_state:
-                    # Check if this strategy is wanted in ANY book.
-                    is_wanted = any(
-                        v.get("desired", 0) == 1
-                        for v in wanted.values()
-                    )
-                    if is_wanted:
-                        continue
-                    # Look up the row for the CURRENT book only
-                    # (AUTO_START is a DRIED convenience).
-                    this_key = _runtime_key(name)
-                    row = recorded.get(this_key) if this_key else None
-                    # LAW + cost guard: heavy API abusers (quick_flip) are never
-                    # auto-started onto a book with no record. The operator left
-                    # them OFF on purpose; AUTO_START_ALL must not resurrect
-                    # them. An explicit Start press still goes through the toggle
-                    # endpoint (which refuses abusers with an explanation), and
-                    # a pre-existing desired=1 row is still honoured/resumed.
-                    if row is None and name in HEAVY_API_ABUSERS:
-                        continue
-                    if row is not None:
-                        # A row exists, so this book's button has been pushed
-                        # before. The operator's last click is PERMANENT truth:
-                        # a Stop keeps the lane down across redeploys, book
-                        # switches and any number of logins, forever, until
-                        # Start is pressed in this book again. No expiry, no
-                        # instance scoping - the button is welded to the state.
-                        if (row.get("stop_reason") or "") in _OPERATOR_STOP_REASONS:
-                            continue
-                    if not _creds_present():
-                        continue
-                    try:
-                        _run_async(store.set_desired(name, True, book_mode))
-                        _spawn_strategy(name, book_mode)
-                        _push_error(
-                            f"Started {name} in {book_mode.upper()} "
-                            f"(all strategies run by default)."
-                        )
-                        # Stagger the boot storm. Six strategies starting at once
-                        # all race for the SQLite write lock, and their lock
-                        # contention is what turned the dashboard's DB reads into
-                        # timed-out, thread-leaking calls on boot.
-                        time.sleep(3)
-                    except Exception as exc:  # noqa: BLE001
-                        _push_error(f"Auto-start {name} failed: {exc}")
+            # NO AUTO-START, EVER (operator order). The only thing that may
+            # arm a lane is a Start press; _spawn_strategy refuses any lane
+            # whose button is off, and this supervisor's only start path is
+            # the desired=1 resume loop below. Nothing seeds itself.
             for _ck, row in wanted.items():
                 name = row.get("name") or ""
                 if name not in strategy_state:
@@ -1923,7 +1862,7 @@ def _strategy_cards(
         )
     # REORDER: Priority: btc_updown #1, xrp_updown #2, xau_updown #3, btc_1h_updown #4, then ai_directional, rest
     ordered = []
-    priority_order = ["btc_updown", "xrp_updown", "xau_updown", "btc_1h_updown", "ai_directional", "beast_mode", "safe_compounder", "market_making", "quick_flip"]
+    priority_order = ["btc_updown", "xrp_updown", "xau_updown", "btc_1h_updown", "hyperliquid_updown", "ai_directional", "beast_mode", "safe_compounder", "market_making", "quick_flip"]
     for name in priority_order:
         if name in cards:
             ordered.append(cards[name])
@@ -2848,6 +2787,56 @@ def api_dry_reset():
         return jsonify({"error": str(e)}), 500
     _broadcast("mode", {"mode": run(mgr.current()), "action": "dry_reset"})
     return jsonify({"ok": True, "dry": account})
+
+
+@app.route("/api/strategies/reset-state", methods=["POST"])
+def api_strategies_reset_state():
+    """THE LATCH RESET (operator order): kill the one part of the volume that
+    can make a button push look ignored.
+
+    The Railway volume carries every past era's `strategy_runtime` rows -
+    stale desired=1 flags armed by the old keep-alive, rows recorded before
+    the book split, crashed-instance leftovers. Those rows are the only
+    thing on the volume that can resurrect a lane the operator stopped.
+
+    This endpoint is the surgical kill for exactly that part: it stops every
+    recorded child and walls every lane OFF (desired=0, operator reason) in
+    BOTH books. Every other table - trades, positions, the DRY ledger, the
+    runtime mode - is untouched. After it runs, the buttons are the only
+    authors of state: press Start on the lanes you want, and the latch keeps
+    that decision forever.
+    """
+    denied = require_token()
+    if denied is not None:
+        return denied
+    from src.utils.strategy_runtime import key as _rk
+
+    store = _runtime_store()
+    killed = 0
+    cleared = 0
+    try:
+        snapshot = _run_async(store.snapshot())
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+    for lane in strategy_state:
+        for book in ("paper", "live"):
+            row = snapshot.get(_rk(lane, book))
+            if not row:
+                continue
+            pid = row.get("pid")
+            if pid and _pid_alive(pid, row):
+                try:
+                    _stop_child({"pid": pid, "running": True})
+                    killed += 1
+                except Exception:  # noqa: BLE001 - a dead pid is fine
+                    pass
+            _run_async(store.disarm(lane, book, "stopped by operator"))
+            cleared += 1
+    _recorded_state()
+    _broadcast(
+        "strategy", {"action": "latch_reset", "killed": killed, "cleared": cleared}
+    )
+    return jsonify({"ok": True, "killed": killed, "lanes_cleared": cleared})
 
 
 @app.route("/api/dry/ledger")
@@ -3980,8 +3969,8 @@ def api_strategy_toggle(name):
     # START request. Never clear intent here: a Start that fails validation
     # (mode mismatch, missing creds, spawn error) must leave the previous
     # intent exactly as it was, not flip a lane the operator turned ON into
-    # OFF-forever. _spawn_strategy records desired=True on success; the Stop
-    # path above (db_running) is the only place desired=False is written.
+    # OFF-forever. The Start path arms the lane before spawning (the latch);
+    # the Stop path above (db_running) is the only place desired=False is written.
     
     print(f"[api_strategy_toggle] {name} is NOT RUNNING, executing START in {book_mode} book", flush=True)
 
@@ -4019,6 +4008,10 @@ def api_strategy_toggle(name):
         )
 
     try:
+        # THE LATCH: the Start press arms the lane FIRST (persisting desired=1
+        # for this book), then spawns. If the spawn fails, the intent survives
+        # and the supervisor retries - a Start stays a Start, forever.
+        _run_async(store.arm(name, mode))
         result = _spawn_strategy(name, mode)
         print(f"[api_strategy_toggle] {name} spawned successfully in {mode} mode (PID {result['pid']})", flush=True)
         # PERMANENT ASSERTION: The book we read must match the mode we spawned.
@@ -4153,6 +4146,20 @@ def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
     identical child: same command, same environment, same persisted record.
     """
     store = _runtime_store()
+
+    # THE LATCH (operator order): only a Start press may arm a lane, and a
+    # spawn may only proceed for a lane the button armed in THIS book. Every
+    # other spawn path (the supervisor's resume, any future code) must find
+    # desired=1 already recorded; anything else refuses. This is the hard
+    # guarantee that a lane can never come up behind the operator's back.
+    from src.utils.strategy_runtime import key as _latch_key
+
+    _record = _run_async(store.snapshot(mode=mode)).get(_latch_key(name, mode)) or {}
+    if int(_record.get("desired") or 0) != 1:
+        raise RuntimeError(
+            f"button law: {name} is OFF in {mode.upper()} - refusing to spawn. "
+            "Press Start to arm this lane; nothing else can arm it."
+        )
 
     # sys.executable guarantees the child uses the same interpreter (and venv)
     # as the dashboard, rather than whatever 'python' resolves to on PATH.
@@ -6805,8 +6812,8 @@ def start_background_workers():
          _log_tail_loop,
          _backup_loop,
          _market_data_loop,
-         # Button-only control, with restart persistence. AUTO_START_ALL
-         # is False, so this loop NEVER starts an unpushed lane and
+         # Button-only control, with restart persistence. This loop NEVER
+         # starts an unpushed lane and
          # NEVER kills anything (a stale heartbeat only alerts). What
          # it does is honour the operator's own pushes across a
          # redeploy: a lane with desired=1 whose process died with the
