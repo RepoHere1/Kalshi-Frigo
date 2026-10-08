@@ -65,14 +65,21 @@ MAX_CLIPS_PER_TICKER = 1
 # never to reopen the $0.90+ "4%-win" band (that hard block stays global).
 ASSET_TUNING: Dict[str, Dict[str, float]] = {
     "XRP-USD": {
-        "noise_pct": 0.0008,          # ~0.08% of price: XRP moves like BTC/ETH
+        "noise_pct": 0.0008,          # ~0.08% of price: XRP/XAU move like BTC/ETH
+        "max_entry_price": 0.60,
+        "max_entry_price_maker": 0.75,
+        "sweet_band_low": 0.20,
+        "sweet_band_high": 0.50,
+    },
+    "XAU-USD": {
+        "noise_pct": 0.0003,          # ~0.03% of price (~$0.90): Gold moves steadily
         "max_entry_price": 0.60,
         "max_entry_price_maker": 0.75,
         "sweet_band_low": 0.20,
         "sweet_band_high": 0.50,
     },
     "ETH-USD": {
-        "noise_pct": 0.0002,          # ~0.02% of price (~$0.51): ETH is a large
+        "noise_pct": 0.0002,          # ~0.02% of price (~$0.51): ETH/XAU are large
                                       # asset like BTC; 0.1% was far too wide
         "max_entry_price": 0.60,
         "max_entry_price_maker": 0.75,
@@ -289,8 +296,8 @@ class UpDownConfig:
         """Apply per-asset deadband and entry-band overrides.
 
         Called once by the runner with the lane's Coinbase pair so a sub-dollar
-        asset (XRP) is not graded against BTC's microstructure defaults. Unknown
-        products keep BTC defaults unchanged.
+        asset (XRP) or Gold (XAU) is not graded against BTC's microstructure
+        defaults. Unknown products keep BTC defaults unchanged.
         """
         tuning = ASSET_TUNING.get((spot_product or "").strip().upper())
         if not tuning:
@@ -457,7 +464,7 @@ class UpDownTrader:
         self.feed = feed
         self.config = config or UpDownConfig()
         self.db_manager = db_manager
-        # This process's own lane identity. Each crypto (BTC/XRP/ETH) is a
+        # This process's own lane identity. Each crypto (BTC/XRP/XAU/ETH) is a
         # SEPARATE book and must attribute its positions and veto streaks to its
         # own lane, never to a shared "btc_updown" bucket - otherwise the four
         # lanes fight over one position table and one guard.
@@ -641,7 +648,7 @@ class UpDownTrader:
             except Exception:  # noqa: BLE001 - guard failure never blocks
                 pass
         # Hard deadband.
-        # noise scales with target price so XRP/ETH/BTC all work.
+        # noise scales with target price so XRP/XAU/ETH/BTC all work.
         noise_usd = target * self.config.noise_pct
         if abs(delta) <= noise_usd:
             self.book.skipped_no_edge += 1
@@ -1661,7 +1668,7 @@ def _lane_name() -> str:
     xrp_updown, btc_1h_updown). The four lanes run the same
     trader but each must attribute its positions, its veto streaks and its
     heartbeat to its OWN row - a hardcoded "btc_updown" made every crypto lane
-    share one position table, which is why XRP/ETH never showed their own
+    share one position table, which is why XRP/XAU/ETH never showed their own
     trades. A manual run without the stamp falls back to btc_updown.
     """
     import os
@@ -1678,8 +1685,8 @@ async def run_updown_trader(
 ) -> None:
     """Run the up/down trader, optionally on a loop until interrupted.
 
-    `series` is the Kalshi series ticker (e.g. KXXRP15M, KXBTC15M, KXETH15M).
-    `spot_product` is the Coinbase pair (e.g. XRP-USD, BTC-USD, ETH-USD).
+    `series` is the Kalshi series ticker (e.g. KXXRP15M, KXXAU15M, KXBTC15M, KXETH15M).
+    `spot_product` is the Coinbase pair (e.g. XRP-USD, XAU-USD, BTC-USD, ETH-USD).
     """
     from src.jobs.market_data import MarketDataHub
 
