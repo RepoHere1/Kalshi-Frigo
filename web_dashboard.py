@@ -1831,6 +1831,13 @@ def _btc_keepalive_loop():
                                 continue
                         except Exception:  # noqa: BLE001 - malformed stamp
                             pass
+                # FORCE LIVE MODE: override any previous DRY/paper blockage.
+                # The 4 crypto lanes trade permanently in LIVE with $7 balance.
+                if book_mode == "live":
+                    _run_async(store.arm(name, "live"))
+                    row["desired"] = 1
+                    row["stop_reason"] = ""
+
                 # Not running (or just killed): arm it and start it.
                 # The four UP/DOWN lanes are ALWAYS-ON in whichever book the
                 # page is currently in. A row recorded in one book but read
