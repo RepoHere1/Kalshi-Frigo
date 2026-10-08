@@ -1779,13 +1779,20 @@ def _btc_keepalive_loop():
                 # for these four is that they run every second, every book. Clear
                 # any stale operator stop and arm.
                 row = dict(row)
-                if (row.get("desired") == 0) or (
-                    (row.get("stop_reason") or "") in _OPERATOR_STOP_REASONS
-                ):
-                    _run_async(store.arm(name, book_mode))
-                    row["desired"] = 1
-                    row["stop_reason"] = ""
+                # PERMANENT LAW: operator STOP button is absolute truth.
+                # Only restart crashed lanes (desired==1, stale heartbeat);
+                # never override an explicit operator stop.
+                operator_stopped = (row.get("stop_reason") or "") in _OPERATOR_STOP_REASONS
                 pid = row.get("pid")
+                if operator_stopped and row.get("desired") == 0:
+                    # Operator explicitly stopped in this book: stay OFF forever.
+                    if pid and _pid_alive(pid, row):
+                        try:
+                            _stop_child({"pid": pid, "running": True})
+                        except Exception:  # noqa: BLE001 - dead pid is fine
+                            pass
+                    _run_async(store.set_desired(name, False, book_mode))
+                    continue
                 if pid and _pid_alive(pid, row):
                     hb = row.get("heartbeat_at")
                     wedged = False
