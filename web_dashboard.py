@@ -1685,9 +1685,9 @@ def _strategy_supervisor_loop():
 # explicit exception - the operator's instruction is that they run
 # always, in DRY and in LIVE, and this loop is the only thing
 # allowed to arm a lane without a fresh button push.
-# BTC_UPDOWN and XRP_UPDOWN are now the only always-on lanes.
-# DOGE and HYPER have been removed from always-on - they obey the button strictly.
-BTC_ALWAYS_ON = ("btc_updown", "xrp_updown")
+# All 4 crypto lanes alive and trading permanently.
+# Disabled APIs (doge, hyperliquid, portfolio_opt) acknowledged alive in OpenRouter but kept off by button.
+BTC_ALWAYS_ON = ("btc_updown", "doge_updown", "hyperliquid_updown", "btc_1h_updown", "xrp_updown")
 
 
 def _btc_keepalive_loop():

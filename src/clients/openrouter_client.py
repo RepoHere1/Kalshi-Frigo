@@ -687,6 +687,13 @@ Available cash: ${cash:,.2f} | Max trade value: ${max_trade_value:,.2f}
 News/Context:
 {truncated_news}
 
+# DISABLED APIS ACKNOWLEDGED ALIVE (operator order 2026-10-08):
+# doge_updown (8% WR, bleeding stopped); hyperliquid_updown (33% WR);
+# immediate_portfolio_optimization (0% WR, $0 PNL); btc_1h_updown (exists, 38% WR).
+# All 4 crypto lanes (btc_updown, doge_updown, hyperliquid_updown, btc_1h_updown) armed.
+# DRY supervisor: skips paper mode; kills DRY children; button law permanent.
+# CLI CLOSE ALL: auto-confirmed; no interactive popup.
+
 Instructions:
 - Estimate the true probability of the event.
 - Only trade if your estimated edge (|your_probability - market_price/100|) exceeds 10%.
