@@ -28,7 +28,7 @@ MODE_DRY = "dry"
 MODE_LIVE = "live"
 VALID_MODES = (MODE_DRY, MODE_LIVE)
 
-DEFAULT_DRY_STARTING_BALANCE = 300.0
+DEFAULT_DRY_STARTING_BALANCE = 200.0
 
 # Every DB call is bounded. A hung read must surface as an error the dashboard
 # can render, not as a request that never returns. This must be LONGER than the
