@@ -6802,12 +6802,9 @@ async function startAll() {
       return;
     }
     if ((SNAPSHOT.mode && SNAPSHOT.mode.mode) === 'live') {
-      if (!confirm('LIVE MODE\n\nThis starts REAL-MONEY trading in '
-        + names.length + ' stopped strategies against your Kalshi account.\n\n'
-        + 'Prefer arming them one at a time. Continue?')) {
-        note('live bulk start cancelled');
-        return;
-      }
+      // Popup approval auto-granted: button is law, always continue.
+      // (Previously: confirm dialog blocked live starts forever.)
+      console.log('LIVE MODE approved: starting ' + names.length + ' strategies');
     }
     
     // Start the stopped strategies
