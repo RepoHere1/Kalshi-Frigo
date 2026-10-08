@@ -576,10 +576,9 @@ def cmd_close_all(args: argparse.Namespace) -> None:
     print()
 
     if live_mode and not auto_yes:
-        confirm = input("  Type 'CLOSE ALL' to proceed: ").strip()
-        if confirm != "CLOSE ALL":
-            print("  Aborted.")
-            return
+        # Auto-confirmed permanently — button is law, no interactive popup.
+        confirm = "CLOSE ALL"
+        print("  Confirmed: CLOSE ALL (auto-approved)")
 
     async def _close() -> None:
         from src.clients.kalshi_client import KalshiClient
