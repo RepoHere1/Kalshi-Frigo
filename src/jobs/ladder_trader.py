@@ -206,6 +206,17 @@ class UpDownConfig:
     maker_only_mode: bool = True  # NEW: Only place limit orders at bid/ask
     maker_wait_seconds: float = 5.0  # Wait time for maker order to fill
 
+    # QUICK_WIN: safe high-confidence mode for tiny accounts ($7).
+    # Only takes very certain trades (high edge, sweet spot only), very small clips,
+    # quick exit. No unlimited leverage — just faster capture of confirmed edges.
+    quick_win_enabled: bool = False  # Enable via QUICK_WIN_ENABLED=1
+    quick_win_edge: float = 0.15     # 15% min edge (very high confidence only)
+    quick_win_max_clip_usd: float = 0.50  # Max $0.50 per trade (1 contract @ 50c)
+    quick_win_profit_target: float = 0.08  # 8% quick profit take
+    quick_win_stop_loss: float = 0.03      # 3% tight stop
+    quick_win_sweet_low: float = 0.30
+    quick_win_sweet_high: float = 0.45
+
     def __post_init__(self) -> None:
         import os as _os
 
@@ -238,6 +249,16 @@ class UpDownConfig:
             self.vol_edge_enabled = False
         if _os.environ.get("KELLY_SIZING", "1") != "1":
             self.kelly_sizing = False
+        if _os.environ.get("QUICK_WIN_ENABLED", "") == "1":
+            self.quick_win_enabled = True
+            # Quick win: very tight high-confidence mode for tiny accounts.
+            # Only takes 15%+ edge, tight sweet band 0.30-0.45, $0.50 max clip,
+            # 8% quick profit, 3% stop. No maker-only delay — takes immediately.
+            self.min_edge = max(self.min_edge, self.quick_win_edge)
+            self.max_entry_price = self.quick_win_sweet_high
+            self.min_entry_price = self.quick_win_sweet_low
+            self.notional_usd = self.quick_win_max_clip_usd
+            self.maker_only_mode = False  # Take immediately for speed
         try:
             self.kelly_scale = float(_os.environ.get("KELLY_SCALE", self.kelly_scale))
             self.kelly_cap = float(_os.environ.get("KELLY_CAP", self.kelly_cap))
@@ -1033,6 +1054,10 @@ class UpDownTrader:
                 f"{self.config.min_win_prob:.2f} on {signal.side.upper()}"
             )
 
+        # Quick win mode: tight high-confidence capture for tiny accounts ($7).
+        if self.config.quick_win_enabled:
+            signal.notional = min(signal.notional, self.config.quick_win_max_clip_usd)
+            # Quick exit targets applied externally; here we just enforce tight size.
         open_notional = sum(float(p.get("notional") or 0.0) for p in held)
         if open_notional + signal.notional > self.config.max_open_notional:
             return (
