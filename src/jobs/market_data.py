@@ -181,7 +181,7 @@ class SpotFeed:
     reports itself as degraded, because a slow spot price must never be silently
     used as a leading indicator.
 
-    `product` is the Coinbase exchange pair, e.g. BTC-USD, DOGE-USD.
+    `product` is the Coinbase exchange pair, e.g. BTC-USD, XRP-USD.
     """
 
     def __init__(self, product: str = "BTC-USD") -> None:

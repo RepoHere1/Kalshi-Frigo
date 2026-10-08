@@ -894,14 +894,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--series",
         type=str,
-        default="KXBTC15M",
-        help="Kalshi series ticker (e.g. KXBTC15M, KXDOGE15M, KXETH15M) for --btc-updown",
+        default="KXXRP15M",
+        help="Kalshi series ticker (e.g. KXXRP15M, KXBTC15M, KXETH15M) for --btc-updown",
     )
     p_run.add_argument(
         "--spot-product",
         type=str,
-        default="BTC-USD",
-        help="Coinbase spot product (e.g. BTC-USD, DOGE-USD) for --btc-updown",
+        default="XRP-USD",
+        help="Coinbase spot product (e.g. XRP-USD, BTC-USD) for --btc-updown",
     )
     p_run.add_argument(
         "--loop",

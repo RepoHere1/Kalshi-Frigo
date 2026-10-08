@@ -73,7 +73,13 @@ HEAVY_API_ABUSERS = {
     "quick_flip": (
         "quick_flip is the #1 OpenRouter spender - 3,079 LLM calls and over "
         "half of the tracked API cost. It is left OFF on purpose."
-    )
+    ),
+    "hyperliquid_updown": (
+        "hyperliquid_updown has been permanently disabled by operator command. "
+        "It re-enabled itself after being stopped, which violates the operator's "
+        "button is law rule. To stop it: press Stop on the dashboard. "
+        "DO NOT re-enable."
+    ),
 }
 # Every strategy is wanted from boot. The operator stops lanes by hand; the app
 # does not decide that a strategy it could not start once is better off down.
@@ -122,9 +128,8 @@ dashboard_state = {
 # Strategy control state
 strategy_state = {
     "btc_updown": {"running": False, "pid": None, "mode": "paper"},
-    "doge_updown": {"running": False, "pid": None, "mode": "paper"},
+    "xrp_updown": {"running": False, "pid": None, "mode": "paper"},
     "btc_1h_updown": {"running": False, "pid": None, "mode": "paper"},
-    "hyperliquid_updown": {"running": False, "pid": None, "mode": "paper"},
     "ai_directional": {"running": False, "pid": None, "mode": "paper"},
     "safe_compounder": {"running": False, "pid": None, "mode": "paper"},
     "beast_mode": {"running": False, "pid": None, "mode": "paper"},
@@ -143,9 +148,8 @@ strategy_state = {
 # now part of the command rather than an afterthought.
 STRATEGY_COMMANDS: Dict[str, List[str]] = {
     "btc_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
-    "doge_updown": ["cli.py", "run", "--btc-updown", "--series", "KXDOGE15M", "--spot-product", "DOGE-USD", "--paper", "--loop", "--interval", "0"],
+    "xrp_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRP15M", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
     "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETH15M", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
-    "hyperliquid_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPE15M", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
     "ai_directional": ["cli.py", "run", "--paper", "--loop", "--interval", "300"],
     "safe_compounder": [
         "cli.py",
@@ -174,9 +178,8 @@ STRATEGY_COMMANDS: Dict[str, List[str]] = {
 # this map every card would read "unattributed" except ai_directional.
 STRATEGY_ALIASES = {
     "btc_updown": "btc_updown",
-    "doge_updown": "doge_updown",
+    "xrp_updown": "xrp_updown",
     "btc_1h_updown": "btc_1h_updown",
-    "hyperliquid_updown": "hyperliquid_updown",
     "ai_directional": "ai_directional",
     "ai directional": "ai_directional",
     "directional_trading": "ai_directional",
@@ -199,8 +202,8 @@ STRATEGY_ALIASES = {
     "quick_flip_scalping": "quick_flip",
     "quick flip": "quick_flip",
     "quick_flip_scalping_strategy": "quick_flip",
-    "hyperliquid": "hyperliquid_updown",
-    "hyperliquid_15m": "hyperliquid_updown",
+    "xrp": "xrp_updown",
+    "xrp_15m": "xrp_updown",
 }
 
 # Alert webhooks
@@ -873,10 +876,10 @@ STRATEGY_DOCS = {
         "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
         "the current book every second of every day.",
     ),
-    "doge_updown": (
-        "DOGE 15-min up/down",
-        'Reads Kalshi\'s DOGE 15-min up/down contract and compares its Up/Down price '
-        "against live Coinbase spot. Takes one $5 clip only when the two disagree "
+    "xrp_updown": (
+        "XRP 15-min up/down",
+        'Reads Kalshi\'s XRP 15-min up/down contract and compares its Up/Down price '
+        "against live Coinbase XRP-USD spot. Takes one $5 clip only when the two disagree "
         "by more than the configured edge. "
         "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
         "the current book every second of every day.",
@@ -886,14 +889,6 @@ STRATEGY_DOCS = {
         'Reads Kalshi\'s ETH 15-min up/down contract (KXETH15M) and compares its Up/Down '
         "price against live Coinbase ETH-USD spot. Takes one $5 clip when profitable "
         "edge detected. "
-        "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
-        "the current book every second of every day.",
-    ),
-    "hyperliquid_updown": (
-        "Hyperliquid 15-min up/down",
-        'Reads Kalshi\'s Hyperliquid 15-min up/down contract (KXHYPE15M) and compares its '
-        "Up/Down price against live Coinbase HYPE-USD spot. Takes one $5 clip when "
-        "profitable edge detected. "
         "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
         "the current book every second of every day.",
     ),
@@ -1672,7 +1667,9 @@ def _strategy_supervisor_loop():
 # explicit exception - the operator's instruction is that they run
 # always, in DRY and in LIVE, and this loop is the only thing
 # allowed to arm a lane without a fresh button push.
-BTC_ALWAYS_ON = ("btc_updown", "doge_updown", "btc_1h_updown", "hyperliquid_updown")
+# BTC_UPDOWN and XRP_UPDOWN are now the only always-on lanes.
+# DOGE and HYPER have been removed from always-on - they obey the button strictly.
+BTC_ALWAYS_ON = ("btc_updown", "xrp_updown")
 
 
 def _btc_keepalive_loop():
@@ -2046,9 +2043,9 @@ def _strategy_cards(
         card["win_rate"] = (
             round(100.0 * card["wins"] / card["trades"], 1) if card["trades"] else 0.0
         )
-    # REORDER: Priority: btc_updown #1, doge_updown #2, hyperliquid_updown #3, btc_1h_updown #4, then ai_directional, rest
+    # REORDER: Priority: btc_updown #1, xrp_updown #2, btc_1h_updown #3, then ai_directional, rest
     ordered = []
-    priority_order = ["btc_updown", "doge_updown", "hyperliquid_updown", "btc_1h_updown", "ai_directional", "beast_mode", "safe_compounder", "market_making", "quick_flip"]
+    priority_order = ["btc_updown", "xrp_updown", "btc_1h_updown", "ai_directional", "beast_mode", "safe_compounder", "market_making", "quick_flip"]
     for name in priority_order:
         if name in cards:
             ordered.append(cards[name])
