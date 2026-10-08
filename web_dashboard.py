@@ -1840,6 +1840,23 @@ def _btc_keepalive_loop():
                     row["desired"] = 1
                     row["stop_reason"] = ""
 
+                # Clear DRY contamination for always-on lanes when in LIVE mode.
+                # This prevents BOOK MODE GUARD blocking lanes that were
+                # recorded in DRY but should now run in LIVE.
+                if book_mode == "live" and name in BTC_ALWAYS_ON:
+                    from src.utils.strategy_runtime import StrategyRuntime
+                    store_live = StrategyRuntime(db_path)
+                    dry_row = await asyncio.wait_for(
+                        store_live.snapshot(), timeout=5
+                    )
+                    for mode_word in ("paper",):
+                        key_live = f"{name}_{mode_word}"
+                        if key_live in dry_row:
+                            await asyncio.wait_for(
+                                store_live.disarm(name, mode_word, "DRY cleared for LIVE"),
+                                timeout=5,
+                            )
+
                 # Not running (or just killed): arm it and start it.
                 # The four UP/DOWN lanes are ALWAYS-ON in whichever book the
                 # page is currently in. A row recorded in one book but read
