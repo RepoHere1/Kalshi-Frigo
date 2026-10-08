@@ -211,7 +211,7 @@ class UpDownConfig:
     # quick exit. No unlimited leverage — just faster capture of confirmed edges.
     quick_win_enabled: bool = False  # Enable via QUICK_WIN_ENABLED=1
     quick_win_edge: float = 0.15     # 15% min edge (very high confidence only)
-    quick_win_max_clip_usd: float = 0.50  # Max $0.50 per trade (1 contract @ 50c)
+    quick_win_max_clip_usd: float = 6.00  # Scaled to $7 account: take $6 wins
     quick_win_profit_target: float = 0.08  # 8% quick profit take
     quick_win_stop_loss: float = 0.03      # 3% tight stop
     quick_win_sweet_low: float = 0.30
