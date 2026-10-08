@@ -879,7 +879,7 @@ def _trading_setting(name: str, default: Any = None) -> Any:
 # the dashboard documents the system it is monitoring.
 STRATEGY_DOCS = {
     "btc_updown": (
-        "BTC 15-min up/down",
+        "BTC 15-Min Up/Down",
         'Reads Kalshi\'s own KXBTC15M contract - "BTC price up in next 15 mins?" - '
         "and compares its Up/Down price against live Coinbase spot. Takes one $5 "
         "clip only when the two disagree by more than the configured edge. "
