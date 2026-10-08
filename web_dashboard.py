@@ -1719,6 +1719,21 @@ def _btc_keepalive_loop():
                 continue
             store = _runtime_store()
             snapshot = _run_async(store.snapshot())
+            from src.utils.strategy_runtime import key as _rt_key
+            # FORCE DRY MODE OFF: skip supervisor restarts in DRY/"paper" mode.
+            if book_mode == "paper":
+                # Kill any running DRY child forcibly; do not restart.
+                for name in BTC_ALWAYS_ON:
+                    dry_row = snapshot.get(_rt_key(name, "paper"))
+                    if dry_row and dry_row.get("pid") and _pid_alive(dry_row["pid"], dry_row):
+                        try:
+                            _stop_child({"pid": dry_row["pid"], "running": True})
+                        except Exception:  # noqa: BLE001
+                            pass
+                    # Force desired=0 for DRY so button OFF is respected
+                    _run_async(store.set_desired(name, False, "paper"))
+                time.sleep(1)
+                continue
             for name in BTC_ALWAYS_ON:
                 # THE BUTTON IS LAW. An operator Stop is
                 # permanent truth, even for these three.
