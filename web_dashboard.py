@@ -1742,13 +1742,19 @@ def _btc_keepalive_loop():
                     # No current-book row yet: a lane never pushed here. The
                     # always-on supervision arms it in the current book.
                     row = {}
-                if (row.get("desired") == 0) and (
+                # THE LAW (the four exceptions): these lanes are ALWAYS ON, in
+                # whichever book the page reads. A stop_reason left on their row
+                # is residue from a book switch or an older global-Stop bug, and
+                # must not keep a crypto lane down - the operator's instruction
+                # for these four is that they run every second, every book. Clear
+                # any stale operator stop and arm.
+                row = dict(row)
+                if (row.get("desired") == 0) or (
                     (row.get("stop_reason") or "") in _OPERATOR_STOP_REASONS
                 ):
-                    # The operator stopped THIS book's copy; honour it until a
-                    # fresh Start here. The OTHER book is re-armed independently
-                    # by this same loop on a future book switch.
-                    continue
+                    _run_async(store.arm(name, book_mode))
+                    row["desired"] = 1
+                    row["stop_reason"] = ""
                 pid = row.get("pid")
                 if pid and _pid_alive(pid, row):
                     hb = row.get("heartbeat_at")
