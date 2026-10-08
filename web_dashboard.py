@@ -1685,9 +1685,11 @@ def _strategy_supervisor_loop():
 # explicit exception - the operator's instruction is that they run
 # always, in DRY and in LIVE, and this loop is the only thing
 # allowed to arm a lane without a fresh button push.
-# All 4 crypto lanes alive and trading permanently.
-# Disabled APIs (doge, hyperliquid, portfolio_opt) acknowledged alive in OpenRouter but kept off by button.
-BTC_ALWAYS_ON = ("btc_updown", "doge_updown", "hyperliquid_updown", "btc_1h_updown", "xrp_updown")
+# DOGE permanently dead (8% WR, -$9.76 bleeding). Never on — live or dry.
+# Hyperliquid moved up next to BTC lanes (live). DOGE stays dead forever.
+BTC_ALWAYS_ON = ("btc_updown", "hyperliquid_updown", "xrp_updown")
+# DOGE blocked permanently: supervisor skips any doge_updown restart in any mode.
+DOGE_KILLED = ("doge_updown",)
 
 
 def _btc_keepalive_loop():
