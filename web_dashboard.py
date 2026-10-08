@@ -194,7 +194,7 @@ STRATEGY_ALIASES = {
     # routine that produced them. Without this, every trade and position it made
     # landed in "unattributed" and the ai_directional card read 0 trades / $0.00
     # realized while the bot had in fact been trading.
-    "immediate_portfolio_optimization": "ai_directional",
+    # immediate_portfolio_optimization disabled - 0% win rate, $0 PnL
     "portfolio_optimization": "ai_directional",
     "safe_compounder": "safe_compounder",
     "safe compounding": "safe_compounder",

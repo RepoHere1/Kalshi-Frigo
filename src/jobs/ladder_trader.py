@@ -109,14 +109,15 @@ class UpDownConfig:
     #     EXTRA edge before they are worth taking
     #   - NO trades win 83% vs YES at 67%: the NO side is preferred unless YES
     #     is clearly better
-    max_entry_price: float = 0.60  # REDUCED: 11% win above 0.65, stop the bleeding
+    max_entry_price: float = 0.55  # Tightened: only trade $0.40-$0.55 sweet spot
+    min_entry_price: float = 0.40  # NEW: block entries below 40¢
     # LIVE log showed entries at 0.80-0.85 YES resolve to zero almost every time
     # (the $0.90+ "4% win" band bleeding lower). Cap maker entries below that.
     yes_extra_edge: float = 0.03   # YES/UP must beat its bar by +0.03 (NO wins more)
     sweet_band_low: float = 0.20
     sweet_band_high: float = 0.50
     out_of_band_extra_edge: float = 0.04  # RAISED: Now out-of-band is 0.50-0.60, needs +4c edge
-    prefer_side: str = "down"
+    prefer_side: str = "up"
     up_override_margin: float = 0.02
     # Fee per fill. Kalshi charges 0.07 * price * (1-price) per
     # contract on every fill, so a 6c edge that clears DRY is only
