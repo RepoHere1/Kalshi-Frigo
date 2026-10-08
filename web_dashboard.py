@@ -911,27 +911,27 @@ STRATEGY_DOCS = {
         "the current book every second of every day.",
     ),
     "ai_directional": (
-        "LLM directional",
+        "LLM Directional",
         "Ingests Kalshi markets, scores each one with an LLM decision pass, then "
         "sizes a Kelly-criterion position and places paper or live orders.",
     ),
     "safe_compounder": (
-        "Safe compounder",
+        "Safe Compounder",
         "No LLM. Pure edge math: only takes trades whose model-implied probability "
         "beats the market price by more than the configured threshold.",
     ),
     "beast_mode": (
-        "Beast mode",
+        "Beast Mode",
         "Aggressive multi-strategy runner (market making + directional + arbitrage) "
         "with risk-parity allocation. Not the default.",
     ),
     "market_making": (
-        "Market making",
+        "Market Making",
         "Quotes both sides of the order book and earns the spread, capped by "
         "inventory-risk and correlation limits.",
     ),
     "quick_flip": (
-        "Quick flip scalping",
+        "Quick Flip Scalping",
         "Short-horizon strategy that enters on momentum and exits on a small " "favourable move.",
     ),
 }
