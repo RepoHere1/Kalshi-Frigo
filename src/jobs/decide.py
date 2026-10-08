@@ -22,6 +22,88 @@ from src.clients.xai_client import XAIClient
 from src.clients.kalshi_client import KalshiClient
 
 
+def _calculate_kelly_position_size(
+    balance: float,
+    market_price: float,
+    ai_probability: float,
+    side: str,
+    confidence: float,
+    is_maker: bool = False
+) -> int:
+    """
+    Calculate position size using Kelly Criterion.
+    
+    Kelly formula for binary markets:
+    - For YES positions: f* = (p - c) / (1 - c) when p > c
+    - For NO positions: f* = (q - c_NO) / (1 - c_NO) when q > c_NO
+    
+    Where:
+    - f* = fraction of bankroll to wager
+    - p = AI estimated probability of YES
+    - c = market price (implied probability)
+    - q = 1 - p (probability of NO)
+    - c_NO = 1 - c_YES (market price for NO)
+    
+    We use quarter-Kelly for safety and to reduce volatility.
+    
+    Args:
+        balance: Current available portfolio balance
+        market_price: The price of the contract (0.01-0.99)
+        ai_probability: AI's estimated probability (0.0-1.0)
+        side: "YES" or "NO"
+        confidence: AI confidence level (0.0-1.0)
+        is_maker: Whether using maker fees (1.75%) or taker fees (7%)
+        
+    Returns:
+        Number of contracts to purchase
+    """
+    if balance <= 0 or market_price <= 0 or market_price >= 1.0:
+        return 0
+    
+    from src.utils.edge_filter import calculate_roundtrip_fees_dollars
+    
+    # Calculate Kelly fraction
+    if side.upper() == "YES":
+        # YES position: buy when AI prob > market price
+        p = ai_probability
+        c = market_price
+        if p <= c:
+            return 0  # No edge
+        # f* = (p - c) / (1 - c)
+        kelly_fraction = (p - c) / (1.0 - c)
+    else:
+        # NO position: sell when AI prob for NO > market price for NO
+        p = ai_probability
+        c = market_price
+        q = 1.0 - p  # Probability of NO
+        c_no = 1.0 - c  # Market price for NO (if YES is c)
+        if q <= c_no:
+            return 0  # No edge
+        # f* = (q - c_NO) / (1 - c_NO)
+        kelly_fraction = (q - c_no) / (1.0 - c_no)
+    
+    # Use quarter-Kelly for safety (reduces volatility while retaining ~50% growth)
+    # Higher confidence = slightly more aggressive (up to full Kelly)
+    # Lower confidence = more conservative (down to quarter Kelly)
+    confidence_factor = 0.25 + (confidence * 0.25)  # 0.25 to 0.50
+    kelly_fraction *= confidence_factor
+    
+    # Cap at 15% of bankroll (max_single_position setting)
+    kelly_fraction = min(kelly_fraction, 0.15)
+    
+    # Calculate dollar amount
+    investment_amount = balance * kelly_fraction
+    
+    # Calculate quantity
+    quantity = int(investment_amount // market_price)
+    
+    # Ensure minimum of 1 contract if we have edge
+    if quantity < 1 and kelly_fraction > 0.01:
+        quantity = 1
+    
+    return quantity
+
+
 def _calculate_dynamic_quantity(
     balance: float,
     market_price: float,
@@ -157,8 +239,15 @@ async def make_decision_for_market(
                         market.market_id, decision_action, confidence, total_analysis_cost, "high_confidence"
                     )
                     
-                    confidence_delta = decision.confidence - market.yes_price
-                    quantity = _calculate_dynamic_quantity(available_balance, market.yes_price, confidence_delta)
+                    # Use Kelly Criterion for position sizing
+                    quantity = _calculate_kelly_position_size(
+                        available_balance,
+                        market.yes_price,
+                        decision.confidence,
+                        decision.side,
+                        confidence,
+                        is_maker=True  # Maker fees apply for high-confidence strategy
+                    )
 
                     if quantity > 0:
                         # Calculate exit strategy using Grok4 recommendations  
@@ -325,9 +414,19 @@ async def make_decision_for_market(
             # Check position limits before calculating quantity
             from src.utils.position_limits import check_can_add_position
             
-            # Calculate initial position size
-            confidence_delta = decision.confidence - price
-            initial_quantity = _calculate_dynamic_quantity(available_balance, price, confidence_delta)
+            # Calculate initial position size using Kelly Criterion
+            # Determine if this will be a maker or taker order based on wait time
+            _maker_wait = getattr(settings.trading, 'maker_wait_seconds', 8.0)
+            is_maker = _maker_wait > 0
+            
+            initial_quantity = _calculate_kelly_position_size(
+                available_balance,
+                price,
+                decision.confidence,
+                decision.side,
+                confidence,
+                is_maker=is_maker
+            )
             initial_position_value = initial_quantity * price
             
             # Check if position can be added within limits and adjust if needed

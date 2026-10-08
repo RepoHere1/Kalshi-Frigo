@@ -16,6 +16,22 @@ from dataclasses import dataclass
 import math
 
 
+def calculate_roundtrip_fees_dollars(price: float, contracts: int, is_maker: bool = False) -> float:
+    """
+    Calculate round-trip fees (Kalshi taker/maker).
+    Taker: 7% of price * (1-price) * contracts, rounded up
+    Maker: 1.75% of price * (1-price) * contracts, rounded up
+    """
+    p = max(0.01, min(0.99, float(price or 0.0)))
+    n = max(int(contracts or 0), 0)
+    if n <= 0:
+        return 0.0
+    
+    fee_rate = 0.0175 if is_maker else 0.07
+    total = fee_rate * n * p * (1.0 - p)
+    return math.ceil(total * 100 - 1e-9) / 100.0
+
+
 @dataclass
 class EdgeFilterResult:
     """Result of edge filtering analysis."""
@@ -34,14 +50,14 @@ class EdgeFilter:
     UPDATED: More aggressive thresholds to allow more trading opportunities.
     """
     
-    # LOOSENED: Allow more trading opportunities (approved 2026-03-29)
-    MIN_EDGE_REQUIREMENT = 0.04        # LOOSENED: 4% minimum edge (was 8%)
-    HIGH_CONFIDENCE_EDGE = 0.03        # LOOSENED: 3% edge for high confidence (was 6%)  
-    MEDIUM_CONFIDENCE_EDGE = 0.05      # LOOSENED: 5% edge for medium confidence (was 8%)
-    LOW_CONFIDENCE_EDGE = 0.08         # LOOSENED: 8% edge for low confidence (was 12%)
+    # STRATEGIC: Align with LLM prompt (requires >10% edge) and Kalshi fees (7% taker)
+    MIN_EDGE_REQUIREMENT = 0.10        # 10% minimum edge (matches prompt and covers 7% fees)
+    HIGH_CONFIDENCE_EDGE = 0.10        # 10% edge for high confidence (>=80%)
+    MEDIUM_CONFIDENCE_EDGE = 0.12      # 12% edge for medium confidence (>=60%)
+    LOW_CONFIDENCE_EDGE = 0.15         # 15% edge for low confidence (<60%)
     
-    # LOOSENED: Lower confidence floor for more opportunities
-    MIN_CONFIDENCE_FOR_TRADE = 0.35    # LOOSENED: 35% minimum confidence (was 50%)
+    # STRATEGIC: Higher confidence for better edge reliability
+    MIN_CONFIDENCE_FOR_TRADE = 0.55    # 55% minimum confidence (more reliable signals)
     MAX_ACCEPTABLE_RISK = 0.6          # INCREASED: 60% max position risk (was 50%)
     
     # UPDATED: More permissive quality filters
@@ -53,7 +69,10 @@ class EdgeFilter:
         cls,
         ai_probability: float,
         market_probability: float,
-        confidence: Optional[float] = None
+        confidence: Optional[float] = None,
+        price: Optional[float] = None,
+        contracts: Optional[int] = None,
+        is_maker: bool = False
     ) -> EdgeFilterResult:
         """
         Calculate edge and determine if it meets filtering criteria.
@@ -62,6 +81,9 @@ class EdgeFilter:
             ai_probability: AI predicted probability (0.0 to 1.0)
             market_probability: Current market price/probability (0.0 to 1.0)
             confidence: AI confidence level (0.0 to 1.0)
+            price: Entry price for fee calculation
+            contracts: Number of contracts for fee calculation
+            is_maker: Whether using maker fees (1.75%) or taker fees (7%)
             
         Returns:
             EdgeFilterResult with filtering decision and details
@@ -76,6 +98,14 @@ class EdgeFilter:
         edge_magnitude = ai_probability - market_probability
         edge_percentage = abs(edge_magnitude)
         
+        # Calculate fees and adjust edge
+        edge_after_fees = edge_percentage
+        if price is not None and contracts is not None:
+            fees = calculate_roundtrip_fees_dollars(price, contracts, is_maker)
+            # Convert fees to percentage of contract value
+            fee_percentage = fees / (contracts * price) if contracts * price > 0 else 0
+            edge_after_fees = max(0.0, edge_percentage - fee_percentage)
+        
         # Determine position side based on edge direction
         if edge_magnitude > 0:
             side = "YES"  # AI thinks YES is underpriced
@@ -84,17 +114,17 @@ class EdgeFilter:
         
         # Confidence-adjusted edge thresholds
         if confidence >= 0.8:
-            required_edge = cls.HIGH_CONFIDENCE_EDGE     # 8% for high confidence
+            required_edge = cls.HIGH_CONFIDENCE_EDGE     # 10% for high confidence
         elif confidence >= 0.6:
-            required_edge = cls.MEDIUM_CONFIDENCE_EDGE   # 10% for medium confidence
+            required_edge = cls.MEDIUM_CONFIDENCE_EDGE   # 12% for medium confidence
         else:
             required_edge = cls.LOW_CONFIDENCE_EDGE      # 15% for low confidence
         
         # Calculate confidence-adjusted edge
-        confidence_adjusted_edge = edge_percentage * confidence
+        confidence_adjusted_edge = edge_after_fees * confidence
         
         # Check if edge meets requirements (use > instead of >= to avoid floating point precision issues)
-        passes_basic_edge = edge_percentage > (required_edge - 0.001)  # Allow tiny tolerance for floating point
+        passes_basic_edge = edge_after_fees > (required_edge - 0.001)  # Allow tiny tolerance for floating point
         passes_confidence = confidence >= cls.MIN_CONFIDENCE_FOR_TRADE
         
         # Generate filtering decision and reason
@@ -103,10 +133,10 @@ class EdgeFilter:
             reason = f"Confidence {confidence:.1%} below minimum {cls.MIN_CONFIDENCE_FOR_TRADE:.1%}"
         elif not passes_basic_edge:
             passes_filter = False
-            reason = f"Edge {edge_percentage:.1%} below required {required_edge:.1%} for confidence {confidence:.1%}"
+            reason = f"Edge after fees {edge_after_fees:.1%} below required {required_edge:.1%} for confidence {confidence:.1%}"
         else:
             passes_filter = True
-            reason = f"Meets requirements: {edge_percentage:.1%} edge, {confidence:.1%} confidence"
+            reason = f"Meets requirements: {edge_percentage:.1%} raw edge, {edge_after_fees:.1%} after fees, {confidence:.1%} confidence"
         
         return EdgeFilterResult(
             passes_filter=passes_filter,
@@ -204,6 +234,63 @@ class EdgeFilter:
         return True, f"TRADE APPROVED: {edge_result.reason}", edge_result
     
     @classmethod
+    def should_trade_market_with_fees(
+        cls,
+        ai_probability: float,
+        market_probability: float,
+        confidence: float,
+        price: float,
+        contracts: int,
+        is_maker: bool = False,
+        additional_filters: Optional[Dict[str, Any]] = None
+    ) -> tuple[bool, str, EdgeFilterResult]:
+        """
+        Comprehensive trading decision with fee-aware edge calculation.
+        
+        Args:
+            ai_probability: AI predicted probability
+            market_probability: Market price/probability  
+            confidence: AI confidence level
+            price: Entry price for fee calculation
+            contracts: Number of contracts
+            is_maker: Use maker fees (1.75%) or taker fees (7%)
+            additional_filters: Optional additional filtering criteria
+            
+        Returns:
+            (should_trade, reason, edge_result)
+        """
+        
+        # Calculate edge with fees
+        edge_result = cls.calculate_edge(
+            ai_probability=ai_probability,
+            market_probability=market_probability,
+            confidence=confidence,
+            price=price,
+            contracts=contracts,
+            is_maker=is_maker
+        )
+        
+        # Basic edge filter
+        if not edge_result.passes_filter:
+            return False, edge_result.reason, edge_result
+        
+        # Additional filters if provided
+        if additional_filters:
+            volume = additional_filters.get('volume', 0)
+            min_volume = additional_filters.get('min_volume', 1000)
+            
+            if volume < min_volume:
+                return False, f"Volume {volume} below minimum {min_volume}", edge_result
+            
+            time_to_expiry = additional_filters.get('time_to_expiry_days', 30)
+            max_time = additional_filters.get('max_time_to_expiry', 365)
+            
+            if time_to_expiry > max_time:
+                return False, f"Time to expiry {time_to_expiry} days exceeds maximum {max_time}", edge_result
+        
+        return True, f"TRADE APPROVED: {edge_result.reason}", edge_result
+    
+    @classmethod
     def get_edge_summary(cls, edge_results: List[EdgeFilterResult]) -> Dict[str, Any]:
         """
         Generate summary statistics for a list of edge filtering results.
@@ -238,14 +325,14 @@ class EdgeFilter:
 
 
 # Convenience functions for backward compatibility
-def calculate_edge(ai_prob: float, market_prob: float, confidence: float = 0.7) -> EdgeFilterResult:
+def calculate_edge(ai_prob: float, market_prob: float, confidence: float = 0.7, **kwargs) -> EdgeFilterResult:
     """Convenience function for edge calculation."""
-    return EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+    return EdgeFilter.calculate_edge(ai_prob, market_prob, confidence, **kwargs)
 
 
-def passes_edge_filter(ai_prob: float, market_prob: float, confidence: float = 0.7) -> bool:
+def passes_edge_filter(ai_prob: float, market_prob: float, confidence: float = 0.7, **kwargs) -> bool:
     """Simple boolean check for edge filtering."""
-    result = EdgeFilter.calculate_edge(ai_prob, market_prob, confidence)
+    result = EdgeFilter.calculate_edge(ai_prob, market_prob, confidence, **kwargs)
     return result.passes_filter
 
 

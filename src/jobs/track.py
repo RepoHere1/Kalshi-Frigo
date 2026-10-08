@@ -87,6 +87,40 @@ def _infer_strategy(position: Position) -> str:
     return "unattributed"
 
 
+async def _get_orderbook_volume(kalshi_client, market_id: str, side: str, price: float) -> float:
+    """
+    Get total volume available at or better than the given price level.
+    Returns volume in contracts available for execution.
+    """
+    try:
+        orderbook = await kalshi_client.get_orderbook(market_id, depth=50)
+        orderbook_data = orderbook.get("orderbook", {})
+        
+        asks = orderbook_data.get("asks", [])
+        bids = orderbook_data.get("bids", [])
+        
+        total_volume = 0.0
+        side_lower = side.lower()
+        
+        if side_lower == "yes":
+            # For YES, we're selling - need bids
+            for bid in bids:
+                bid_price = float(bid.get("price_dollars", 0) or bid.get("price", 0) or 0)
+                if bid_price >= price:
+                    total_volume += float(bid.get("quantity", 0))
+        else:
+            # For NO, we're selling - need bids
+            for bid in bids:
+                bid_price = float(bid.get("price_dollars", 0) or bid.get("price", 0) or 0)
+                if bid_price >= price:
+                    total_volume += float(bid.get("quantity", 0))
+        
+        return total_volume
+    except Exception:
+        # If we can't get orderbook, return 0 (conservative)
+        return 0.0
+
+
 async def should_exit_position(
     position: Position,
     current_yes_price: float,
@@ -138,14 +172,38 @@ async def should_exit_position(
         )
 
         if should_trigger:
-            # Calculate the actual loss to log it
-            expected_pnl = StopLossCalculator.calculate_pnl_at_stop_loss(
-                entry_price=position.entry_price,
-                stop_loss_price=position.stop_loss_price,
-                quantity=position.quantity,
-                side=position.side,
+            # Validate there's sufficient volume to exit at stop price
+            # Otherwise we're stuck waiting for a fill that may never come
+            from src.clients.kalshi_client import KalshiClient
+            from src.utils.mode import get_mode
+            
+            # Get current position to access kalshi_client
+            mode = get_mode()
+            
+            # Only check volume if we have access to orderbook
+            # Volume filter: need at least 5x position size available
+            min_volume_required = position.quantity * 5
+            available_volume = await _get_orderbook_volume(
+                kalshi_client, position.market_id, position.side, position.stop_loss_price
             )
-            return True, f"stop_loss_triggered_pnl_{expected_pnl:.2f}", current_price
+            
+            if available_volume >= min_volume_required:
+                # Calculate the actual loss to log it
+                expected_pnl = StopLossCalculator.calculate_pnl_at_stop_loss(
+                    entry_price=position.entry_price,
+                    stop_loss_price=position.stop_loss_price,
+                    quantity=position.quantity,
+                    side=position.side,
+                )
+                return True, f"stop_loss_triggered_pnl_{expected_pnl:.2f}", current_price
+            else:
+                # Not enough volume at stop price - log and hold
+                logger = get_trading_logger("exit_tracker")
+                logger.warning(
+                    f"Stop loss at ${position.stop_loss_price:.3f} for {position.market_id} "
+                    f"blocked: only ${available_volume:.0f} contracts available (need ${min_volume_required:.0f})"
+                )
+                return False, "insufficient_volume_at_stop", current_price
 
     # 3. Take-profit exit (enhanced logic for YES/NO)
     if position.take_profit_price:
@@ -159,7 +217,22 @@ async def should_exit_position(
             take_profit_triggered = current_price <= position.take_profit_price
 
         if take_profit_triggered:
-            return True, "take_profit", current_price
+            # Validate there's sufficient volume to exit at take-profit price
+            min_volume_required = position.quantity * 5
+            available_volume = await _get_orderbook_volume(
+                kalshi_client, position.market_id, position.side, position.take_profit_price
+            )
+            
+            if available_volume >= min_volume_required:
+                return True, "take_profit", current_price
+            else:
+                # Not enough volume - log and hold
+                logger = get_trading_logger("exit_tracker")
+                logger.warning(
+                    f"Take profit at ${position.take_profit_price:.3f} for {position.market_id} "
+                    f"blocked: only ${available_volume:.0f} contracts available (need ${min_volume_required:.0f})"
+                )
+                return False, "insufficient_volume_at_take_profit", current_price
 
     # 4. Time-based exit
     if position.max_hold_hours:

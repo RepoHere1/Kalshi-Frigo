@@ -232,6 +232,19 @@ async def execute_position(
                     f"{maker_wait_seconds:.0f}s; dropped, nothing simulated"
                 )
                 return False
+            
+            # Re-price position to actual book price when maker fill occurred
+            # This ensures DRY ledger matches what would have happened LIVE
+            md = await kalshi_client.get_market(position.market_id)
+            market = (md or {}).get("market") or {}
+            from src.utils.market_prices import get_market_prices
+            _yb, ya, _nb, na = get_market_prices(market)
+            actual_price = ya if position.side == "YES" else na
+            if actual_price is not None:
+                position.entry_price = float(actual_price)
+                logger.info(
+                    f"✅ DRY maker entry on {position.market_id} filled @ ${actual_price:.3f} (actual book)"
+                )
 
         if live_mode:
             logger.warning(

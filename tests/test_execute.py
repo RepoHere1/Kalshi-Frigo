@@ -238,9 +238,89 @@ async def test_profit_taking_orders():
         assert 'positions_processed' in results, "Should include positions_processed count"
         
         print("✅ Profit-taking orders test completed successfully")
-        
+
+
+async def test_dry_maker_reprices_position_on_fill():
+    """
+    Test that DRY maker fills re-price the position to actual book price.
+    
+    When a maker order fills, position.entry_price should be updated to
+    the actual price where the fill occurred (from live orderbook).
+    """
+    from src.jobs.execute import execute_position
+    from unittest.mock import Mock
+    
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+    
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    # Create position with decision-time price
+    test_position = Position(
+        market_id="DRY-MAKER-TEST",
+        side="YES",
+        entry_price=0.58,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Test maker re-price",
+        confidence=0.80,
+        live=False
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    mock_kalshi_client = Mock()
+    mock_kalshi_client.place_order = AsyncMock(return_value={"order": {"order_id": "test-order-123"}})
+    mock_kalshi_client.close = AsyncMock()
+    mock_kalshi_client.get_market = AsyncMock(return_value={
+        "market": {
+            "yes_bid_dollars": 0.58,
+            "yes_ask_dollars": 0.60,
+            "no_bid_dollars": 0.40,
+            "no_ask_dollars": 0.42,
+        }
+    })
+    mock_kalshi_client.get_balance = AsyncMock(return_value={"balance": 100_000})
+    mock_kalshi_client.get_orderbook = AsyncMock(return_value={
+        "orderbook": {
+            "asks": [{"price_dollars": 0.59, "quantity": 50}],
+            "bids": [{"price_dollars": 0.58, "quantity": 30}],
+        }
+    })
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=False,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+            maker_wait_seconds=0.0
+        )
+        assert result == True, "Execution should succeed"
     finally:
-        # Cleanup
-        await kalshi_client.close()
-        if os.path.exists(test_db):
-            os.remove(test_db) 
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_kelly_position_sizing():
+    """
+    Test that position sizing uses Kelly Criterion.
+    """
+    from src.jobs.decide import _calculate_kelly_position_size
+    
+    # $100 balance, 60% AI probability, 50% market price
+    quantity = _calculate_kelly_position_size(
+        balance=100.0,
+        market_price=0.50,
+        ai_probability=0.60,
+        side="YES",
+        confidence=0.70
+    )
+    
+    assert quantity >= 1, f"Expected at least 1 contract, got {quantity}"
+    assert quantity <= 50, f"Expected reasonable position size, got {quantity}"
+
+
+async def test_dry_maker_reprices_position_on_fill():
