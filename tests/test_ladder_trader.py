@@ -289,13 +289,16 @@ def test_an_entry_under_min_win_prob_is_refused():
     assert trader.book.skipped_low_prob == 1
 
 
-def test_a_large_edge_overrides_min_win_prob():
+def test_a_large_edge_does_not_override_min_win_prob():
     trader = UpDownTrader(SpotFeed(), Btc15mFeed())
-    # Same sub-0.60 win_prob (0.11 on down), but a big edge is a genuine
-    # dislocation and must NOT be refused - Kelly exists for exactly this.
+    # Even a big edge must NOT override a sub-0.60 win probability: a 9%-chance
+    # bet held to a 15-min settlement is a loss, not a dislocation win. The
+    # edge-override escape was removed because the live log proved these trades
+    # held to market_resolution and bled.
     down = _signal("KXBTC15M-26OCT011715-15", side="down", ask=0.5, contracts=8)
     down.edge = 0.40
-    assert trader._entry_block(down, []) == ""
+    blocked = trader._entry_block(down, [])
+    assert "win probability" in blocked
 
 
 def test_the_notional_cap_stops_accumulation():

@@ -259,11 +259,9 @@ class UpDownConfig:
     # anti-churn rule - repeated buys of the same contract are allowed, but only
     # while the contract is still more likely than not to pay.
     min_win_prob: float = 0.60
-    # A sufficiently large edge overrides the min_win_prob floor: a genuine
-    # mispricing is the trade Kelly exists for, even when the model's absolute
-    # probability on the chosen side sits under 0.60 (common on short-odds
-    # DOWN legs). Below this edge, the floor still blocks coin-flip churn.
-    min_win_prob_edge_override: float = 0.25
+    # (removed the edge-override escape: a sub-0.60 win probability cannot be
+    # guaranteed a profitable pre-settlement exit on a 15-min bucket, so it is
+    # now refused outright rather than bought on the mispricing theory)
     # SURVIVAL / HYPER-CAUTION: when the real balance is at or below
     # `survival_floor_usd`, the book is one losing clip from being unable to
     # trade at all (no outside funding will ever arrive). So it raises the bar
@@ -1026,12 +1024,13 @@ class UpDownTrader:
             )
 
         win_prob = signal.fair if signal.side == "up" else 1.0 - signal.fair
-        # min_win_prob stops coin-flip churn, but it must never refuse a large
-        # genuine dislocation: a +0.25+ edge means the market is dramatically
-        # mispriced, and the model's absolute probability (which can be 0.4x for
-        # a short-odds DOWN contract) is not the decision - the edge is. Apply
-        # the floor only to marginal edges, not to the trades Kelly exists for.
-        if win_prob < self.config.min_win_prob and signal.edge < self.config.min_win_prob_edge_override:
+        # A sub-0.50 win probability is a coin-flip-or-worse bet. Unless we can
+        # GUARANTEE selling it back profitably BEFORE it settles a loser (which
+        # a 15-minute bucket with no early-exit fill does not), taking it is just
+        # paying fee on a 9% chance. The old edge-override let these through on
+        # the theory that "the market is mispriced", but the live log shows them
+        # held to market_resolution and lost. Refuse them outright.
+        if win_prob < self.config.min_win_prob:
             self.book.skipped_low_prob += 1
             return (
                 f"win probability {win_prob:.2f} below "
