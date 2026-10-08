@@ -25,6 +25,10 @@ from src.utils.logging_setup import TradingLoggerMixin, log_error_with_context
 # Model registry: pricing per 1K tokens (USD)
 # ---------------------------------------------------------------------------
 
+# Active AI brain: Claude (anthropic/claude-sonnet-4.5) — "Cloddsbot"
+# All crypto lanes (BTC, DOGE disabled, HYPE, BTC-1H + XRP) use Claude for high-confidence quick-win decisions.
+# Quick win mode: 15% edge, $6 max clip, 8% quick profit, 3% stop, sweet band 0.30-0.45.
+
 MODEL_PRICING: Dict[str, Dict[str, float]] = {
     "anthropic/claude-sonnet-4": {
         "input_per_1k": 0.003,

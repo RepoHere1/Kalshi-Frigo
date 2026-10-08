@@ -18,7 +18,7 @@ class TraderAgent(BaseAgent):
 
     AGENT_NAME = "trader"
     AGENT_ROLE = "trader"
-    DEFAULT_MODEL = "grok-4-1-fast-reasoning"
+    DEFAULT_MODEL = "anthropic/claude-sonnet-4.5"  # Cloddsbot (Claude) — primary AI brain for crypto lanes
 
     SYSTEM_PROMPT = (
         "You are the head trader at an AI-powered prediction market fund. "
