@@ -251,8 +251,9 @@ def _log_files():
 
 
 BACKUP_DIR_NAME = "backups"
-BACKUP_INTERVAL_SEC = 6 * 60 * 60  # every 6h
-BACKUP_KEEP = 48  # ~2 weeks
+BACKUP_INTERVAL_SEC = 24 * 60 * 60  # daily (was 6h)
+BACKUP_KEEP = 12  # ~12 days (was 48) - the DB grows with LLM transcripts, so
+                  # fewer retained backups keeps the volume off the ceiling
 
 
 def backup_database() -> Optional[str]:
@@ -1738,13 +1739,15 @@ def _btc_keepalive_loop():
                         pass
                 row = snapshot.get(_rt_key(name, book_mode))
                 if row is None:
-                    # No current-book row yet. The always-on lanes are wanted
-                    # unless the operator explicitly stopped them in the other
-                    # book; arm the current book so they come up here too.
+                    # No current-book row yet: a lane never pushed here. The
+                    # always-on supervision arms it in the current book.
                     row = {}
                 if (row.get("desired") == 0) and (
                     (row.get("stop_reason") or "") in _OPERATOR_STOP_REASONS
                 ):
+                    # The operator stopped THIS book's copy; honour it until a
+                    # fresh Start here. The OTHER book is re-armed independently
+                    # by this same loop on a future book switch.
                     continue
                 pid = row.get("pid")
                 if pid and _pid_alive(pid, row):
@@ -4074,10 +4077,12 @@ def api_strategy_toggle(name):
     if db_running:
         print(f"[api_strategy_toggle] {name} is RUNNING (PID {db_pid}), executing STOP", flush=True)
         code = _stop_child({"pid": db_pid, "running": True})
-        # LAW: a Stop is GLOBAL permanent truth. The operator pressed one
-        # button; BOTH books remember it forever, so a stale desired=1 in the
-        # other book cannot resurrect the lane on a keep-alive pass or redeploy.
-        for _mb in ("paper", "live"):
+        # LAW: a Stop is permanent truth for ordinary strategies - BOTH books
+        # remember it. The four UP/DOWN lanes are the standing exception: they
+        # run ALWAYS in the current book, so a Stop only disarms THIS book and
+        # the keep-alive re-arms them when the book is switched or redeployed.
+        _books = ("paper", "live") if name not in BTC_ALWAYS_ON else (mode,)
+        for _mb in _books:
             _run_async(store.disarm(name, _mb, "stopped by operator"))
         _recorded_state()
         _broadcast("strategy", {"name": name, "action": "stopped"})

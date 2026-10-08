@@ -1011,12 +1011,13 @@ def test_toggle_refuses_when_only_api_key_present(client, auth, monkeypatch):
 
 
 def test_stopping_one_book_never_stops_the_other(client, auth, monkeypatch, tmp_path):
-    """DRY and LIVE are factually separate books, but one button push is LAW.
+    """DRY and LIVE are factually separate books; the crypto lanes are the
+    always-on exception.
 
-    Each book keeps its own row (its own pid), so a lane can run in both or
-    either. But the operator's Stop is GLOBAL permanent truth: pressing Stop
-    disarms the lane in BOTH books, so a stale desired=1 in the other book can
-    never resurrect it on a keep-alive pass or redeploy.
+    Each book keeps its own row. The four UP/DOWN lanes are the standing
+    exception: a Stop disarms only the CURRENT book, and the keep-alive re-arms
+    them in whatever book the operator is viewing. Ordinary strategies are the
+    ones whose Stop is global-permanent.
     """
     import asyncio
     import subprocess as sp
@@ -1033,7 +1034,7 @@ def test_stopping_one_book_never_stops_the_other(client, auth, monkeypatch, tmp_
         asyncio.run(
             store.record_start("btc_updown", proc.pid, "paper", "cli.py run --btc-updown")
         )
-        # The book is DRY (default). Stop must disarm the lane in BOTH books.
+        # The book is DRY (default). Stop disarms ONLY this book (always-on lane).
         r = client.post("/api/strategy/btc_updown/toggle", json={}, headers=auth)
         assert r.status_code == 200
         body = r.get_json()
@@ -1043,10 +1044,8 @@ def test_stopping_one_book_never_stops_the_other(client, auth, monkeypatch, tmp_
         snap = asyncio.run(store.snapshot())
         assert snap[rt_key("btc_updown", "paper")]["pid"] is None
         assert snap[rt_key("btc_updown", "paper")]["stop_reason"] == "stopped by operator"
-        # The LIVE row is disarmed too: the operator's Stop is global LAW.
-        assert snap[rt_key("btc_updown", "live")]["pid"] is None
-        assert snap[rt_key("btc_updown", "live")]["stop_reason"] == "stopped by operator"
-        assert rt_key("btc_updown", "live") not in asyncio.run(store.desired())
+        # The LIVE row is untouched: the always-on lane's other book keeps running.
+        assert snap[rt_key("btc_updown", "live")]["pid"] == proc.pid
     finally:
         proc.kill()
         try:
