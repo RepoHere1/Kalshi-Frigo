@@ -196,6 +196,7 @@ class XAIClient(TradingLoggerMixin):
                     self._openrouter_client = OpenRouterClient(
                         api_key=settings.api.dry_openrouter_api_key or None,
                         default_model=settings.api.dry_openrouter_model,
+                        free_only=True,
                         db_manager=self.db_manager,
                     )
                 self.logger.info("OpenRouter client initialised (via XAIClient shim)")

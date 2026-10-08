@@ -77,8 +77,8 @@ async def test_total_pnl_is_equity_minus_starting_not_a_double_count(tmp_path, m
     )
 
     account = await mgr.book_account(MODE_DRY)
-    # cash: 300 - 10 + 12.50 = 302.50. realized (trade_logs): 2.50.
-    assert account["cash"] == pytest.approx(302.50, abs=0.01)
+    # cash: 200 - 10 + 12.50 = 202.50. realized (trade_logs): 2.50.
+    assert account["cash"] == pytest.approx(202.50, abs=0.01)
     assert account["realized"] == pytest.approx(2.50, abs=0.01)
     # equity = cash + deployed (position row still open) - but for the identity
     # test what matters is that total_pnl is equity - starting, never
@@ -102,7 +102,7 @@ async def test_a_clean_book_audits_ok(tmp_path, monkeypatch):
     report = await mgr.repair_dry_book()
     assert report["orphan_positions"] == 0
     assert report["duplicate_closes"] == 0
-    assert report["cash"] == pytest.approx(297.50, abs=0.01)
+    assert report["cash"] == pytest.approx(197.50, abs=0.01)
     assert report["ok"] is True
     assert pid is not None
 
@@ -241,7 +241,7 @@ async def test_a_reset_clears_the_whole_simulated_book(tmp_path, monkeypatch):
 
     account = await mgr.reset_dry_account()
 
-    assert account["cash"] == pytest.approx(300.0, abs=0.01)
+    assert account["cash"] == pytest.approx(200.0, abs=0.01)
     assert account["open_positions"] == 0
     assert account["closed_trades"] == 0
     assert await db.get_open_positions(mode="dry") == []

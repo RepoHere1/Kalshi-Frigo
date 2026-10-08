@@ -154,16 +154,26 @@ class OpenRouterClient(TradingLoggerMixin):
     # Cap on backoff delay (seconds)
     MAX_BACKOFF: float = 30.0
 
+    # DRY-book safety flag. Instances built for the DRY book set it True in
+    # __init__; the class-level default keeps __new__-constructed clients
+    # (tests, edge wiring) resolving to the paid-safe behaviour.
+    free_only: bool = False
+
     def __init__(
         self,
         api_key: Optional[str] = None,
         default_model: str = "anthropic/claude-sonnet-4",
         db_manager: Any = None,
+        free_only: bool = False,
     ):
         self.api_key = api_key or settings.api.openrouter_api_key
         self.base_url = settings.api.openrouter_base_url
         self.default_model = default_model
         self.db_manager = db_manager
+        # DRY-book safety: when True this client may only ever request
+        # `:free` OpenRouter models. A paid model is refused outright
+        # (no fallback, no downgrade) so a simulated cycle can never bill.
+        self.free_only = bool(free_only)
 
         # OpenAI-compatible async client pointed at OpenRouter
         self.client = AsyncOpenAI(
@@ -396,7 +406,21 @@ class OpenRouterClient(TradingLoggerMixin):
         """
         Return an ordered list of models to try.  The *requested_model* is
         first, followed by the remaining models from DEFAULT_FALLBACK_ORDER.
+
+        A free-only client (the DRY book) short-circuits the whole chain:
+        the single `:free` default is the only model it will ever name. A
+        paid model passed in by an older caller is ignored, and a default
+        that is not a `:free` listing yields NO chain - the call becomes a
+        no-op instead of a bill.
         """
+        if self.free_only:
+            if str(self.default_model).endswith(":free"):
+                return [self.default_model]
+            self.logger.warning(
+                "free-only client refusing a non-free default model",
+                default_model=self.default_model,
+            )
+            return []
         first = requested_model or self.default_model
         chain = [first]
         for model in DEFAULT_FALLBACK_ORDER:
@@ -418,12 +442,17 @@ class OpenRouterClient(TradingLoggerMixin):
         """
         Make a completion request to a single model with retries.
 
+        A free-only client (DRY book) refuses a paid model outright - the
+        call raises instead of billing; the chain builders never name one.
+
         Returns:
             (response_text, cost, input_tokens, output_tokens)
 
         Raises:
             Exception -- if all retries are exhausted for this model.
         """
+        if self.free_only and not str(model).endswith(":free"):
+            raise ValueError(f"free-only client refusing paid model '{model}'")
         temperature = temperature if temperature is not None else self.temperature
         max_tokens = max_tokens or self.max_tokens
         last_exc: Optional[Exception] = None

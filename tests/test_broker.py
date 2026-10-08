@@ -259,12 +259,12 @@ def test_dry_submit_debits_simulated_cash(mode_manager):
     assert response["simulated"] is True
     assert response["order"]["status"] == "filled"
     assert response["order"]["order_id"].startswith("dry-")
-    assert run(mode_manager.dry_account())["cash"] == pytest.approx(295.62)
+    assert run(mode_manager.dry_account())["cash"] == pytest.approx(195.62)
 
 
 def test_dry_available_cents_comes_from_the_simulated_book(mode_manager):
     broker = DryBroker(mode_manager)
-    assert asyncio.run(broker.available_cents()) == 300_00
+    assert asyncio.run(broker.available_cents()) == 200_00
 
 
 def test_dry_refuses_when_simulated_cash_is_gone(mode_manager):
@@ -312,7 +312,7 @@ def test_dry_sell_credits_cash(mode_manager, tmp_path):
         limit_price_dollars=0.60,
     )
     asyncio.run(DryBroker(mode_manager).submit(req))
-    assert run(mode_manager.dry_account())["cash"] == pytest.approx(305.83)
+    assert run(mode_manager.dry_account())["cash"] == pytest.approx(205.83)
 
 
 def test_dry_sell_without_a_backing_position_is_refused(mode_manager):
@@ -328,7 +328,7 @@ def test_dry_sell_without_a_backing_position_is_refused(mode_manager):
     )
     response = asyncio.run(DryBroker(mode_manager).submit(req))
     assert response.get("error")
-    assert run(mode_manager.dry_account())["cash"] == pytest.approx(300.0)
+    assert run(mode_manager.dry_account())["cash"] == pytest.approx(200.0)
 
 
 def test_live_broker_calls_place_order_with_validated_kwargs():
@@ -406,7 +406,7 @@ def test_execute_dry_does_not_promote_the_position(monkeypatch, tmp_path):
     client.place_order.assert_not_called(), "DRY must never transmit"
     # The simulated ledger recorded the real notional.
     mgr = TradingMode(db_path=str(tmp_path / "m.db"))
-    assert run(mgr.dry_account())["cash"] == pytest.approx(295.62)
+    assert run(mgr.dry_account())["cash"] == pytest.approx(195.62)
 
 
 def test_execute_live_promotes_the_position(monkeypatch, tmp_path):

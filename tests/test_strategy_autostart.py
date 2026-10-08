@@ -254,24 +254,42 @@ def test_every_command_is_pinned_to_paper(name):
 
 
 # ---------------------------------------------------------------------------
-# The BTC keep-alive obeys the button
+# The button is the ONLY authority. No keep-alive, in any book.
 # ---------------------------------------------------------------------------
-def test_btc_keepalive_never_overrides_an_operator_stop():
-    """The button is law, even for the always-on BTC lanes.
+def test_no_keepalive_can_override_the_button():
+    """The always-armed keep-alive was removed by operator order.
 
-    The keep-alive keeps the three UP/DOWN lanes on, but a lane
-    the operator stopped in this book stays down until Start is
-    pressed here again. Only a crash (desired still 1) or a lane
-    never pushed comes back up - those are not decisions.
+    It force-armed BTC/HYPE/XRP on every pass and disarmed DRY children
+    behind the page's back - the "lanes do not obey my buttons" bug. No
+    background loop may start a lane the operator has not armed: the
+    button is the only authority, in every book.
     """
-    src = inspect.getsource(wd._btc_keepalive_loop)
-    # It reads the operator-stop reasons and the desired flag...
-    assert "_OPERATOR_STOP_REASONS" in src
-    assert 'row.get("desired") == 0' in src
-    # ...and skips the lane before it can re-arm it.
-    assert "continue" in src
-    # A crashed lane (desired still 1) is still re-armed.
-    assert "set_desired(name, True, spawn_mode)" in src
+    assert not hasattr(wd, "_btc_keepalive_loop")
+    assert "_btc_keepalive_loop" not in inspect.getsource(wd.start_background_workers)
+    assert "BTC_ALWAYS_ON" not in inspect.getsource(wd)
+
+
+def test_start_and_stop_rule_only_the_current_book():
+    """A push in one book must never arm or disarm the other.
+
+    Start arms only the book it runs in; Stop disarms only that same
+    book. The old code mirrored intent into the other book and
+    special-cased the crypto lanes, which is how a DRY push could
+    touch LIVE state (and vice versa).
+    """
+    src = inspect.getsource(wd.api_strategy_toggle)
+    assert 'for _mb in ("paper", "live")' not in src
+    assert "if _mb != mode" not in src
+    assert "BTC_ALWAYS_ON" not in src
+
+
+def test_hyperliquid_is_a_real_toggleable_lane():
+    """Hyperliquid is enabled by operator order and obeys its buttons."""
+    assert "hyperliquid_updown" in wd.strategy_state
+    assert "hyperliquid_updown" in wd.STRATEGY_COMMANDS
+    assert "hyperliquid_updown" not in wd.HEAVY_API_ABUSERS
+    cmd = wd.STRATEGY_COMMANDS["hyperliquid_updown"]
+    assert "KXHYPE15M" in cmd and "HYPE-USD" in cmd and "--paper" in cmd
 
 
 def test_start_all_only_starts_stopped_strategies():

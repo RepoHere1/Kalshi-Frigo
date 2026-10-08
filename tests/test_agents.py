@@ -106,7 +106,7 @@ class TestAgentProperties:
         agent = TraderAgent()
         assert agent.name == "trader"
         assert agent.role == "trader"
-        assert agent.model_name == "grok-4-1-fast-reasoning"
+        assert agent.model_name == "anthropic/claude-sonnet-4.5"
 
 
 class TestAgentAnalyze:

@@ -74,12 +74,6 @@ HEAVY_API_ABUSERS = {
         "quick_flip is the #1 OpenRouter spender - 3,079 LLM calls and over "
         "half of the tracked API cost. It is left OFF on purpose."
     ),
-    "hyperliquid_updown": (
-        "hyperliquid_updown has been permanently disabled by operator command. "
-        "It re-enabled itself after being stopped, which violates the operator's "
-        "button is law rule. To stop it: press Stop on the dashboard. "
-        "DO NOT re-enable."
-    ),
 }
 # Every strategy is wanted from boot. The operator stops lanes by hand; the app
 # does not decide that a strategy it could not start once is better off down.
@@ -132,6 +126,7 @@ strategy_state = {
     "xau_updown": {"running": False, "pid": None, "mode": "paper"},
     "xau_updown": {"running": False, "pid": None, "mode": "paper"},
     "btc_1h_updown": {"running": False, "pid": None, "mode": "paper"},
+    "hyperliquid_updown": {"running": False, "pid": None, "mode": "paper"},
     "ai_directional": {"running": False, "pid": None, "mode": "paper"},
     "safe_compounder": {"running": False, "pid": None, "mode": "paper"},
     "beast_mode": {"running": False, "pid": None, "mode": "paper"},
@@ -154,6 +149,7 @@ STRATEGY_COMMANDS: Dict[str, List[str]] = {
     "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXAU15M", "--spot-product", "XAU-USD", "--paper", "--loop", "--interval", "0"],
     "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXAU15M", "--spot-product", "XAU-USD", "--paper", "--loop", "--interval", "0"],
     "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETH15M", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
+    "hyperliquid_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPE15M", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
     "ai_directional": ["cli.py", "run", "--paper", "--loop", "--interval", "300"],
     "safe_compounder": [
         "cli.py",
@@ -186,6 +182,7 @@ STRATEGY_ALIASES = {
     "xau_updown": "xau_updown",
     "xau_updown": "xau_updown",
     "btc_1h_updown": "btc_1h_updown",
+    "hyperliquid_updown": "hyperliquid_updown",
     "ai_directional": "ai_directional",
     "ai directional": "ai_directional",
     "directional_trading": "ai_directional",
@@ -883,32 +880,39 @@ STRATEGY_DOCS = {
         'Reads Kalshi\'s own KXBTC15M contract - "BTC price up in next 15 mins?" - '
         "and compares its Up/Down price against live Coinbase spot. Takes one $5 "
         "clip only when the two disagree by more than the configured edge. "
-        "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
-        "the current book every second of every day.",
+        "MANUAL CONTROL: starts only when you press Start in this book, and "
+        "keeps running until you press Stop - nothing re-arms it for you.",
     ),
     "xrp_updown": (
         "XRP 15-Min Up/Down",
         'Reads Kalshi\'s XRP 15-min up/down contract and compares its Up/Down price '
         "against live Coinbase XRP-USD spot. Takes one $5 clip only when the two disagree "
         "by more than the configured edge. "
-        "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
-        "the current book every second of every day.",
+        "MANUAL CONTROL: starts only when you press Start in this book, and "
+        "keeps running until you press Stop - nothing re-arms it for you.",
     ),
     "xau_updown": (
         "GOLD 15-Min Up/Down",
         'Reads Kalshi\'s GOLD 15-min up/down contract (KXXAU15M) and compares its Up/Down price '
         "against live Coinbase XAU-USD spot. Takes one $5 clip only when the two disagree "
         "by more than the configured edge. "
-        "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
-        "the current book every second of every day.",
+        "MANUAL CONTROL: starts only when you press Start in this book, and "
+        "keeps running until you press Stop - nothing re-arms it for you.",
     ),
     "btc_1h_updown": (
         "ETH 15-Min Up/Down",
         'Reads Kalshi\'s ETH 15-min up/down contract (KXETH15M) and compares its Up/Down '
         "price against live Coinbase ETH-USD spot. Takes one $5 clip when profitable "
         "edge detected. "
-        "SUPERVISED ALWAYS-ON: a dedicated supervisor keeps this lane running in "
-        "the current book every second of every day.",
+        "MANUAL CONTROL: starts only when you press Start in this book, and "
+        "keeps running until you press Stop - nothing re-arms it for you.",
+    ),
+    "hyperliquid_updown": (
+        "Hyperliquid (HYPE) 15-Min Up/Down",
+        'Reads Kalshi\'s HYPE 15-min up/down contract (KXHYPE15M) and compares '
+        "its Up/Down price against HYPE-USD spot. Takes one clip only when the "
+        "two disagree by more than the configured edge. Enabled by operator "
+        "order; toggled by hand like every other lane.",
     ),
     "ai_directional": (
         "LLM Directional",
@@ -1533,6 +1537,13 @@ def _strategy_supervisor_loop():
                 name = row.get("name") or ""
                 if name not in strategy_state:
                     continue
+                # BOOK-SCOPED: each pass manages only the book the page is
+                # in. A desired=1 row recorded in the other book is left
+                # untouched - it resumes the next time that book is active.
+                # This is what keeps a DRY child from being spawned while
+                # LIVE is on screen, and vice versa.
+                if (row.get("mode") or "") != book_mode:
+                    continue
                 row_pid = row.get("pid")
                 if row_pid and _pid_alive(row_pid, row):
                     # A pid that exists is not proof of life. A strategy that
@@ -1679,211 +1690,12 @@ def _strategy_supervisor_loop():
         time.sleep(10)
 
 
-# The four UP/DOWN lanes the operator wants ON every second of
-# every day, in whichever book the page is in. Everything else
-# stays under the button-only law: these four are the standing,
-# explicit exception - the operator's instruction is that they run
-# always, in DRY and in LIVE, and this loop is the only thing
-# allowed to arm a lane without a fresh button push.
-# DOGE permanently dead (8% WR, -$9.76 bleeding). Never on — live or dry.
-# Hyperliquid moved up next to BTC lanes (live). DOGE stays dead forever.
-BTC_ALWAYS_ON = ("btc_updown", "hyperliquid_updown", "xrp_updown")
-# DOGE blocked permanently: supervisor skips any doge_updown restart in any mode.
-DOGE_KILLED = ("doge_updown",)
-
-
-def _btc_keepalive_loop():
-    """The four UP/DOWN lane supervisors: those lanes are ALWAYS ON.
-
-    One pass per second over the four UP/DOWN lanes, in the book
-    the page is actually in:
-
-    - a lane with no live pid is armed (desired=1) and started,
-    - a lane whose pid is alive but whose heartbeat went stale is
-      killed and started again - a wedged loop is not "on",
-    - a lane that is up and heartbeating is left alone.
-
-    The book is read fail-safe: an unreadable book arms nothing,
-    and no credentials means there is nothing to start with. Every
-    spawn goes through the same _spawn_strategy path as a button
-    press, so a BTC lane is recorded, book-scoped and stoppable
-    exactly like any other lane - the only difference is that this
-    loop re-arms it on the next pass, which is what "always on"
-    means. A boot already in flight (started seconds ago, pid not
-    up yet) is given time to come up before a second copy of the
-    same lane is spawned.
-    """
-    while True:
-        try:
-            book_mode = _runtime_mode()
-            if book_mode is None or not _creds_present():
-                time.sleep(1)
-                continue
-            store = _runtime_store()
-            snapshot = _run_async(store.snapshot())
-            from src.utils.strategy_runtime import key as _rt_key
-            # FORCE DRY MODE OFF: skip supervisor restarts in DRY/"paper" mode.
-            if book_mode == "paper":
-                # Kill any running DRY child forcibly; do not restart.
-                for name in BTC_ALWAYS_ON:
-                    dry_row = snapshot.get(_rt_key(name, "paper"))
-                    if dry_row and dry_row.get("pid") and _pid_alive(dry_row["pid"], dry_row):
-                        try:
-                            _stop_child({"pid": dry_row["pid"], "running": True})
-                        except Exception:  # noqa: BLE001
-                            pass
-                    # Force desired=0 for DRY so button OFF is respected
-                    _run_async(store.set_desired(name, False, "paper"))
-                time.sleep(1)
-                continue
-            for name in BTC_ALWAYS_ON:
-                # THE BUTTON IS LAW. An operator Stop is
-                # permanent truth, even for these three.
-                # The keep-alive keeps a lane ON only while
-                # the operator wants it on: a lane stopped by
-                # hand in THIS BOOK stays down until Start is
-                # pressed here again - this loop never changes
-                # a pushed button. A crash (desired still 1)
-                # or a lane never pushed is not a decision, so
-                # those come back up.
-                # Check BOTH books — the button state must be
-                # respected regardless of which book the page
-                # is currently viewing.
-                row = None
-                from src.utils.strategy_runtime import key as _rt_key
-                # The always-on lanes run in WHICHEVER book the page is in. A
-                # stale child armed under the OTHER book (before a switch) must
-                # be killed or it keeps scoring as DRY while the page reads LIVE
-                # - the exact duplicate-process mess. So: kill any child whose
-                # book word disagrees with the current book, then arm ONLY the
-                # current book.
-                other_word = "paper" if book_mode == "live" else "live"
-                other_row = snapshot.get(_rt_key(name, other_word))
-                if other_row and other_row.get("pid") and _pid_alive(other_row["pid"], other_row):
-                    try:
-                        _stop_child({"pid": other_row["pid"], "running": True})
-                        _run_async(store.disarm(name, other_word, "book switch"))
-                        _push_error(
-                            f"BTC keep-alive: killed stale {other_word.upper()} "
-                            f"child of {name} (book is now {book_mode.upper()})."
-                        )
-                    except Exception:  # noqa: BLE001 - a dead pid is fine
-                        pass
-                row = snapshot.get(_rt_key(name, book_mode))
-                if row is None:
-                    # No current-book row yet: a lane never pushed here. The
-                    # always-on supervision arms it in the current book.
-                    row = {}
-                # THE LAW (the four exceptions): these lanes are ALWAYS ON, in
-                # whichever book the page reads. A stop_reason left on their row
-                # is residue from a book switch or an older global-Stop bug, and
-                # must not keep a crypto lane down - the operator's instruction
-                # for these four is that they run every second, every book. Clear
-                # any stale operator stop and arm.
-                row = dict(row)
-                # PERMANENT LAW: operator STOP button is absolute truth.
-                # Only restart crashed lanes (desired==1, stale heartbeat);
-                # never override an explicit operator stop.
-                operator_stopped = (row.get("stop_reason") or "") in _OPERATOR_STOP_REASONS
-                pid = row.get("pid")
-                if operator_stopped and row.get("desired") == 0:
-                    # Operator explicitly stopped in this book: stay OFF forever.
-                    if pid and _pid_alive(pid, row):
-                        try:
-                            _stop_child({"pid": pid, "running": True})
-                        except Exception:  # noqa: BLE001 - dead pid is fine
-                            pass
-                    _run_async(store.set_desired(name, False, book_mode))
-                    continue
-                if pid and _pid_alive(pid, row):
-                    hb = row.get("heartbeat_at")
-                    wedged = False
-                    if hb:
-                        try:
-                            hb_age = (
-                                datetime.now() - datetime.fromisoformat(str(hb))
-                            ).total_seconds()
-                            wedged = hb_age > _HEARTBEAT_STALE_SECONDS
-                        except Exception:  # noqa: BLE001 - malformed stamp: ignore
-                            pass
-                    if not wedged:
-                        continue
-                    # Alive but not trading: a wedged loop is not "on".
-                    _push_error(
-                        f"BTC keep-alive: {name} heartbeat is stale "
-                        f"(wedged); restarting in {book_mode.upper()}."
-                    )
-                    try:
-                        _stop_child({"pid": pid, "running": True})
-                    except Exception:  # noqa: BLE001 - a dead pid is fine
-                        pass
-                else:
-                    # Dead pid. A row born seconds ago means a boot is
-                    # already in flight - this loop or the main
-                    # supervisor spawned it - so give it time to come
-                    # up rather than spawning a second copy alongside.
-                    started_at = row.get("started_at")
-                    if started_at:
-                        try:
-                            age = (
-                                datetime.now()
-                                - datetime.fromisoformat(str(started_at))
-                            ).total_seconds()
-                            if 0 <= age < 10:
-                                continue
-                        except Exception:  # noqa: BLE001 - malformed stamp
-                            pass
-                # FORCE LIVE MODE: override any previous DRY/paper blockage.
-                # The 4 crypto lanes trade permanently in LIVE with $7 balance.
-                if book_mode == "live":
-                    _run_async(store.arm(name, "live"))
-                    row["desired"] = 1
-                    row["stop_reason"] = ""
-
-                # Clear DRY contamination for always-on lanes when in LIVE mode.
-                # This prevents BOOK MODE GUARD blocking lanes that were
-                # recorded in DRY but should now run in LIVE.
-                if book_mode == "live" and name in BTC_ALWAYS_ON:
-                    from src.utils.strategy_runtime import StrategyRuntime
-                    store_live = StrategyRuntime(db_path)
-                    dry_row = await asyncio.wait_for(
-                        store_live.snapshot(), timeout=5
-                    )
-                    for mode_word in ("paper",):
-                        key_live = f"{name}_{mode_word}"
-                        if key_live in dry_row:
-                            await asyncio.wait_for(
-                                store_live.disarm(name, mode_word, "DRY cleared for LIVE"),
-                                timeout=5,
-                            )
-
-                # Not running (or just killed): arm it and start it.
-                # The four UP/DOWN lanes are ALWAYS-ON in whichever book the
-                # page is currently in. A row recorded in one book but read
-                # from the other (a book switch) must be re-armed into the
-                # CURRENT book, not re-spawned under its stale book word -
-                # that stale word is exactly what fed the supervisor's
-                # "BOOK MODE GUARD" refusal and left the lane down forever.
-                spawn_mode = book_mode
-                _run_async(store.set_desired(name, True, spawn_mode))
-                try:
-                    started = _spawn_strategy(name, spawn_mode)
-                    _push_error(
-                        f"BTC keep-alive: {name} ON in {spawn_mode.upper()} "
-                        f"(pid {started['pid']})."
-                    )
-                except Exception as exc:  # noqa: BLE001 - retry next pass
-                    _push_error(
-                        f"BTC keep-alive: {name} start failed: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                # Stagger the three boots so they do not race for the
-                # SQLite write lock all at once.
-                time.sleep(2)
-        except Exception as exc:  # noqa: BLE001 - the supervisor must never die
-            _push_error(f"BTC keep-alive: {type(exc).__name__}: {exc}")
-        time.sleep(1)
-
+# Every lane obeys its buttons, in its own book. The old "always-on"
+# keep-alive that force-armed crypto lanes every second (and disarmed DRY
+# children behind the page's back) was removed by operator order - it was
+# the "lanes do not obey my buttons" bug. A lane starts only from a Start
+# press and stops only from a Stop press. DOGE has no card and no command
+# entry, so it can never be started from this dashboard.
 
 def _creds_present() -> bool:
     return bool(os.environ.get("KALSHI_API_KEY")) and bool(
@@ -4146,13 +3958,10 @@ def api_strategy_toggle(name):
     if db_running:
         print(f"[api_strategy_toggle] {name} is RUNNING (PID {db_pid}), executing STOP", flush=True)
         code = _stop_child({"pid": db_pid, "running": True})
-        # LAW: a Stop is permanent truth for ordinary strategies - BOTH books
-        # remember it. The four UP/DOWN lanes are the standing exception: they
-        # run ALWAYS in the current book, so a Stop only disarms THIS book and
-        # the keep-alive re-arms them when the book is switched or redeployed.
-        _books = ("paper", "live") if name not in BTC_ALWAYS_ON else (mode,)
-        for _mb in _books:
-            _run_async(store.disarm(name, _mb, "stopped by operator"))
+        # A Stop is permanent truth FOR THE BOOK THE PAGE IS IN. It disarms
+        # only this book; the other book's row - its pid, its desired flag -
+        # is never touched. Each book's buttons rule only themselves.
+        _run_async(store.disarm(name, mode, "stopped by operator"))
         _recorded_state()
         _broadcast("strategy", {"name": name, "action": "stopped"})
         print(f"[api_strategy_toggle] {name} STOPPED successfully", flush=True)
@@ -4241,12 +4050,9 @@ def api_strategy_toggle(name):
         _push_error(f"Strategy start ({name}): {e}")
         return jsonify({"error": f"Failed to start: {e}"}), 500
 
-    # LAW: a Start is GLOBAL permanent truth too. Spawn only started the CURRENT
-    # book; arm the OTHER book's intent so a book switch or redeploy keeps the
-    # lane on, and clear any operator-stop the other book still remembered.
-    for _mb in ("paper", "live"):
-        if _mb != mode:
-            _run_async(store.arm(name, _mb))
+    # A Start is permanent truth FOR THE BOOK THE PAGE IS IN: _spawn_strategy
+    # recorded desired=True for this book only. The other book keeps whatever
+    # its own buttons last said.
 
     _broadcast("strategy", {"name": name, "action": "started", "pid": result["pid"]})
     return jsonify(result)
@@ -7009,11 +6815,6 @@ def start_background_workers():
          # themselves off" the operator reported. The operator's Stop
           # stays welded: desired=0 lanes are not touched.
           _strategy_supervisor_loop,
-          # The four BTC UP/DOWN lanes are ALWAYS ON (the
-          # operator's standing instruction): a dedicated
-          # supervisor per lane arms and (re)starts them every
-          # second, in whichever book the page is in.
-          _btc_keepalive_loop,
     ):
         threading.Thread(target=target, daemon=True).start()
 

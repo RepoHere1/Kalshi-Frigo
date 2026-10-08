@@ -1112,20 +1112,19 @@ class UpDownTrader:
                     # paid models). The DRY key is used when set; otherwise the
                     # only configured key carries the calls — a `:free` model
                     # bills nothing to it either way.
-                    _api_key = (
-                        settings.api.dry_openrouter_api_key
-                        if not live
-                        else None
-                    )
-                    _model = (
-                        settings.api.dry_openrouter_model
-                        if not live
-                        else None
-                    )
-                    self._ai_client = OpenRouterClient(
-                        api_key=_api_key or None,
-                        default_model=_model,
-                    )
+                    if live:
+                        # LIVE keeps the paid default; the job roster below
+                        # picks its own (paid) judge models.
+                        self._ai_client = OpenRouterClient()
+                    else:
+                        # DRY is free-only: the `:free` model is the ONLY
+                        # model this client can ever request. If it cannot,
+                        # the veto simply has no opinion - never a paid call.
+                        self._ai_client = OpenRouterClient(
+                            api_key=settings.api.dry_openrouter_api_key or None,
+                            default_model=settings.api.dry_openrouter_model,
+                            free_only=True,
+                        )
                 _streak = "unknown"
                 try:
                     _recent = await self._recent_side_outcomes(signal.side)

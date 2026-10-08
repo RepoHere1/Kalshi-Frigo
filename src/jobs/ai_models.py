@@ -57,7 +57,15 @@ async def complete_for_job(
     cfg = JOB_MODELS[job]
     if not await client._check_daily_limits():
         return None
-    for model in (cfg["primary"], cfg["fallback"]):
+    # FREE-ONLY books (DRY) never touch the paid job roster: the client's own
+    # `:free` default is the only model allowed. A non-free default means the
+    # judge simply has no opinion - never a bill.
+    if getattr(client, "free_only", False):
+        free_model = str(getattr(client, "default_model", "") or "")
+        model_chain = (free_model,) if free_model.endswith(":free") else ()
+    else:
+        model_chain = (cfg["primary"], cfg["fallback"])
+    for model in model_chain:
         try:
             content, cost, in_tok, out_tok = await client._request_single_model(
                 messages=[{"role": "user", "content": prompt}],
