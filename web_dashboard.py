@@ -129,6 +129,7 @@ dashboard_state = {
 strategy_state = {
     "btc_updown": {"running": False, "pid": None, "mode": "paper"},
     "xrp_updown": {"running": False, "pid": None, "mode": "paper"},
+    "xau_updown": {"running": False, "pid": None, "mode": "paper"},
     "btc_1h_updown": {"running": False, "pid": None, "mode": "paper"},
     "ai_directional": {"running": False, "pid": None, "mode": "paper"},
     "safe_compounder": {"running": False, "pid": None, "mode": "paper"},
@@ -149,6 +150,7 @@ strategy_state = {
 STRATEGY_COMMANDS: Dict[str, List[str]] = {
     "btc_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
     "xrp_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRP15M", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
+    "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXAU15M", "--spot-product", "XAU-USD", "--paper", "--loop", "--interval", "0"],
     "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETH15M", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
     "ai_directional": ["cli.py", "run", "--paper", "--loop", "--interval", "300"],
     "safe_compounder": [
@@ -179,6 +181,7 @@ STRATEGY_COMMANDS: Dict[str, List[str]] = {
 STRATEGY_ALIASES = {
     "btc_updown": "btc_updown",
     "xrp_updown": "xrp_updown",
+    "xau_updown": "xau_updown",
     "btc_1h_updown": "btc_1h_updown",
     "ai_directional": "ai_directional",
     "ai directional": "ai_directional",
@@ -204,6 +207,8 @@ STRATEGY_ALIASES = {
     "quick_flip_scalping_strategy": "quick_flip",
     "xrp": "xrp_updown",
     "xrp_15m": "xrp_updown",
+    "xau": "xau_updown",
+    "xau_15m": "xau_updown",
 }
 
 # Alert webhooks
@@ -2045,7 +2050,7 @@ def _strategy_cards(
         )
     # REORDER: Priority: btc_updown #1, xrp_updown #2, btc_1h_updown #3, then ai_directional, rest
     ordered = []
-    priority_order = ["btc_updown", "xrp_updown", "btc_1h_updown", "ai_directional", "beast_mode", "safe_compounder", "market_making", "quick_flip"]
+    priority_order = ["btc_updown", "xrp_updown", "xau_updown", "btc_1h_updown", "ai_directional", "beast_mode", "safe_compounder", "market_making", "quick_flip"]
     for name in priority_order:
         if name in cards:
             ordered.append(cards[name])

@@ -84,6 +84,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
         series = getattr(args, "series", "KXBTC15M")
         spot_product = getattr(args, "spot_product", "BTC-USD")
+        series = series.replace("KX", "KXX") if not series.startswith("KXX") else series
         print(f"📈 {series.replace('KX','').upper()} UP/DOWN MODE")
         print(f"   {series} | live spot ({spot_product}) vs Kalshi's own quote")
         print("   $5 per clip | fee-aware in LIVE | no trade inside the noise band")
@@ -895,13 +896,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--series",
         type=str,
         default="KXXRP15M",
-        help="Kalshi series ticker (e.g. KXXRP15M, KXBTC15M, KXETH15M) for --btc-updown",
+        help="Kalshi series ticker (e.g. KXXRP15M, KXBTC15M, KXETH15M, KXXAU15M) for --btc-updown",
     )
     p_run.add_argument(
         "--spot-product",
         type=str,
         default="XRP-USD",
-        help="Coinbase spot product (e.g. XRP-USD, BTC-USD) for --btc-updown",
+        help="Coinbase spot product (e.g. XRP-USD, BTC-USD, XAU-USD) for --btc-updown",
     )
     p_run.add_argument(
         "--loop",
