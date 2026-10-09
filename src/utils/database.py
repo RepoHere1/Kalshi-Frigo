@@ -55,6 +55,12 @@ class Position:
     # positions, so DRY exits never evaluated.
     mode: Optional[str] = None
 
+    # CALIBRATION: the model's fair probability at entry, as computed from the
+    # live stream. `confidence` on updown lanes stores the edge magnitude; the
+    # fair is the number every win-rate-by-band report needs. Appended last so
+    # positional construction stays compatible.
+    entry_fair: Optional[float] = None
+
 
 def _position_from_row(row: aiosqlite.Row) -> Position:
     """Build a Position from a `SELECT *` row by column name.
@@ -123,6 +129,9 @@ class TradeLog:
     # and net it out of pnl so the dashboard shows fee-net results.
     fee_paid: Optional[float] = None
     id: Optional[int] = None
+    # CALIBRATION: the entry fair carried through from the position, so a
+    # closed trade can always be bucketed by the model's own probability.
+    entry_fair: Optional[float] = None
 
 
 def _tradelog_from_row(row: aiosqlite.Row) -> TradeLog:
@@ -503,6 +512,9 @@ class DatabaseManager(TradingLoggerMixin):
             lambda: add_column("positions", "max_hold_hours", "INTEGER"),
             lambda: add_column("positions", "target_confidence_change", "REAL"),
             lambda: add_column("positions", "mode", "TEXT"),
+            # CALIBRATION: the entry fair per position and per closed trade.
+            lambda: add_column("positions", "entry_fair", "REAL"),
+            lambda: add_column("trade_logs", "entry_fair", "REAL"),
             lambda: add_column("trade_logs", "strategy", "TEXT"),
             # cli.py queries blocked_trades unguarded, but it was only ever
             # created by PortfolioEnforcer - any database that had not run the
@@ -849,10 +861,14 @@ class DatabaseManager(TradingLoggerMixin):
             try:
                 await db.execute(
                     """
-                    INSERT INTO trade_logs (market_id, side, entry_price, exit_price, quantity, pnl, entry_timestamp, exit_timestamp, rationale, strategy, exit_reason, mode, fee_paid)
-                    VALUES (:market_id, :side, :entry_price, :exit_price, :quantity, :pnl, :entry_timestamp, :exit_timestamp, :rationale, :strategy, :exit_reason, :mode, :fee_paid)
+                    INSERT INTO trade_logs (market_id, side, entry_price, exit_price, quantity, pnl, entry_timestamp, exit_timestamp, rationale, strategy, exit_reason, mode, fee_paid, entry_fair)
+                    VALUES (:market_id, :side, :entry_price, :exit_price, :quantity, :pnl, :entry_timestamp, :exit_timestamp, :rationale, :strategy, :exit_reason, :mode, :fee_paid, :entry_fair)
                 """,
-                    {**trade_dict, "fee_paid": trade_dict.get("fee_paid") or 0.0},
+                    {
+                        **trade_dict,
+                        "fee_paid": trade_dict.get("fee_paid") or 0.0,
+                        "entry_fair": trade_dict.get("entry_fair"),
+                    },
                 )
             except Exception:  # noqa: BLE001 - pre-migration DB without fee_paid
                 await db.execute(
@@ -1355,8 +1371,8 @@ class DatabaseManager(TradingLoggerMixin):
 
             cursor = await db.execute(
                 """
-                INSERT OR REPLACE INTO positions (market_id, side, entry_price, quantity, timestamp, rationale, confidence, live, status, strategy, stop_loss_price, take_profit_price, max_hold_hours, target_confidence_change, mode)
-                VALUES (:market_id, :side, :entry_price, :quantity, :timestamp, :rationale, :confidence, :live, :status, :strategy, :stop_loss_price, :take_profit_price, :max_hold_hours, :target_confidence_change, :mode)
+                INSERT OR REPLACE INTO positions (market_id, side, entry_price, quantity, timestamp, rationale, confidence, live, status, strategy, stop_loss_price, take_profit_price, max_hold_hours, target_confidence_change, mode, entry_fair)
+                VALUES (:market_id, :side, :entry_price, :quantity, :timestamp, :rationale, :confidence, :live, :status, :strategy, :stop_loss_price, :take_profit_price, :max_hold_hours, :target_confidence_change, :mode, :entry_fair)
             """,
                 position_dict,
             )

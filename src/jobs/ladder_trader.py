@@ -263,6 +263,15 @@ class UpDownConfig:
     conviction_mult: float = 2.0
     conviction_max_fraction: float = 0.5  # hard ceiling: balance share/clip
 
+    # CERTIFIED CERTAINTY (new): a view at/above certified_prob - the model
+    # AND the price agreeing with a big cushion - sizes at certified_mult.
+    # The only "bet more on near certainty" that is not degen: certification
+    # is an information edge (fair must still clear price + bar), never a
+    # feeling, and every existing ceiling (fraction, budget, notional,
+    # correlation) still binds the result.
+    certified_prob: float = 0.85
+    certified_mult: float = 3.0
+
     def __post_init__(self) -> None:
         import os as _os
 
@@ -533,7 +542,11 @@ def conviction_scale(
     if float(win_prob) < cfg.strong_prob:
         return clip_usd
     base = float(clip_usd) if clip_usd is not None else float(cfg.notional_usd)
-    return round(base * float(cfg.conviction_mult), 2)
+    mult = float(cfg.conviction_mult)
+    certified = getattr(cfg, "certified_prob", None)
+    if certified is not None and float(win_prob) >= float(certified):
+        mult = max(mult, float(getattr(cfg, "certified_mult", mult)))
+    return round(base * mult, 2)
 
 
 def fair_up_probability(
@@ -1051,6 +1064,10 @@ class UpDownTrader:
                         f" | strong view ({_wp:.2f}): "
                         f"{self.config.strong_edge_scale:.2f}x edge bar"
                     )
+                    if _wp >= self.config.certified_prob:
+                        reason += (
+                            f" | certified: {self.config.certified_mult:.1f}x clip"
+                        )
                 elif _wp < self.config.marginal_prob:
                     reason += (
                         f" | marginal view ({_wp:.2f}): "
@@ -1459,6 +1476,7 @@ class UpDownTrader:
                 f"{signal.seconds_left}s left"
             ),
             confidence=abs(signal.edge),
+            entry_fair=float(signal.fair),
             live=live,
             strategy=self.lane,
             mode="live" if live else "dry",

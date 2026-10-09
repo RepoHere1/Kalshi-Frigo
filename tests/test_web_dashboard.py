@@ -536,7 +536,9 @@ def test_dry_headline_shows_the_simulated_book_not_real_money(client):
     assert "DRY cash" in tiles
     assert "DRY positions" in tiles
     assert "DRY deployed" in tiles
-    assert "DRY realized P&amp;L" in tiles
+    # (Renamed: the tile shows whole-book P&L since reset, labelled with its
+    # time frame; the realized figure lives in the subtitle.)
+    assert "DRY book P&amp;L" in tiles and "since reset" in tiles
     # The real account's money must not appear in the DRY headline.
     assert "$200.00" in tiles
     assert "Kalshi balance" not in tiles
@@ -3224,3 +3226,14 @@ def test_live_mode_is_blood_red(client, auth, monkeypatch, tmp_path):
     assert ".modebtn.live.on" in html
     assert "color:var(--blood)" in html
     assert "border-color:var(--blood)" in html
+
+
+def test_dashboard_shows_the_calibration_report_card(client):
+    """The tally time frames are labelled and the calibration table exists:
+    DRY book P&L is 'since reset', bot P&L says 'closed trades', and the
+    outcomes-by-entry-fair table is rendered."""
+    html = client.get("/").get_data(as_text=True)
+    assert "DRY book P&amp;L" in html and "since reset" in html
+    assert "Bot realized P&amp;L" in html and "closed trades" in html
+    assert "Calibration" in html and "fairBandsBody" in html
+    assert "Entry fair band" in html

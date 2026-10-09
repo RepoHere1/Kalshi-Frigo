@@ -1915,6 +1915,26 @@ _SQL_TRADES = (
     " SUM(CASE WHEN COALESCE(exit_reason,'') = 'no_kalshi_position' THEN 1 ELSE 0 END) AS phantom"
     " FROM trade_logs WHERE {book}"
 )
+_SQL_FAIR_BANDS = (
+    # CALIBRATION: the model's own report card. Closed trades bucketed by the
+    # fair value recorded at entry - win rate and net $ per confidence band.
+    # This is what turns "near certainty" from an opinion into a measurement.
+    "SELECT"
+    " CASE"
+    "  WHEN entry_fair IS NULL THEN 'unknown'"
+    "  WHEN entry_fair >= 0.85 THEN '0.85 up'"
+    "  WHEN entry_fair >= 0.75 THEN '0.75-0.85'"
+    "  WHEN entry_fair >= 0.65 THEN '0.65-0.75'"
+    "  WHEN entry_fair >= 0.55 THEN '0.55-0.65'"
+    "  ELSE 'below 0.55'"
+    " END AS band,"
+    " COUNT(*) AS trades,"
+    " COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,"
+    " ROUND(COALESCE(SUM(pnl), 0.0), 2) AS pnl"
+    " FROM trade_logs WHERE {book}"
+    " GROUP BY band ORDER BY band"
+)
+
 _SQL_OPEN = (
     "SELECT COUNT(*) AS positions,"
     " COALESCE(SUM(quantity * entry_price), 0.0) AS capital,"
@@ -2030,6 +2050,24 @@ def _row_trades(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Win rate over REAL trades only (wins + losses, phantom excluded).
         "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) else 0.0,
     }
+
+
+def _row_fair_bands(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Calibration rows: win rate and net $ per entry-fair band."""
+    out: List[Dict[str, Any]] = []
+    for r in rows or []:
+        trades = int(r.get("trades") or 0)
+        wins = int(r.get("wins") or 0)
+        out.append(
+            {
+                "band": r.get("band") or "?",
+                "trades": trades,
+                "wins": wins,
+                "win_rate": round(wins / trades * 100, 1) if trades else 0.0,
+                "pnl": round(float(r.get("pnl") or 0.0), 2),
+            }
+        )
+    return out
 
 
 def _row_open(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2328,13 +2366,15 @@ def build_snapshot() -> Dict[str, Any]:
             (_SQL_EQUITY.format(book=where), ()),
             (_SQL_POSITIONS.format(book=where), ()),
             (_SQL_STRATEGY_CURVE, ()),
+            (_SQL_FAIR_BANDS.format(book=where), ()),
         ]
         + [(f"SELECT COUNT(*) AS n FROM {t}", ()) for t in DATA_TABLES]
     )
     trades_r, open_r, dry_open_r, ai_r, llm_r, strat_r, recent_r, equity_r, pos_r, curve_r = batch[
         :10
     ]
-    counts = batch[10:]
+    fairs_r = batch[10]
+    counts = batch[11:]
 
     # Equity curve is fetched newest-first; flip it so the chart reads left to right.
     equity_rows = list(reversed(equity_r))
@@ -2407,7 +2447,7 @@ def build_snapshot() -> Dict[str, Any]:
         # Nothing has run if we have never ingested a market or recorded a
         # decision. Shown as an explicit banner instead of a page of zeros.
         "never_run": never_run,
-        "trades": _row_trades(trades_r),
+        "trades": {**_row_trades(trades_r), "by_fair_band": _row_fair_bands(fairs_r)},
         "open": _row_open(open_r),
         "open_dry": _row_open_dry(dry_open_r),
         "data": _row_data(counts, ai_r, llm_r),
@@ -3239,6 +3279,7 @@ def build_snapshot_cached() -> Dict[str, Any]:
                     "best_trade": 0.0,
                     "worst_trade": 0.0,
                     "avg_pnl": 0.0,
+                    "by_fair_band": [],
                 },
                 "open": {"positions": 0, "capital": 0.0, "paper": 0, "live": 0},
                 "kalshi": None,
@@ -5147,14 +5188,14 @@ button.loading.yellow::after {
     <div class="s">of {{ '$%.2f'|format(dry.equity) }} equity</div>
   </div>
   <div class="tile">
-    <div class="k">DRY realized P&amp;L</div>
-    <div class="v {{ 'up' if dry.realized > 0 else ('down' if dry.realized < 0 else 'flat') }}" id="dRealTile">{{ '$%.2f'|format(dry.total_pnl) }}</div>
-    <div class="s">{{ dry.ledger_entries }} simulated fill{{ '' if dry.ledger_entries == 1 else 's' }}</div>
+    <div class="k">DRY book P&amp;L &middot; since reset</div>
+    <div class="v {{ 'up' if dry.total_pnl > 0 else ('down' if dry.total_pnl < 0 else 'flat') }}" id="dRealTile">{{ '$%.2f'|format(dry.total_pnl) }}</div>
+    <div class="s" id="dRealSub">realized {{ '$%.2f'|format(dry.realized) }} &middot; {{ dry.closed_trades }} closed &middot; {{ dry.ledger_entries }} fills</div>
   </div>
   {% endif %}
 
   <div class="tile">
-    <div class="k">Bot realized P&amp;L</div>
+    <div class="k">Bot realized P&amp;L &middot; closed trades</div>
     <div class="v {{ 'up' if s.trades and s.trades.realized_pnl > 0 else ('down' if s.trades and s.trades.realized_pnl < 0 else 'flat') }}" id="tBotPnl">{{ '$%.2f'|format(s.trades.realized_pnl) if s.trades else '$0.00' }}</div>
     <div class="s">{{ s.trades.trades if s.trades else 0 }} closed trades &middot; bot log only, not account history</div>
   </div>
@@ -5173,6 +5214,24 @@ button.loading.yellow::after {
     <div class="v" id="tRunning">{{ s.running_count if s.running_count is defined else 0 }}</div>
     <div class="s">of {{ s.bots|length }} available</div>
   </div>
+</div>
+
+<!-- ============ calibration ============ -->
+<div class="panel" style="margin-bottom:12px">
+  <div class="ph">
+    <h2>Calibration &mdash; outcomes by entry fair</h2>
+    <span class="note">the model's own report card &middot; closed trades, current book</span>
+  </div>
+  <div class="pb"><div class="scroll">
+  <table><thead><tr><th>Entry fair band</th><th class="num">Trades</th><th class="num">Wins</th><th class="num">Win %</th><th class="num">Net $</th></tr></thead>
+  <tbody id="fairBandsBody">
+    {%- for b in (s.trades.by_fair_band if s.trades else []) %}
+    <tr><td>{{ b.band }}</td><td class="num">{{ b.trades }}</td><td class="num">{{ b.wins }}</td><td class="num">{{ b.win_rate }}%</td><td class="num {{ 'up' if b.pnl > 0 else ('down' if b.pnl < 0 else 'flat') }}">{{ '$%.2f'|format(b.pnl) }}</td></tr>
+    {%- else %}
+    <tr><td colspan="5" class="empty">No closed trades yet</td></tr>
+    {%- endfor %}
+  </tbody></table>
+  </div></div>
 </div>
 
 <!-- ============ openrouter usage ============ -->
@@ -5840,15 +5899,24 @@ function paint(s) {
     set('dCashTile', money(dry.cash));
     set('dPosTile', od.positions || 0);
     set('dDepTile', money(od.capital));
-    set('dRealTile', money(dry.total_pnl));
-    const dr = document.getElementById('dRealTile');
-    if (dr) dr.className = 'v ' + sgn(dry.total_pnl || 0);
+  set('dRealTile', money(dry.total_pnl));
+  const dr = document.getElementById('dRealTile');
+  if (dr) dr.className = 'v ' + sgn(dry.total_pnl || 0);
+  set('dRealSub', 'realized ' + money(dry.realized) + ' \u00b7 ' + (dry.closed_trades || 0) + ' closed \u00b7 ' + (dry.ledger_entries || 0) + ' fills');
   }
 
   const t = s.trades || {}, d = s.data || {};
   set('tBotPnl', money(t.realized_pnl));
   const br = document.getElementById('tBotPnl');
   if (br) br.className = 'v ' + sgn(t.realized_pnl || 0);
+  const fb = document.getElementById('fairBandsBody');
+  if (fb && t.by_fair_band) {
+    fb.innerHTML = t.by_fair_band.length
+      ? t.by_fair_band.map(function (b) {
+          return '<tr><td>' + b.band + '</td><td class="num">' + b.trades + '</td><td class="num">' + b.wins + '</td><td class="num">' + b.win_rate + '%</td><td class="num ' + sgn(b.pnl) + '">' + money(b.pnl) + '</td></tr>';
+        }).join('')
+      : '<tr><td colspan="5" class="empty">No closed trades yet</td></tr>';
+  }
   set('tWinRate', (t.win_rate || 0) + '%');
   set('tWinRateNote', (t.wins || 0) + 'W / ' + (t.losses || 0) + 'L');
   set('tAiSpend', money(d.ai_cost_today));

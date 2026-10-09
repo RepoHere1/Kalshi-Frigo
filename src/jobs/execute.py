@@ -728,6 +728,7 @@ async def _close_after_sell(
         exit_ts = datetime.now()
 
     trade_log = TradeLog(
+        entry_fair=getattr(position, "entry_fair", None),
         market_id=position.market_id,
         side=position.side,
         entry_price=position.entry_price,

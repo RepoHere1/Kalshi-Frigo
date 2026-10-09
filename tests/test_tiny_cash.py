@@ -209,11 +209,10 @@ def test_kelly_scales_the_clip_with_the_edge():
 
 
 def test_kelly_cap_bounds_a_single_clip():
-    """Fair 0.95 at 0.70: k* = 0.833 but kelly_scale=0.25 gives k_quarter =
-    0.208 -> clip $2.08 -> 2 contracts; conviction doubles to ~$4.16 ->
-    5 contracts, still under the 0.5-of-balance ceiling ($5 on a $10
-    book). kelly_cap=0.35 never binds at quarter scale - the conviction
-    ceiling is the binding money law now."""
+    """Fair 0.95 at 0.70: certified tier (>=85%) triples the 0.208 quarter-
+    Kelly clip to ~$6.24, and the 0.5-of-book ceiling ($5 on a $10 book)
+    clips it to $5.00 -> 7 contracts at 0.70 ($4.90). The fraction ceiling
+    is the binding money law; kelly_cap never binds at quarter scale."""
     import src.jobs.ladder_trader as lt
 
     trader = _trader()
@@ -226,8 +225,8 @@ def test_kelly_cap_bounds_a_single_clip():
         mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.95)
         signal = trader.evaluate(market, live=True)
     assert signal is not None and signal.side == "up"
-    assert signal.contracts == 5
-    assert signal.notional == pytest.approx(3.50, abs=0.01)
+    assert signal.contracts == 7
+    assert signal.notional == pytest.approx(4.90, abs=0.01)
     assert signal.notional <= 10.0 * trader.config.conviction_max_fraction + 0.01
 
 

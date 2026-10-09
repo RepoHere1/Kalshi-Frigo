@@ -409,6 +409,7 @@ async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
                             )
                         )
                         _log = TradeLog(
+                            entry_fair=getattr(position, "entry_fair", None),
                             market_id=position.market_id,
                             side=position.side,
                             entry_price=position.entry_price,
@@ -464,6 +465,7 @@ async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
                                 _live_fees.taker_fee_dollars(_entry, _qty)
                             )
                             _log = TradeLog(
+                                entry_fair=getattr(position, "entry_fair", None),
                                 market_id=position.market_id,
                                 side=position.side,
                                 entry_price=position.entry_price,
@@ -527,6 +529,7 @@ async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
                     )
                 )
             trade_log = TradeLog(
+                entry_fair=getattr(position, "entry_fair", None),
                 market_id=position.market_id,
                 side=position.side,
                 entry_price=position.entry_price,
@@ -882,6 +885,7 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                         _fee_label = "LIVE" if _fee_is_live else "DRY"
                         _rationale += f" | {_fee_label} fees est ${fee_paid:.2f} (net PnL)"
                     trade_log = TradeLog(
+                        entry_fair=getattr(position, "entry_fair", None),
                         market_id=position.market_id,
                         side=position.side,
                         entry_price=position.entry_price,

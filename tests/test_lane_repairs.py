@@ -74,6 +74,16 @@ def test_gold_lane_prices_against_the_paxg_proxy():
     assert "PAXG-USD" in src
 
 
+def test_every_trade_log_carries_the_entry_fair():
+    """CALIBRATION invariant: every close path must stamp the model's entry
+    fair onto the trade log, or the win-rate-by-band report card is blind."""
+    from src.jobs import execute as ex
+    from src.jobs import track as tk
+
+    src = inspect.getsource(tk) + inspect.getsource(ex)
+    assert src.count("entry_fair=getattr(position") >= 5
+
+
 def test_every_crypto_lane_carries_its_own_series_and_feed():
     """No lane may inherit another lane's default series again.
 
