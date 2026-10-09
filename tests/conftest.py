@@ -20,6 +20,21 @@ import pytest
 RUN_LIVE_TESTS = os.getenv("RUN_LIVE_TESTS", "").lower() in {"1", "true", "yes"}
 
 
+@pytest.fixture(autouse=True)
+def _isolate_the_repo_db(tmp_path, monkeypatch):
+    """Point every default DB resolution at this test's own temp file.
+
+    Code that resolves the book from the environment (`DB_PATH`, falling
+    back to "trading_system.db") was picking up the developer's LOCAL
+    database: a stale dry cash figure made funded tests fail on one machine
+    and pass in CI, and a test's writes could land in real local state.
+    CI runs with no such file; with this fixture a contributor run behaves
+    identically. Tests that set DB_PATH themselves still win - their
+    monkeypatch applies after this one.
+    """
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "trading_system.db"))
+
+
 def pytest_collection_modifyitems(config, items):
     if RUN_LIVE_TESTS:
         return

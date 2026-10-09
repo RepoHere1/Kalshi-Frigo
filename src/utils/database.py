@@ -734,7 +734,14 @@ class DatabaseManager(TradingLoggerMixin):
         """
         import os
 
-        resolved = mode or _resolve_current_mode(os.getenv("DB_PATH", self.db_path))
+        # The manager's OWN path is authoritative. This used to resolve the
+        # book from the global DB_PATH env var first, even when the manager
+        # had been constructed with an explicit path - which is how test
+        # databases, temp books and tools silently read the developer's
+        # repo-root trading_system.db instead (the "local-DB pollution"
+        # pattern). In production the manager's path comes from that same
+        # env var, so this is byte-identical there.
+        resolved = mode or _resolve_current_mode(self.db_path)
         # An unlabelled row (mode IS NULL / '') is read as DRY, which is what the
         # dashboard's COALESCE(NULLIF(mode,''),'dry') does with it. Letting the
         # LIVE query match those rows too meant a position the books could not
@@ -1369,7 +1376,7 @@ class DatabaseManager(TradingLoggerMixin):
     async def release_position_claim(self, position_id: int) -> bool:
         """Hand a claimed close back, so the position can be retried.
 
-        Without this, any exit that fails after the claim - a refused \$0 price,
+        Without this, any exit that fails after the claim - a refused $0 price,
         a rejected sell order - leaves the row stuck in 'closing'. It would drop
         out of every `status='open'` query while still being a live obligation:
         capital frozen and no exit ever retried.
