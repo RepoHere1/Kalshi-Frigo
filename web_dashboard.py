@@ -1915,6 +1915,26 @@ _SQL_TRADES = (
     " SUM(CASE WHEN COALESCE(exit_reason,'') = 'no_kalshi_position' THEN 1 ELSE 0 END) AS phantom"
     " FROM trade_logs WHERE {book}"
 )
+def _parse_entry_fair(rationale: Any) -> Optional[float]:
+    """Recover the chosen side's entry fair from a lane rationale string.
+
+    The lane's reason format: "fair 0.81 vs Kalshi 0.64 on DOWN - edge
+    +0.183". Used by the backfill endpoint to identify historical trades
+    that predate the entry_fair column. Returns None (never a guess) when
+    the text does not prove the value.
+    """
+    import re as _re
+
+    m = _re.search(r"fair ([01]\.\d{2}) vs Kalshi", str(rationale or ""))
+    if not m:
+        return None
+    try:
+        val = float(m.group(1))
+    except ValueError:
+        return None
+    return val if 0.0 < val < 1.0 else None
+
+
 _SQL_FAIR_BANDS = (
     # CALIBRATION: the model's own report card. Closed trades bucketed by the
     # fair value recorded at entry - win rate and net $ per confidence band.
@@ -2945,6 +2965,60 @@ def api_maintenance_lean():
             "vacuumed": vacuumed,
             "before": before,
             "after": after,
+        }
+    )
+
+
+@app.route("/api/maintenance/backfill-fair", methods=["POST"])
+def api_maintenance_backfill_fair():
+    """Identify the unknown calibration rows: recover entry_fair from text.
+
+    Every lane trade stamps its rationale with the CHOSEN SIDE's fair
+    ("fair 0.81 vs Kalshi 0.64 on DOWN - edge +0.183"), so the 342 rows that
+    predate the entry_fair column are not actually unknowable - they are
+    mislabelled. This parses the rationale in both tables, writes the fair
+    back wherever the text proves it, and leaves truly unparseable rows as
+    'unknown' rather than guessing. Idempotent: re-running changes nothing.
+    """
+    denied = require_token()
+    if denied is not None:
+        return denied
+    import aiosqlite
+
+    updated_logs = 0
+    updated_pos = 0
+    unparseable = 0
+
+    async def _run() -> None:
+        nonlocal updated_logs, updated_pos, unparseable
+        async with aiosqlite.connect(DB_PATH) as conn:
+            for table, tag in (("trade_logs", "log"), ("positions", "pos")):
+                cur = await conn.execute(f"SELECT id, rationale FROM {table}")
+                rows = await cur.fetchall()
+                for rid, rationale in rows:
+                    val = _parse_entry_fair(rationale)
+                    if val is None:
+                        unparseable += 1
+                        continue
+                    await conn.execute(
+                        f"UPDATE {table} SET entry_fair=? WHERE id=?", (val, rid)
+                    )
+                    if tag == "log":
+                        updated_logs += 1
+                    else:
+                        updated_pos += 1
+            await conn.commit()
+
+    try:
+        _run_async(_run())
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+    return jsonify(
+        {
+            "ok": True,
+            "trade_logs_updated": updated_logs,
+            "positions_updated": updated_pos,
+            "unparseable": unparseable,
         }
     )
 

@@ -1260,6 +1260,7 @@ MUTATING_ROUTES = [
     ("/api/dry/reset", {}),
     ("/api/strategies/reset-state", {}),
     ("/api/maintenance/lean", {}),
+    ("/api/maintenance/backfill-fair", {}),
     ("/api/strategy/ai_directional/toggle", {"mode": "paper"}),
     ("/api/bot/ai_directional/kill", {}),
     ("/api/config", {"max_positions": 5}),
@@ -3237,3 +3238,67 @@ def test_dashboard_shows_the_calibration_report_card(client):
     assert "Bot realized P&amp;L" in html and "closed trades" in html
     assert "Calibration" in html and "fairBandsBody" in html
     assert "Entry fair band" in html
+
+
+def test_parse_entry_fair_reads_the_chosen_side():
+    """The rationale proves the fair; garbage yields None, never a guess."""
+    assert wd._parse_entry_fair(
+        "coinbase-coinbase-ws 82,457 vs target 82,478 (-20.51): fair 0.81 vs "
+        "Kalshi 0.44 on DOWN - edge +0.382"
+    ) == 0.81
+    assert wd._parse_entry_fair("fair 0.55 vs Kalshi 0.50 on UP - edge +0.05") == 0.55
+    assert wd._parse_entry_fair("no fair here") is None
+    assert wd._parse_entry_fair(None) is None
+    assert wd._parse_entry_fair("fair 1.50 vs Kalshi") is None
+
+
+def test_backfill_fair_identifies_the_unknown_rows(client, auth, monkeypatch, tmp_path):
+    """The 342-'unknown' fix: rationale-parsed fair lands in both tables;
+    unparseable rows stay unknown; re-running is idempotent."""
+    import aiosqlite
+
+    db = str(tmp_path / "backfill.db")
+    monkeypatch.setattr(wd, "DB_PATH", db)
+    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
+
+    import asyncio
+
+    async def _seed():
+        async with aiosqlite.connect(db) as conn:
+            await conn.execute(
+                "CREATE TABLE trade_logs (id INTEGER PRIMARY KEY, rationale TEXT, entry_fair REAL)"
+            )
+            await conn.execute(
+                "CREATE TABLE positions (id INTEGER PRIMARY KEY, rationale TEXT, entry_fair REAL)"
+            )
+            await conn.execute(
+                "INSERT INTO trade_logs (rationale) VALUES "
+                "('fair 0.81 vs Kalshi 0.64 on DOWN - edge +0.183')"
+            )
+            await conn.execute(
+                "INSERT INTO trade_logs (rationale) VALUES ('no parseable fair')"
+            )
+            await conn.execute(
+                "INSERT INTO positions (rationale) VALUES "
+                "('fair 0.58 vs Kalshi 0.52 on UP - edge +0.06')"
+            )
+            await conn.commit()
+
+    asyncio.run(_seed())
+    r = client.post("/api/maintenance/backfill-fair", headers=auth)
+    assert r.status_code == 200, r.get_data(as_text=True)
+    body = r.get_json()
+    assert body["trade_logs_updated"] == 1
+    assert body["positions_updated"] == 1
+    assert body["unparseable"] == 1
+
+    async def _check():
+        async with aiosqlite.connect(db) as conn:
+            cur = await conn.execute("SELECT entry_fair FROM trade_logs WHERE id=1")
+            assert (await cur.fetchone())[0] == 0.81
+            cur = await conn.execute("SELECT entry_fair FROM trade_logs WHERE id=2")
+            assert (await cur.fetchone())[0] is None
+            cur = await conn.execute("SELECT entry_fair FROM positions WHERE id=1")
+            assert (await cur.fetchone())[0] == 0.58
+
+    asyncio.run(_check())

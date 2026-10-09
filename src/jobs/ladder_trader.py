@@ -1476,7 +1476,13 @@ class UpDownTrader:
                 f"{signal.seconds_left}s left"
             ),
             confidence=abs(signal.edge),
-            entry_fair=float(signal.fair),
+            # CALIBRATION: the CHOSEN SIDE's win probability, not the up-fair.
+            # Storing signal.fair stored 0.19 for a strong DOWN trade (up-fair
+            # 0.19, down-fair 0.81), which inverted the report card: the
+            # "below 0.55" band was secretly the strong-DOWN band. The fair in
+            # the rationale ("fair 0.81 vs Kalshi ... on DOWN") is the chosen
+            # side - match it.
+            entry_fair=float(signal.fair if side == "up" else 1.0 - signal.fair),
             live=live,
             strategy=self.lane,
             mode="live" if live else "dry",

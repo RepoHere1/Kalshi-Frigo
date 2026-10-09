@@ -76,12 +76,20 @@ def test_gold_lane_prices_against_the_paxg_proxy():
 
 def test_every_trade_log_carries_the_entry_fair():
     """CALIBRATION invariant: every close path must stamp the model's entry
-    fair onto the trade log, or the win-rate-by-band report card is blind."""
+    fair onto the trade log, or the win-rate-by-band report card is blind.
+    And the lane must record the CHOSEN SIDE's fair, not the up-fair - the
+    inversion that put strong DOWN trades in the 'below 0.55' band."""
     from src.jobs import execute as ex
     from src.jobs import track as tk
+    from src.jobs.ladder_trader import UpDownTrader
 
     src = inspect.getsource(tk) + inspect.getsource(ex)
     assert src.count("entry_fair=getattr(position") >= 5
+    lane_src = inspect.getsource(UpDownTrader)
+    assert (
+        'entry_fair=float(signal.fair if side == "up" else 1.0 - signal.fair)'
+        in lane_src
+    )
 
 
 def test_no_strategy_reads_the_env_live_gate():
