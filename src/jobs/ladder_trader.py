@@ -1482,7 +1482,10 @@ class UpDownTrader:
             # "below 0.55" band was secretly the strong-DOWN band. The fair in
             # the rationale ("fair 0.81 vs Kalshi ... on DOWN") is the chosen
             # side - match it.
-            entry_fair=float(signal.fair if side == "up" else 1.0 - signal.fair),
+            entry_fair=float(
+                signal.fair if str(getattr(signal, "side", "")).lower() == "up"
+                else 1.0 - signal.fair
+            ),
             live=live,
             strategy=self.lane,
             mode="live" if live else "dry",

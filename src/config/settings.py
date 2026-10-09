@@ -81,12 +81,16 @@ class TradingConfig:
     # Position sizing and risk management — DISCIPLINED DEFAULTS
     max_position_size_pct: float = 3.0  # SANE: 3% per position (was 5% "beast mode")
     max_daily_loss_pct: float = 10.0    # SANE: 10% daily loss limit (was 15%)
-    max_positions: int = 10              # SANE: 10 concurrent positions (was 15)
+    # OPERATOR ORDER (2026-10-09): the machine may hold 100 positions, in
+    # BOTH books. The dashboard editor persists edits in runtime_config and
+    # they are re-applied at every process start; the default itself is 100
+    # so nothing can revert it.
+    max_positions: int = 100
     # Per-strategy ceiling, enforced in execute_position so it applies to every
-    # strategy rather than only the ones that remember to check. Six processes
-    # sharing one book each saw the same global headroom and filled it between
-    # them; ai_directional alone reached 23 open positions.
-    max_positions_per_strategy: int = 3
+    # strategy rather than only the ones that remember to check. Raised to 100
+    # by operator order alongside the global cap - the money laws (Kelly,
+    # notional, correlated caps) remain the real risk bounds downstream.
+    max_positions_per_strategy: int = 100
     min_balance: float = 100.0          # SANE: $100 minimum balance (was $50)
     
     # Market filtering criteria — DISCIPLINED

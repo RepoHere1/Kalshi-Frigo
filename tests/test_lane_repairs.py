@@ -86,10 +86,9 @@ def test_every_trade_log_carries_the_entry_fair():
     src = inspect.getsource(tk) + inspect.getsource(ex)
     assert src.count("entry_fair=getattr(position") >= 5
     lane_src = inspect.getsource(UpDownTrader)
-    assert (
-        'entry_fair=float(signal.fair if side == "up" else 1.0 - signal.fair)'
-        in lane_src
-    )
+    assert "entry_fair=float(" in lane_src
+    assert "1.0 - signal.fair" in lane_src  # side-aware: chosen-side prob
+    assert 'getattr(signal, "side"' in lane_src
 
 
 def test_no_strategy_reads_the_env_live_gate():

@@ -495,6 +495,12 @@ class DatabaseManager(TradingLoggerMixin):
         async def add_column(table: str, column: str, decl: str) -> None:
             if column not in await columns_of(table):
                 await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+                # Commit DDL immediately: later migration steps (and any step
+                # that opens its own connection) must SEE the new column.
+                # Uncommitted ALTERs were invisible across connections, which
+                # made the strategy-backfill step die with "no column named
+                # entry_fair" on the first init pass.
+                await db.commit()
                 self.logger.info(f"Added {column} to {table}")
 
         async def ensure_table(name: str, ddl: str) -> None:
@@ -503,6 +509,7 @@ class DatabaseManager(TradingLoggerMixin):
             )
             if not await cur.fetchone():
                 await db.execute(ddl)
+                await db.commit()
                 self.logger.info(f"Created {name} table")
 
         steps: List[Any] = [

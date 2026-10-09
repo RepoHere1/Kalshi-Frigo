@@ -18,6 +18,7 @@ in process memory, so a redeploy cannot silently revert LIVE trading to DRY or
 the other way around.
 """
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -29,6 +30,57 @@ MODE_LIVE = "live"
 VALID_MODES = (MODE_DRY, MODE_LIVE)
 
 DEFAULT_DRY_STARTING_BALANCE = 200.0
+
+
+async def apply_persisted_trading_config(db_path: Optional[str] = None) -> int:
+    """Apply saved dashboard config edits onto settings.trading.
+
+    The config editor persists each change as a `cfg.<field>` key in the
+    restart-proof runtime_config table; this re-applies them at process
+    startup so a redeploy cannot revert an operator's settings (the
+    "max positions keeps reverting to 10" bug). Called by the dashboard at
+    boot and by every strategy child before it reads settings. Coerces to
+    the field's current type; unknown fields are ignored. Returns how many
+    fields were applied.
+    """
+    import os as _os
+
+    from src.config.settings import settings
+
+    path = db_path or _os.getenv("DB_PATH", "trading_system.db")
+    applied = 0
+    try:
+        _mode = TradingMode(path)
+        async with _mode._conn() as conn:
+            cur = await conn.execute(
+                "SELECT key, value FROM runtime_config WHERE key LIKE 'cfg.%'"
+            )
+            rows = await cur.fetchall()
+    except Exception:  # noqa: BLE001 - no table yet is not an error
+        return 0
+    for row in rows:
+        field = str(row["key"])[4:]
+        if not hasattr(settings.trading, field):
+            continue
+        try:
+            val = json.loads(row["value"])
+        except Exception:  # noqa: BLE001
+            continue
+        current = getattr(settings.trading, field)
+        try:
+            if isinstance(current, bool):
+                val = bool(val)
+            elif isinstance(current, int):
+                val = int(val)
+            elif isinstance(current, float):
+                val = float(val)
+            elif isinstance(current, str):
+                val = str(val)
+        except (TypeError, ValueError):
+            continue
+        setattr(settings.trading, field, val)
+        applied += 1
+    return applied
 
 # Every DB call is bounded. A hung read must surface as an error the dashboard
 # can render, not as a request that never returns. This must be LONGER than the
@@ -143,6 +195,20 @@ class TradingMode:
             " updated_at = excluded.updated_at",
             (key, str(value), _now()),
         )
+
+    async def save_trading_config(self, fields: Dict[str, Any]) -> None:
+        """Persist dashboard config edits so they survive redeploys.
+
+        The config editor used to mutate `settings.trading` in memory only -
+        a redeploy silently reverted every saved value to its default (the
+        "max positions keeps reverting to 10" bug). Values live as
+        `cfg.<field>` keys in runtime_config, the same restart-proof table
+        the DRY/LIVE switch uses.
+        """
+        async with self._conn() as conn:
+            for key, val in fields.items():
+                await self._set(conn, f"cfg.{key}", json.dumps(val))
+            await conn.commit()
 
     async def _exec_optional(self, conn, sql: str, params: Optional[List[Any]] = None) -> bool:
         """Run a statement, tolerating a table that does not exist yet.

@@ -4751,6 +4751,21 @@ def api_config():
             updated.append(key)
         if skipped:
             _push_error(f"Ignored unknown config keys: {', '.join(skipped)}")
+        # PERSIST: a config edit must survive redeploys. In-memory setattr is
+        # not enough - Railway rebuilds constantly and the next boot reverted
+        # every saved value to its default ("max positions keeps reverting
+        # to 10"). Saved as cfg.<field> in runtime_config and re-applied at
+        # every process start (dashboard and strategy children).
+        try:
+            from src.utils.mode import TradingMode as _CfgMode
+
+            _run_async(
+                _CfgMode(db_path=DB_PATH).save_trading_config(
+                    {k: getattr(settings.trading, k) for k in updated}
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed save is loud, not fatal
+            _push_error(f"config persist failed: {type(exc).__name__}: {exc}")
         # Bust the snapshot memo so the very next refresh re-reads the just-saved
         # config. Without this the cache served the pre-save values, which is why
         # "save + refresh" looked like the numbers reverted.
@@ -7024,6 +7039,14 @@ def start_background_workers():
     if _workers_started:
         return
     _workers_started = True
+    # Operator config survives redeploys: apply saved dashboard config edits
+    # (runtime_config cfg.* keys) before any worker reads settings.
+    try:
+        from src.utils.mode import apply_persisted_trading_config
+
+        _run_async(apply_persisted_trading_config(str(DB_PATH)))
+    except Exception as exc:  # noqa: BLE001 - boot never fails on config
+        _push_error(f"config apply failed: {type(exc).__name__}: {exc}")
     for target in (
          _monitor_loop,
          _log_tail_loop,

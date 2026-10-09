@@ -46,6 +46,17 @@ def cmd_run(args: argparse.Namespace) -> None:
     log_level = getattr(args, "log_level", "INFO")
     setup_logging(log_level=log_level)
 
+    # Operator config survives redeploys: apply saved dashboard config edits
+    # (runtime_config cfg.* keys) before any strategy reads settings. Without
+    # this a lane child could see the dataclass defaults while the page shows
+    # the operator's saved values - two different laws in one machine.
+    try:
+        from src.utils.mode import apply_persisted_trading_config
+
+        asyncio.run(apply_persisted_trading_config())
+    except Exception as exc:  # noqa: BLE001 - boot never fails on config
+        print(f"config apply failed: {type(exc).__name__}: {exc}")
+
     live = getattr(args, "live", False)
     paper = getattr(args, "paper", False)
     beast = getattr(args, "beast", False)

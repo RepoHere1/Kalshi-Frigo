@@ -62,13 +62,15 @@ class PositionLimitsManager:
         self.kalshi_client = kalshi_client
         self.logger = get_trading_logger("position_limits")
         
-        # INCREASED: More aggressive limits for more opportunities
-        self.max_positions = 15  # INCREASED: Allow 15 positions (was 10)
+        # OPERATOR ORDER (2026-10-09): allow up to 100 concurrent positions,
+        # in both books. The dashboard config editor persists its value and
+        # every process re-applies it at start.
+        self.max_positions = 100  # operator order (was 15, was 10)
         self.max_position_size_pct = 5.0  # INCREASED: 5% max per trade (was 3%)
-        self.warning_threshold = self.max_positions - 3  # Warning at 12 positions
-        
+        self.warning_threshold = self.max_positions - 3  # Warning at 97 positions
+
         # Additional safety limits - MORE AGGRESSIVE FOR FULL PORTFOLIO USE
-        self.emergency_position_limit = 20  # INCREASED: Higher emergency threshold (was 15)
+        self.emergency_position_limit = 100  # operator order (was 20, was 15)
         self.min_cash_reserve_pct = 0.5  # DECREASED: Only 0.5% cash reserves (was 1% - nearly full deployment)
         
     async def check_position_limits(

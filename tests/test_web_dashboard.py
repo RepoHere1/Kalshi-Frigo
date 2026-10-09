@@ -3240,8 +3240,48 @@ def test_dashboard_shows_the_calibration_report_card(client):
     assert "Entry fair band" in html
 
 
+def test_config_edits_survive_a_restart(client, auth, monkeypatch, tmp_path):
+    """The 'max positions keeps reverting to 10' bug: a saved edit must be
+    persisted in runtime_config and re-applied at the next process start."""
+    import asyncio
+
+    from src.config.settings import settings as _S
+    from src.utils.mode import apply_persisted_trading_config
+
+    db = str(tmp_path / "cfg_survive.db")
+    monkeypatch.setattr(wd, "DB_PATH", db)
+    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
+    before = _S.trading.max_positions
+    try:
+        r = client.post("/api/config", json={"max_positions": 77}, headers=auth)
+        assert r.status_code == 200, r.get_data(as_text=True)
+        assert _S.trading.max_positions == 77
+        # Simulate the redeploy: memory is fresh, only the DB remembers.
+        _S.trading.max_positions = before
+        applied = asyncio.run(apply_persisted_trading_config(db))
+        assert applied >= 1
+        assert _S.trading.max_positions == 77
+    finally:
+        _S.trading.max_positions = before
+
+
+def test_default_max_positions_is_one_hundred():
+    """Operator order: 100 concurrent positions, both books, nothing can
+    revert it - the dataclass default itself is 100."""
+    from src.config.settings import settings as _S
+
+    assert _S.trading.max_positions == 100
+    assert _S.trading.max_positions_per_strategy == 100
+    from src.utils.position_limits import PositionLimitsManager
+
+    # The manager's hardcoded cap must honor the same order.
+    import inspect
+
+    src = inspect.getsource(PositionLimitsManager.__init__)
+    assert "self.max_positions = 100" in src
+
+
 def test_parse_entry_fair_reads_the_chosen_side():
-    """The rationale proves the fair; garbage yields None, never a guess."""
     assert wd._parse_entry_fair(
         "coinbase-coinbase-ws 82,457 vs target 82,478 (-20.51): fair 0.81 vs "
         "Kalshi 0.44 on DOWN - edge +0.382"
