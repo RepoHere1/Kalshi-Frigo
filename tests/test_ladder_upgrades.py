@@ -327,3 +327,77 @@ def test_btc_sigma_stays_in_its_old_band():
     s = rv.sigma_dollars(900.0, last_price=base)
     assert s is not None
     assert 8.0 <= s <= 6500.0
+
+
+def test_recent_move_measures_the_burst_window():
+    """The raw material for the fresh-burst invention: delta over the last
+    N seconds, and honest None when history is too short."""
+    from src.jobs.realized_vol import RealizedVol
+
+    rv = RealizedVol()
+    for i in range(60):
+        rv.observe(100.0, now=float(i))
+    rv.observe(100.9, now=60.0)  # a burst at the end
+    mv = rv.recent_move(20.0)
+    assert mv is not None
+    delta, span = mv
+    assert abs(delta - 0.9) < 1e-9
+    assert 19.0 <= span <= 21.0
+    assert rv.recent_move(0.0) is None
+
+    short = RealizedVol()
+    short.observe(100.0, now=0.0)
+    short.observe(101.0, now=1.0)
+    assert short.recent_move(20.0) is None  # a 1-second "move" is noise
+
+
+def test_burst_forces_taker_and_respects_config():
+    import inspect
+
+    from src.jobs.ladder_trader import UpDownConfig, UpDownTrader
+
+    cfg = UpDownConfig()
+    assert cfg.burst_enabled is True
+    assert cfg.burst_sigma_mult >= 2.0
+    assert cfg.burst_min_seconds_left >= 120.0
+    src = inspect.getsource(UpDownTrader.evaluate)
+    assert "recent_move" in src
+    assert "self._burst = True" in src
+    # The maker/taker choice consumes the flag.
+    assert "if self._burst:" in src
+
+
+def test_correlated_cap_blocks_an_over_cap_same_side_clip():
+    """Four same-direction crypto lanes are ONE bet; the cap makes that
+    literal: a clip that would push same-side exposure past the cap is
+    refused with its own counter."""
+    from src.jobs.ladder_trader import UpDownSignal, UpDownTrader
+    from src.jobs.market_data import Btc15mFeed, SpotFeed
+
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed())
+    signal = UpDownSignal(
+        ticker="KXXRP15M-TEST",
+        bucket="test",
+        side="up",
+        target=1.0,
+        spot=1.0,
+        spot_vs_target=0.0,
+        fair=0.80,
+        kalshi_price=0.5,
+        edge=0.30,
+        ask=0.5,
+        contracts=10,
+        notional=5.0,
+        seconds_left=300.0,
+        reason="",
+        truth="coinbase",
+    )
+    held = [
+        {"ticker": f"KXTEST-{i}", "side": "YES", "notional": 5.0} for i in range(3)
+    ]
+    block = trader._entry_block(signal, held)
+    assert "correlated" in block
+    assert trader.book.skipped_correlated == 1
+    # A clip that stays under the cap is not blocked by this gate.
+    ok = trader._entry_block(signal, held[:2])
+    assert "correlated" not in ok

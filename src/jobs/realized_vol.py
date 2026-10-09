@@ -126,6 +126,32 @@ class RealizedVol:
         out = max(p * MIN_SIGMA_FRACTION, min(p * MAX_SIGMA_FRACTION, out))
         return round(out, 2)
 
+    def recent_move(self, seconds: float) -> Optional[Tuple[float, float]]:
+        """(delta, span) between the newest print and the newest print at
+        least `seconds` older - the raw material for burst detection.
+
+        None when the history is too short to span half the lookback: a
+        "move" measured over two seconds is noise, not information.
+        """
+        try:
+            want = float(seconds)
+        except (TypeError, ValueError):
+            return None
+        pts = list(self._samples)
+        if len(pts) < 2 or want <= 0.0:
+            return None
+        t_now, p_now = pts[-1]
+        older = None
+        for t, p in reversed(pts[:-1]):
+            if t <= t_now - want:
+                older = (t, p)
+                break
+        if older is None:
+            older = pts[0]
+            if (t_now - older[0]) < want * 0.5:
+                return None
+        return (p_now - older[1], t_now - older[0])
+
 
 def gaussian_cdf(z: float) -> float:
     """Standard normal CDF via erf - stdlib, no scipy on the hot path."""

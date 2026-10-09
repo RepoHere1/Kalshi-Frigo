@@ -227,6 +227,22 @@ class UpDownConfig:
     certain_win_max_usd: float = 50.0    # per-pair budget cap
     certain_win_cash_fraction: float = 0.5
 
+    # FRESH-BURST (latency capture, new): when the last ~20s of spot moved
+    # >=2.5 sigma of that lookback and the contract quote has not repriced,
+    # the entry goes TAKER instead of resting at the bid - the one moment
+    # the taker fee buys something. Real moves with runway only; the veto's
+    # explosion/chase rules still apply on top.
+    burst_enabled: bool = True
+    burst_lookback_sec: float = 20.0
+    burst_sigma_mult: float = 2.5
+    burst_min_seconds_left: float = 180.0
+
+    # CORRELATED-CRYPTO CAP (new): BTC/ETH/XRP/HYPE move together - four
+    # same-direction lanes are ONE bet wearing four hats. Cap the total
+    # same-side up/down exposure so a single reversal cannot hit every
+    # lane at once.
+    correlated_cap_usd: float = 15.0
+
     def __post_init__(self) -> None:
         import os as _os
 
@@ -392,6 +408,7 @@ class UpDownBook:
     skipped_sentinel: int = 0
     skipped_venue_guard: int = 0
     skipped_poly_divergence: int = 0
+    skipped_correlated: int = 0
     last_error: str = ""
     dry: bool = True
     # CERTAIN-WIN pair counters (the arithmetic-only trades).
@@ -418,6 +435,7 @@ class UpDownBook:
             "skipped_sentinel": self.skipped_sentinel,
             "skipped_venue_guard": self.skipped_venue_guard,
             "skipped_poly_divergence": self.skipped_poly_divergence,
+            "skipped_correlated": self.skipped_correlated,
             "last_error": self.last_error,
             "dry": self.dry,
             "certain_wins": self.certain_wins,
@@ -549,6 +567,9 @@ class UpDownTrader:
         self.hl = HyperliquidMark()
         self.poly_arb_last: Optional[Dict[str, Any]] = None
         self._vol_adj: float = 0.0
+        # FRESH-BURST flag for this pass: a fresh spot move the quote has
+        # not repriced. Set by _score; consumed by the maker/taker choice.
+        self._burst: bool = False
         # Certain-win pair bookkeeping: cooldown + max rounds per ticker, so
         # the arithmetic trade repeats a few times per market at most.
         self._cw_last: Dict[str, float] = {}
@@ -762,6 +783,27 @@ class UpDownTrader:
                     self._vol_adj = -self.config.vol_cheap_edge_credit
             except Exception:  # noqa: BLE001 - vol read never blocks scoring
                 self._impl_sigma = None
+        # FRESH-BURST (latency capture, new): a quick oversized move in the
+        # last ~20s that the contract quote has not repriced is the one
+        # moment worth PAYING the taker fee instead of resting at the bid -
+        # the edge decays in seconds, not minutes. Real (>=2.5 sigma of the
+        # lookback) and with runway (>=180s) only; the veto's explosion and
+        # chase rules still apply on top.
+        self._burst = False
+        if self.config.burst_enabled and self._sigma_used:
+            try:
+                _rm = self.rv.recent_move(self.config.burst_lookback_sec)
+                if _rm is not None and seconds_left >= self.config.burst_min_seconds_left:
+                    _b_delta, _b_span = _rm
+                    _b_sigma = self._sigma_used * (
+                        max(float(_b_span), 1.0) / max(float(seconds_left), 1.0)
+                    ) ** 0.5
+                    if _b_sigma > 0 and abs(float(_b_delta)) >= (
+                        self.config.burst_sigma_mult * _b_sigma
+                    ):
+                        self._burst = True
+            except Exception:  # noqa: BLE001 - a burst upgrade never blocks
+                self._burst = False
         fair = fair_up_probability(
             spot, target, target * self.config.noise_pct, seconds_left, self._sigma_used
         )
@@ -803,6 +845,12 @@ class UpDownTrader:
             if _down_spread is not None and 0.0 < _down_spread <= 0.05:
                 _down_maker = True
                 _down_ref = _nb
+
+        if self._burst:
+            # Take the quote NOW: a resting bid will not fill before the move
+            # is priced in. The taker fee is the cost of capturing the burst.
+            _up_maker = False
+            _down_maker = False
 
         # Symmetric comparison: what this contract is worth to us, minus what
         # Kalshi charges for it. Both sides are a probability in [0, 1], so the
@@ -920,6 +968,8 @@ class UpDownTrader:
             _chosen_maker = (_up_maker if side == "up" else _down_maker)
             if _chosen_maker:
                 reason += " | maker-bar (quarter fee, bid-priced)"
+            if self._burst:
+                reason += " | burst: taker on a fresh move (stale quote)"
 
         # Size on the price the order will actually fill at: the side's own ask.
         # UP fills at yes_ask, DOWN fills at no_ask. An earlier revision filled
@@ -1100,6 +1150,25 @@ class UpDownTrader:
                 f"${open_notional:.2f} already deployed; adding "
                 f"${signal.notional:.2f} would exceed the "
                 f"${self.config.max_open_notional:.2f} cap"
+            )
+
+        # CORRELATED-CRYPTO CAP (new): BTC/ETH/XRP/HYPE move together - four
+        # same-direction lanes are ONE bet wearing four hats. After the
+        # global cap passes, cap the total same-side up/down exposure so a
+        # single reversal cannot hit every lane at once. Money risk, not
+        # trade counting.
+        _want = "YES" if signal.side == "up" else "NO"
+        _same_side = sum(
+            float(p.get("notional") or 0.0)
+            for p in held
+            if str(p.get("side") or "").upper() == _want
+        )
+        if _same_side + float(signal.notional or 0.0) > self.config.correlated_cap_usd:
+            self.book.skipped_correlated += 1
+            return (
+                f"correlated {signal.side.upper()} exposure would reach "
+                f"${_same_side + float(signal.notional or 0.0):.2f} "
+                f"(cap ${self.config.correlated_cap_usd:.2f})"
             )
         return ""
 
