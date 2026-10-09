@@ -3023,12 +3023,42 @@ def api_maintenance_backfill_fair():
         _run_async(_run())
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e)}), 500
+
+    # Post-pass diagnostics: how many rows still have no fair, with samples.
+    # This is how 'unknown' stopped being a mystery: the DB names them.
+    still_null = 0
+    samples: List[Dict[str, Any]] = []
+    try:
+        import aiosqlite as _a
+
+        async def _diag() -> None:
+            nonlocal still_null
+            async with _a.connect(DB_PATH) as conn:
+                conn.row_factory = lambda c, r: dict(
+                    zip([d[0] for d in c.description], r)
+                )
+                cur = await conn.execute(
+                    "SELECT COUNT(*) AS n FROM trade_logs WHERE entry_fair IS NULL"
+                )
+                still_null = int((await cur.fetchone())["n"])
+                cur = await conn.execute(
+                    "SELECT id, market_id, strategy, exit_reason,"
+                    " substr(COALESCE(rationale,''),1,110) AS why"
+                    " FROM trade_logs WHERE entry_fair IS NULL LIMIT 20"
+                )
+                samples.extend(await cur.fetchall())
+
+        _run_async(_diag())
+    except Exception:  # noqa: BLE001 - diagnostics never fail the backfill
+        pass
     return jsonify(
         {
             "ok": True,
             "trade_logs_updated": updated_logs,
             "positions_updated": updated_pos,
             "unparseable": unparseable,
+            "still_null_trade_logs": still_null,
+            "samples": samples,
         }
     )
 
@@ -3067,7 +3097,7 @@ def api_trades():
                 async with db.execute(
                     "SELECT market_id, side, entry_price, pnl, quantity, "
                     "exit_timestamp, mode, strategy, rationale, exit_reason, "
-                    "entry_price * quantity AS cost_basis "
+                    "entry_fair, entry_price * quantity AS cost_basis "
                     "FROM trade_logs WHERE exit_timestamp IS NOT NULL "
                     f"AND {where} "
                     "ORDER BY exit_timestamp DESC LIMIT 500"
