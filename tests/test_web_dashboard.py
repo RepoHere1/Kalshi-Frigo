@@ -3331,11 +3331,18 @@ def test_calibration_excludes_phantoms_and_never_says_unknown():
 
 
 def test_parse_entry_fair_reads_the_chosen_side():
+    """The rationale proves the fair; garbage yields None, never a guess.
+    Fair 1.00 is VALID (deadband-past-target certainty) - the strict '< 1.0'
+    bound was exactly what left the last 15 calibration rows unknown."""
     assert wd._parse_entry_fair(
         "coinbase-coinbase-ws 82,457 vs target 82,478 (-20.51): fair 0.81 vs "
         "Kalshi 0.44 on DOWN - edge +0.382"
     ) == 0.81
     assert wd._parse_entry_fair("fair 0.55 vs Kalshi 0.50 on UP - edge +0.05") == 0.55
+    assert (
+        wd._parse_entry_fair("fair 1.00 vs Kalshi 0.46 on DOWN - edge +0.540")
+        == 1.00
+    )
     assert wd._parse_entry_fair("no fair here") is None
     assert wd._parse_entry_fair(None) is None
     assert wd._parse_entry_fair("fair 1.50 vs Kalshi") is None
