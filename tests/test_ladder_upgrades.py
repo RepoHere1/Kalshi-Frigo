@@ -290,3 +290,40 @@ def test_venue_guard_config_env_overrides(monkeypatch):
     cfg = UpDownConfig()
     assert cfg.venue_guard_enabled is False
     assert cfg.venue_guard_pct == 0.0003
+
+
+def test_sub_dollar_assets_get_a_realistic_sigma_not_the_btc_floor():
+    """XRP's honest 15-min sigma is fractions of a cent; the old absolute
+    $5 floor pinned its fair at ~0.5 forever (198 skipped_low_prob in one
+    log) while the market quoted a 44-point edge. The clamp is now a
+    fraction of spot."""
+    import random as _random
+
+    rv = RealizedVol()
+    base = 1.3860
+    rnd = _random.Random(7)
+    t = 0.0
+    for _ in range(150):
+        t += 5.0
+        rv.observe(base * (1.0 + rnd.gauss(0.0, 0.0004)), now=t)
+    s = rv.sigma_dollars(900.0, last_price=base)
+    assert s is not None
+    assert s < 0.02          # a few tenths of a cent, NOT the old $5 floor
+    assert s > 0.00005
+
+
+def test_btc_sigma_stays_in_its_old_band():
+    """The relative clamp must not change BTC's behaviour (the fraction
+    version equals ~$8..$6.5k at $81k, essentially the old $5..$5000)."""
+    import random as _random
+
+    rv = RealizedVol()
+    base = 81000.0
+    rnd = _random.Random(11)
+    t = 0.0
+    for _ in range(150):
+        t += 5.0
+        rv.observe(base * (1.0 + rnd.gauss(0.0, 0.0003)), now=t)
+    s = rv.sigma_dollars(900.0, last_price=base)
+    assert s is not None
+    assert 8.0 <= s <= 6500.0

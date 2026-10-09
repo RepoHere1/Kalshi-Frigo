@@ -509,7 +509,7 @@ class _Req:
     client_order_id = "cid-1"
 
 
-def _pos(ticker="KXTEST-T", qty=12, pid=None):
+def _pos(ticker="KXTEST-T", qty=12, pid=None, strategy="ai_directional"):
     from src.utils.database import Position
 
     return Position(
@@ -518,6 +518,7 @@ def _pos(ticker="KXTEST-T", qty=12, pid=None):
         entry_price=0.44,
         quantity=qty,
         timestamp=datetime.now(timezone.utc),
+        strategy=strategy,
         id=pid,
     )
 
@@ -691,6 +692,7 @@ def _btc_pos():
         quantity=10,
         timestamp=datetime.now(timezone.utc),
         strategy="btc_updown",
+        id=1,
     )
 
 
@@ -707,28 +709,67 @@ def test_live_profit_take_skips_btc15m():
             return [_btc_pos()]
         async def get_open_live_positions(self, mode=None):
             return [_btc_pos()]
+        async def claim_position_for_close(self, pid):
+            return True
+        async def release_position_claim(self, pid):
+            return True
 
     res = asyncio.run(
         ex.place_profit_taking_orders(
             _FakeDB(), _ExplodingClient(), 0.20, live_mode=True
         )
     )
-    assert res == {"orders_placed": 0, "positions_processed": 0}
+    assert res["orders_placed"] == 0
 
 
-def test_live_stop_loss_skips_btc15m():
+def test_btc15m_losers_are_stopped_not_ridden(monkeypatch):
+    """The down-tail is cut for every lane now: a BTC loser at ~-30% must
+    place a stop (the -78c resolution losses are what killed the record)."""
     from src.jobs import execute as ex
 
+    close_later = (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat()
+    market = {
+        "status": "open",
+        "yes_bid_dollars": "0.68",
+        "yes_ask_dollars": "0.70",
+        "no_bid_dollars": "0.30",
+        "no_ask_dollars": "0.32",
+        "close_time": close_later,
+    }
+
     class _FakeDB:
+        def __init__(self):
+            self.closed = []
+
         async def get_open_positions(self, mode=None):
             return [_btc_pos()]
         async def get_open_live_positions(self, mode=None):
             return [_btc_pos()]
+        async def claim_position_for_close(self, pid):
+            return True
+        async def release_position_claim(self, pid):
+            return True
+        async def add_trade_log(self, trade_log):
+            self.closed.append(trade_log)
+        async def update_position_status(self, pid, status):
+            self.closed.append((pid, status))
 
+    class _FakeClient:
+        async def get_market(self, ticker):
+            return {"market": market}
+
+    sells = []
+
+    async def _fake_sell(**kw):
+        sells.append(kw)
+        return True
+
+    monkeypatch.setattr(ex, "place_sell_limit_order", _fake_sell)
     res = asyncio.run(
-        ex.place_stop_loss_orders(_FakeDB(), _ExplodingClient(), -0.15, live_mode=True)
+        ex.place_stop_loss_orders(_FakeDB(), _FakeClient(), -0.15, live_mode=True)
     )
-    assert res == {"orders_placed": 0, "positions_processed": 0}
+    assert res["orders_placed"] == 1
+    assert len(sells) == 1
 
 
 def test_dry_also_skips_btc15m_mid_bucket(monkeypatch):
@@ -772,3 +813,93 @@ def test_dry_also_skips_btc15m_mid_bucket(monkeypatch):
     )
     assert res["orders_placed"] == 0
     assert len(sells) == 0
+
+
+def _xrp_pos():
+    from src.utils.database import Position
+
+    return Position(
+        market_id="KXXRP15M-26OCT082200-00",
+        side="YES",
+        entry_price=0.44,
+        quantity=10,
+        timestamp=datetime.now(timezone.utc),
+        strategy="xrp_updown",
+        id=1,
+    )
+
+
+def test_non_btc_updown_lanes_also_ride_winners():
+    """XRP/ETH/HYPE winners ride to settlement exactly like BTC: the ride
+    rule is the whole up/down family, not a BTC special case."""
+    from src.jobs import execute as ex
+
+    class _FakeDB:
+        async def get_open_positions(self, mode=None):
+            return [_xrp_pos()]
+        async def get_open_live_positions(self, mode=None):
+            return [_xrp_pos()]
+        async def claim_position_for_close(self, pid):
+            return True
+        async def release_position_claim(self, pid):
+            return True
+
+    # _ExplodingClient proves the ride fires BEFORE any book read.
+    res = asyncio.run(
+        ex.place_profit_taking_orders(
+            _FakeDB(), _ExplodingClient(), 0.20, live_mode=True
+        )
+    )
+    assert res["orders_placed"] == 0
+
+
+def test_ordinary_strategies_still_take_profit(monkeypatch):
+    """The ride rule is scoped to up/down lanes; ordinary strategies keep
+    their mid-bucket profit-taking."""
+    from src.jobs import execute as ex
+
+    close_later = (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat()
+    market = {
+        "status": "open",
+        "yes_bid_dollars": "0.55",
+        "yes_ask_dollars": "0.57",
+        "no_bid_dollars": "0.43",
+        "no_ask_dollars": "0.45",
+        "close_time": close_later,
+    }
+
+    class _FakeDB:
+        def __init__(self):
+            self.closed = []
+
+        async def get_open_positions(self, mode=None):
+            return [_pos(qty=10, pid=1, strategy="ai_directional")]
+        async def get_open_live_positions(self, mode=None):
+            return [_pos(qty=10, pid=1, strategy="ai_directional")]
+        async def claim_position_for_close(self, pid):
+            return True
+        async def release_position_claim(self, pid):
+            return True
+        async def add_trade_log(self, trade_log):
+            self.closed.append(trade_log)
+        async def update_position_status(self, pid, status):
+            self.closed.append((pid, status))
+
+    class _FakeClient:
+        async def get_market(self, ticker):
+            return {"market": market}
+
+    sells = []
+
+    async def _fake_sell(**kw):
+        sells.append(kw)
+        return True
+
+    monkeypatch.setattr(ex, "place_sell_limit_order", _fake_sell)
+    db = _FakeDB()
+    res = asyncio.run(
+        ex.place_profit_taking_orders(db, _FakeClient(), 0.20, live_mode=True)
+    )
+    assert res["orders_placed"] == 1
+    assert len(sells) == 1
+    assert any(isinstance(x, tuple) for x in db.closed)  # status write happened

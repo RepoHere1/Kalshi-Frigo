@@ -615,6 +615,23 @@ async def place_sell_limit_order(
         return False
 
 
+_UPDOWN_SERIES = ("KXBTC15M", "KXXRP15M", "KXXAU15M", "KXETH15M", "KXHYPE15M")
+
+
+def _rides_to_settlement(position) -> bool:
+    """True when a position belongs to an up/down 15-minute lane.
+
+    Winners in these lanes ride to the $1.00 print: the trade record showed
+    scalp exits (+$0.08-0.11) making a 70%-win book LOSE money while
+    full-size resolution losses (-$0.78) did the damage the other way. The
+    payoff symmetry only exists at settlement; the down-tail is cut by the
+    stop-loss instead (losing positions do NOT ride).
+    """
+    strat = str(getattr(position, "strategy", "") or "").lower()
+    mid = str(getattr(position, "market_id", "") or "")
+    return strat.endswith("_updown") or mid.startswith(_UPDOWN_SERIES)
+
+
 async def _close_after_sell(
     db_manager: DatabaseManager,
     position: Position,
@@ -717,18 +734,14 @@ async def place_profit_taking_orders(
         logger.info(f"📊 Checking {len(positions)} positions for profit-taking opportunities")
 
         for position in positions:
-            # Ride-to-settlement: 15-minute binaries ride to the
-            # $1.00/$0.00 settlement. A 20% profit-take exits mid-bucket and
-            # pays the spread plus a second fee for nothing; tracking closes
-            # these at resolution instead. Applied to BOTH books so DRY
-            # rehearses exactly what LIVE does.
-            if (
-                str(getattr(position, "strategy", "") or "") == "btc_updown"
-                or str(position.market_id or "").startswith("KXBTC15M")
-            ):
+            # Ride-to-settlement (ALL up/down lanes, operator order after the
+            # 33-trade record): winners ride to the $1.00 print. Scalping
+            # +8-11c made a 70%-win book LOSE money while resolution losses
+            # ran to -78c - the payoff symmetry only exists at settlement.
+            if _rides_to_settlement(position):
                 logger.debug(
                     f"Skipping mid-bucket profit-take for {position.market_id}: "
-                    "BTC 15m rides to settlement in LIVE"
+                    "15m binary rides to settlement (payoff lives there)"
                 )
                 continue
             # HARD LAW: one closer per position, claim before selling. Without
@@ -915,20 +928,10 @@ async def place_stop_loss_orders(
         logger.info(f"🛡️ Checking {len(positions)} positions for stop-loss protection")
 
         for position in positions:
-            # Ride-to-settlement: 15-minute binaries ride to the
-            # $1.00/$0.00 settlement. A 15% stop exits mid-bucket and pays
-            # the spread plus a second fee for nothing; tracking closes
-            # these at resolution instead. Applied to BOTH books so DRY
-            # rehearses exactly what LIVE does.
-            if (
-                str(getattr(position, "strategy", "") or "") == "btc_updown"
-                or str(position.market_id or "").startswith("KXBTC15M")
-            ):
-                logger.debug(
-                    f"Skipping mid-bucket stop-loss for {position.market_id}: "
-                    "BTC 15m rides to settlement in LIVE"
-                )
-                continue
+            # Losers do NOT ride (operator order after the 33-trade record):
+            # full-size resolution losses (-78c on BTC) dwarfed every scalp
+            # win, so the down-tail is CUT at the stop for every lane. Only
+            # the profit side rides to settlement (see place_profit_taking).
             # HARD LAW: same claim-first rule as profit-taking; see the
             # long note there. A stop sold-but-never-closed was the same
             # money-printer shape.

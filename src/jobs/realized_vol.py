@@ -35,9 +35,16 @@ MAX_PAIR_GAP_SECONDS = 90.0
 # feeds can echo the last price for seconds; treating those zeros as calm
 # would fake a volatility collapse and overconfident fair values.
 IDENTICAL_EPSILON = 1e-9
-# Hard sanity clamp on the published $ sigma for a 15-minute horizon.
-MIN_SIGMA_15M_DOLLARS = 5.0
-MAX_SIGMA_15M_DOLLARS = 5000.0
+# Sanity clamp on the published $ sigma, as FRACTIONS of spot over the
+# horizon. The old absolute clamp ($5..$5000) was sized for BTC and silently
+# blinded every sub-$100 asset: XRP's honest 15-minute sigma is a few tenths
+# of a cent, so the $5 floor pinned its fair value at ~0.5 forever (198
+# skipped_low_prob in a single log) while its market quoted a 44-point edge.
+# A fraction of price is the unit-correct version: for BTC (~$81k) that is
+# ~$8..$6.5k, essentially the old band; for XRP (~$1.39) ~$0.0001..$0.11,
+# which lets the model speak.
+MIN_SIGMA_FRACTION = 1e-4   # 1 bp of spot at the horizon
+MAX_SIGMA_FRACTION = 8e-2   # 8% of spot at the horizon
 
 
 class RealizedVol:
@@ -116,7 +123,7 @@ class RealizedVol:
         if s is None:
             return None
         out = p * s * math.sqrt(horizon)
-        out = max(MIN_SIGMA_15M_DOLLARS, min(MAX_SIGMA_15M_DOLLARS, out))
+        out = max(p * MIN_SIGMA_FRACTION, min(p * MAX_SIGMA_FRACTION, out))
         return round(out, 2)
 
 
