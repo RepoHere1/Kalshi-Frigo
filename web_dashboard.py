@@ -2865,8 +2865,12 @@ def api_maintenance_lean():
 
     before = _sizes()
     dropped: List[str] = []
+    vacuumed = False
 
     async def _run() -> None:
+        nonlocal vacuumed
+        import asyncio as _aio
+
         async with aiosqlite.connect(DB_PATH) as conn:
             cur = await conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "
@@ -2876,7 +2880,18 @@ def api_maintenance_lean():
                 await conn.execute("DROP TABLE strategy_runtime_legacy")
                 dropped.append("strategy_runtime_legacy")
             await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            await conn.execute("VACUUM")
+            # VACUUM needs a quiet database; the live app constantly reads it.
+            # Retry briefly, then degrade to checkpoint-only - the drop and
+            # the WAL fold are the actual lean, VACUUM is the polish.
+            for attempt in range(4):
+                try:
+                    await conn.execute("VACUUM")
+                    vacuumed = True
+                    break
+                except Exception:  # noqa: BLE001 - busy db: retry, then skip
+                    if attempt >= 3:
+                        break
+                    await _aio.sleep(1.5)
             await conn.commit()
 
     try:
@@ -2884,7 +2899,15 @@ def api_maintenance_lean():
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e)}), 500
     after = _sizes()
-    return jsonify({"ok": True, "dropped": dropped, "before": before, "after": after})
+    return jsonify(
+        {
+            "ok": True,
+            "dropped": dropped,
+            "vacuumed": vacuumed,
+            "before": before,
+            "after": after,
+        }
+    )
 
 
 @app.route("/api/dry/ledger")
