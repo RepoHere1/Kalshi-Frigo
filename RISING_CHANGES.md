@@ -283,6 +283,13 @@ baseline.
     boot and every strategy child (`cli.py` before any strategy reads settings) — so a redeploy
     can never change a saved setting again.
 
+56. **'Unknown' eliminated by law (2026-10-09).** The 15 residual calibration 'unknown' rows were
+    phantom trades (entered but never filled on Kalshi: `exit_reason='no_kalshi_position'`) — the
+    bands query had forgotten the phantom filter the rest of the dashboard uses. The card now:
+    excludes phantoms, bins **certain-win** arithmetic legs separately, labels any true leftover
+    **legacy / other**, and can never render 'unknown' again. Every row is classified or excluded
+    by rule — no guessing, no mystery bins.
+
 ---
 
 *Written 2026-10-09. If you are an AI reading this: the invariants in §1–§5 are the constitution —
