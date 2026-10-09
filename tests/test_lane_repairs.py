@@ -84,6 +84,37 @@ def test_every_trade_log_carries_the_entry_fair():
     assert src.count("entry_fair=getattr(position") >= 5
 
 
+def test_no_strategy_reads_the_env_live_gate():
+    """The dashboard switch is the money law: no strategy CODE may read the
+    LIVE_TRADING_ENABLED env var. Spawned children have it scrubbed, so any
+    reader silently runs DRY inside a LIVE child - the exact bug fixed in
+    market_making, unified_trading_system, and immediate. Comments that
+    explain the old bug are fine; executable reads are not."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "strategies"
+    offenders = []
+    for p in root.rglob("*.py"):
+        for line in p.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            code = stripped.split("#", 1)[0]
+            reads_env = (
+                "settings.trading.live_trading_enabled" in code
+                or "getattr(settings.trading, 'live_trading_enabled'" in code
+                or 'getattr(settings.trading, "live_trading_enabled"' in code
+                or 'getenv("LIVE_TRADING_ENABLED"' in code
+                or "getenv('LIVE_TRADING_ENABLED'" in code
+                or 'environ.get("LIVE_TRADING_ENABLED"' in code
+                or "environ.get('LIVE_TRADING_ENABLED'" in code
+                or 'environ["LIVE_TRADING_ENABLED"]' in code
+            )
+            if reads_env:
+                offenders.append(f"{p.relative_to(root)}: {code[:70]}")
+    assert offenders == [], offenders
+
+
 def test_every_crypto_lane_carries_its_own_series_and_feed():
     """No lane may inherit another lane's default series again.
 

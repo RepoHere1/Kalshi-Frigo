@@ -378,8 +378,14 @@ async def _evaluate_immediate_trade(
             # Set the position ID so execute_position can update the database
             position.id = position_id
             
-            # Execute the trade - respect the global trading mode setting
-            live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+            # Execute the trade - respect the dashboard's persisted DRY/LIVE
+            # switch, never the env var: spawned children have
+            # LIVE_TRADING_ENABLED scrubbed precisely so a stale parent value
+            # cannot arm them, so the env read always said "DRY" inside a
+            # LIVE child. Same fix as market_making and unified_trading_system.
+            from src.jobs.broker import should_trade_live
+
+            live_mode = should_trade_live()
             success = await execute_position(position, live_mode, db_manager, kalshi_client)
             if success:
                 logger.info(f"✅ IMMEDIATE TRADE EXECUTED: {opportunity.market_id} - ${position_size:.0f} position")
