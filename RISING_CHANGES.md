@@ -264,6 +264,25 @@ baseline.
     positions), the CLI help, and the regression test. The lane now trades gold during session
     hours on PAXG-USD spot.
 
+54. **Calibration identified + semantics fixed (2026-10-09).** `entry_fair` was storing the
+    UP-side fair even for DOWN trades — the "below 0.55" band was secretly strong DOWN views at
+    85% wins. It now stores the CHOSEN SIDE's win probability: `entry_fair=signal.fair` for up,
+    `1 − signal.fair` for down (matching the rationale text, which always carried the truth:
+    "fair 0.81 vs Kalshi 0.64 on DOWN"). A token-protected `POST /api/maintenance/backfill-fair`
+    parsed every rationale in `trade_logs` and `positions` and wrote the fair back where the text
+    proved it — **553 logs and 593 positions identified; unknown dropped 342 → 15** (66 truly
+    unparseable stay honestly unknown). The report card now shows real calibration: win rate rises
+    with model confidence (69.8% → 74.6% → 78.9% across 0.55→0.85 bands, every band net positive).
+
+55. **Max positions = 100, and it STAYS (2026-10-09, operator order).** `max_positions` and
+    `max_positions_per_strategy` default to **100** in both books; `PositionLimitsManager` caps
+    raised to 100. Root cause of the reverting: the dashboard config editor mutated
+    `settings.trading` **in memory only**, so every redeploy silently restored the default
+    ("max positions keeps reverting to 10"). Now every edit is persisted as `cfg.<field>` in the
+    restart-proof `runtime_config` table and **re-applied at every process start** — the dashboard
+    boot and every strategy child (`cli.py` before any strategy reads settings) — so a redeploy
+    can never change a saved setting again.
+
 ---
 
 *Written 2026-10-09. If you are an AI reading this: the invariants in §1–§5 are the constitution —
