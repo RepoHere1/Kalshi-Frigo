@@ -2063,7 +2063,7 @@ async def run_updown_trader(
 ) -> None:
     """Run the up/down trader, optionally on a loop until interrupted.
 
-    `series` is the Kalshi series ticker (e.g. KXXRP15M, KXXAU15M, KXBTC15M, KXETH15M).
+    `series` is the Kalshi series ticker (e.g. KXXRP15M, KXGOLD15M, KXBTC15M, KXETH15M).
     `spot_product` is the Coinbase pair (e.g. XRP-USD, XAU-USD, BTC-USD, ETH-USD).
     """
     from src.jobs.market_data import MarketDataHub

@@ -253,6 +253,19 @@ baseline.
 
 ---
 
+## 1️⃣4️⃣ Addenda (append-only)
+
+53. **Gold series corrected (2026-10-09 night).** The gold lane was aimed at `KXXAU15M` — a
+    **dead ticker** (0 open *and* 0 settled markets in its entire history), which is why it never
+    traded: 369+ consecutive `skipped_unquoted` skips while its PAXG spot feed worked fine. The
+    live gold 15-minute series is **`KXGOLD15M`** (verified: 200 buckets settled in the last three
+    days, ~85/day, with a daily session break around 21:00–22:00 UTC — futures-style maintenance).
+    Fixed in the lane command, the docs text, `execute._UPDOWN_SERIES` (KXXAU15M kept for legacy
+    positions), the CLI help, and the regression test. The lane now trades gold during session
+    hours on PAXG-USD spot.
+
+---
+
 *Written 2026-10-09. If you are an AI reading this: the invariants in §1–§5 are the constitution —
 do not weaken them without an explicit operator order recorded in this file. If you are a human:
 you now hold the machine's autobiography. Keep it rising.* 🚀

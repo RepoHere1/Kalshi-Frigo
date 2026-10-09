@@ -147,7 +147,7 @@ strategy_state = {
 STRATEGY_COMMANDS: Dict[str, List[str]] = {
     "btc_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTC15M", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
     "xrp_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRP15M", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
-    "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXAU15M", "--spot-product", "PAXG-USD", "--paper", "--loop", "--interval", "0"],
+    "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXGOLD15M", "--spot-product", "PAXG-USD", "--paper", "--loop", "--interval", "0"],
     "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETH15M", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
     "hyperliquid_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPE15M", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
     "ai_directional": ["cli.py", "run", "--paper", "--loop", "--interval", "300"],
@@ -893,7 +893,7 @@ STRATEGY_DOCS = {
     ),
     "xau_updown": (
         "GOLD 15-Min Up/Down",
-        'Reads Kalshi\'s GOLD 15-min up/down contract (KXXAU15M) and compares its Up/Down price '
+        'Reads Kalshi\'s GOLD 15-min up/down contract (KXGOLD15M) and compares its Up/Down price '
         "against live Coinbase PAXG-USD spot (the tradable gold proxy - "
         "by more than the configured edge. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "

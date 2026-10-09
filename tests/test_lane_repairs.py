@@ -128,7 +128,7 @@ def test_every_crypto_lane_carries_its_own_series_and_feed():
     assert "BTC-USD" in cmds["btc_updown"]
     for lane, series in (
         ("xrp_updown", "KXXRP15M"),
-        ("xau_updown", "KXXAU15M"),
+        ("xau_updown", "KXGOLD15M"),
         ("btc_1h_updown", "KXETH15M"),
         ("hyperliquid_updown", "KXHYPE15M"),
     ):
