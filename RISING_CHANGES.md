@@ -300,6 +300,19 @@ baseline.
     real calibration bands — the confidence→win-rate curve: 70.3% → 74.6% → 78.9% → 75.8% across
     0.55→0.85+, every band net positive, no mystery bins.
 
+58. **The funky numbers repaired (2026-10-09).** The DRY book read −$92.57 while realized said +$25.60 —
+    a **$119.43 ledger hole** of close credits that never reached the simulated cash: pre-payout-fix
+    resolution winners (before settlement credits were booked), phantom reaper closes (entered,
+    never filled, never credited), and fee drift. New one-time repair
+    `POST /api/maintenance/reconcile-dry` enforces the identity **cash = starting + realized −
+    open cost**, computes the delta from the DB itself, and books it as ONE auditable `adjust`
+    ledger row (`TradingMode.adjust_cash`, same BEGIN IMMEDIATE discipline as fills). Idempotent
+    (second run finds $0) and sanity-capped at $1000. Ran live: cash $105.80 → **$225.23**; book
+    P&L now reads **+$25.23** next to realized +$25.71 — the same story, at last. Also in this fix:
+    `/api/trades` had started 500ing ("too many values to unpack") because the `entry_fair` column
+    added to its SELECT was not mirrored in the row unpack — repaired and pinned by a regression
+    test.
+
 ---
 
 *Written 2026-10-09. If you are an AI reading this: the invariants in §1–§5 are the constitution —
