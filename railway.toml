@@ -4,3 +4,6 @@ builder = "railpack"
 [env]
 LIVE_TRADING_ENABLED = "true"
 DB_PATH = "/data/trading_system.db"
+RECYCLE_WINNERS = "1"
+RECYCLE_PRICE = "0.95"
+RECYCLE_MIN_SECONDS = "180"

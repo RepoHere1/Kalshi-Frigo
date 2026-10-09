@@ -627,12 +627,12 @@ def _recycle_config() -> Tuple[bool, float, float]:
     import os as _os
 
     if _os.environ.get("RECYCLE_WINNERS", "1") != "1":
-        return False, 0.96, 300.0
+        return False, 0.95, 180.0
     try:
-        price = float(_os.environ.get("RECYCLE_PRICE", "0.96"))
-        secs = float(_os.environ.get("RECYCLE_MIN_SECONDS", "300"))
+        price = float(_os.environ.get("RECYCLE_PRICE", "0.95"))
+        secs = float(_os.environ.get("RECYCLE_MIN_SECONDS", "180"))
     except (TypeError, ValueError):
-        price, secs = 0.96, 300.0
+        price, secs = 0.95, 180.0
     return True, price, secs
 
 
