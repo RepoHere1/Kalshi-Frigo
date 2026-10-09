@@ -401,3 +401,32 @@ def test_correlated_cap_blocks_an_over_cap_same_side_clip():
     # A clip that stays under the cap is not blocked by this gate.
     ok = trader._entry_block(signal, held[:2])
     assert "correlated" not in ok
+
+
+def test_tiered_edge_bar_prices_confidence():
+    """Strong views trade MORE (lower bar); the marginal cushion ships at
+    1.0x so nothing is refused that the fee alone would not refuse; the fee
+    is added after the scaling, unchanged."""
+    from src.jobs.ladder_trader import UpDownConfig, tiered_edge_bar
+
+    cfg = UpDownConfig()
+    assert cfg.tiered_edge_enabled is True
+    strong = tiered_edge_bar(0.80, 0.06, cfg)
+    normal = tiered_edge_bar(0.68, 0.06, cfg)
+    marginal = tiered_edge_bar(0.58, 0.06, cfg)
+    assert strong < normal == 0.06 == marginal
+    cfg2 = UpDownConfig()
+    cfg2.tiered_edge_enabled = False
+    assert tiered_edge_bar(0.80, 0.06, cfg2) == 0.06
+    assert tiered_edge_bar(0.58, 0.06, cfg2) == 0.06
+
+
+def test_evaluate_uses_the_tiered_bar_for_both_sides():
+    import inspect
+
+    from src.jobs.ladder_trader import UpDownTrader
+
+    src = inspect.getsource(UpDownTrader.evaluate)
+    assert "tiered_edge_bar" in src
+    assert "_required(up_fill, _up_maker, _up_wp)" in src
+    assert "_required(down_fill, _down_maker, _down_wp)" in src

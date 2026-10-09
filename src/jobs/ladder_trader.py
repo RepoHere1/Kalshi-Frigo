@@ -243,6 +243,19 @@ class UpDownConfig:
     # lane at once.
     correlated_cap_usd: float = 15.0
 
+    # TIERED ENTRY BAR (new): the flat min_edge treated a 57% view and a
+    # 90% view as equal. Strong views (>= strong_prob) get a LOWER bar so
+    # the lanes fire more of the trades the model actually believes - more
+    # trades, and a higher win rate per trade, at zero new refusals. The
+    # marginal cushion (marginal_edge_scale) ships at 1.0 - the record's
+    # "0.55-0.65 loses" claim needs its own evidence pass before it is
+    # allowed to refuse anything the fee alone would not.
+    tiered_edge_enabled: bool = True
+    strong_prob: float = 0.72
+    strong_edge_scale: float = 0.6
+    marginal_prob: float = 0.65
+    marginal_edge_scale: float = 1.0
+
     def __post_init__(self) -> None:
         import os as _os
 
@@ -475,6 +488,26 @@ def _min_viable_notional(cents: float) -> float:
     # are bounded downstream by the actual fill price. This is just a sane
     # dollar floor so a 2-cent balance still submits something concrete.
     return max(0.01, round(cents / 100.0, 4))
+
+
+def tiered_edge_bar(win_prob: float, base_edge: float, cfg: Any) -> float:
+    """The raw edge bar before fees, scaled by the model's own confidence.
+
+    One flat bar treats a 57% view and a 90% view as equal; they are not.
+    STRONG views (>= strong_prob) are the trades the model actually has an
+    opinion on - their bar drops so the lane fires MORE of them (more
+    trades, and a higher win rate per trade). MARGINAL views (below
+    marginal_prob) must pay a bigger cushion, because the record shows the
+    0.55-0.65 zone is where losing entries cluster. Fees are added after
+    this scaling, unchanged.
+    """
+    base = float(base_edge)
+    if getattr(cfg, "tiered_edge_enabled", True):
+        if float(win_prob) >= cfg.strong_prob:
+            base *= cfg.strong_edge_scale
+        elif float(win_prob) < cfg.marginal_prob:
+            base *= cfg.marginal_edge_scale
+    return max(base, 0.0)
 
 
 def fair_up_probability(
@@ -871,11 +904,20 @@ class UpDownTrader:
         # built DRY's ledger is the edge LIVE trades on now.
         # DRY also fakes the fee (dry_fee_enabled) so the simulated
         # P&L matches what LIVE actually pays.
-        def _required(fill_price: Optional[float], maker: bool = False) -> float:
+        def _required(
+            fill_price: Optional[float],
+            maker: bool = False,
+            win_prob: Optional[float] = None,
+        ) -> float:
             # Same fee math for BOTH books so DRIED edge bar matches LIVE exactly.
             _fee_rate = 0.07 * (1.0 - float(fill_price or 0.5))
             kalshi_fee = 0.25 * _fee_rate if maker else _fee_rate
-            return max(self.config.min_edge + kalshi_fee + self._vol_adj, 0.0)
+            if win_prob is None:
+                _base = float(self.config.min_edge)
+            else:
+                # TIERED BAR: the model's confidence prices the cushion.
+                _base = tiered_edge_bar(win_prob, self.config.min_edge, self.config)
+            return max(_base + kalshi_fee + self._vol_adj, 0.0)
 
         # The band check and sizing run on the price the entry actually pays:
         # the maker bid when resting, else the taker ask.
@@ -905,9 +947,13 @@ class UpDownTrader:
                 r += self.config.out_of_band_extra_edge
             return edge >= r
 
-        up_ok = _side_ok(up_edge, up_fill, _required(up_fill, _up_maker), _up_maker)
+        # Each side's required bar is priced by ITS OWN win probability:
+        # the model's confidence is what decides how much cushion is needed.
+        _up_wp = float(fair)
+        _down_wp = 1.0 - float(fair)
+        up_ok = _side_ok(up_edge, up_fill, _required(up_fill, _up_maker, _up_wp), _up_maker)
         down_ok = _side_ok(
-            down_edge, down_fill, _required(down_fill, _down_maker), _down_maker
+            down_edge, down_fill, _required(down_fill, _down_maker, _down_wp), _down_maker
         )
 
         # LIVE trade-log truth: YES loses net (40 losses vs 27 for NO) while NO
@@ -916,7 +962,9 @@ class UpDownTrader:
         # money, not a tie-breaker. This is the single highest-leverage lever
         # on the win rate: stop the marginal YES entries that bleed.
         if self.config.yes_extra_edge > 0 and up_ok:
-            up_ok = up_edge >= (_required(up_fill, _up_maker) + self.config.yes_extra_edge)
+            up_ok = up_edge >= (
+                _required(up_fill, _up_maker, _up_wp) + self.config.yes_extra_edge
+            )
 
         side = ""
         ask: Optional[float] = None
@@ -970,6 +1018,18 @@ class UpDownTrader:
                 reason += " | maker-bar (quarter fee, bid-priced)"
             if self._burst:
                 reason += " | burst: taker on a fresh move (stale quote)"
+            if self.config.tiered_edge_enabled and side:
+                _wp = fair if side == "up" else 1.0 - fair
+                if _wp >= self.config.strong_prob:
+                    reason += (
+                        f" | strong view ({_wp:.2f}): "
+                        f"{self.config.strong_edge_scale:.2f}x edge bar"
+                    )
+                elif _wp < self.config.marginal_prob:
+                    reason += (
+                        f" | marginal view ({_wp:.2f}): "
+                        f"{self.config.marginal_edge_scale:.2f}x edge bar"
+                    )
 
         # Size on the price the order will actually fill at: the side's own ask.
         # UP fills at yes_ask, DOWN fills at no_ask. An earlier revision filled
