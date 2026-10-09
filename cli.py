@@ -22,6 +22,23 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 
+def _normalize_updown_series(series: str) -> str:
+    """One rule, no vowel surgery: a series is either already a Kalshi ticker
+    (KX...) or a bare suffix that gets the KX prefix.
+
+    The old `replace("KX", "KXX")` mangled REAL tickers: KXBTC15M became
+    KXXBTC15M and KXETH15M became KXXETH15M - those lanes fetched an empty
+    series forever and could never trade. XRP/XAU/HYPE tickers (which are
+    KX + XRP15M = KXXRP15M etc.) already start with KX and pass through.
+    """
+    s = str(series or "").strip().upper()
+    if not s:
+        return "KXBTC15M"
+    if not s.startswith("KX"):
+        s = "KX" + s
+    return s
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     """Start the trading bot (disciplined mode by default)."""
     from src.utils.logging_setup import setup_logging
@@ -82,9 +99,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         from src.utils.mode import TradingMode
         from src.utils.database import DatabaseManager
 
-        series = getattr(args, "series", "KXBTC15M")
+        series = _normalize_updown_series(getattr(args, "series", "KXBTC15M"))
         spot_product = getattr(args, "spot_product", "BTC-USD")
-        series = series.replace("KX", "KXX") if not series.startswith("KXX") else series
         print(f"📈 {series.replace('KX','').upper()} UP/DOWN MODE")
         print(f"   {series} | live spot ({spot_product}) vs Kalshi's own quote")
         print("   $5 per clip | fee-aware in LIVE | no trade inside the noise band")
@@ -901,7 +917,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--spot-product",
         type=str,
         default="XRP-USD",
-        help="Coinbase spot product (e.g. XRP-USD, BTC-USD, XAU-USD) for --btc-updown",
+        help="Coinbase spot product (e.g. XRP-USD, BTC-USD, PAXG-USD) for --btc-updown",
     )
     p_run.add_argument(
         "--loop",

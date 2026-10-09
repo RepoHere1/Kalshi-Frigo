@@ -145,9 +145,8 @@ strategy_state = {
 # that was already gone. `--loop` is what makes a strategy continuous, so it is
 # now part of the command rather than an afterthought.
 STRATEGY_COMMANDS: Dict[str, List[str]] = {
-    "btc_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
+    "btc_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTC15M", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
     "xrp_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRP15M", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
-    "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXAU15M", "--spot-product", "PAXG-USD", "--paper", "--loop", "--interval", "0"],
     "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXAU15M", "--spot-product", "PAXG-USD", "--paper", "--loop", "--interval", "0"],
     "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETH15M", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
     "hyperliquid_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPE15M", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],

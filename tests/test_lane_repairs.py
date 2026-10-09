@@ -72,3 +72,36 @@ def test_quick_win_no_longer_reads_the_environment():
 def test_gold_lane_prices_against_the_paxg_proxy():
     src = inspect.getsource(UpDownConfig.apply_asset)
     assert "PAXG-USD" in src
+
+
+def test_every_crypto_lane_carries_its_own_series_and_feed():
+    """No lane may inherit another lane's default series again.
+
+    The btc_updown command shipped without --series/--spot-product, so it
+    silently traded XRP (the argparse defaults). Every lane now names its
+    own market explicitly.
+    """
+    from web_dashboard import STRATEGY_COMMANDS as cmds
+
+    assert "KXBTC15M" in cmds["btc_updown"]
+    assert "BTC-USD" in cmds["btc_updown"]
+    for lane, series in (
+        ("xrp_updown", "KXXRP15M"),
+        ("xau_updown", "KXXAU15M"),
+        ("btc_1h_updown", "KXETH15M"),
+        ("hyperliquid_updown", "KXHYPE15M"),
+    ):
+        assert series in cmds[lane], lane
+        assert "--spot-product" in cmds[lane], lane
+        assert cmds[lane].count("--series") == 1, lane
+
+
+def test_series_normalization_never_mangles_real_tickers():
+    from cli import _normalize_updown_series
+
+    assert _normalize_updown_series("KXBTC15M") == "KXBTC15M"
+    assert _normalize_updown_series("KXETH15M") == "KXETH15M"
+    assert _normalize_updown_series("KXXAU15M") == "KXXAU15M"
+    assert _normalize_updown_series("btc15m") == "KXBTC15M"
+    assert _normalize_updown_series("XRP15M") == "KXXRP15M"
+    assert _normalize_updown_series("") == "KXBTC15M"
