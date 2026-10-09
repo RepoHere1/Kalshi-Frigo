@@ -509,7 +509,7 @@ class _Req:
     client_order_id = "cid-1"
 
 
-def _pos(ticker="KXTEST-T", qty=12):
+def _pos(ticker="KXTEST-T", qty=12, pid=None):
     from src.utils.database import Position
 
     return Position(
@@ -518,6 +518,7 @@ def _pos(ticker="KXTEST-T", qty=12):
         entry_price=0.44,
         quantity=qty,
         timestamp=datetime.now(timezone.utc),
+        id=pid,
     )
 
 
@@ -615,10 +616,21 @@ def test_winning_position_with_time_left_still_takes_profit(monkeypatch):
     }
 
     class _FakeDB:
+        def __init__(self):
+            self.closed = []
+
         async def get_open_positions(self, mode=None):
-            return [_pos(qty=10)]
+            return [_pos(qty=10, pid=1)]
         async def get_open_live_positions(self, mode=None):
-            return [_pos(qty=10)]
+            return [_pos(qty=10, pid=1)]
+        async def claim_position_for_close(self, pid):
+            return True
+        async def release_position_claim(self, pid):
+            return True
+        async def add_trade_log(self, trade_log):
+            self.closed.append(trade_log)
+        async def update_position_status(self, pid, status):
+            self.closed.append((pid, status))
 
     class _FakeClient:
         async def get_market(self, ticker):

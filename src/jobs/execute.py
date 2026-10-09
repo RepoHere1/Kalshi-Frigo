@@ -615,6 +615,73 @@ async def place_sell_limit_order(
         return False
 
 
+async def _close_after_sell(
+    db_manager: DatabaseManager,
+    position: Position,
+    exit_price: float,
+    exit_reason: str,
+    logger,
+    live_mode: bool = False,
+) -> None:
+    """Write the close after a sell booked. The caller must hold the claim.
+
+    This step used to be MISSING entirely from the profit-taking and
+    stop-loss helpers: they sold and credited but never closed the row, so
+    every process re-found the same 'open' position every few seconds and
+    sold it again - the DRY book became a money printer (cash tripled in an
+    hour of duplicate credits, with zero closes to show for it). Mirrors
+    the tracking loop's close writes: fee-netted PnL, trade log, status.
+    """
+    from datetime import datetime, timezone
+
+    from src.utils.database import TradeLog
+
+    pnl = (float(exit_price) - float(position.entry_price)) * int(position.quantity or 0)
+    fee_paid = 0.0
+    try:
+        from src.jobs import live_fees as _lf
+
+        if str(position.mode or "").lower() in ("dry", "live", ""):
+            fee_paid = float(
+                _lf.roundtrip_fee_dollars(
+                    position.entry_price,
+                    float(exit_price),
+                    int(position.quantity or 0),
+                    maker_exit=True,
+                )
+            )
+            pnl = round(pnl - fee_paid, 2)
+    except Exception:  # noqa: BLE001 - fees never block a close
+        fee_paid = 0.0
+
+    # Timestamps must agree on timezone-awareness, or later duration math
+    # explodes ("can't subtract offset-naive and offset-aware datetimes").
+    if getattr(position.timestamp, "tzinfo", None) is not None:
+        exit_ts = datetime.now(timezone.utc)
+    else:
+        exit_ts = datetime.now()
+
+    trade_log = TradeLog(
+        market_id=position.market_id,
+        side=position.side,
+        entry_price=position.entry_price,
+        exit_price=float(exit_price),
+        quantity=position.quantity,
+        pnl=pnl,
+        entry_timestamp=position.timestamp,
+        exit_timestamp=exit_ts,
+        rationale=f"{position.rationale} | EXIT: {exit_reason} (sell booked)",
+        strategy=position.strategy,
+        exit_reason=exit_reason,
+        mode=position.mode or ("live" if live_mode else "dry"),
+        fee_paid=round(fee_paid, 2),
+    )
+    if position.id is None:
+        return
+    await db_manager.add_trade_log(trade_log)
+    await db_manager.update_position_status(position.id, "closed")
+
+
 async def place_profit_taking_orders(
     db_manager: DatabaseManager,
     kalshi_client: KalshiClient,
@@ -663,6 +730,23 @@ async def place_profit_taking_orders(
                     f"Skipping mid-bucket profit-take for {position.market_id}: "
                     "BTC 15m rides to settlement in LIVE"
                 )
+                continue
+            # HARD LAW: one closer per position, claim before selling. Without
+            # this claim every process and every pass sold the same open row
+            # again - the DRY ledger credited the same contract dozens of
+            # times ("dry limit order ..." repeats) while nothing ever
+            # closed. The claim releases in `finally` only when no sell
+            # booked, so a booked fill can never be re-sold.
+            claimed = False
+            booked = False
+            if position.id is None:
+                continue
+            _pid = int(position.id)
+            try:
+                claimed = await db_manager.claim_position_for_close(_pid)
+            except Exception:  # noqa: BLE001 - a claim failure is a skip
+                claimed = False
+            if not claimed:
                 continue
             try:
                 results["positions_processed"] += 1
@@ -755,7 +839,16 @@ async def place_profit_taking_orders(
                         )
 
                         if success:
+                            booked = True
                             results["orders_placed"] += 1
+                            await _close_after_sell(
+                                db_manager,
+                                position,
+                                exit_price=sell_price,
+                                exit_reason="take_profit",
+                                logger=logger,
+                                live_mode=live_mode,
+                            )
                             logger.info(f"✅ Profit-taking order placed for {position.market_id}")
                         else:
                             logger.error(
@@ -767,6 +860,15 @@ async def place_profit_taking_orders(
                     f"Error processing position {position.market_id} for profit taking: {e}"
                 )
                 continue
+            finally:
+                # Release only a claim that never converted into a booked
+                # sell; a booked fill keeps 'closing' so it can never be
+                # sold a second time.
+                if claimed and not booked:
+                    try:
+                        await db_manager.release_position_claim(_pid)
+                    except Exception:  # noqa: BLE001
+                        pass
 
         logger.info(
             f"🎯 Profit-taking summary: {results['orders_placed']} orders placed from {results['positions_processed']} positions"
@@ -827,6 +929,20 @@ async def place_stop_loss_orders(
                     "BTC 15m rides to settlement in LIVE"
                 )
                 continue
+            # HARD LAW: same claim-first rule as profit-taking; see the
+            # long note there. A stop sold-but-never-closed was the same
+            # money-printer shape.
+            claimed = False
+            booked = False
+            if position.id is None:
+                continue
+            _pid = int(position.id)
+            try:
+                claimed = await db_manager.claim_position_for_close(_pid)
+            except Exception:  # noqa: BLE001 - a claim failure is a skip
+                claimed = False
+            if not claimed:
+                continue
             try:
                 results["positions_processed"] += 1
 
@@ -873,7 +989,16 @@ async def place_stop_loss_orders(
                         )
 
                         if success:
+                            booked = True
                             results["orders_placed"] += 1
+                            await _close_after_sell(
+                                db_manager,
+                                position,
+                                exit_price=stop_price,
+                                exit_reason="stop_loss",
+                                logger=logger,
+                                live_mode=live_mode,
+                            )
                             logger.info(f"✅ Stop-loss order placed for {position.market_id}")
                         else:
                             logger.error(
@@ -883,6 +1008,14 @@ async def place_stop_loss_orders(
             except Exception as e:
                 logger.error(f"Error processing position {position.market_id} for stop loss: {e}")
                 continue
+            finally:
+                # Release only a claim that never converted into a booked
+                # sell; a booked fill keeps 'closing' and can never re-sell.
+                if claimed and not booked:
+                    try:
+                        await db_manager.release_position_claim(_pid)
+                    except Exception:  # noqa: BLE001
+                        pass
 
         logger.info(
             f"🛡️ Stop-loss summary: {results['orders_placed']} orders placed from {results['positions_processed']} positions"

@@ -105,3 +105,38 @@ def test_series_normalization_never_mangles_real_tickers():
     assert _normalize_updown_series("btc15m") == "KXBTC15M"
     assert _normalize_updown_series("XRP15M") == "KXXRP15M"
     assert _normalize_updown_series("") == "KXBTC15M"
+
+
+def test_exit_helpers_claim_before_selling_and_close_after():
+    """The DRY money printer: helpers sold+credited without claim or close.
+
+    Every process re-found the same open row every few seconds and sold it
+    again - cash tripled off duplicate credits with zero closes. Both
+    helpers must claim first, close on a booked sell, and release only when
+    nothing booked.
+    """
+    import inspect
+
+    from src.jobs import execute as ex
+
+    for fn in (ex.place_profit_taking_orders, ex.place_stop_loss_orders):
+        src = inspect.getsource(fn)
+        assert "claim_position_for_close" in src, fn.__name__
+        assert src.index("claim_position_for_close") < src.index("place_sell_limit_order"), fn.__name__
+        assert "_close_after_sell" in src, fn.__name__
+        assert "release_position_claim(_pid)" in src, fn.__name__
+        # Release is conditional on nothing having booked.
+        assert "claimed and not booked" in src, fn.__name__
+
+
+def test_hours_since_matches_timestamp_awareness():
+    """Naive vs aware subtraction crashed every tracking pass for DB rows."""
+    from datetime import datetime, timedelta, timezone
+
+    from src.jobs.track import _hours_since
+
+    naive = datetime.now() - timedelta(hours=2)
+    aware = datetime.now(timezone.utc) - timedelta(hours=2)
+    assert 1.9 < _hours_since(naive) < 2.1
+    assert 1.9 < _hours_since(aware) < 2.1
+    assert _hours_since(None) == 0.0

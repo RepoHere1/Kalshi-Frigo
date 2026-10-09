@@ -36,6 +36,26 @@ def _current_mode() -> str:
     return _resolve_current_mode(_os.getenv("DB_PATH", "trading_system.db"))
 
 
+def _hours_since(ts: Optional[datetime]) -> float:
+    """Hours since ts, matching its timezone-awareness.
+
+    DB rows come back timezone-AWARE (ISO with +00:00) while this module
+    mostly builds naive datetimes; subtracting across the two raises
+    "can't subtract offset-naive and offset-aware datetimes" - which was
+    crashing every tracking pass for those positions, leaving closes
+    half-done and feeding a duplicate-sell loop.
+    """
+    if ts is None:
+        return 0.0
+    if getattr(ts, "tzinfo", None) is not None:
+        from datetime import timezone
+
+        now = datetime.now(timezone.utc)
+    else:
+        now = datetime.now()
+    return (now - ts).total_seconds() / 3600
+
+
 async def _confirm_fill(kalshi_client, position: Position, limit_price: float) -> bool:
     """Best-effort check that a submitted sell actually filled.
 
@@ -250,7 +270,7 @@ async def should_exit_position(
 
     # 4. Time-based exit
     if position.max_hold_hours:
-        hours_held = (datetime.now() - position.timestamp).total_seconds() / 3600
+        hours_held = _hours_since(position.timestamp)
         if hours_held >= position.max_hold_hours:
             return True, "time_based", current_price
 
@@ -903,7 +923,7 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                         current_yes_price if position.side == "YES" else current_no_price
                     )
                     unrealized_pnl = (current_price - position.entry_price) * position.quantity
-                    hours_held = (datetime.now() - position.timestamp).total_seconds() / 3600
+                    hours_held = _hours_since(position.timestamp)
 
                     logger.debug(
                         f"Position {position.market_id} status: "
