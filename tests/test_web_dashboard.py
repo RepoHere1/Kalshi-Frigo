@@ -1261,6 +1261,7 @@ MUTATING_ROUTES = [
     ("/api/strategies/reset-state", {}),
     ("/api/maintenance/lean", {}),
     ("/api/maintenance/backfill-fair", {}),
+    ("/api/maintenance/reconcile-dry", {}),
     ("/api/strategy/ai_directional/toggle", {"mode": "paper"}),
     ("/api/bot/ai_directional/kill", {}),
     ("/api/config", {"max_positions": 5}),
@@ -3328,6 +3329,79 @@ def test_calibration_excludes_phantoms_and_never_says_unknown():
             assert sum(r[1] for r in rows.values()) == 3
 
     asyncio.run(_run())
+
+
+def test_api_trades_lists_rows_with_entry_fair(client, monkeypatch, tmp_path):
+    """Regression: adding entry_fair to the SELECT must be mirrored in the
+    unpack, or the endpoint dies with 'too many values to unpack'."""
+    import asyncio
+
+    import aiosqlite
+
+    db = str(tmp_path / "trades_api.db")
+    monkeypatch.setattr(wd, "DB_PATH", db)
+    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
+
+    async def _seed():
+        async with aiosqlite.connect(db) as conn:
+            await conn.execute(
+                "CREATE TABLE trade_logs (market_id TEXT, side TEXT,"
+                " entry_price REAL, pnl REAL, quantity REAL, exit_timestamp TEXT,"
+                " mode TEXT, strategy TEXT, rationale TEXT, exit_reason TEXT,"
+                " entry_fair REAL)"
+            )
+            await conn.execute(
+                "INSERT INTO trade_logs VALUES ('KX-T','YES',0.5,1.0,2,'t1','dry',"
+                "'btc_updown','r','market_resolution',0.8)"
+            )
+            await conn.commit()
+
+    asyncio.run(_seed())
+    r = client.get("/api/trades?mode=dry")
+    assert r.status_code == 200, r.get_data(as_text=True)
+    trades = r.get_json()["trades"]
+    assert trades and trades[0]["entry_fair"] == 0.8
+
+
+def test_reconcile_dry_credits_the_missing_close_money(
+    client, auth, monkeypatch, tmp_path
+):
+    """The funky-number repair: after it runs, cash equals starting +
+    realized (nothing open), the gap was booked as ONE 'adjust' row, and a
+    second run is a no-op."""
+    import asyncio
+
+    from src.utils.mode import TradingMode, run
+
+    db = str(tmp_path / "reconcile.db")
+    monkeypatch.setattr(wd, "DB_PATH", db)
+    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
+    m = TradingMode(db_path=db)
+    # A real entry debit with no booked close credit: the exact hole shape.
+    run(
+        m.record_fill(
+            market_id="KTEST", side="YES", action="buy", quantity=10, price=0.5
+        )
+    )
+
+    r1 = client.post("/api/maintenance/reconcile-dry", headers=auth)
+    assert r1.status_code == 200, r1.get_data(as_text=True)
+    body = r1.get_json()
+    assert body["ok"] is True
+    acct = run(m.dry_account())
+    assert abs(
+        acct["cash"] - (acct["starting_balance"] + acct["realized"] - acct["deployed"])
+    ) < 0.01
+    ledger = run(m.ledger(50))
+    assert any(
+        row.get("action") == "adjust" and "reconciliation" in (row.get("note") or "")
+        for row in ledger
+    )
+
+    r2 = client.post("/api/maintenance/reconcile-dry", headers=auth)
+    body2 = r2.get_json()
+    assert abs(body2["delta"]) < 0.01
+    assert body2.get("applied") is None
 
 
 def test_parse_entry_fair_reads_the_chosen_side():

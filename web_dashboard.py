@@ -3068,6 +3068,96 @@ def api_maintenance_backfill_fair():
     )
 
 
+@app.route("/api/maintenance/reconcile-dry", methods=["POST"])
+def api_maintenance_reconcile_dry():
+    """One-time DRY ledger repair: credit the close money the book never got.
+
+    Reconciliation identity — the simulated cash must equal
+        starting + realized (trade logs) − cost of open positions.
+    The gap is money that was never booked: pre-payout-fix resolution
+    winners, phantom reaper closes (entered, never filled, never credited),
+    and fee drift. This computes the delta from the DB itself and books it
+    as ONE 'adjust' ledger row naming the repair. Idempotent: a second run
+    finds ~$0 and changes nothing.
+    """
+    denied = require_token()
+    if denied is not None:
+        return denied
+    import aiosqlite as _a
+
+    async def _work() -> Dict[str, Any]:
+        mode = _mode_manager()
+        acct = await mode.dry_account()
+        cash = float(acct.get("cash") or 0.0)
+        realized = float(acct.get("realized") or 0.0)
+        starting = float(acct.get("starting_balance") or 200.0)
+        deployed = 0.0
+        phantom_cost = 0.0
+        phantoms = 0
+        async with _a.connect(DB_PATH) as conn:
+            conn.row_factory = lambda c, r: dict(
+                zip([d[0] for d in c.description], r)
+            )
+
+            async def _has(table: str) -> bool:
+                cur = await conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                )
+                return await cur.fetchone() is not None
+
+            if await _has("positions"):
+                cur = await conn.execute(
+                    "SELECT COALESCE(ROUND(SUM(entry_price*quantity),2),0) AS cost,"
+                    " COUNT(*) AS n FROM positions WHERE status='open'"
+                    " AND COALESCE(NULLIF(mode,''),'dry')='dry'"
+                )
+                row = await cur.fetchone()
+                deployed = float(row["cost"] or 0.0)
+            if await _has("trade_logs"):
+                cur = await conn.execute(
+                    "SELECT COALESCE(ROUND(SUM(entry_price*quantity),2),0) AS pc,"
+                    " COUNT(*) AS n FROM trade_logs"
+                    " WHERE exit_reason='no_kalshi_position'"
+                    " AND COALESCE(NULLIF(mode,''),'dry')='dry'"
+                )
+                row = await cur.fetchone()
+                phantom_cost = float(row["pc"] or 0.0)
+                phantoms = int(row["n"] or 0)
+        expected = round(starting + realized - deployed, 2)
+        delta = round(expected - cash, 2)
+        if abs(delta) > 1000.0:
+            return {
+                "ok": False,
+                "error": f"refusing a ${delta:.2f} adjustment - outside sanity",
+            }
+        applied = None
+        if abs(delta) > 0.01:
+            note = (
+                "reconciliation repair: close credits missing from the ledger "
+                f"(phantom reaper closes ${phantom_cost:.2f} across {phantoms}; "
+                "pre-payout-fix resolutions and fee drift make up the rest)"
+            )
+            applied = await mode.adjust_cash(delta, note)
+        return {
+            "ok": True,
+            "starting": starting,
+            "realized": realized,
+            "deployed": deployed,
+            "cash_before": cash,
+            "cash_expected": expected,
+            "delta": delta,
+            "phantom_cost": phantom_cost,
+            "phantoms": phantoms,
+            "applied": applied,
+        }
+
+    try:
+        return jsonify(_run_async(_work()))
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/dry/ledger")
 def api_dry_ledger():
     """Recent simulated fills."""
@@ -3110,7 +3200,8 @@ def api_trades():
                     rows = await cur.fetchall()
             trades = []
             for (market_id, side, entry_price, pnl, quantity, exit_ts,
-                 mode, strategy, rationale, exit_reason, cost_basis) in rows:
+                 mode, strategy, rationale, exit_reason, entry_fair,
+                 cost_basis) in rows:
                 trades.append({
                     "market_id": market_id,
                     "side": side,
@@ -3123,6 +3214,9 @@ def api_trades():
                     "strategy": strategy or "",
                     "rationale": rationale or "",
                     "exit_reason": exit_reason or "",
+                    "entry_fair": (
+                        float(entry_fair) if entry_fair is not None else None
+                    ),
                 })
             return {"trades": trades, "mode_filter": mode_filter or "all"}
         

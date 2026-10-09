@@ -652,6 +652,51 @@ class TradingMode:
             await conn.commit()
             return {"cash": round(cash_f, 2), "amount": amount}
 
+    async def adjust_cash(self, delta: float, note: str = "") -> Dict[str, Any]:
+        """One-off simulated-cash correction, logged as an 'adjust' row.
+
+        Used by the reconciliation repair: historical close credits that
+        never reached the ledger (pre-payout-fix resolution winners, phantom
+        reaper closes, fee drift) are trued up in ONE auditable entry so the
+        book's cash tells the same story as the trade logs. Same
+        BEGIN IMMEDIATE discipline as record_fill: the balance and the
+        ledger row move together or not at all.
+        """
+        delta = round(float(delta), 2)
+        async with self._conn() as conn:
+            try:
+                await conn.execute("BEGIN IMMEDIATE")
+            except Exception:  # noqa: BLE001 - already in a transaction
+                pass
+            cash = await self._get(conn, _CASH_KEY)
+            starting = await self._get(conn, _START_KEY)
+            starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
+            cash_f = float(cash) if cash is not None else starting_f
+            new_cash = round(cash_f + delta, 2)
+            if new_cash < 0.0:
+                raise ModeError(
+                    f"adjustment would push simulated cash negative: "
+                    f"${new_cash:.2f} from ${cash_f:.2f}"
+                )
+            await self._set(conn, _CASH_KEY, str(new_cash))
+            await conn.execute(
+                "INSERT INTO dry_ledger (ts, market_id, side, action, quantity,"
+                " price, amount, cash_after, note) VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    _now(),
+                    "RECONCILIATION",
+                    "-",
+                    "adjust",
+                    0.0,
+                    0.0,
+                    delta,
+                    new_cash,
+                    note,
+                ),
+            )
+            await conn.commit()
+            return {"delta": delta, "cash": new_cash, "note": note}
+
     async def repair_dry_book(self) -> Dict[str, Any]:
         """Reconcile the DRY book against its own ledger and report the repairs.
 
