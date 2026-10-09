@@ -290,6 +290,16 @@ baseline.
     **legacy / other**, and can never render 'unknown' again. Every row is classified or excluded
     by rule — no guessing, no mystery bins.
 
+57. **Zero unknowns — the last 15 named themselves (2026-10-09).** Peeling the 'unknown' bin to
+    the bottom: (a) phantom rows (`exit_reason='no_kalshi_position'`) are excluded from the
+    calibration card by law; (b) certain-win pair legs get their own bin; (c) the final 15 were
+    trades where the model's fair **clamps to exactly 1.00** (spot past the deadband =
+    near-certainty) — and `_parse_entry_fair`'s sanity bound `0.0 < val < 1.0` silently rejected
+    exactly 1.00. The bound now accepts `<= 1.0`, the backfill re-ran (**574 logs + 619 positions
+    identified**), and those rows correctly band into '0.85 up'. The report card now shows ONLY
+    real calibration bands — the confidence→win-rate curve: 70.3% → 74.6% → 78.9% → 75.8% across
+    0.55→0.85+, every band net positive, no mystery bins.
+
 ---
 
 *Written 2026-10-09. If you are an AI reading this: the invariants in §1–§5 are the constitution —
