@@ -10,7 +10,7 @@ This job monitors open positions and implements smart exit strategies:
 """
 import asyncio
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 from src.clients.kalshi_client import KalshiClient
 from src.config.settings import settings
@@ -127,6 +127,7 @@ async def should_exit_position(
     current_no_price: float,
     market_status: str,
     market_result: Optional[str] = None,
+    kalshi_client: Optional[Any] = None,
 ) -> tuple[bool, str, float]:
     """
     Determine if position should be exited based on smart exit strategies.
@@ -172,22 +173,31 @@ async def should_exit_position(
         )
 
         if should_trigger:
-            # Validate there's sufficient volume to exit at stop price
-            # Otherwise we're stuck waiting for a fill that may never come
-            from src.clients.kalshi_client import KalshiClient
-            from src.utils.mode import get_mode
-            
-            # Get current position to access kalshi_client
-            mode = get_mode()
-            
-            # Only check volume if we have access to orderbook
-            # Volume filter: need at least 5x position size available
+            # Validate there's sufficient volume to exit at stop price.
+            # The old code referenced a `kalshi_client` that was never a
+            # parameter of this function - a NameError every time a stop
+            # triggered, crashing the tracking pass for that position
+            # ("name 'kalshi_client' is not defined"). The client arrives as
+            # an argument now; with no client the volume filter is skipped
+            # and the stop is allowed to fire - a stop that cannot be checked
+            # must still be able to fire.
+            if kalshi_client is None:
+                expected_pnl = StopLossCalculator.calculate_pnl_at_stop_loss(
+                    entry_price=position.entry_price,
+                    stop_loss_price=position.stop_loss_price,
+                    quantity=position.quantity,
+                    side=position.side,
+                )
+                return True, f"stop_loss_triggered_pnl_{expected_pnl:.2f}", current_price
             min_volume_required = position.quantity * 5
             available_volume = await _get_orderbook_volume(
                 kalshi_client, position.market_id, position.side, position.stop_loss_price
             )
-            
-            if available_volume >= min_volume_required:
+            # Unknown depth (unreadable/empty book reads 0) must not block a
+            # stop: a stranded loser is worse than a resting sell order.
+            # Only a genuinely thin read (some depth, below the 5x rule)
+            # holds the position back.
+            if available_volume <= 0.0 or available_volume >= min_volume_required:
                 # Calculate the actual loss to log it
                 expected_pnl = StopLossCalculator.calculate_pnl_at_stop_loss(
                     entry_price=position.entry_price,
@@ -217,13 +227,17 @@ async def should_exit_position(
             take_profit_triggered = current_price <= position.take_profit_price
 
         if take_profit_triggered:
-            # Validate there's sufficient volume to exit at take-profit price
+            # Volume check only with a live client; no client must not crash
+            # the exit path (same NameError bug the stop branch carried).
+            if kalshi_client is None:
+                return True, "take_profit", current_price
             min_volume_required = position.quantity * 5
             available_volume = await _get_orderbook_volume(
                 kalshi_client, position.market_id, position.side, position.take_profit_price
             )
-            
-            if available_volume >= min_volume_required:
+            # Same rule as the stop branch: no depth data -> let the exit
+            # fire (the order can rest); only a truly thin book blocks.
+            if available_volume <= 0.0 or available_volume >= min_volume_required:
                 return True, "take_profit", current_price
             else:
                 # Not enough volume - log and hold
@@ -650,7 +664,12 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
 
                 # Check if position should be exited (market resolution, time-based, etc.)
                 should_exit, exit_reason, exit_price = await should_exit_position(
-                    position, current_yes_price, current_no_price, market_status, market_result
+                    position,
+                    current_yes_price,
+                    current_no_price,
+                    market_status,
+                    market_result,
+                    kalshi_client=kalshi_client,
                 )
 
                 if should_exit:
