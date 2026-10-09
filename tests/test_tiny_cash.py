@@ -187,8 +187,10 @@ def test_vol_rich_never_raises_the_bar_only_annotates():
 # Fractional Kelly: the compounding engine
 # ---------------------------------------------------------------------------
 def test_kelly_scales_the_clip_with_the_edge():
-    """Quarter-Kelly on a real edge: $10 book, fair 0.75 at 0.55 ->
-    k* = 0.20/0.45 = 0.444, k_quarter = 0.111 -> clip $1.11 -> 2 contracts."""
+    """Quarter-Kelly on a real edge, THEN conviction on top: $10 book,
+    fair 0.75 at 0.55 -> k* = 0.20/0.45 = 0.444, k_quarter = 0.111 ->
+    clip $1.11; the view is >= strong_prob so conviction doubles it to
+    ~$2.22 -> 4 contracts."""
     import src.jobs.ladder_trader as lt
 
     trader = _trader()
@@ -202,13 +204,16 @@ def test_kelly_scales_the_clip_with_the_edge():
         mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.75)
         signal = trader.evaluate(market, live=True)
     assert signal is not None and signal.side == "up"
-    assert signal.contracts == 2
-    assert signal.notional == pytest.approx(1.10, abs=0.01)
+    assert signal.contracts == 4
+    assert signal.notional == pytest.approx(2.20, abs=0.01)
 
 
 def test_kelly_cap_bounds_a_single_clip():
-    """Fair 0.95 at 0.70: k* = 0.833 but kelly_scale=0.25 gives k_quarter = 0.208.
-    This is well under the kelly_cap=0.35, so kelly_cap doesn't bind."""
+    """Fair 0.95 at 0.70: k* = 0.833 but kelly_scale=0.25 gives k_quarter =
+    0.208 -> clip $2.08 -> 2 contracts; conviction doubles to ~$4.16 ->
+    5 contracts, still under the 0.5-of-balance ceiling ($5 on a $10
+    book). kelly_cap=0.35 never binds at quarter scale - the conviction
+    ceiling is the binding money law now."""
     import src.jobs.ladder_trader as lt
 
     trader = _trader()
@@ -221,10 +226,9 @@ def test_kelly_cap_bounds_a_single_clip():
         mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.95)
         signal = trader.evaluate(market, live=True)
     assert signal is not None and signal.side == "up"
-    # kelly_scale=0.25: clip ~$2.08 * 0.25 = $0.52 but we see 2 contracts at ~$1.40
-    # This is bounded by kelly_cap=0.35: 10 * 0.25 * 0.35 = $0.875 still undersized
-    assert signal.contracts == 2
-    assert signal.notional == pytest.approx(1.40, abs=0.01)
+    assert signal.contracts == 5
+    assert signal.notional == pytest.approx(3.50, abs=0.01)
+    assert signal.notional <= 10.0 * trader.config.conviction_max_fraction + 0.01
 
 
 def test_maker_entries_stop_at_75c_takers_stop_at_60c():
@@ -288,7 +292,9 @@ def test_ninety_cents_hard_block_holds_for_makers_too():
 
 def test_dry_mirrors_kelly_on_its_own_cash():
     """The law: the same sizing rule, on the DRY book's own money.
-    Quarter-Kelly: 300 x 0.111 = $33.30 -> 60 contracts at 0.55."""
+    Quarter-Kelly: 300 x 0.111 = $33.30 -> 60 contracts at 0.55; the
+    strong view (0.75) doubles via conviction -> $66.60 -> 121 contracts,
+    still under the 0.5-of-book ceiling."""
     import src.jobs.ladder_trader as lt
 
     trader = _trader()
@@ -301,7 +307,8 @@ def test_dry_mirrors_kelly_on_its_own_cash():
         mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.75)
         signal = trader.evaluate(market, live=False)
     assert signal is not None and signal.side == "up"
-    assert signal.contracts == 60
+    assert signal.contracts == 121
+    assert signal.notional <= 300.0 * trader.config.conviction_max_fraction + 0.01
 
 
 # ---------------------------------------------------------------------------
