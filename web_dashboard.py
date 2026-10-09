@@ -1922,6 +1922,11 @@ def _parse_entry_fair(rationale: Any) -> Optional[float]:
     +0.183". Used by the backfill endpoint to identify historical trades
     that predate the entry_fair column. Returns None (never a guess) when
     the text does not prove the value.
+
+    Bounds are `0.0 < val <= 1.0`: the model's fair legitimately CLAMPS to
+    exactly 1.00 when spot is past the deadband (near-certainty), and the
+    strict `< 1.0` bound silently rejected exactly those rows - the last 15
+    'unknown' calibration trades were all `fair 1.00`.
     """
     import re as _re
 
@@ -1932,7 +1937,7 @@ def _parse_entry_fair(rationale: Any) -> Optional[float]:
         val = float(m.group(1))
     except ValueError:
         return None
-    return val if 0.0 < val < 1.0 else None
+    return val if 0.0 < val <= 1.0 else None
 
 
 _SQL_FAIR_BANDS = (
