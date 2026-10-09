@@ -209,13 +209,23 @@ class UpDownConfig:
     # QUICK_WIN: safe high-confidence mode for tiny accounts ($7).
     # Only takes very certain trades (high edge, sweet spot only), very small clips,
     # quick exit. No unlimited leverage — just faster capture of confirmed edges.
-    quick_win_enabled: bool = False  # Enable via QUICK_WIN_ENABLED=1
-    quick_win_edge: float = 0.15     # 15% min edge (very high confidence only)
+    quick_win_enabled: bool = False  # DEAD: experiment removed 2026-10-09
+    quick_win_edge: float = 0.15     # (kept only for the entry clamp default)
     quick_win_max_clip_usd: float = 6.00  # Scaled to $7 account: take $6 wins
     quick_win_profit_target: float = 0.08  # 8% quick profit take
     quick_win_stop_loss: float = 0.03      # 3% tight stop
     quick_win_sweet_low: float = 0.30
     quick_win_sweet_high: float = 0.45
+
+    # CERTAIN-WIN PAIR (the operator's "take larger amounts on a provable
+    # win" rule). YES + NO together pay exactly $1.00 at settlement; when both
+    # ASKS plus both taker fees leave a net, buying both sides is arithmetic,
+    # not a prediction. This is the one place size may be larger than an edge
+    # clip - bounded by cash and the notional law, never unlimited.
+    certain_win_enabled: bool = True
+    certain_win_min_net: float = 0.015   # $ net per pair, after both fees
+    certain_win_max_usd: float = 50.0    # per-pair budget cap
+    certain_win_cash_fraction: float = 0.5
 
     def __post_init__(self) -> None:
         import os as _os
@@ -243,22 +253,23 @@ class UpDownConfig:
             self.dry_maker_entry = False
         if _os.environ.get("VENUE_GUARD", "1") != "1":
             self.venue_guard_enabled = False
+        if _os.environ.get("CERTAIN_WIN", "1") != "1":
+            self.certain_win_enabled = False
+        if _os.environ.get("CERTAIN_WIN_MIN_NET"):
+            try:
+                self.certain_win_min_net = float(_os.environ["CERTAIN_WIN_MIN_NET"])
+            except ValueError:
+                pass
         if _os.environ.get("POLY_GUARD", "1") != "1":
             self.poly_guard_enabled = False
         if _os.environ.get("VOL_EDGE", "1") != "1":
             self.vol_edge_enabled = False
         if _os.environ.get("KELLY_SIZING", "1") != "1":
             self.kelly_sizing = False
-        if _os.environ.get("QUICK_WIN_ENABLED", "") == "1":
-            self.quick_win_enabled = True
-            # Quick win: very tight high-confidence mode for tiny accounts.
-            # Only takes 15%+ edge, tight sweet band 0.30-0.45, $0.50 max clip,
-            # 8% quick profit, 3% stop. No maker-only delay — takes immediately.
-            self.min_edge = max(self.min_edge, self.quick_win_edge)
-            self.max_entry_price = self.quick_win_sweet_high
-            self.min_entry_price = self.quick_win_sweet_low
-            self.notional_usd = self.quick_win_max_clip_usd
-            self.maker_only_mode = False  # Take immediately for speed
+        # (The QUICK_WIN experiment is removed for good: it forced a 15%
+        # minimum edge no real 15-minute market clears, which - stacked with
+        # the venue-guard scoping bug - is why every lane sat silent. The
+        # fields above remain as inert defaults for the entry clamp only.)
         try:
             self.kelly_scale = float(_os.environ.get("KELLY_SCALE", self.kelly_scale))
             self.kelly_cap = float(_os.environ.get("KELLY_CAP", self.kelly_cap))
@@ -278,10 +289,13 @@ class UpDownConfig:
     # "one clip per market" guard was removed; this is what replaces it as the
     # anti-churn rule - repeated buys of the same contract are allowed, but only
     # while the contract is still more likely than not to pay.
-    min_win_prob: float = 0.60
-    # (removed the edge-override escape: a sub-0.60 win probability cannot be
+    min_win_prob: float = 0.55
+    # (removed the edge-override escape: a sub-0.55 win probability cannot be
     # guaranteed a profitable pre-settlement exit on a 15-min bucket, so it is
-    # now refused outright rather than bought on the mispricing theory)
+    # refused outright rather than bought on the mispricing theory. Lowered
+    # 0.60 -> 0.55 on 2026-10-09: 0.60 + the fee-aware edge gate stacked into
+    # never trading on near-the-money dislocations the market genuinely
+    # mispriced; 0.55 keeps the majority-odds rule while letting those fire)
     # SURVIVAL / HYPER-CAUTION: when the real balance is at or below
     # `survival_floor_usd`, the book is one losing clip from being unable to
     # trade at all (no outside funding will ever arrive). So it raises the bar
@@ -321,7 +335,13 @@ class UpDownConfig:
         asset (XRP) or Gold (XAU) is not graded against BTC's microstructure
         defaults. Unknown products keep BTC defaults unchanged.
         """
-        tuning = ASSET_TUNING.get((spot_product or "").strip().upper())
+        _prod = (spot_product or "").strip().upper()
+        # Gold proxy: Coinbase has no XAU-USD product, so the gold lane prices
+        # against PAXG-USD (1 troy oz of tokenised gold). Grade it with the
+        # XAU tuning rather than BTC's microstructure defaults.
+        if _prod == "PAXG-USD":
+            _prod = "XAU-USD"
+        tuning = ASSET_TUNING.get(_prod)
         if not tuning:
             return
         self.noise_pct = tuning["noise_pct"]
@@ -374,6 +394,9 @@ class UpDownBook:
     skipped_poly_divergence: int = 0
     last_error: str = ""
     dry: bool = True
+    # CERTAIN-WIN pair counters (the arithmetic-only trades).
+    certain_wins: int = 0
+    certain_win_net: float = 0.0
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -397,6 +420,8 @@ class UpDownBook:
             "skipped_poly_divergence": self.skipped_poly_divergence,
             "last_error": self.last_error,
             "dry": self.dry,
+            "certain_wins": self.certain_wins,
+            "certain_win_net": round(self.certain_win_net, 4),
         }
 
 
@@ -509,6 +534,13 @@ class UpDownTrader:
         self.venue_guard = VenueDislocation(
             max_dislocation_usd=0.0  # set dynamically per-market
         )
+        # SCOPE THE GUARD TO THE BTC LANE. The Kraken/Bitstamp feeds inside
+        # VenueDislocation are hardcoded BTC pairs; on any other underlying
+        # the "dislocation" compared BTC's price (~81,707) against, say,
+        # XRP's 1.38 and vetoed every single entry forever ("gap +81,707").
+        # A dislocation read only exists for the asset those feeds carry.
+        if getattr(feed, "series", "KXBTC15M") != "KXBTC15M":
+            self.config.venue_guard_enabled = False
         # Polymarket same-window scanner + Hyperliquid mark (both keyless).
         from src.jobs.cross_venue_poly import PolyScanner
         from src.jobs.vol_edge import HyperliquidMark
@@ -517,6 +549,10 @@ class UpDownTrader:
         self.hl = HyperliquidMark()
         self.poly_arb_last: Optional[Dict[str, Any]] = None
         self._vol_adj: float = 0.0
+        # Certain-win pair bookkeeping: cooldown + max rounds per ticker, so
+        # the arithmetic trade repeats a few times per market at most.
+        self._cw_last: Dict[str, float] = {}
+        self._cw_rounds: Dict[str, int] = {}
         self._sigma_used: Optional[float] = None
         self._impl_sigma: Optional[float] = None
         # Per-pass book balances, for the Kelly sizer. DRY caches its own
@@ -1307,6 +1343,123 @@ class UpDownTrader:
                 self.book.last_error = f"orphan cleanup failed: {type(exc).__name__}: {exc}"
         return filled
 
+    async def _certain_win_pair(self, market: Any, live: bool) -> bool:
+        """Buy BOTH sides when YES+NO cost less than $1.00 after both fees.
+
+        The pair pays $1.00 at settlement whatever happens, so this is the
+        only trade in the book that is arithmetic instead of prediction -
+        which is why it may take a larger slice (still capped by cash and the
+        notional law). Both legs are taker: resting an "instant" arb risks
+        one leg never filling while the other market runs away. Every leg is
+        inserted and funded through the same canonical path as any clip, so
+        DRY rehearses exactly what LIVE does.
+        """
+        from src.jobs import certain_win as _cw
+        from src.jobs.execute import execute_position
+        from src.utils.database import DatabaseManager, Position
+
+        if market is None:
+            return False
+        up_ask = float(getattr(market, "up_price", 0.0) or 0.0)
+        down_ask = float(getattr(market, "down_price", 0.0) or 0.0)
+        ok, net = _cw.evaluate(up_ask, down_ask, self.config.certain_win_min_net)
+        if not ok:
+            return False
+
+        import time as _time
+
+        now = _time.monotonic()
+        if now - float(self._cw_last.get(market.ticker, 0.0)) < 120.0:
+            return False
+        if int(self._cw_rounds.get(market.ticker, 0)) >= 3:
+            return False
+
+        if self.db_manager is None:
+            self.db_manager = DatabaseManager()
+            await self.db_manager.initialize()
+        if self._client is None:
+            try:
+                from src.clients.kalshi_client import KalshiClient
+
+                self._client = KalshiClient()
+            except Exception as exc:  # noqa: BLE001
+                self.book.last_error = f"certain_win: no Kalshi client: {exc}"
+                return False
+
+        avail = self._live_balance if live else self._dry_cash_cache
+        avail = float(avail or 0.0)
+        if avail <= 0.0:
+            return False
+        budget = min(
+            self.config.certain_win_max_usd,
+            avail * self.config.certain_win_cash_fraction,
+            self.config.max_open_notional,
+        )
+        contracts = _cw.contracts_for(up_ask, down_ask, budget)
+        if contracts < 1:
+            return False
+
+        placed: List[str] = []
+        for side, price in (("YES", up_ask), ("NO", down_ask)):
+            position = Position(
+                market_id=market.ticker,
+                side=side,
+                entry_price=round(float(price), 4),
+                quantity=contracts,
+                timestamp=_utcnow(),
+                rationale=(
+                    f"CERTAIN-WIN pair ({self.lane.upper()}): both sides of "
+                    f"{market.ticker} for {contracts} x "
+                    f"${up_ask + down_ask:.3f} = ${net:.3f}/pair net after fees"
+                ),
+                confidence=0.99,
+                live=live,
+                strategy=self.lane,
+                mode="live" if live else "dry",
+            )
+            try:
+                position_id = await self.db_manager.add_position(
+                    position, allow_duplicate=True
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.book.last_error = (
+                    f"certain_win insert failed: {type(exc).__name__}: {exc}"
+                )
+                continue
+            if position_id is None:
+                continue
+            position.id = position_id
+            try:
+                filled = await execute_position(
+                    position, live, self.db_manager, self._client
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.book.last_error = (
+                    f"certain_win submit failed: {type(exc).__name__}: {exc}"
+                )
+                filled = False
+            if filled:
+                placed.append(side)
+            else:
+                try:
+                    await self.db_manager.delete_position(position_id)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        if len(placed) == 2:
+            self._cw_last[market.ticker] = now
+            self._cw_rounds[market.ticker] = self._cw_rounds.get(market.ticker, 0) + 1
+            self.book.certain_wins += 1
+            self.book.certain_win_net += net * contracts
+            return True
+        if len(placed) == 1:
+            # Leg risk: one side filled. Flag loudly; tracking manages the
+            # single leg like any other position.
+            self.book.last_error = (
+                f"certain_win LEG RISK: only {placed[0]} filled on {market.ticker}"
+            )
+        return False
+
     async def cycle(self) -> Dict[str, Any]:
         """One pass: refresh the series, score it, take at most one trade."""
         from src.jobs.broker import should_trade_live
@@ -1445,6 +1598,19 @@ class UpDownTrader:
                 self._dry_cash_cache = cents / 100.0
         except Exception as exc:  # noqa: BLE001
             self.book.last_error = f"balance read: {type(exc).__name__}: {exc}"
+
+        # CERTAIN-WIN PAIR: a binary contract's two sides pay $1.00 together.
+        # When both asks plus both taker fees leave a net, buying BOTH is the
+        # one trade here that is not a prediction - sized larger than an edge
+        # clip because it cannot lose, still capped by cash and the notional
+        # law. Fired before scoring: it needs no view on anything.
+        if self.config.certain_win_enabled and market is not None:
+            try:
+                if await self._certain_win_pair(market, live):
+                    return self.book.summary()
+            except Exception as exc:  # noqa: BLE001 - never block the cycle
+                self.book.last_error = f"certain_win: {type(exc).__name__}: {exc}"
+
         # Variance-commensurate sizing: the bigger Kalshi's lie
         # (spot far from target with minutes to close), the bigger the clip
         # -- up to 2.5x -- because convergence is proportionally more
@@ -1666,7 +1832,7 @@ class UpDownTrader:
                 "required_edge": round(
                     self.config.min_edge
                     + (0.07 * (1.0 - float(signal.ask or 0.5))
-                       if (live or self.config.dry_fee_enabled) else 0.0)
+                       if (signal and (live or self.config.dry_fee_enabled)) else 0.0)
                     + _session_bump,
                     4,
                 ),

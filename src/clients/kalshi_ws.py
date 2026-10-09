@@ -231,13 +231,25 @@ class KalshiWebSocket(TradingLoggerMixin):
 
         self.logger.info("Connecting to Kalshi WebSocket", url=ws_url)
         try:
-            self._ws = await websockets.connect(
-                ws_url,
-                additional_headers=headers,
+            _conn_kwargs = dict(
                 ping_interval=None,   # we handle pings ourselves
                 ping_timeout=None,
                 close_timeout=5,
             )
+            # The header kwarg was renamed across websockets majors: v13+
+            # wants `additional_headers`, the pinned v12 wants `extra_headers`.
+            # Passing the wrong one left the socket dead with
+            # "create_connection() got an unexpected keyword argument", which
+            # is why the BRTI truth feed sat permanently degraded. Try the
+            # pinned spelling first, fall back to the newer one.
+            try:
+                self._ws = await websockets.connect(
+                    ws_url, extra_headers=headers, **_conn_kwargs
+                )
+            except TypeError:
+                self._ws = await websockets.connect(
+                    ws_url, additional_headers=headers, **_conn_kwargs
+                )
             self._state = ConnectionState.CONNECTED
             self.logger.info("WebSocket connected")
         except Exception as exc:

@@ -4,4 +4,3 @@ builder = "railpack"
 [env]
 LIVE_TRADING_ENABLED = "true"
 DB_PATH = "/data/trading_system.db"
-QUICK_WIN_ENABLED = "1"

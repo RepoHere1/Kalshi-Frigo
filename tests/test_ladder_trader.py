@@ -244,7 +244,7 @@ def test_limits_are_hard_defaults():
     # is money (total open notional) and probability (min_win_prob).
     assert not hasattr(c, "max_open_positions")
     assert c.max_open_notional == 25.0
-    assert c.min_win_prob == 0.60
+    assert c.min_win_prob == 0.55
 
 
 def test_book_summary_reports_the_limits_it_enforces():
@@ -279,7 +279,7 @@ def test_the_opposite_side_of_the_same_contract_is_still_blocked():
 
 def test_an_entry_under_min_win_prob_is_refused():
     trader = UpDownTrader(SpotFeed(), Btc15mFeed())
-    # fair=0.89 for up -> a DOWN clip has win_prob 0.11, below min_win_prob 0.60.
+    # fair=0.89 for up -> a DOWN clip has win_prob 0.11, below min_win_prob 0.55.
     # A MARGINAL edge (under the 0.25 override) is still refused by the floor;
     # only a large genuine dislocation overrides it.
     down = _signal("KXBTC15M-26OCT011715-15", side="down", ask=0.5, contracts=8)
@@ -291,7 +291,7 @@ def test_an_entry_under_min_win_prob_is_refused():
 
 def test_a_large_edge_does_not_override_min_win_prob():
     trader = UpDownTrader(SpotFeed(), Btc15mFeed())
-    # Even a big edge must NOT override a sub-0.60 win probability: a 9%-chance
+    # Even a big edge must NOT override a sub-0.55 win probability: a 9%-chance
     # bet held to a 15-min settlement is a loss, not a dislocation win. The
     # edge-override escape was removed because the live log proved these trades
     # held to market_resolution and bled.

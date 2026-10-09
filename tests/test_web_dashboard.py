@@ -1257,6 +1257,7 @@ MUTATING_ROUTES = [
     ("/api/mode", {"mode": "dry"}),
     ("/api/dry/reset", {}),
     ("/api/strategies/reset-state", {}),
+    ("/api/maintenance/lean", {}),
     ("/api/strategy/ai_directional/toggle", {"mode": "paper"}),
     ("/api/bot/ai_directional/kill", {}),
     ("/api/config", {"max_positions": 5}),

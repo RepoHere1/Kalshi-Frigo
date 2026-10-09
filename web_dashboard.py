@@ -147,8 +147,8 @@ strategy_state = {
 STRATEGY_COMMANDS: Dict[str, List[str]] = {
     "btc_updown": ["cli.py", "run", "--btc-updown", "--paper", "--loop", "--interval", "0"],
     "xrp_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRP15M", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
-    "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXAU15M", "--spot-product", "XAU-USD", "--paper", "--loop", "--interval", "0"],
-    "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXAU15M", "--spot-product", "XAU-USD", "--paper", "--loop", "--interval", "0"],
+    "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXAU15M", "--spot-product", "PAXG-USD", "--paper", "--loop", "--interval", "0"],
+    "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXAU15M", "--spot-product", "PAXG-USD", "--paper", "--loop", "--interval", "0"],
     "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETH15M", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
     "hyperliquid_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPE15M", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
     "ai_directional": ["cli.py", "run", "--paper", "--loop", "--interval", "300"],
@@ -895,7 +895,7 @@ STRATEGY_DOCS = {
     "xau_updown": (
         "GOLD 15-Min Up/Down",
         'Reads Kalshi\'s GOLD 15-min up/down contract (KXXAU15M) and compares its Up/Down price '
-        "against live Coinbase XAU-USD spot. Takes one $5 clip only when the two disagree "
+        "against live Coinbase PAXG-USD spot (the tradable gold proxy - "
         "by more than the configured edge. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "
         "keeps running until you press Stop - nothing re-arms it for you.",
@@ -2837,6 +2837,54 @@ def api_strategies_reset_state():
         "strategy", {"action": "latch_reset", "killed": killed, "cleared": cleared}
     )
     return jsonify({"ok": True, "killed": killed, "lanes_cleared": cleared})
+
+
+@app.route("/api/maintenance/lean", methods=["POST"])
+def api_maintenance_lean():
+    """Lean the volume: drop dead tables, fold the WAL, compact the file.
+
+    The volume carries years of schema history. This does the surgical,
+    data-preserving clean-up only: drop the one known-dead table
+    (`strategy_runtime_legacy`, superseded by the live table), checkpoint the
+    write-ahead log back into the database, and VACUUM. It touches no trades,
+    no positions, no ledger, no settings.
+    """
+    denied = require_token()
+    if denied is not None:
+        return denied
+    import aiosqlite
+
+    def _sizes() -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        for suffix, tag in (("", "db"), ("-wal", "wal"), ("-shm", "shm")):
+            try:
+                out[tag] = os.path.getsize(f"{DB_PATH}{suffix}")
+            except OSError:
+                out[tag] = 0
+        return out
+
+    before = _sizes()
+    dropped: List[str] = []
+
+    async def _run() -> None:
+        async with aiosqlite.connect(DB_PATH) as conn:
+            cur = await conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='strategy_runtime_legacy'"
+            )
+            if await cur.fetchone():
+                await conn.execute("DROP TABLE strategy_runtime_legacy")
+                dropped.append("strategy_runtime_legacy")
+            await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            await conn.execute("VACUUM")
+            await conn.commit()
+
+    try:
+        _run_async(_run())
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+    after = _sizes()
+    return jsonify({"ok": True, "dropped": dropped, "before": before, "after": after})
 
 
 @app.route("/api/dry/ledger")
