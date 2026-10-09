@@ -256,6 +256,12 @@ class UpDownConfig:
     marginal_prob: float = 0.65
     marginal_edge_scale: float = 1.0
 
+    # CONVICTION MULTIPLIER (new): the tiered bar finds the high-confidence
+    # trades; this sizes them up to `conviction_mult` x on top of Kelly.
+    # Bounded by every existing money cap - sizing never escapes a law.
+    conviction_sizing: bool = True
+    conviction_mult: float = 2.0
+
     def __post_init__(self) -> None:
         import os as _os
 
@@ -508,6 +514,25 @@ def tiered_edge_bar(win_prob: float, base_edge: float, cfg: Any) -> float:
         elif float(win_prob) < cfg.marginal_prob:
             base *= cfg.marginal_edge_scale
     return max(base, 0.0)
+
+
+def conviction_scale(
+    clip_usd: Optional[float], win_prob: float, cfg: Any
+) -> Optional[float]:
+    """Clip size multiplied by conviction - the money maximizer.
+
+    The strong-view discount (tiered bar) finds the trades the model
+    believes most; this makes them PAY: a view at/above strong_prob sizes up
+    to `conviction_mult` x on top of whatever Kelly produced. The money
+    laws downstream (correlated cap, max_open_notional, cash fraction)
+    still bound the result - aggression never escapes a cap.
+    """
+    if not getattr(cfg, "conviction_sizing", True):
+        return clip_usd
+    if float(win_prob) < cfg.strong_prob:
+        return clip_usd
+    base = float(clip_usd) if clip_usd is not None else float(cfg.notional_usd)
+    return round(base * float(cfg.conviction_mult), 2)
 
 
 def fair_up_probability(
@@ -1043,6 +1068,7 @@ class UpDownTrader:
         contracts = 0
         if side:
             _clip = clip_usd
+            _win_side = fair if side == "up" else (1.0 - fair)
             # FRACTIONAL KELLY: clip = balance x clip(scale x k*), k* =
             # (f - c) / (1 - c). The clip compounds with the book and widens
             # with the edge; kelly_cap bounds any single bet. This is what
@@ -1056,8 +1082,7 @@ class UpDownTrader:
                 # DRIED uses the simulated cash cache, LIVE uses the real balance.
                 _bal = self._live_balance if live else self._dry_cash_cache
                 if _bal and _bal > 0.0:
-                    _win = fair if side == "up" else (1.0 - fair)
-                    _kelly = (_win - fill_price) / (1.0 - fill_price)
+                    _kelly = (_win_side - fill_price) / (1.0 - fill_price)
                     _k = max(
                         0.0,
                         min(
@@ -1066,6 +1091,16 @@ class UpDownTrader:
                         ),
                     )
                     _clip = round(_bal * _k, 2)
+            # CONVICTION MULTIPLIER (new): the strong-view discount finds
+            # these trades; this makes them PAY. A view at/above strong_prob
+            # sizes up to conviction_mult x on top of Kelly. The money laws
+            # (correlated cap, max_open_notional, cash fraction) still bound
+            # the outcome: aggression never escapes a cap. When an explicit
+            # cash budget is passed (LIVE's balance fraction), conviction may
+            # only climb TOWARD that budget, never past it.
+            _clip = conviction_scale(_clip, _win_side, self.config)
+            if clip_usd is not None:
+                _clip = min(float(_clip), float(clip_usd))
             contracts = self._size(fill_price, clip_usd=_clip)
         if side and contracts > 0:
             # The Hyperliquid perp hedge that flattens this clip's direction,

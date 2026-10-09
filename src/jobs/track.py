@@ -911,6 +911,39 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                         exit_sell_failures += 1
                         continue
                     await db_manager.update_position_status(position.id, "closed")
+
+                    # DRY SETTLEMENT PAYOUT (new): LIVE's Kalshi account is
+                    # credited automatically at settlement; DRY has no
+                    # exchange behind it, so a resolution WIN used to pay
+                    # NOTHING into the simulated book - cash fell $80 while
+                    # realized said +$12 (every payout missing), and the
+                    # starved cash then shrank every future Kelly clip. Book
+                    # the payout locally (no fee at settlement) for the DRY
+                    # book only; LIVE already has it from Kalshi.
+                    if (
+                        is_resolution
+                        and not _pos_is_live
+                        and exit_price > 0.0
+                        and position.id is not None
+                    ):
+                        try:
+                            from src.utils.mode import TradingMode as _TM
+
+                            _mgr = _TM(db_path=db_manager.db_path)
+                            await _mgr.record_fill(
+                                market_id=position.market_id,
+                                side=position.side,
+                                action="sell",
+                                quantity=float(position.quantity or 0),
+                                price=float(exit_price),
+                                note="settlement payout (no fee)",
+                                fee=0.0,
+                            )
+                        except Exception as _exc:  # noqa: BLE001 - never block a close
+                            logger.warning(
+                                f"DRY settlement payout booking failed for "
+                                f"{position.market_id}: {_exc}"
+                            )
                     if is_resolution:
                         resolution_exits += 1
                     logger.info(

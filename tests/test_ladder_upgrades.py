@@ -430,3 +430,28 @@ def test_evaluate_uses_the_tiered_bar_for_both_sides():
     assert "tiered_edge_bar" in src
     assert "_required(up_fill, _up_maker, _up_wp)" in src
     assert "_required(down_fill, _down_maker, _down_wp)" in src
+
+
+def test_conviction_multiplier_sizes_strong_views_up():
+    """The money maximizer: at/above strong_prob the clip multiplies;
+    below it the clip is untouched; None falls back to the base clip."""
+    from src.jobs.ladder_trader import UpDownConfig, conviction_scale
+
+    cfg = UpDownConfig()
+    assert cfg.conviction_sizing is True
+    assert cfg.conviction_mult == 2.0
+    assert conviction_scale(10.0, 0.80, cfg) == 20.0
+    assert conviction_scale(10.0, 0.60, cfg) == 10.0
+    assert conviction_scale(None, 0.80, cfg) == round(cfg.notional_usd * 2.0, 2)
+    cfg2 = UpDownConfig()
+    cfg2.conviction_sizing = False
+    assert conviction_scale(10.0, 0.95, cfg2) == 10.0
+
+
+def test_evaluate_applies_conviction_before_sizing():
+    import inspect
+
+    from src.jobs.ladder_trader import UpDownTrader
+
+    src = inspect.getsource(UpDownTrader.evaluate)
+    assert "conviction_scale(_clip, _win_side, self.config)" in src

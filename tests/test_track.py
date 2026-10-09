@@ -26,6 +26,52 @@ async def get_position_by_market_id_any_status(db_manager: DatabaseManager, mark
         return None
 
 @patch('src.jobs.track.KalshiClient')
+async def test_dry_resolution_credits_the_settlement_payout(mock_kalshi_client):
+    """LIVE gets its settlement from Kalshi; DRY must book it locally.
+
+    The book showed realized +$12 while cash FELL $80 - every resolution
+    win paid nothing into the simulated ledger, and the starved cash shrank
+    every future Kelly clip. Closing a DRY winner must credit 1.00 x qty.
+    """
+    from src.utils.mode import TradingMode
+
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+    mode = TradingMode(db_path=db_path)
+    acct0 = await mode.dry_account()
+
+    pos = Position(
+        market_id="KXPAY-TEST-1",
+        side="YES",
+        entry_price=0.40,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="payout test",
+        confidence=0.7,
+        live=False,
+        mode="dry",
+        status="open",
+    )
+    await db_manager.add_position(pos)
+
+    mock_api = mock_kalshi_client.return_value
+    mock_api.get_market = AsyncMock(return_value={
+        "market": {"status": "closed", "result": "YES"}
+    })
+    mock_api.close = AsyncMock()
+
+    await run_tracking(db_manager=db_manager)
+
+    acct1 = await mode.dry_account()
+    # The position was seeded without a ledger debit, so the payout alone
+    # must appear: +1.00 x 10 contracts = +$10.
+    assert abs(acct1["cash"] - (acct0["cash"] + 10.0)) < 0.01
+
+
+@patch('src.jobs.track.KalshiClient')
 async def test_run_tracking_closes_position(mock_kalshi_client):
     """
     Test that the tracking job correctly identifies a closed market,
