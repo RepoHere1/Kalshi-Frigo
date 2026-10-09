@@ -3281,6 +3281,55 @@ def test_default_max_positions_is_one_hundred():
     assert "self.max_positions = 100" in src
 
 
+def test_calibration_excludes_phantoms_and_never_says_unknown():
+    """The 15 'unknown' rows were phantoms (entered, never filled). The
+    calibration query must exclude them, bin certain-win arithmetic
+    separately, and label any true leftover 'legacy / other' - never
+    'unknown'."""
+    import asyncio
+
+    import aiosqlite
+
+    sql = wd._SQL_FAIR_BANDS.format(book="1=1")
+    assert "no_kalshi_position" in sql
+    assert "certain-win" in sql
+    assert "legacy / other" in sql
+    assert "'unknown'" not in sql
+
+    async def _run():
+        async with aiosqlite.connect(":memory:") as conn:
+            await conn.execute(
+                "CREATE TABLE trade_logs (exit_reason TEXT, entry_fair REAL,"
+                " rationale TEXT, pnl REAL)"
+            )
+            await conn.execute(
+                "INSERT INTO trade_logs (exit_reason, entry_fair, pnl) VALUES"
+                " ('take_profit', 0.70, 1.0)"
+            )
+            await conn.execute(
+                "INSERT INTO trade_logs (exit_reason, entry_fair, pnl) VALUES"
+                " ('no_kalshi_position', NULL, 0.0)"
+            )
+            await conn.execute(
+                "INSERT INTO trade_logs (exit_reason, entry_fair, rationale, pnl)"
+                " VALUES ('take_profit', NULL, 'CERTAIN-WIN pair x', 0.05)"
+            )
+            await conn.execute(
+                "INSERT INTO trade_logs (exit_reason, entry_fair, rationale, pnl)"
+                " VALUES ('take_profit', NULL, 'old format', -0.5)"
+            )
+            cur = await conn.execute(sql)
+            rows = {r[0]: r for r in await cur.fetchall()}
+            assert "0.65-0.75" in rows and rows["0.65-0.75"][1] == 1
+            assert "certain-win" in rows
+            assert "legacy / other" in rows
+            assert "unknown" not in rows
+            # Phantom row is nowhere to be found.
+            assert sum(r[1] for r in rows.values()) == 3
+
+    asyncio.run(_run())
+
+
 def test_parse_entry_fair_reads_the_chosen_side():
     assert wd._parse_entry_fair(
         "coinbase-coinbase-ws 82,457 vs target 82,478 (-20.51): fair 0.81 vs "

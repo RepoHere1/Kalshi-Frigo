@@ -1936,12 +1936,17 @@ def _parse_entry_fair(rationale: Any) -> Optional[float]:
 
 
 _SQL_FAIR_BANDS = (
-    # CALIBRATION: the model's own report card. Closed trades bucketed by the
-    # fair value recorded at entry - win rate and net $ per confidence band.
-    # This is what turns "near certainty" from an opinion into a measurement.
+    # CALIBRATION: the model's own report card. Closed REAL trades, bucketed
+    # by the CHOSEN SIDE's fair at entry. Phantom rows (entered but never
+    # filled: exit_reason='no_kalshi_position') are excluded - they are not
+    # bets and must not invent an 'unknown' band. Certain-win pair legs are
+    # arithmetic, not predictions, and get their own bin; anything that
+    # predates the fair stamping is labelled 'legacy / other'. The card never
+    # says 'unknown' again - every row is classified or excluded by law.
     "SELECT"
     " CASE"
-    "  WHEN entry_fair IS NULL THEN 'unknown'"
+    "  WHEN entry_fair IS NULL AND rationale LIKE 'CERTAIN-WIN%' THEN 'certain-win'"
+    "  WHEN entry_fair IS NULL THEN 'legacy / other'"
     "  WHEN entry_fair >= 0.85 THEN '0.85 up'"
     "  WHEN entry_fair >= 0.75 THEN '0.75-0.85'"
     "  WHEN entry_fair >= 0.65 THEN '0.65-0.75'"
@@ -1952,7 +1957,12 @@ _SQL_FAIR_BANDS = (
     " COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,"
     " ROUND(COALESCE(SUM(pnl), 0.0), 2) AS pnl"
     " FROM trade_logs WHERE {book}"
-    " GROUP BY band ORDER BY band"
+    " AND COALESCE(exit_reason,'') != 'no_kalshi_position'"
+    " GROUP BY band"
+    " ORDER BY CASE band"
+    "  WHEN '0.55-0.65' THEN 1 WHEN '0.65-0.75' THEN 2 WHEN '0.75-0.85' THEN 3"
+    "  WHEN '0.85 up' THEN 4 WHEN 'below 0.55' THEN 5"
+    "  WHEN 'certain-win' THEN 6 ELSE 7 END"
 )
 
 _SQL_OPEN = (
