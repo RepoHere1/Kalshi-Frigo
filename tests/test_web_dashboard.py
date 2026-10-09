@@ -3198,3 +3198,29 @@ def test_reset_state_walls_every_lane_off_in_both_books(
         row = snap[key(lane, book)]
         assert row["desired"] == 0
         assert (row["stop_reason"] or "") in wd._OPERATOR_STOP_REASONS
+
+
+def test_live_mode_is_blood_red(client, auth, monkeypatch, tmp_path):
+    """Operator order: pressing LIVE turns the button's word blood red and
+    makes the LIVE MODE flag red with a red border (both books of styling
+    are class-driven, so the poll update keeps it red without a reload)."""
+    import asyncio
+
+    from src.utils.mode import TradingMode
+
+    db = str(tmp_path / "blood.db")
+    monkeypatch.setattr(wd, "DB_PATH", db)
+    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
+    # Persist LIVE directly: the endpoint rightly refuses to go live without
+    # Kalshi credentials, and this test is about the RENDERED styling.
+    asyncio.run(TradingMode(db_path=db).set("live", confirmed=True))
+
+    html = client.get("/").get_data(as_text=True)
+    assert "--blood" in html
+    # The live classes are on the right elements...
+    assert 'id="modeLive"' in html and "modebtn live on" in html
+    assert 'id="modeFlag"' in html and "modeflag live" in html
+    # ...and the red rules hang off exactly those classes.
+    assert ".modebtn.live.on" in html
+    assert "color:var(--blood)" in html
+    assert "border-color:var(--blood)" in html

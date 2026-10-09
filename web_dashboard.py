@@ -4736,6 +4736,7 @@ _TEMPLATE = r"""<!doctype html>
   --bg:#080b12; --panel:#0f1420; --panel2:#141b2a; --line:#1f2937; --line2:#2b3648;
   --fg:#e6edf6; --dim:#b8cce0; --faint:#5b6a80;
   --up:#2ee6a8; --down:#a10000; --live:#8a0303; --live-bg:rgba(138,3,3,.20); --blue:#4d9fff; --amber:#ffb454; --violet:#a78bfa;
+  --blood:#a10000;  /* the LIVE-mode warning red: button word + flag border */
   --r:14px; --shadow:0 1px 0 rgba(255,255,255,.03) inset, 0 8px 30px rgba(0,0,0,.45);
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -4796,7 +4797,9 @@ h1 span{color:var(--dim);font-weight:400}
 }
 .modebtn:hover{background:rgba(255,255,255,.07)}
 .modebtn.on{background:rgba(46,230,168,.16);color:var(--up);box-shadow:inset 0 -2px 0 var(--up)}
-.modebtn.live.on{background:rgba(46,230,168,.16);color:var(--up);box-shadow:inset 0 -2px 0 var(--up)}
+/* OPERATOR ORDER: when LIVE is the active book the button's word is BLOOD
+   RED - the same alarm the flag carries - not the shared green. */
+.modebtn.live.on{background:rgba(161,0,0,.20);color:var(--blood);box-shadow:inset 0 -2px 0 var(--blood);text-shadow:0 0 10px rgba(161,0,0,.55)}
 .modebtn:disabled{opacity:.5;cursor:not-allowed}
 
 /* ---------- Mode is a whole-page state, not a badge you have to find ----------
@@ -4829,7 +4832,9 @@ body[data-mode="dry"]  .brand .logo{border-color:rgba(77,159,255,.4);box-shadow:
 }
 .modeflag.dry{color:var(--up);background:rgba(46,230,168,.12)}
 .modeflag.dry {color:var(--up);background:rgba(46,230,168,.10)}
-.modeflag.live{color:var(--up);background:rgba(46,230,168,.12)}
+/* OPERATOR ORDER: the LIVE MODE flag goes blood red with a red border when
+   the book is LIVE - text, border and glow all in the alarm colour. */
+.modeflag.live{color:var(--blood);background:rgba(161,0,0,.16);border-color:var(--blood);box-shadow:0 0 0 1px rgba(0,0,0,.35),0 4px 14px rgba(161,0,0,.45)}
 .modeflag .dot{width:9px;height:9px}
 .orbitring{display:none}
 .url{
