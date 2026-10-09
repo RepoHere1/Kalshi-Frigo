@@ -702,7 +702,19 @@ class _ExplodingClient:
 
 
 def test_live_profit_take_skips_btc15m():
+    """A below-recycle winner rides: book is read (recycling needs it) but
+    no sell happens."""
     from src.jobs import execute as ex
+
+    close_later = (datetime.now(timezone.utc) + timedelta(seconds=400)).isoformat()
+    market = {
+        "status": "open",
+        "yes_bid_dollars": "0.28",
+        "yes_ask_dollars": "0.30",
+        "no_bid_dollars": "0.70",
+        "no_ask_dollars": "0.72",
+        "close_time": close_later,
+    }
 
     class _FakeDB:
         async def get_open_positions(self, mode=None):
@@ -714,9 +726,13 @@ def test_live_profit_take_skips_btc15m():
         async def release_position_claim(self, pid):
             return True
 
+    class _FakeClient:
+        async def get_market(self, ticker):
+            return {"market": market}
+
     res = asyncio.run(
         ex.place_profit_taking_orders(
-            _FakeDB(), _ExplodingClient(), 0.20, live_mode=True
+            _FakeDB(), _FakeClient(), 0.20, live_mode=True
         )
     )
     assert res["orders_placed"] == 0
@@ -773,11 +789,13 @@ def test_btc15m_losers_are_stopped_not_ridden(monkeypatch):
 
 
 def test_dry_also_skips_btc15m_mid_bucket(monkeypatch):
-    """DRY and LIVE both skip mid-bucket BTC profit-take.
+    """DRY and LIVE both skip mid-bucket BTC profit-take below the recycle
+    price.
 
     The 15-minute BTC binary rides to settlement. Exiting mid-bucket
-    pays the spread plus a second fee for nothing. Applied to
-    BOTH books so DRY rehearses exactly what LIVE does.
+    below ~96c pays the spread plus a second fee for nothing. Applied to
+    BOTH books so DRY rehearses exactly what LIVE does. (The book IS read -
+    recycling needs a price - but no sell happens.)
     """
     from src.jobs import execute as ex
 
@@ -796,6 +814,10 @@ def test_dry_also_skips_btc15m_mid_bucket(monkeypatch):
             return [_btc_pos()]
         async def get_open_live_positions(self, mode=None):
             return [_btc_pos()]
+        async def claim_position_for_close(self, pid):
+            return True
+        async def release_position_claim(self, pid):
+            return True
 
     class _FakeClient:
         async def get_market(self, ticker):
@@ -829,10 +851,121 @@ def _xrp_pos():
     )
 
 
+def test_near_locked_winner_recycles_before_settlement(monkeypatch):
+    """CASH RECYCLING: a winner already at >=96c with >=5 min left is sold -
+    the last cents price the tail, and the cash goes to work immediately."""
+    from src.jobs import execute as ex
+
+    close_later = (datetime.now(timezone.utc) + timedelta(seconds=400)).isoformat()
+    market = {
+        "status": "open",
+        "yes_bid_dollars": "0.02",
+        "yes_ask_dollars": "0.04",
+        "no_bid_dollars": "0.96",
+        "no_ask_dollars": "0.98",
+        "close_time": close_later,
+    }
+
+    class _FakeDB:
+        def __init__(self):
+            self.closed = []
+
+        async def get_open_positions(self, mode=None):
+            return [_btc_pos()]
+        async def get_open_live_positions(self, mode=None):
+            return [_btc_pos()]
+        async def claim_position_for_close(self, pid):
+            return True
+        async def release_position_claim(self, pid):
+            return True
+        async def add_trade_log(self, trade_log):
+            self.closed.append(trade_log)
+        async def update_position_status(self, pid, status):
+            self.closed.append((pid, status))
+
+    class _FakeClient:
+        async def get_market(self, ticker):
+            return {"market": market}
+
+    sells = []
+
+    async def _fake_sell(**kw):
+        sells.append(kw)
+        return True
+
+    monkeypatch.setattr(ex, "place_sell_limit_order", _fake_sell)
+    res = asyncio.run(
+        ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=True)
+    )
+    assert res["orders_placed"] == 1
+    assert len(sells) == 1
+
+
+def test_uncertain_winner_still_rides(monkeypatch):
+    """Below the recycle price the ride law stands: no mid-bucket exit."""
+    from src.jobs import execute as ex
+
+    close_later = (datetime.now(timezone.utc) + timedelta(seconds=400)).isoformat()
+    market = {
+        "status": "open",
+        "yes_bid_dollars": "0.16",
+        "yes_ask_dollars": "0.18",
+        "no_bid_dollars": "0.82",
+        "no_ask_dollars": "0.84",
+        "close_time": close_later,
+    }
+
+    class _FakeDB:
+        async def get_open_positions(self, mode=None):
+            return [_btc_pos()]
+        async def get_open_live_positions(self, mode=None):
+            return [_btc_pos()]
+        async def claim_position_for_close(self, pid):
+            return True
+        async def release_position_claim(self, pid):
+            return True
+
+    class _FakeClient:
+        async def get_market(self, ticker):
+            return {"market": market}
+
+    sells = []
+
+    async def _fake_sell(**kw):
+        sells.append(kw)
+        return True
+
+    monkeypatch.setattr(ex, "place_sell_limit_order", _fake_sell)
+    res = asyncio.run(
+        ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=True)
+    )
+    assert res["orders_placed"] == 0
+    assert len(sells) == 0
+
+
+def test_recycle_respects_its_kill_switch(monkeypatch):
+    """RECYCLE_WINNERS=0 restores the pure ride law."""
+    from src.jobs import execute as ex
+
+    monkeypatch.setenv("RECYCLE_WINNERS", "0")
+    enabled, _, _ = ex._recycle_config()
+    assert enabled is False
+
+
 def test_non_btc_updown_lanes_also_ride_winners():
     """XRP/ETH/HYPE winners ride to settlement exactly like BTC: the ride
     rule is the whole up/down family, not a BTC special case."""
     from src.jobs import execute as ex
+
+    close_later = (datetime.now(timezone.utc) + timedelta(seconds=400)).isoformat()
+    market = {
+        "status": "open",
+        "yes_bid_dollars": "0.55",
+        "yes_ask_dollars": "0.57",
+        "no_bid_dollars": "0.43",
+        "no_ask_dollars": "0.45",
+        "close_time": close_later,
+    }
 
     class _FakeDB:
         async def get_open_positions(self, mode=None):
@@ -844,10 +977,13 @@ def test_non_btc_updown_lanes_also_ride_winners():
         async def release_position_claim(self, pid):
             return True
 
-    # _ExplodingClient proves the ride fires BEFORE any book read.
+    class _FakeClient:
+        async def get_market(self, ticker):
+            return {"market": market}
+
     res = asyncio.run(
         ex.place_profit_taking_orders(
-            _FakeDB(), _ExplodingClient(), 0.20, live_mode=True
+            _FakeDB(), _FakeClient(), 0.20, live_mode=True
         )
     )
     assert res["orders_placed"] == 0

@@ -7,7 +7,7 @@ import asyncio
 import os
 import uuid
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from src.clients.kalshi_client import KalshiAPIError, KalshiClient
 from src.config.settings import settings
@@ -618,6 +618,55 @@ async def place_sell_limit_order(
 _UPDOWN_SERIES = ("KXBTC15M", "KXXRP15M", "KXXAU15M", "KXETH15M", "KXHYPE15M")
 
 
+def _recycle_config() -> Tuple[bool, float, float]:
+    """(enabled, min_price, min_seconds_left) for the cash-recycling exit.
+
+    Env-tunable because this helper is module-level: RECYCLE_WINNERS=0 turns
+    it off entirely; RECYCLE_PRICE / RECYCLE_MIN_SECONDS tune the gate.
+    """
+    import os as _os
+
+    if _os.environ.get("RECYCLE_WINNERS", "1") != "1":
+        return False, 0.96, 300.0
+    try:
+        price = float(_os.environ.get("RECYCLE_PRICE", "0.96"))
+        secs = float(_os.environ.get("RECYCLE_MIN_SECONDS", "300"))
+    except (TypeError, ValueError):
+        price, secs = 0.96, 300.0
+    return True, price, secs
+
+
+def _updown_recycle_ready(position, market_data: dict) -> bool:
+    """True when a near-locked winner may be sold for cash recycling.
+
+    Ride the UNCERTAIN, recycle the CERTAIN: at >= ~96c with >= 5 minutes
+    left, selling is EV-neutral versus riding (the last cents are the fair
+    price of the 3% tail) but frees the cash minutes early for the next
+    edge and removes the tail risk. This is the velocity lever: same math
+    per trade, more trades per hour.
+    """
+    enabled, min_price, min_secs = _recycle_config()
+    if not enabled:
+        return False
+    try:
+        from datetime import datetime, timezone
+
+        side = str(getattr(position, "side", "") or "").upper()
+        field = "yes_bid_dollars" if side == "YES" else "no_bid_dollars"
+        bid = float(market_data.get(field) or 0.0)
+        if bid < min_price:
+            return False
+        ct_raw = market_data.get("close_time")
+        if not ct_raw:
+            return False
+        ct = datetime.fromisoformat(str(ct_raw).replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc) if ct.tzinfo is not None else datetime.now()
+        secs_left = (ct - now).total_seconds()
+        return secs_left >= min_secs
+    except Exception:  # noqa: BLE001 - a recycle read never blocks the ride
+        return False
+
+
 def _rides_to_settlement(position) -> bool:
     """True when a position belongs to an up/down 15-minute lane.
 
@@ -734,16 +783,6 @@ async def place_profit_taking_orders(
         logger.info(f"📊 Checking {len(positions)} positions for profit-taking opportunities")
 
         for position in positions:
-            # Ride-to-settlement (ALL up/down lanes, operator order after the
-            # 33-trade record): winners ride to the $1.00 print. Scalping
-            # +8-11c made a 70%-win book LOSE money while resolution losses
-            # ran to -78c - the payoff symmetry only exists at settlement.
-            if _rides_to_settlement(position):
-                logger.debug(
-                    f"Skipping mid-bucket profit-take for {position.market_id}: "
-                    "15m binary rides to settlement (payoff lives there)"
-                )
-                continue
             # HARD LAW: one closer per position, claim before selling. Without
             # this claim every process and every pass sold the same open row
             # again - the DRY ledger credited the same contract dozens of
@@ -783,6 +822,32 @@ async def place_profit_taking_orders(
                     current_price = (yes_bid + yes_ask) / 2.0
                 else:
                     current_price = (no_bid + no_ask) / 2.0
+
+                # Ride-to-settlement (ALL up/down lanes, operator order after
+                # the 33-trade record): winners ride to the $1.00 print.
+                # Scalping +8-11c made a 70%-win book LOSE money while
+                # resolution losses ran to -78c - the payoff symmetry only
+                # exists at settlement.
+                # EXCEPTION - CASH RECYCLING (new, operator order for speed):
+                # a winner already at >= ~96c with >= 5 minutes left is sold
+                # so the cash can work another edge before settlement.
+                # EV-neutral per trade (the last cents price the tail),
+                # strictly more trades per hour, and the tail risk vanishes.
+                # Ride the uncertain; recycle the certain. (Needs the book:
+                # hence the decision lives here, after the quote read.)
+                if _rides_to_settlement(position) and not _updown_recycle_ready(
+                    position, market_data
+                ):
+                    logger.debug(
+                        f"Skipping mid-bucket profit-take for {position.market_id}: "
+                        "15m binary rides to settlement (payoff lives there)"
+                    )
+                    continue
+                if _rides_to_settlement(position):
+                    logger.info(
+                        f"♻️ Cash recycling {position.market_id}: near-locked "
+                        "winner sold early to free the clip for the next edge"
+                    )
 
                 # Calculate current profit
                 if current_price > 0:
