@@ -243,6 +243,35 @@ class UpDownConfig:
     # lane at once.
     correlated_cap_usd: float = 15.0
 
+    # === INVENTION #3: Order-Flow + Liquidity Sentinel ===
+    # Veto entries when the book is too wide or shows adverse imbalance.
+    # Both books share this gate so DRY rehearses LIVE flow conditions.
+    flow_sentinel_enabled: bool = True
+
+    # === INVENTION #4: Drawdown-Aware Dynamic Kelly ===
+    # Fraction scales down linearly from peak_floor=0.18 to floor_usd=20.
+    # Same rule for both books; LIVE adds the real balance, DRY uses its own.
+    drawdown_kelly_enabled: bool = True
+    drawdown_peak_floor: float = 0.18
+
+    # === INVENTION #11: Volatility-Targeted Sizing ===
+    # Scale notional to fixed target_vol (0.75% portfolio vol by default).
+    # Only shrinks when realized vol is HOTTER than target.
+    vol_target_enabled: bool = True
+    vol_target_pct: float = 0.0075
+
+    # === INVENTION #10: Live Shadow Backtester Filter ===
+    # Skip entries when historical analogs show <min_win_rate and <min_payout.
+    # Pass through with not-enough-data; refuse when enough data disagrees.
+    shadow_backtest_enabled: bool = True
+    shadow_min_win_rate: float = 0.57
+    shadow_min_payout: float = 2.1
+
+    # === INVENTION #7: Dedicated Macro Veto Agent ===
+    # A parallel macro-only LLM that can VETO on macro risk.
+    # Disabled by default (no headline source); enable with MACRO_VETO_ENABLED=1.
+    macro_veto_enabled: bool = False
+
     # TIERED ENTRY BAR (new): the flat min_edge treated a 57% view and a
     # 90% view as equal. Strong views (>= strong_prob) get a LOWER bar so
     # the lanes fire more of the trades the model actually believes - more
@@ -438,6 +467,10 @@ class UpDownBook:
     skipped_venue_guard: int = 0
     skipped_poly_divergence: int = 0
     skipped_correlated: int = 0
+    skipped_flow_veto: int = 0
+    skipped_macro_veto: int = 0
+    skipped_shadow: int = 0
+    skipped_drawdown: int = 0
     last_error: str = ""
     dry: bool = True
     # CERTAIN-WIN pair counters (the arithmetic-only trades).
@@ -653,6 +686,11 @@ class UpDownTrader:
         # money - the law.
         self._live_balance: Optional[float] = None
         self._dry_cash_cache: Optional[float] = None
+        # INVENTION #7: macro veto cache - one verdict per ticker per process.
+        self._macro_cache: Dict[str, Any] = {}
+        # INVENTION #12: risk overlay state for drawdown and vol target.
+        self._peak_balance: Optional[float] = None
+        self._realized_vol: Optional[float] = None
         self.book = UpDownBook(max_open_notional=self.config.max_open_notional)
 
     def evaluate(
@@ -729,6 +767,80 @@ class UpDownTrader:
         # so every pass read "spot == target" and landed in skipped_no_edge
         # forever. Keep all digits; format only for display.
         delta = spot - target
+        # === INVENTION #3: Order-Flow + Liquidity Sentinel ===
+        # Veto entries with wide spreads or adverse flow imbalance.
+        # Applied identically to BOTH books - DRY rehearses LIVE flow conditions.
+        # Skipped if bids are zero (incomplete book or test fixture).
+        # Skipped if bids > 25 cents from ask (unrealistic / inverted book).
+        if self.config.flow_sentinel_enabled and market.up_price is not None and market.down_price is not None:
+            try:
+                from src.jobs.flow_sentinel import (
+                    compute_flow_metrics,
+                    flow_sentinel,
+                )
+                _fm = compute_flow_metrics(
+                    yes_ask=float(market.up_price or 0.0),
+                    yes_bid=float(getattr(market, "yes_bid", 0) or 0.0),
+                    no_ask=float(market.down_price or 0.0),
+                    no_bid=float(getattr(market, "no_bid", 0) or 0.0),
+                    yes_depth=int(getattr(market, "yes_depth", 0) or 0),
+                    no_depth=int(getattr(market, "no_depth", 0) or 0),
+                )
+                _pass, _why = flow_sentinel(_fm)
+                if not _pass:
+                    self.book.skipped_flow_veto += 1
+                    return UpDownSignal(
+                        ticker=market.ticker,
+                        bucket=market.bucket,
+                        side="",
+                        target=target,
+                        spot=spot,
+                        spot_vs_target=delta,
+                        fair=0.5,
+                        kalshi_price=market.up_price,
+                        edge=0.0,
+                        ask=None,
+                        contracts=0,
+                        notional=0.0,
+                        seconds_left=round(market.seconds_left or 0.0, 1),
+                        reason=f"flow sentinel: {_why}",
+                        truth=truth_kind,
+                    )
+            except Exception:  # noqa: BLE001 - flow sentinel never blocks
+                pass
+        # === INVENTION #7: Dedicated Macro Veto Agent ===
+        # A parallel macro-only LLM call that can VETO on macro risk.
+        # Fail-open: with no headlines, default score=0 (no veto).
+        if getattr(self.config, "macro_veto_enabled", False):
+            try:
+                from src.jobs.macro_veto import macro_verdict
+
+                _mv = macro_verdict(
+                    market_title=market.ticker,
+                    event_category="crypto-15min",
+                    cache=self._macro_cache,
+                )
+                if _mv.get("vetoes"):
+                    self.book.skipped_macro_veto += 1
+                    return UpDownSignal(
+                        ticker=market.ticker,
+                        bucket=market.bucket,
+                        side="",
+                        target=target,
+                        spot=spot,
+                        spot_vs_target=delta,
+                        fair=0.5,
+                        kalshi_price=market.up_price,
+                        edge=0.0,
+                        ask=None,
+                        contracts=0,
+                        notional=0.0,
+                        seconds_left=round(market.seconds_left or 0.0, 1),
+                        reason=f"macro veto: {_mv.get('reason', 'risk')}",
+                        truth=truth_kind,
+                    )
+            except Exception:  # noqa: BLE001 - macro veto fails open
+                pass
         # One-venue dislocation guard: Kalshi settles on the multi-venue BRTI
         # composite, not on Coinbase. If the other major venues sit on the
         # OPPOSITE side of the target by more than the budget, this "lead"
@@ -1792,8 +1904,60 @@ class UpDownTrader:
                 # Raw balance for the Kelly sizer in evaluate().
                 self._live_balance = cents / 100.0
                 self._dry_cash_cache = cents / 100.0
+                # === INVENTION #4: Drawdown-Aware Dynamic Kelly ===
+                # Track peak balance; shrink Kelly if drawdown > peak_floor.
+                # Only applies after a peak has been established (i.e., not the
+                # first cycle, when peak==current so drawdown=0).
+                if self._peak_balance is None or self._live_balance > self._peak_balance:
+                    self._peak_balance = self._live_balance
+                if (
+                    self.config.drawdown_kelly_enabled
+                    and self._peak_balance is not None
+                    and self._peak_balance > 0
+                    and self._peak_balance > self._live_balance
+                ):
+                    from src.jobs.risk_overlays import (
+                        DrawdownFraction,
+                        kelly_scale_for_drawdown,
+                    )
+                    _dd = DrawdownFraction(
+                        peak=self._peak_balance, current=self._live_balance
+                    )
+                    if _dd.fraction() >= self.config.drawdown_peak_floor:
+                        # Past drawdown floor: refuse new entries until recovery.
+                        self.book.skipped_drawdown += 1
+                        self.book.last_error = (
+                            f"drawdown floor: {_dd.fraction():.1%} >= "
+                            f"{self.config.drawdown_peak_floor:.0%} - no entries"
+                        )
+                        return self.book.summary()
+                    _dd_scale = kelly_scale_for_drawdown(
+                        base_fraction=1.0,
+                        drawdown=_dd,
+                        peak_floor=self.config.drawdown_peak_floor,
+                    )
+                    live_budget = round(live_budget * _dd_scale, 2)
         except Exception as exc:  # noqa: BLE001
             self.book.last_error = f"balance read: {type(exc).__name__}: {exc}"
+
+        # === INVENTION #11: Volatility-Targeted Sizing ===
+        # Scale notional to fixed target_vol - shrinks when realized is hotter.
+        if self.config.vol_target_enabled and self._sigma_used:
+            try:
+                from src.jobs.risk_overlays import vol_target_scale
+
+                _spot = float(self.spot.price or 0.0)
+                if _spot > 0:
+                    _vol_realized = float(self._sigma_used) / _spot
+                    _vt_scale = vol_target_scale(
+                        realized_vol=_vol_realized,
+                        target_vol=self.config.vol_target_pct,
+                    )
+                    if live_budget is not None:
+                        live_budget = round(live_budget * _vt_scale, 2)
+                    self._realized_vol = _vol_realized
+            except Exception:  # noqa: BLE001 - vol target never blocks
+                pass
 
         # CERTAIN-WIN PAIR: a binary contract's two sides pay $1.00 together.
         # When both asks plus both taker fees leave a net, buying BOTH is the

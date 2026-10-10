@@ -299,6 +299,37 @@ async def should_exit_position(
     # This would require periodic re-analysis, which we're avoiding for cost reasons
     # Could be implemented as a separate, less frequent job
 
+    # 7. INVENTION #5: Conviction Collapse Exit
+    # Cut LOSING positions whose conviction has dropped - never cut winners.
+    # Only triggers for losers, never winners (Law 25: winners ride to settlement).
+    try:
+        from src.jobs.risk_overlays import (
+            collapse_allowance,
+            conviction_collapsed,
+        )
+        # Use position's entry confidence vs current conviction
+        original = position.confidence or 0.0
+        # Current conviction is approximated from current_price action
+        # For a YES position, conviction = current_price / entry_price (truncated)
+        # For a NO position, conviction = (1 - current_price) / (1 - entry_price)
+        if position.side == "YES" and position.entry_price and position.entry_price > 0:
+            current = min(1.0, current_price / position.entry_price)
+        elif position.side == "NO" and position.entry_price is not None:
+            current = min(1.0, (1.0 - current_price) / max(0.01, 1.0 - position.entry_price))
+        else:
+            current = original
+        # Only consider this for losing positions
+        is_losing = (
+            (position.side == "YES" and current_price < position.entry_price)
+            or (position.side == "NO" and current_price > position.entry_price)
+        )
+        if is_losing and original > 0:
+            allowance = collapse_allowance(time_left=300.0)
+            if conviction_collapsed(original, current, allowance):
+                return True, "conviction_collapse", current_price
+    except Exception:  # noqa: BLE001 - conviction exit never blocks
+        pass
+
     return False, "", current_price
 
 

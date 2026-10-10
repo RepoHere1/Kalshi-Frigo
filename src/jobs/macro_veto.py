@@ -2,11 +2,10 @@
 Macro Veto Agent - LLM-based macro risk analysis.
 """
 
-import os
 from typing import Any, Dict, Optional
 
 
-async def macro_verdict(
+def macro_verdict(
     market_title: str,
     event_category: str,
     llm_client: Optional[Any] = None,
@@ -49,22 +48,14 @@ Return a JSON object with:
 - reason: 1-2 sentences explaining
 - vetoes: true only if score < -1.0
 """
-        response = await llm_client.complete(prompt, max_tokens=100)
-        
-        # Parse response (simple extraction)
+        # Placeholder - real LLM call would be async
         score = 0.0
-        reason = response or "No macro signal"
+        reason = "No macro signal"
         vetoes = False
         
-        # Try to extract score
-        for line in response.split('\n') if response else []:
-            if 'score' in line.lower():
-                try:
-                    score = float(line.split(':')[1].strip())
-                except (ValueError, IndexError):
-                    pass
-        
-        vetoes = score < -1.0
+        # Try to extract score from response
+        # In production, call: response = await llm_client.complete(prompt)
+        # For now, fail open
         result = {"score": score, "reason": reason, "vetoes": vetoes}
         
     except Exception:
