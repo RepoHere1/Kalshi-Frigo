@@ -441,6 +441,67 @@ def test_a_zero_dollar_live_budget_produces_no_clip():
     assert not live.actionable
 
 
+async def test_live_variance_sizing_uses_market_target(monkeypatch):
+    """Regression: variance_clip_multiplier must be called with market.target, not
+    an out-of-scope 'target' variable (fixed: target -> _tgt at line 2005).
+
+    Verifies the call HAPPENS with the correct delta/noise values; the budget
+    math after that follows a known chain (kelly, conviction) that existing
+    tests cover."""
+    import src.jobs.broker as broker
+    import src.jobs.live_fees as live_fees
+    from src.utils.mode import TradingMode
+
+    trader = _scorer()
+    trader.config.certain_win_enabled = False
+    trader.config.venue_guard_enabled = False
+    trader.config.poly_guard_enabled = False
+    trader.config.kelly_sizing = False
+    trader.config.conviction_sizing = False
+    market = _quoted_market(target=84000.0)
+    trader.feed.markets = [market]
+    trader.db_manager = type(
+        "_Database",
+        (),
+        {"get_open_positions": lambda self, mode: []},
+    )()
+
+    class _BalanceClient:
+        async def get_balance(self):
+            return {"balance": 10000}
+
+    async def _noop():
+        return None
+
+    async def _current(_self):
+        return "live"
+
+    async def _track(_db):
+        return None
+
+    calls = []
+
+    def _variance(delta, noise):
+        calls.append((delta, noise))
+        return 1.75
+
+    trader._client = _BalanceClient()
+    monkeypatch.setattr(broker, "should_trade_live", lambda: True)
+    monkeypatch.setattr(TradingMode, "current", _current)
+    monkeypatch.setattr("src.jobs.track.run_tracking", _track)
+    monkeypatch.setattr(trader.feed, "fetch", _noop)
+    monkeypatch.setattr(trader.hl, "refresh", _noop)
+    monkeypatch.setattr(live_fees, "variance_clip_multiplier", _variance)
+
+    result = await trader.cycle()
+
+    # Key assertions: the variance call happened with market-derived values
+    assert calls == [(900.0, 84000.0 * trader.config.noise_pct)], (
+        f"variance_clip_multiplier not called or called with wrong args: {calls}"
+    )
+    assert result["variance_mult"] == 1.75
+
+
 # ---------------------------------------------------------------------------
 # The process must be immortal: nothing but Stop ends it
 # ---------------------------------------------------------------------------

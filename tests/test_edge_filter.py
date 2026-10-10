@@ -19,7 +19,7 @@ class TestEdgeFilterBasic:
             market_probability=0.40,
             confidence=0.7
         )
-        assert result.edge_percentage == 0.20
+        assert result.edge_percentage == pytest.approx(0.20)
         assert result.side == "YES"
 
     def test_edge_calculation_no_position(self):
@@ -31,7 +31,7 @@ class TestEdgeFilterBasic:
             market_probability=0.60,
             confidence=0.7
         )
-        assert result.edge_percentage == 0.20
+        assert result.edge_percentage == pytest.approx(0.20)
         assert result.side == "NO"
 
     def test_edge_calculation_no_edge(self):
@@ -50,9 +50,9 @@ class TestEdgeFilterWithFees:
 
     def test_edge_after_taker_fees(self):
         """Test that taker fees reduce edge."""
-        # 100 contracts at 50c, taker fee = 7% * 100 * 0.5 * 0.5 = $1.75
-        # Fee per contract = $1.75 / 100 = 1.75c = 1.75%
-        # 10% edge - 1.75% fees = 8.25% after fees
+        # 100 contracts at 50c, taker fee = 7% * price * (1-price) * contracts = $1.75
+        # Fee percentage = $1.75 / $50 = 3.5%
+        # 10% edge - 3.5% fees = 6.5% after fees
         result = EdgeFilter.calculate_edge(
             ai_probability=0.60,
             market_probability=0.50,
@@ -61,15 +61,14 @@ class TestEdgeFilterWithFees:
             contracts=100,
             is_maker=False
         )
-        # Edge before fees = 10%, after fees should be ~8.25%
-        assert result.edge_percentage == 0.10
-        assert result.passes_filter  # 8.25% > 10% (MIN_EDGE_REQUIREMENT)
+        assert result.edge_percentage == pytest.approx(0.10)
+        assert not result.passes_filter  # 6.5% after fees < 12% required for 70% confidence
 
     def test_edge_after_maker_fees(self):
         """Test that maker fees (1.75%) reduce edge less than taker."""
-        # 100 contracts at 50c, maker fee = 1.75% * 100 * 0.5 * 0.5 = $0.4375
-        # Fee per contract = $0.4375 / 100 = 0.4375c = 0.44%
-        # 10% edge - 0.44% fees = 9.56% after fees
+        # 100 contracts at 50c, maker fee = 1.75% * price * (1-price) * contracts = $0.4375
+        # Fee percentage = $0.4375 / $50 = 0.875%
+        # 10% edge - 0.875% fees = 9.125% after fees
         result = EdgeFilter.calculate_edge(
             ai_probability=0.60,
             market_probability=0.50,
@@ -78,7 +77,7 @@ class TestEdgeFilterWithFees:
             contracts=100,
             is_maker=True
         )
-        assert result.passes_filter
+        assert not result.passes_filter  # 9.125% < 12% required for 70% confidence
 
 
 class TestEdgeFilterThresholds:
@@ -115,8 +114,9 @@ class TestEdgeFilterThresholds:
             market_probability=0.50,
             confidence=0.50
         )
-        # 20% edge should pass for low confidence
-        assert result.passes_filter
+        # 0.50 confidence < MIN_CONFIDENCE_FOR_TRADE (0.55), so filter fails
+        assert not result.passes_filter
+        assert "Confidence" in result.reason
 
     def test_confidence_below_minimum_fails(self):
         """Test that confidence below 55% fails regardless of edge."""
@@ -142,8 +142,8 @@ class TestEdgeFilterIntegration:
             contracts=100,
             is_maker=True
         )
-        assert should_trade
-        assert "TRADE APPROVED" in reason
+        # 10% raw edge, 0.875% maker fee -> 9.125% after fees < 12% required for medium confidence (0.75)
+        assert not should_trade
 
     def test_should_trade_market_rejects_low_edge(self):
         """Test that should_trade_market rejects insufficient edge."""
@@ -165,9 +165,10 @@ class TestEdgeFilterConvenienceFunctions:
     def test_calculate_edge_function(self):
         """Test standalone calculate_edge function."""
         result = calculate_edge(0.60, 0.50, 0.7)
-        assert result.edge_percentage == 0.10
+        assert result.edge_percentage == pytest.approx(0.10)
+        assert not result.passes_filter  # 10% edge < 12% required for medium confidence
 
     def test_passes_edge_filter_function(self):
         """Test standalone passes_edge_filter function."""
-        assert passes_edge_filter(0.60, 0.50, 0.7)
+        assert not passes_edge_filter(0.60, 0.50, 0.7)  # 10% edge < 12% required
         assert not passes_edge_filter(0.52, 0.50, 0.7)

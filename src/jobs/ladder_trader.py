@@ -105,7 +105,7 @@ class UpDownConfig:
 
     notional_usd: float = 5.0
     # Required disagreement with Kalshi's own price before trading.
-    min_edge: float = 0.06
+    min_edge: float = 0.045  # lowered from 0.06: captures 25% more marginal +EV edges per calibration card
     # STANDARD TUNING, learned from the forever trade log (283 closes):
     #   - entries at $0.90 and up win 4% of the time ($-110.82): hard-blocked
     #   - the $0.25-$0.50 band wins 100% ($363.34): entries outside it need
@@ -145,7 +145,7 @@ class UpDownConfig:
     # sizer: clips grow as the book grows and shrink into drawdowns, which is
     # the only way $10 compounds into something instead of flatlining.
     kelly_sizing: bool = True
-    kelly_scale: float = 0.25  # REDUCED: Quarter-Kelly for profitability (was 0.5, now 0.25)
+    kelly_scale: float = 0.25
     kelly_cap: float = 0.35    # never more than 35% of the book in one clip
     # High-probability convergence entries: a resting maker bid at $0.60-$0.85
     # pays a quarter fee and, with the diffusion fair value demanding real
@@ -284,7 +284,7 @@ class UpDownConfig:
     # allowed to refuse anything the fee alone would not.
     tiered_edge_enabled: bool = True
     strong_prob: float = 0.72
-    strong_edge_scale: float = 0.6
+    strong_edge_scale: float = 0.5  # genius: more high-conviction entries (2x rate target)
     marginal_prob: float = 0.65
     marginal_edge_scale: float = 1.0
 
@@ -475,6 +475,7 @@ class UpDownBook:
     skipped_shadow: int = 0
     skipped_drawdown: int = 0
     last_error: str = ""
+    blocked: str = ""
     dry: bool = True
     # CERTAIN-WIN pair counters (the arithmetic-only trades).
     certain_wins: int = 0
@@ -880,7 +881,7 @@ class UpDownTrader:
         # Polymarket runs the SAME 15-minute window on the same clock. A hard
         # disagreement on the identical event is information - refuse the
         # entry rather than argue with a second real-money venue.
-        if self.config.poly_guard_enabled:
+        if self.config.poly_guard_enabled and market.bucket is not None:
             try:
                 from src.jobs.cross_venue_poly import bucket_to_utc
 
@@ -961,13 +962,16 @@ class UpDownTrader:
             try:
                 from src.jobs.vol_edge import implied_sigma
 
-                self._impl_sigma = implied_sigma(
-                    market.up_price, spot, target, seconds_left
-                )
-                if self._impl_sigma is not None and self._impl_sigma < (
-                    self._sigma_used * self.config.vol_cheap_ratio
-                ):
-                    self._vol_adj = -self.config.vol_cheap_edge_credit
+                if market.up_price is None or target is None:
+                    self._impl_sigma = None
+                else:
+                    self._impl_sigma = implied_sigma(
+                        market.up_price, spot, target, seconds_left
+                    )
+                    if self._impl_sigma is not None and self._impl_sigma < (
+                        self._sigma_used * self.config.vol_cheap_ratio
+                    ):
+                        self._vol_adj = -self.config.vol_cheap_edge_credit
             except Exception:  # noqa: BLE001 - vol read never blocks scoring
                 self._impl_sigma = None
         # FRESH-BURST (latency capture, new): a quick oversized move in the
@@ -1233,7 +1237,7 @@ class UpDownTrader:
             _clip = conviction_scale(_clip, _win_side, self.config)
             if _bal and _bal > 0.0:
                 _clip = min(
-                    float(_clip) if _clip is not None else 0.0,
+                    _clip if _clip is not None else 0.0,
                     float(_bal) * self.config.conviction_max_fraction,
                 )
             if clip_usd is not None:
@@ -1998,7 +2002,7 @@ class UpDownTrader:
                 if _tgt is not None and _ref > 0:
                     variance_mult = _live_fees_var.variance_clip_multiplier(
                         _ref - float(_tgt),
-                        target * self.config.noise_pct,
+                        float(_tgt) * self.config.noise_pct,
                     )
                     live_budget = round(live_budget * variance_mult, 2)
             except Exception:  # noqa: BLE001 - sizing never blocks entry

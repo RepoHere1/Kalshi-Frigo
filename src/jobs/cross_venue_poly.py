@@ -161,8 +161,8 @@ class PolyScanner:
                     except ValueError:
                         continue
                     # Next-month windows show up near month end; keep only
-                    # windows whose start is within +/- 1 day.
-                    if abs((end_utc - now).total_seconds()) > 86400:
+                    # windows within a week (avoids stale cache from old events).
+                    if abs((end_utc - now).total_seconds()) > 86400 * 7:
                         continue
                     if end_utc <= start_utc:
                         continue
@@ -180,7 +180,7 @@ class PolyScanner:
                         end_utc = et_to_utc(now.month, day, h1, minute, ap1)
                     except ValueError:
                         continue
-                    if abs((end_utc - now).total_seconds()) > 86400 * 2:
+                    if abs((end_utc - now).total_seconds()) > 86400 * 7:
                         continue
                     strikes.append(
                         PolyStrike(end_utc=end_utc, strike=strike, yes=up, no=down)

@@ -57,11 +57,11 @@ class TestDryMakerFillRepricing:
     async def test_maker_fill_returns_false_when_book_does_not_cross(self):
         """Test that maker fill returns False when book never crosses."""
         mock_kalshi_client = Mock()
-        # Book price is below limit price, so no fill
+        # Book ask is above limit price, so no fill (seller wants more than buyer pays)
         mock_kalshi_client.get_market = AsyncMock(return_value={
             "market": {
                 "yes_bid_dollars": 0.58,
-                "yes_ask_dollars": 0.57,  # Below limit price of 0.59
+                "yes_ask_dollars": 0.60,  # Above limit price of 0.59 -> no cross -> no fill
                 "no_bid_dollars": 0.40,
                 "no_ask_dollars": 0.42,
             }
