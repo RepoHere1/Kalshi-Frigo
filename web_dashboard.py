@@ -1756,6 +1756,25 @@ def _current_book_mode() -> Optional[str]:
         return None
 
 
+# Card ordering by market horizon — the ONE source of truth for both the page
+# render (build_snapshot -> _strategy_cards) and the /api payload sort
+# (_mode_payload). All 15-minute strategies lead, then all 1-hour strategies,
+# then the rest (alphabetical tail, so future strategies land predictably).
+# DRY and LIVE both render this exact sequence.
+_CARD_GROUPS: Tuple[Tuple[str, ...], ...] = (
+    ("btc_updown", "xrp_updown", "xau_updown", "hyperliquid_updown"),  # 15-minute
+    ("btc_1h_updown", "eth_1h_updown", "xrp_1h_updown"),  # 1-hour
+)
+
+
+def _card_sort_key(name: str):
+    """15m cards on top, 1h second, the rest last — stable within groups."""
+    for group_index, group in enumerate(_CARD_GROUPS):
+        if name in group:
+            return (group_index, group.index(name), "")
+    return (len(_CARD_GROUPS), 0, name)
+
+
 def _strategy_cards(
     curve_rows: List[Dict[str, Any]],
     position_rows: List[Dict[str, Any]],
@@ -1882,16 +1901,10 @@ def _strategy_cards(
         card["win_rate"] = (
             round(100.0 * card["wins"] / card["trades"], 1) if card["trades"] else 0.0
         )
-    # REORDER: Priority: btc_updown #1, xrp_updown #2, xau_updown #3, btc_1h_updown #4, then ai_directional, rest
-    ordered = []
-    priority_order = ["btc_updown", "xrp_updown", "xau_updown", "btc_1h_updown", "hyperliquid_updown", "ai_directional", "beast_mode", "safe_compounder", "market_making", "quick_flip"]
-    for name in priority_order:
-        if name in cards:
-            ordered.append(cards[name])
-    # Add any strategies not in the priority list (future additions)
-    for card in cards.values():
-        if card["name"] not in priority_order:
-            ordered.append(card)
+    # Horizon grouping: ALL 15-minute cards lead, ALL 1-hour cards follow,
+    # then everything else — one sort (shared with _mode_payload) so DRY and
+    # LIVE can never disagree, and the single page loop stays intact.
+    ordered = sorted(cards.values(), key=lambda c: _card_sort_key(c["name"]))
     return ordered
 
 
@@ -2771,8 +2784,10 @@ def _mode_payload() -> Dict[str, Any]:
             "reason": "",
         }
     assert MODE_DRY  # keeps the import meaningful for readers
-    time_order={"btc_updown":0,"xrp_updown":0,"xau_updown":0,"hyperliquid_updown":0,"btc_1h_updown":1,"eth_1h_updown":1,"xrp_1h_updown":1}
-    payload["cards"]=dict(sorted(payload.get("cards",{}).items(),key=lambda iv:(time_order.get(iv[0],99),iv[0])))
+    # Same horizon order as the page grid: 15m top, 1h second, rest last.
+    payload["cards"] = dict(
+        sorted(payload.get("cards", {}).items(), key=lambda iv: _card_sort_key(iv[0]))
+    )
     return payload
 
 
