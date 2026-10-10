@@ -313,6 +313,20 @@ baseline.
     added to its SELECT was not mirrored in the row unpack — repaired and pinned by a regression
     test.
 
+59. **LIVE MODE win-rate & payout inventions (2026-10-10).** Grok-generated list of 12 concrete, implementable improvements for the LLM-driven LIVE autotrader (builds on existing calibration, edge filter, quarter-Kelly, correlated cap, and phantom-exclusion work). Another AI can selectively implement. 
+    1. Regime-Adaptive RAG Prompting (`decide.py` + `src/research/`): retrieve 5 most similar past markets via embedding and inject outcomes + model accuracy.
+    2. Calibrated Multi-Model Ensemble (`src/agents/`): run Claude/Grok/Gemini in parallel + logistic regression calibration head per model/ticker.
+    3. Order-Flow + Liquidity Sentinel (kalshiclient + decide): veto on wide spread or adverse imbalance; inject flow metrics.
+    4. Drawdown-Aware Dynamic Kelly (`PositionLimitsManager`): fraction = 0.25 * (1-drawdown/0.18) * conviction_multiplier + portfolio vol target.
+    5. Trailing Conviction Exit (`track.py`): tighten TP as LLM conviction rises; add theta decay.
+    6. Correlation-Aware Portfolio Optimizer (`src/strategies/`): quadratic rebalancing of all positions before new trade.
+    7. Dedicated Macro Veto Agent (`src/agents/`): parallel macro-only LLM (-2..+2 score) that can veto or halve size.
+    8. Self-Evolving Prompt Library (nightly `evaluate.py`): meta-agent proposes improved templates; A/B test on paper.
+    9. Synthetic Scenario Stress Test: LLM generates 15 what-if paths and must be consistent across them.
+    10. Live Shadow Backtester Filter (`decide.py`): only execute if historical analogs show >57% win rate and >2.1× payout.
+    11. Volatility-Targeted Sizing (`src/utils/mode.py`): scale notional to fixed 0.75% portfolio vol.
+    12. On-Chain + Sentiment Fusion (crypto lanes): inject funding rate, OI, whale flows, sentiment as structured features + small NN edge scorer.
+
 ---
 
 *Written 2026-10-09. If you are an AI reading this: the invariants in §1–§5 are the constitution —
