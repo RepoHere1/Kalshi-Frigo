@@ -617,7 +617,7 @@ async def place_sell_limit_order(
 
 # KXGOLD15M is the LIVE gold series (KXXAU15M is dead: zero markets ever).
 # KXXAU15M stays listed so legacy positions still ride/recycle correctly.
-_UPDOWN_SERIES = ("KXBTC15M", "KXXRP15M", "KXGOLD15M", "KXXAU15M", "KXETH15M", "KXHYPE15M")
+_UPDOWN_SERIES = ("KXBTC15M", "KXBTC1H", "KXXRP15M", "KXXRP1H", "KXGOLD15M", "KXXAU15M", "KXETH15M", "KXETH1H", "KXHYPE15M")
 
 
 def _recycle_config() -> Tuple[bool, float, float]:

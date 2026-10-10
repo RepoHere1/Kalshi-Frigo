@@ -52,9 +52,7 @@ its own **calibration report card**. LIVE money is governed by a double-switch g
 
 ## 2️⃣ The lanes and what they trade (series truth)
 
-9. **Each lane names its own market.** `btc_updown → KXBTC15M/BTC-USD`, `xrp_updown →
-   KXXRP15M/XRP-USD`, `xau_updown → KXXAU15M/PAXG-USD`, `btc_1h_updown (ETH) →
-   KXETH15M/ETH-USD`, `hyperliquid_updown → KXHYPE15M/HYPE-USD`. The Hyperliquid card sits right
+9. **Each lane names its own market.** `btc_updown → KXBTC15M/BTC-USD`, `btc_1h_updown → KXBTC1H/BTC-USD`, `xrp_updown → KXXRP15M/XRP-USD`, `xrp_1h_updown → KXXRP1H/XRP-USD`, `xau_updown → KXGOLD15M/PAXG-USD`, `eth_1h_updown → KXETH1H/ETH-USD`, `btc_1h_updown (ETH legacy) → KXETH15M/ETH-USD`, `hyperliquid_updown → KXHYPE15M/HYPE-USD`. The Hyperliquid card sits right of ETH on the board.
    of ETH on the board.
 10. **Series-normalisation fixed.** `cli.py`'s old `replace("KX","KXX")` mangled real tickers
     (`KXETH15M→KXXETH15M`, `KXBTC15M→KXXBTC15M`) so those lanes fetched nothing. Replaced with one

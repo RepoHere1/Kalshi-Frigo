@@ -922,7 +922,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--series",
         type=str,
         default="KXXRP15M",
-        help="Kalshi series ticker (e.g. KXXRP15M, KXBTC15M, KXETH15M, KXGOLD15M) for --btc-updown",
+        help="Kalshi series ticker (e.g. KXXRP15M, KXXRP1H, KXBTC15M, KXBTC1H, KXETH15M, KXETH1H, KXGOLD15M) for --btc-updown",
     )
     p_run.add_argument(
         "--spot-product",

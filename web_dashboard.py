@@ -148,7 +148,9 @@ STRATEGY_COMMANDS: Dict[str, List[str]] = {
     "btc_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTC15M", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
     "xrp_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRP15M", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
     "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXGOLD15M", "--spot-product", "PAXG-USD", "--paper", "--loop", "--interval", "0"],
-    "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETH15M", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
+    "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTC1H", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
+    "eth_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETH1H", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
+    "xrp_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRP1H", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
     "hyperliquid_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPE15M", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
     "ai_directional": ["cli.py", "run", "--paper", "--loop", "--interval", "300"],
     "safe_compounder": [
