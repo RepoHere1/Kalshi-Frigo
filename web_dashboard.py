@@ -5539,8 +5539,6 @@ button.loading.yellow::after {
   <div class="pb">
     <div class="cards">
       {%- for c in s.strategy_cards %}
-        {%- if loop.index == 1 %}<div class="row-header" style="font-weight:bold;color:#4d9fff;margin:8px 0 4px">15-MIN LINES</div>{%- endif %}
-        {%- if c.name == 'btc_1h_updown' or c.name == 'eth_1h_updown' or c.name == 'xrp_1h_updown' %}{% if loop.index == 1 or (loop.index > 1 and (loop.previtem.name == 'btc_updown' or loop.previtem.name == 'xrp_updown' or loop.previtem.name == 'xau_updown' or loop.previtem.name == 'hyperliquid_updown')) %}<div class="row-header" style="font-weight:bold;color:#f0a030;margin:12px 0 4px">1-HOUR LINES</div>{% endif %}{% endif %}
       <div class="card{{ ' hot' if c.running else '' }}" id="card-{{ c.name }}" onclick="openStrategy('{{ c.name }}')">
         <div class="ctop">
           <div>
