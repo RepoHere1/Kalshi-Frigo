@@ -64,7 +64,7 @@ def _trade(**kw):
 async def test_ensure_creates_a_book_when_there_is_none(tmp_path):
     mgr = TradingMode(db_path=str(tmp_path / "a.db"))
     account = await mgr.ensure_dry_account()
-    assert account["cash"] == pytest.approx(200.0, abs=0.01)
+    assert account["cash"] == pytest.approx(300.0, abs=0.01)
 
 
 async def test_ensure_never_touches_a_book_with_history(tmp_path):
@@ -108,7 +108,7 @@ async def test_the_explicit_reset_is_still_destructive(tmp_path):
 
     account = await mgr.reset_dry_account()
 
-    assert account["cash"] == pytest.approx(200.0, abs=0.01)
+    assert account["cash"] == pytest.approx(300.0, abs=0.01)
     assert account["open_positions"] == 0
     assert account["closed_trades"] == 0
 
@@ -194,8 +194,8 @@ async def test_ensure_seeds_a_fresh_book_at_the_default(tmp_path, monkeypatch):
     _mirror_env(monkeypatch, 1234.56)
     mgr = TradingMode(db_path=str(tmp_path / "mirror.db"))
     account = await mgr.ensure_dry_account()
-    assert account["starting_balance"] == pytest.approx(200.0, abs=0.01)
-    assert account["cash"] == pytest.approx(200.0, abs=0.01)
+    assert account["starting_balance"] == pytest.approx(300.0, abs=0.01)
+    assert account["cash"] == pytest.approx(300.0, abs=0.01)
 
 
 async def test_ensure_keeps_the_default_when_live_is_unfundable(tmp_path, monkeypatch):
@@ -203,7 +203,7 @@ async def test_ensure_keeps_the_default_when_live_is_unfundable(tmp_path, monkey
     _mirror_env(monkeypatch, 0.004)
     mgr = TradingMode(db_path=str(tmp_path / "poor.db"))
     account = await mgr.ensure_dry_account()
-    assert account["cash"] == pytest.approx(200.0, abs=0.01)
+    assert account["cash"] == pytest.approx(300.0, abs=0.01)
 
 
 async def test_ensure_keeps_the_default_when_no_credentials(tmp_path, monkeypatch):
@@ -211,7 +211,7 @@ async def test_ensure_keeps_the_default_when_no_credentials(tmp_path, monkeypatc
     monkeypatch.setattr(mode_module, "_materialize_private_key", lambda: None)
     mgr = TradingMode(db_path=str(tmp_path / "nocreds.db"))
     account = await mgr.ensure_dry_account()
-    assert account["cash"] == pytest.approx(200.0, abs=0.01)
+    assert account["cash"] == pytest.approx(300.0, abs=0.01)
 
 
 async def test_ensure_never_reseeds_a_book_that_exists(tmp_path, monkeypatch):
@@ -223,7 +223,7 @@ async def test_ensure_never_reseeds_a_book_that_exists(tmp_path, monkeypatch):
     before = await mgr.dry_account()
     account = await mgr.ensure_dry_account()
     assert account["cash"] == pytest.approx(before["cash"], abs=0.01)
-    assert account["starting_balance"] == pytest.approx(200.0, abs=0.01)
+    assert account["starting_balance"] == pytest.approx(300.0, abs=0.01)
 
 
 async def test_reset_reseeds_at_the_fixed_default(tmp_path, monkeypatch):
@@ -237,8 +237,8 @@ async def test_reset_reseeds_at_the_fixed_default(tmp_path, monkeypatch):
 
     account = await mgr.reset_dry_account()
 
-    assert account["starting_balance"] == pytest.approx(200.0, abs=0.01)
-    assert account["cash"] == pytest.approx(200.0, abs=0.01)
+    assert account["starting_balance"] == pytest.approx(300.0, abs=0.01)
+    assert account["cash"] == pytest.approx(300.0, abs=0.01)
     assert account["open_positions"] == 0
     assert account["closed_trades"] == 0
 
@@ -252,5 +252,5 @@ async def test_reset_keeps_the_starting_figure_when_live_is_unreachable(tmp_path
 
     account = await mgr.reset_dry_account()
 
-    assert account["cash"] == pytest.approx(200.0, abs=0.01)
+    assert account["cash"] == pytest.approx(300.0, abs=0.01)
     assert account["open_positions"] == 0

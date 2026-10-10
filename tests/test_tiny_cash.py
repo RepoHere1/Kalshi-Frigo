@@ -23,6 +23,14 @@ def _trader():
     return UpDownTrader(spot, Btc15mFeed(), UpDownConfig())
 
 
+def _trader_no_session_mult():
+    spot = SpotFeed()
+    spot.price = 84900.0
+    spot.ts = __import__("time").time()
+    spot.source = "test"
+    return UpDownTrader(spot, Btc15mFeed(), UpDownConfig(session_mult_enabled=False))
+
+
 def test_size_floors_at_one_contract_not_a_dollar():
     """The exchange minimum is one whole contract; a $0.60 budget at 0.45 still
     submits one contract, never zero and never a fabricated $1 ceiling."""
@@ -193,7 +201,7 @@ def test_kelly_scales_the_clip_with_the_edge():
     ~$2.22 -> 4 contracts."""
     import src.jobs.ladder_trader as lt
 
-    trader = _trader()
+    trader = _trader_no_session_mult()
     trader._live_balance = 10.0
     monkeypatched = lt  # keep the namespace honest for the fair patch below
     market = _mkt(
@@ -215,7 +223,7 @@ def test_kelly_cap_bounds_a_single_clip():
     is the binding money law; kelly_cap never binds at quarter scale."""
     import src.jobs.ladder_trader as lt
 
-    trader = _trader()
+    trader = _trader_no_session_mult()
     trader._live_balance = 10.0
     market = _mkt(
         seconds_left=600, target=84000.0,
@@ -291,12 +299,12 @@ def test_ninety_cents_hard_block_holds_for_makers_too():
 
 def test_dry_mirrors_kelly_on_its_own_cash():
     """The law: the same sizing rule, on the DRY book's own money.
-    Quarter-Kelly: 300 x 0.111 = $33.30 -> 60 contracts at 0.55; the
-    strong view (0.75) doubles via conviction -> $66.60 -> 121 contracts,
-    still under the 0.5-of-book ceiling."""
+    Kelly with confidence-weighting (pivot=0.70): scale = 0.25 + 0.25*(fair-pivot)/(1-pivot)
+    = 0.2917; k = 0.2917*0.444 = 0.1296; clip = 300*0.1296 = $38.88; with conviction
+    doubling -> $77.76 -> 141 contracts at 0.55, under the 0.5-of-book ceiling."""
     import src.jobs.ladder_trader as lt
 
-    trader = _trader()
+    trader = _trader_no_session_mult()
     trader._dry_cash_cache = 300.0
     market = _mkt(
         seconds_left=600, target=84000.0,
@@ -306,7 +314,7 @@ def test_dry_mirrors_kelly_on_its_own_cash():
         mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.75)
         signal = trader.evaluate(market, live=False)
     assert signal is not None and signal.side == "up"
-    assert signal.contracts == 121
+    assert signal.contracts == 141
     assert signal.notional <= 300.0 * trader.config.conviction_max_fraction + 0.01
 
 

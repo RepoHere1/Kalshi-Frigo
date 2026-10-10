@@ -50,15 +50,15 @@ class EdgeFilter:
     UPDATED: More aggressive thresholds to allow more trading opportunities.
     """
     
-    # STRATEGIC: Align with LLM prompt (requires >10% edge) and Kalshi fees (7% taker)
-    MIN_EDGE_REQUIREMENT = 0.10        # 10% minimum edge (matches prompt and covers 7% fees)
-    HIGH_CONFIDENCE_EDGE = 0.10        # 10% edge for high confidence (>=80%)
-    MEDIUM_CONFIDENCE_EDGE = 0.12      # 12% edge for medium confidence (>=60%)
-    LOW_CONFIDENCE_EDGE = 0.15         # 15% edge for low confidence (<60%)
+    # Lowered to capture more trades with smaller edges (Kalshi fees are 7% taker)
+    MIN_EDGE_REQUIREMENT = 0.06        # 6% minimum edge (lowered from 10% to allow more trades)
+    HIGH_CONFIDENCE_EDGE = 0.06        # 6% edge for high confidence (>=80%)
+    MEDIUM_CONFIDENCE_EDGE = 0.08      # 8% edge for medium confidence (>=60%)
+    LOW_CONFIDENCE_EDGE = 0.10         # 10% edge for low confidence (<60%)
     
-    # STRATEGIC: Higher confidence for better edge reliability
-    MIN_CONFIDENCE_FOR_TRADE = 0.55    # 55% minimum confidence (more reliable signals)
-    MAX_ACCEPTABLE_RISK = 0.6          # INCREASED: 60% max position risk (was 50%)
+    # Lowered confidence to capture more opportunities
+    MIN_CONFIDENCE_FOR_TRADE = 0.40    # 40% minimum confidence (lowered from 55%)
+    MAX_ACCEPTABLE_RISK = 0.6          # 60% max position risk
     
     # UPDATED: More permissive quality filters
     MIN_VOLUME_FOR_HIGH_EDGE = 500     # DECREASED: Lower volume requirement (was 2000, now 500)

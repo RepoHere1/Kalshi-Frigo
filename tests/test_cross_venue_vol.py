@@ -215,6 +215,14 @@ def _trader():
     return UpDownTrader(spot, Btc15mFeed(), UpDownConfig())
 
 
+def _trader_no_momentum():
+    spot = SpotFeed()
+    spot.price = 84900.0
+    spot.ts = time.time()
+    spot.source = "test"
+    return UpDownTrader(spot, Btc15mFeed(), UpDownConfig(momentum_filter_enabled=False))
+
+
 def test_reason_names_implied_sigma_when_both_curves_exist():
     trader = _trader()
     t0 = time.monotonic()
@@ -248,7 +256,7 @@ def test_poly_guard_vetoes_when_the_other_venue_disagrees():
 
 
 def test_poly_arb_is_logged_when_the_two_venues_undercut_a_dollar():
-    trader = _trader()
+    trader = _trader_no_momentum()
     end = bucket_to_utc(BUCKET)
     # Kalshi up ~0.41 (ask); Poly down 0.55 -> combined 0.96 -> arb.
     trader.poly._windows = {

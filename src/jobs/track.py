@@ -235,7 +235,40 @@ async def should_exit_position(
                 )
                 return False, "insufficient_volume_at_stop", current_price
 
-    # 3. Take-profit exit (enhanced logic for YES/NO)
+    # 3. QUICK-WIN EXIT: lock profits when >50% of max gain arrives in <=3 min
+    quick_win_minutes = 3.0
+    quick_win_gain_threshold = 0.50
+    try:
+        from src.jobs.live_fees import roundtrip_fee_dollars
+
+        _max_gain = (
+            (1.0 - position.entry_price) * position.quantity
+            if position.side == "YES"
+            else position.entry_price * position.quantity
+        )
+        if _max_gain > 0 and _hours_since(position.timestamp) <= (quick_win_minutes / 60.0):
+            _current_gain = (
+                (current_price - position.entry_price) * position.quantity
+                if position.side == "YES"
+                else (position.entry_price - current_price) * position.quantity
+            )
+            if _current_gain >= _max_gain * quick_win_gain_threshold:
+                _exit_fees = roundtrip_fee_dollars(
+                    position.entry_price, current_price, int(position.quantity), maker_exit=False
+                )
+                _net = _current_gain - _exit_fees
+                if _net > 0:
+                    return True, "quick_win", current_price
+                else:
+                    logger = get_trading_logger("exit_tracker")
+                    logger.info(
+                        f"Quick-win triggered for {position.market_id} but skipped: "
+                        f"net {_net:+.2f} after fees ${_exit_fees:.2f}"
+                    )
+    except Exception:  # noqa: BLE001 - quick-win never blocks
+        pass
+
+    # 4. Take-profit exit (enhanced logic for YES/NO)
     if position.take_profit_price:
         take_profit_triggered = False
 
@@ -329,6 +362,62 @@ async def should_exit_position(
                 return True, "conviction_collapse", current_price
     except Exception:  # noqa: BLE001 - conviction exit never blocks
         pass
+
+    # NEWS SENTIMENT EXIT BOOST: when breaking news moves against our position,
+    # exit faster. When news confirms our direction, hold longer.
+    if position.market_id and kalshi_client is not None:
+        try:
+            from src.data.news_aggregator import NewsAggregator
+            from src.agents.news_analyst_agent import NewsAnalystAgent
+            from src.jobs.risk_overlays import collapse_allowance, conviction_collapsed
+            import asyncio
+
+            _agg = NewsAggregator()
+            _agent = NewsAnalystAgent()
+            _articles = _agg.get_relevant_articles(position.market_id, max_articles=3)
+            if _articles:
+                _news_text = " ".join([f"{a[0].title}: {a[0].summary[:200]}" for a in _articles[:3]])
+                _md = {"title": position.market_id, "yes_price": current_yes_price, "no_price": current_no_price}
+                _ctx = {"additional_news": _news_text}
+
+                async def _run_analysis():
+                    async def _completion(prompt):
+                        from src.clients.xai_client import XAIClient
+                        _client = XAIClient()
+                        return await _client.get_completion(prompt)
+
+                    return await _agent.analyze(_md, _ctx, _completion)
+
+                _analysis = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: asyncio.run(_run_analysis())
+                )
+                if _analysis:
+                    _sentiment = _analysis.get("sentiment", 0.0)
+                    _impact = _analysis.get("impact_direction", "neutral")
+                    _rel = _analysis.get("relevance", 0.0)
+                    if _rel > 0.5:
+                        _is_losing = (position.side == "YES" and current_price < position.entry_price) or \
+                                     (position.side == "NO" and current_price > position.entry_price)
+                        if _is_losing:
+                            if (position.side == "YES" and _impact == "down") or \
+                               (position.side == "NO" and _impact == "up"):
+                                logger = get_trading_logger("exit_tracker")
+                                logger.info(
+                                    f"News-contrary exit for {position.market_id}: "
+                                    f"impact={_impact}, sentiment={_sentiment:.2f}, relevance={_rel:.2f}"
+                                )
+                                return True, "news_contrary", current_price
+                            _allowance = collapse_allowance(time_left=600.0)
+                            if position.side == "YES" and position.entry_price and position.entry_price > 0:
+                                _current = min(1.0, current_price / position.entry_price)
+                            elif position.side == "NO" and position.entry_price is not None:
+                                _current = min(1.0, (1.0 - current_price) / max(0.01, 1.0 - position.entry_price))
+                            else:
+                                _current = position.confidence or 0.0
+                            if not conviction_collapsed(position.confidence or 0.0, _current, _allowance * 2):
+                                pass
+        except Exception:  # noqa: BLE001 - news exit never blocks
+            pass
 
     return False, "", current_price
 

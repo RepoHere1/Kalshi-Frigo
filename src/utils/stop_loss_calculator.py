@@ -24,15 +24,15 @@ class StopLossCalculator:
     in the performance analysis.
     """
     
-    # Grok4 recommended parameters
-    MIN_STOP_LOSS_PCT = 0.05    # 5% minimum stop-loss
-    MAX_STOP_LOSS_PCT = 0.10    # 10% maximum stop-loss  
-    DEFAULT_STOP_LOSS_PCT = 0.07 # 7% default stop-loss
+    # Tighter stops to limit losses and capture gains faster
+    MIN_STOP_LOSS_PCT = 0.03    # 3% minimum stop-loss (tightened from 5%)
+    MAX_STOP_LOSS_PCT = 0.06    # 6% maximum stop-loss (tightened from 10%)
+    DEFAULT_STOP_LOSS_PCT = 0.04 # 4% default stop-loss
     
-    # Take-profit targets
-    MIN_TAKE_PROFIT_PCT = 0.15   # 15% minimum take-profit
-    MAX_TAKE_PROFIT_PCT = 0.30   # 30% maximum take-profit
-    DEFAULT_TAKE_PROFIT_PCT = 0.20 # 20% default take-profit
+    # Lower take-profit to lock in gains faster
+    MIN_TAKE_PROFIT_PCT = 0.10   # 10% minimum take-profit (lowered from 15%)
+    MAX_TAKE_PROFIT_PCT = 0.20   # 20% maximum take-profit (lowered from 30%)
+    DEFAULT_TAKE_PROFIT_PCT = 0.15 # 15% default take-profit
     
     @classmethod
     def calculate_stop_loss_levels(

@@ -144,7 +144,7 @@ def test_index_documents_the_system(client):
 def test_index_renders_config_values(client):
     html = client.get("/").get_data(as_text=True)
     assert "max_position_size_pct" in html
-    assert "0.45" in html, "min_confidence_to_trade value not rendered"
+    assert "0.4" in html, "min_confidence_to_trade value not rendered"
 
 
 def test_snapshot_endpoint_matches_page(client):
@@ -540,7 +540,7 @@ def test_dry_headline_shows_the_simulated_book_not_real_money(client):
     # time frame; the realized figure lives in the subtitle.)
     assert "DRY book P&amp;L" in tiles and "since reset" in tiles
     # The real account's money must not appear in the DRY headline.
-    assert "$200.00" in tiles
+    assert "$300.00" in tiles
     assert "Kalshi balance" not in tiles
     assert "Live positions" not in tiles
 
@@ -1314,9 +1314,9 @@ def test_mode_defaults_to_dry(client):
 
 def test_dry_account_starts_at_200(client):
     dry = client.get("/api/mode").get_json()["dry"]
-    assert dry["starting_balance"] == 200.0
-    assert dry["cash"] == 200.0
-    assert dry["equity"] == 200.0
+    assert dry["starting_balance"] == 300.0
+    assert dry["cash"] == 300.0
+    assert dry["equity"] == 300.0
     assert dry["total_pnl"] == 0.0
 
 
@@ -1409,7 +1409,7 @@ def test_dry_reset_restores_starting_balance(client, auth):
     assert client.get("/api/mode").get_json()["dry"]["cash"] == 12.5
     r = client.post("/api/dry/reset", headers=auth)
     assert r.status_code == 200
-    assert r.get_json()["dry"]["cash"] == 200.0
+    assert r.get_json()["dry"]["cash"] == 300.0
 
 
 # ---------------------------------------------------------------------------
@@ -1420,9 +1420,9 @@ def test_ledger_debits_and_credits(client):
 
     mgr = TradingMode(db_path=wd.DB_PATH)
     run(mgr.record_fill(market_id="KXTEST", side="YES", action="buy", quantity=10, price=0.5))
-    assert mgr and run(mgr.dry_account())["cash"] == 195.0
+    assert mgr and run(mgr.dry_account())["cash"] == 295.0
     run(mgr.record_fill(market_id="KXTEST", side="YES", action="sell", quantity=10, price=0.65))
-    assert run(mgr.dry_account())["cash"] == 201.5
+    assert run(mgr.dry_account())["cash"] == 301.5
     assert run(mgr.ledger(10))[0]["action"] == "sell"
 
 
@@ -1436,7 +1436,7 @@ def test_ledger_refuses_overspend(client):
         raise AssertionError("overspend must be rejected")
     except ModeError as exc:
         assert "Insufficient simulated funds" in str(exc)
-    assert run(mgr.dry_account())["cash"] == 200.0
+    assert run(mgr.dry_account())["cash"] == 300.0
 
 
 def test_ledger_rejects_bad_action(client):
@@ -1456,7 +1456,7 @@ def test_dry_account_tolerates_missing_tables(tmp_path):
 
     mgr = TradingMode(db_path=str(tmp_path / "brand_new.db"))
     acct = run(mgr.dry_account())
-    assert acct["cash"] == 200.0
+    assert acct["cash"] == 300.0
     assert acct["closed_trades"] == 0
 
 
@@ -1468,7 +1468,7 @@ def test_page_renders_mode_switch_and_dry_account(client):
     assert 'id="modeDry"' in html
     assert 'id="modeLive"' in html
     assert "DRY account" in html
-    assert "$200.00" in html, "DRY starting balance not rendered"
+    assert "$300.00" in html, "DRY starting balance not rendered"
     assert "Funding source" in html
 
 
@@ -2338,10 +2338,10 @@ def test_reconcile_derives_cash_from_the_book(client):
 
     mgr = TradingMode(db_path=wd.DB_PATH)
     drift = asyncio.run(mgr.reconcile_dry())
-    # 200 start, no closes, $7.00 deployed in DRY only -> $193.00
-    assert drift["derived_cash"] == 193.0
+    # 300 start, no closes, $7.00 deployed in DRY only -> $293.00
+    assert drift["derived_cash"] == 293.0
     assert drift["ledger_cash"] == 38.47
-    assert drift["drift"] == pytest.approx(154.53, abs=0.01)
+    assert drift["drift"] == pytest.approx(254.53, abs=0.01)
 
 
 def test_dry_account_is_self_consistent_after_reconciling(client):
@@ -2416,7 +2416,7 @@ def test_reconcile_reports_realized_without_restating_cash(client):
     # Realized is reported from the closes.
     assert mode["dry"]["realized"] == pytest.approx(1.0, abs=0.01)
     # The derivation that once overwrote the balance is still *reported* as drift.
-    assert mode["drift"]["derived_cash"] == pytest.approx(199.0, abs=0.01)
+    assert mode["drift"]["derived_cash"] == pytest.approx(299.0, abs=0.01)
     # But cash is untouched: it is the ledger's truth, not the page's opinion.
     assert mode["dry"]["cash"] == pytest.approx(ledger_cash, abs=0.01)
 

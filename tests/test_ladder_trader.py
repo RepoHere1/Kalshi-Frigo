@@ -424,6 +424,7 @@ def test_the_no_side_is_preferred_when_edges_are_close(monkeypatch):
 def test_live_clip_sizes_against_the_balance_budget():
     trader = _scorer()
     trader.spot.price = 85000.0
+    trader.config.session_mult_enabled = False
     # In-band price: the LIVE entry band is 0.10-0.50.
     market = _quoted_market(yes_ask=0.40, no_ask=0.60, target=84000.0)
     # A $4 budget -> 10 contracts at 0.40, not the fixed $5 clip's 12.

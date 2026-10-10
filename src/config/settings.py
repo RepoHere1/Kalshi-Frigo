@@ -94,13 +94,11 @@ class TradingConfig:
     min_balance: float = 100.0          # SANE: $100 minimum balance (was $50)
     
     # Market filtering criteria — DISCIPLINED
-    min_volume: float = 500.0           # SANE: Higher volume requirement (was 200 beast mode)
-    max_time_to_expiry_days: int = 14   # SANE: Shorter timeframes (was 30)
+    min_volume: float = 200.0           # DECREASED: Lower volume requirement to find more markets (was 500)
+    max_time_to_expiry_days: int = 30   # INCREASED: Allow longer duration trades (was 14)
     
     # AI decision making — DATA-DRIVEN THRESHOLDS  
-    min_confidence_to_trade: float = 0.45   # LOOSENED: 45% confidence minimum (was 60%, approved 2026-03-29)
-                                           # Based on analysis: 65% was too conservative, bot finding 0 eligible markets
-                                           # NCAAB NO-side showed 74% WR at +10% ROI, suggesting value at lower thresholds
+    min_confidence_to_trade: float = 0.40   # LOWERED: 40% confidence minimum (was 45%)
     
     # Category-specific confidence adjustments (applied as multipliers to base threshold)
     category_confidence_adjustments: Dict[str, float] = field(default_factory=lambda: {
@@ -110,7 +108,7 @@ class TradingConfig:
         "default": 1.0       # Base multiplier for other categories
     })
     
-    scan_interval_seconds: int = 60      # SANE: 60-second scan interval (was 30)
+    scan_interval_seconds: int = 30      # DECREASED: Scan every 30 seconds for more opportunities
     
     # AI model configuration — HOT (paid) OpenRouter config for LIVE,
     # matching master.env: KALSHI_LLM_MODEL / KALSHI_LLM_FALLBACK.
@@ -125,7 +123,7 @@ class TradingConfig:
     
     # Kelly Criterion settings (PRIMARY position sizing method) — DISCIPLINED
     use_kelly_criterion: bool = True        # Use Kelly Criterion for position sizing (PRIMARY METHOD)
-    kelly_fraction: float = 0.25            # SANE: Quarter-Kelly (was 0.75 beast mode — gambling)
+    kelly_fraction: float = 0.50            # INCREASED: Half-Kelly for bigger position sizes (was 0.25)
     max_single_position: float = 0.03       # SANE: 3% max position cap (was 0.05 beast mode)
     
     # Live trading mode control
@@ -145,9 +143,9 @@ class TradingConfig:
     
     # High-confidence, near-expiry strategy
     enable_high_confidence_strategy: bool = True
-    high_confidence_threshold: float = 0.95  # LLM confidence needed
-    high_confidence_market_odds: float = 0.90 # Market price to look for
-    high_confidence_expiry_hours: int = 24   # Max hours until expiry
+    high_confidence_threshold: float = 0.85  # LOWERED: 85% confidence needed (was 95%)
+    high_confidence_market_odds: float = 0.80 # LOWERED: Market price to look for (was 0.90)
+    high_confidence_expiry_hours: int = 48   # INCREASED: Max hours until expiry (was 24)
 
     # AI trading criteria - MORE PERMISSIVE
     max_analysis_cost_per_decision: float = 0.15  # INCREASED: Allow higher cost per decision (was 0.10, now 0.15)
@@ -215,7 +213,7 @@ max_sector_exposure: float = 0.30       # SANE: 30% sector concentration (was 90
 # System performance objectives - MORE AGGRESSIVE FOR MORE TRADES
 target_sharpe: float = 0.3              # DECREASED: Lower Sharpe requirement (was 0.5, now 0.3)
 target_return: float = 0.15             # INCREASED: Higher return target (was 0.10, now 0.15)
-min_trade_edge: float = 0.08           # DECREASED: Lower edge requirement (was 0.15, now 8%)
+min_trade_edge: float = 0.05           # DECREASED: Lower edge requirement (was 0.08, now 5%)
 min_confidence_for_large_size: float = 0.50  # DECREASED: Lower confidence requirement (was 0.65, now 50%)
 
 # === DYNAMIC EXIT STRATEGIES ===
@@ -238,8 +236,8 @@ max_orders_per_market: int = 4          # Maximum orders per market (2 each side
 # === MARKET SELECTION (ENHANCED FOR MORE OPPORTUNITIES) ===
 # Removed time restrictions - trade ANY deadline with dynamic exits!
 # max_time_to_expiry_days: REMOVED      # No longer used - trade any timeline!
-min_volume_for_analysis: float = 200.0  # DECREASED: Much lower minimum volume (was 1000, now 200)
-min_volume_for_market_making: float = 500.0  # DECREASED: Lower volume for market making (was 2000, now 500)
+min_volume_for_analysis: float = 100.0  # DECREASED: Very low volume threshold (was 200, now 100)
+min_volume_for_market_making: float = 200.0  # DECREASED: Lower volume for market making (was 500, now 200)
 min_price_movement: float = 0.02        # DECREASED: Lower minimum range (was 0.05, now 2¢)
 max_bid_ask_spread: float = 0.15        # INCREASED: Allow wider spreads (was 0.10, now 15¢)
 min_confidence_long_term: float = 0.45  # DECREASED: Lower confidence for distant expiries (was 0.65, now 45%)
@@ -248,8 +246,8 @@ min_confidence_long_term: float = 0.45  # DECREASED: Lower confidence for distan
 # Enhanced cost controls for the beast mode system
 daily_ai_budget: float = 15.0           # INCREASED: Higher budget for more opportunities (was 10.0, now 15.0)
 max_ai_cost_per_decision: float = 0.12  # INCREASED: Higher per-decision limit (was 0.08, now 0.12)
-analysis_cooldown_hours: int = 2        # DECREASED: Much shorter cooldown (was 4, now 2)
-max_analyses_per_market_per_day: int = 6  # INCREASED: More analyses per day (was 3, now 6)
+analysis_cooldown_hours: int = 1        # DECREASED: Very short cooldown for faster reaction (was 2, now 1)
+max_analyses_per_market_per_day: int = 12  # INCREASED: Many more analyses per day (was 6, now 12)
 skip_news_for_low_volume: bool = True   # Skip expensive searches for low volume
 news_search_volume_threshold: float = 1000.0  # News threshold
 

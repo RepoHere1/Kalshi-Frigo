@@ -147,6 +147,8 @@ class UpDownConfig:
     kelly_sizing: bool = True
     kelly_scale: float = 0.25
     kelly_cap: float = 0.35    # never more than 35% of the book in one clip
+    kelly_confidence_pivot: float = 0.70  # fair probability at which kelly_scale begins scaling up
+    kelly_confidence_max_mult: float = 2.0  # max multiplier on kelly_scale (capped at 0.50)
     # High-probability convergence entries: a resting maker bid at $0.60-$0.85
     # pays a quarter fee and, with the diffusion fair value demanding real
     # edge over it, is the steadiest compounding trade this book has. Taker
@@ -205,6 +207,11 @@ class UpDownConfig:
     # until a CLOB executor exists).
     poly_guard_enabled: bool = True
     poly_guard_threshold: float = 0.10
+    # MOMENTUM FILTER: Poly drift confirmation before entry.
+    # When Polymarket's 15-min window drifts opposite our signal direction,
+    # reject the entry as the move may reverse before our window closes.
+    momentum_filter_enabled: bool = True
+    momentum_agree_threshold: float = 0.03  # Poly drift must be within ±0.03 of our direction
     # MAKER-ONLY ORDERS: Post limit orders only, never cross spread for liquidity
     maker_only_mode: bool = True  # NEW: Only place limit orders at bid/ask
     maker_wait_seconds: float = 5.0  # Wait time for maker order to fill
@@ -294,6 +301,8 @@ class UpDownConfig:
     conviction_sizing: bool = True
     conviction_mult: float = 2.0
     conviction_max_fraction: float = 0.5  # hard ceiling: balance share/clip
+    full_conviction_mult: float = 3.0  # multiplier when 3+ signals agree
+    volume_spike_threshold: float = 1000.0  # volume above which counts as a spike
 
     # CERTIFIED CERTAINTY (new): a view at/above certified_prob - the model
     # AND the price agreeing with a big cushion - sizes at certified_mult.
@@ -303,6 +312,13 @@ class UpDownConfig:
     # correlation) still binds the result.
     certified_prob: float = 0.85
     certified_mult: float = 3.0
+
+    # US-EQUITY SESSION BIAS: scale clip size to liquidity. Higher Kalshi
+    # volume during the US session means tighter spreads = more edge/trade.
+    session_mult_enabled: bool = True
+    session_mult_high: float = 1.30   # 9:30-11:30 AM ET (highest volume)
+    session_mult_normal: float = 1.00  # 11:30 AM-4:00 PM ET
+    session_mult_low: float = 0.70     # 4:00 PM-9:30 AM ET (next day)
 
     def __post_init__(self) -> None:
         import os as _os
@@ -350,6 +366,12 @@ class UpDownConfig:
         try:
             self.kelly_scale = float(_os.environ.get("KELLY_SCALE", self.kelly_scale))
             self.kelly_cap = float(_os.environ.get("KELLY_CAP", self.kelly_cap))
+            self.kelly_confidence_pivot = float(
+                _os.environ.get("KELLY_CONFIDENCE_PIVOT", self.kelly_confidence_pivot)
+            )
+            self.kelly_confidence_max_mult = float(
+                _os.environ.get("KELLY_CONFIDENCE_MAX_MULT", self.kelly_confidence_max_mult)
+            )
             self.max_entry_price_maker = float(
                 _os.environ.get("MAX_ENTRY_MAKER", self.max_entry_price_maker)
             )
@@ -469,11 +491,14 @@ class UpDownBook:
     skipped_sentinel: int = 0
     skipped_venue_guard: int = 0
     skipped_poly_divergence: int = 0
+    skipped_momentum: int = 0
     skipped_correlated: int = 0
     skipped_flow_veto: int = 0
     skipped_macro_veto: int = 0
     skipped_shadow: int = 0
     skipped_drawdown: int = 0
+    skipped_quick_win: int = 0
+    skipped_news_sentiment: int = 0
     last_error: str = ""
     blocked: str = ""
     dry: bool = True
@@ -501,7 +526,9 @@ class UpDownBook:
             "skipped_sentinel": self.skipped_sentinel,
             "skipped_venue_guard": self.skipped_venue_guard,
             "skipped_poly_divergence": self.skipped_poly_divergence,
+            "skipped_momentum": self.skipped_momentum,
             "skipped_correlated": self.skipped_correlated,
+            "skipped_news_sentiment": self.skipped_news_sentiment,
             "last_error": self.last_error,
             "dry": self.dry,
             "certain_wins": self.certain_wins,
@@ -541,6 +568,35 @@ def _min_viable_notional(cents: float) -> float:
     # are bounded downstream by the actual fill price. This is just a sane
     # dollar floor so a 2-cent balance still submits something concrete.
     return max(0.01, round(cents / 100.0, 4))
+
+
+def _get_et_hour() -> int:
+    """Current hour in US Eastern Time (EST/EDT), 0-23."""
+    from datetime import datetime, timezone, timedelta
+
+    utc_now = datetime.now(timezone.utc)
+    month = utc_now.month
+    offset = -4 if 3 <= month <= 11 else -5
+    et_now = utc_now + timedelta(hours=offset)
+    return et_now.hour
+
+
+def session_multiplier(cfg: Any) -> float:
+    """US equity market hours multiplier for clip sizing.
+
+    9:30-11:30 AM ET:  highest Kalshi volume, scale up 30%.
+    11:30 AM-4:00 PM ET: normal hours, no change.
+    4:00 PM-9:30 AM ET: reduced volume, scale down 30%.
+    """
+    if not getattr(cfg, "session_mult_enabled", True):
+        return 1.0
+    et_hour = _get_et_hour()
+    if 9 <= et_hour < 11:
+        return float(getattr(cfg, "session_mult_high", 1.30))
+    elif 11 <= et_hour < 16:
+        return float(getattr(cfg, "session_mult_normal", 1.00))
+    else:
+        return float(getattr(cfg, "session_mult_low", 0.70))
 
 
 def tiered_edge_bar(win_prob: float, base_edge: float, cfg: Any) -> float:
@@ -679,6 +735,7 @@ class UpDownTrader:
         # FRESH-BURST flag for this pass: a fresh spot move the quote has
         # not repriced. Set by _score; consumed by the maker/taker choice.
         self._burst: bool = False
+        self._poly_window: Optional[Any] = None  # reused poly window for signal stacking
         # Certain-win pair bookkeeping: cooldown + max rounds per ticker, so
         # the arithmetic trade repeats a few times per market at most.
         self._cw_last: Dict[str, float] = {}
@@ -913,6 +970,42 @@ class UpDownTrader:
                         truth=truth_kind,
                     )
             except Exception:  # noqa: BLE001 - guard failure never blocks
+                pass
+        # MOMENTUM FILTER: reject counter-momentum entries.
+        # If Polymarket's 15-min window is drifting opposite our signal,
+        # the move may reverse before our window closes.
+        if self.config.momentum_filter_enabled and market.bucket is not None:
+            try:
+                from src.jobs.cross_venue_poly import bucket_to_utc
+
+                _end = bucket_to_utc(market.bucket)
+                if _end is not None:
+                    _w = self.poly.window_for(_end)
+                    self._poly_window = _w  # cache for multi-signal conviction stacking
+                    if _w is not None:
+                        _poly_drift = _w.up - _w.down
+                        _our_drift = delta
+                        if (_our_drift > 0 and _poly_drift < -self.config.momentum_agree_threshold) or \
+                           (_our_drift < 0 and _poly_drift > self.config.momentum_agree_threshold):
+                            self.book.skipped_momentum += 1
+                            return UpDownSignal(
+                                ticker=market.ticker,
+                                bucket=market.bucket,
+                                side="",
+                                target=target,
+                                spot=spot,
+                                spot_vs_target=delta,
+                                fair=0.5,
+                                kalshi_price=market.up_price,
+                                edge=0.0,
+                                ask=None,
+                                contracts=0,
+                                notional=0.0,
+                                seconds_left=round(market.seconds_left or 0.0, 1),
+                                reason=f"momentum filter: poly drift {_poly_drift:+.2f} vs our drift {_our_drift:+.2f}",
+                                truth=truth_kind,
+                            )
+            except Exception:  # noqa: BLE001 - momentum filter never blocks on its own failure
                 pass
         # Hard deadband.
         # noise scales with target price so XRP/XAU/ETH/BTC all work.
@@ -1212,6 +1305,17 @@ class UpDownTrader:
             # with the edge; kelly_cap bounds any single bet. This is what
             # turns $10 into something: growth-optimal sizing on every edge,
             # not a flat $5 til the account dies of fee drag.
+            # Confidence-weighted Kelly: scale up for strong model conviction
+            _conf_kelly_scale = (
+                self.config.kelly_scale
+                + self.config.kelly_scale
+                * max(0.0, fair - self.config.kelly_confidence_pivot)
+                / (1.0 - self.config.kelly_confidence_pivot)
+            )
+            _conf_kelly_scale = min(
+                _conf_kelly_scale,
+                self.config.kelly_scale * self.config.kelly_confidence_max_mult,
+            )
             if (
                 self.config.kelly_sizing
                 and 0.0 < fill_price < 1.0
@@ -1224,7 +1328,7 @@ class UpDownTrader:
                         0.0,
                         min(
                             self.config.kelly_cap,
-                            self.config.kelly_scale * _kelly,
+                            _conf_kelly_scale * _kelly,
                         ),
                     )
                     _clip = round(_bal * _k, 2)
@@ -1234,7 +1338,30 @@ class UpDownTrader:
             # still bound the outcome: the conviction fraction ceiling, an
             # explicit cash budget (LIVE's balance fraction), and the
             # correlated/notional caps downstream.
-            _clip = conviction_scale(_clip, _win_side, self.config)
+            # MULTI-SIGNAL CONVICTION STACKING: when 3+ independent signals
+            # agree, apply the full_conviction_mult instead of the base mult.
+            _signal_count = 0
+            _our_dir = 1 if side == "up" else -1
+            if _win_side >= self.config.strong_prob:
+                _signal_count += 1
+            if market.volume is not None and market.volume > self.config.volume_spike_threshold:
+                _signal_count += 1
+            if self._poly_window is not None:
+                _poly_drift = self._poly_window.up - self._poly_window.down
+                if (_our_dir > 0 and _poly_drift > 0) or (_our_dir < 0 and _poly_drift < 0):
+                    _signal_count += 1
+            if self._vol_adj < 0:
+                _signal_count += 1
+            if self._burst:
+                _signal_count += 1
+            _mult = self.config.conviction_mult
+            if _signal_count >= 3:
+                _mult = self.config.full_conviction_mult
+            if _win_side >= self.config.strong_prob:
+                _clip = conviction_scale(_clip, _win_side, self.config)
+                if _signal_count >= 3:
+                    _clip = round(_clip * (_mult / self.config.conviction_mult), 2)
+                    reason += f" | multi-signal ({_signal_count}x/{_mult:.1f}x)"
             if _bal and _bal > 0.0:
                 _clip = min(
                     _clip if _clip is not None else 0.0,
@@ -1242,6 +1369,13 @@ class UpDownTrader:
                 )
             if clip_usd is not None:
                 _clip = min(float(_clip), float(clip_usd))
+            # SESSION MULTIPLIER: scale clip to US equity market liquidity.
+            # High-volume session (9:30-11:30 AM ET) = tighter spreads = bigger clips.
+            _sm = session_multiplier(self.config)
+            if _clip is not None:
+                _clip = round(_clip * _sm, 2)
+                if _sm != 1.00:
+                    reason += f" | session_mult {_sm:.2f}"
             contracts = self._size(fill_price, clip_usd=_clip)
         if side and contracts > 0:
             # The Hyperliquid perp hedge that flattens this clip's direction,

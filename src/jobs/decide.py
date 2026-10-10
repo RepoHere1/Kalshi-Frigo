@@ -82,14 +82,14 @@ def _calculate_kelly_position_size(
         # f* = (q - c_NO) / (1 - c_NO)
         kelly_fraction = (q - c_no) / (1.0 - c_no)
     
-    # Use quarter-Kelly for safety (reduces volatility while retaining ~50% growth)
-    # Higher confidence = slightly more aggressive (up to full Kelly)
-    # Lower confidence = more conservative (down to quarter Kelly)
-    confidence_factor = 0.25 + (confidence * 0.25)  # 0.25 to 0.50
+    # Use half-Kelly as base with confidence scaling (0.33 to 0.67 of calculated Kelly)
+    # Higher confidence = more aggressive (up to 2/3 Kelly)
+    # Lower confidence = more conservative (down to 1/3 Kelly)
+    confidence_factor = 0.33 + (confidence * 0.34)  # 0.33 to 0.67
     kelly_fraction *= confidence_factor
     
-    # Cap at 15% of bankroll (max_single_position setting)
-    kelly_fraction = min(kelly_fraction, 0.15)
+    # Cap at 5% of bankroll per position (max_single_position setting)
+    kelly_fraction = min(kelly_fraction, 0.05)
     
     # Calculate dollar amount
     investment_amount = balance * kelly_fraction
@@ -435,6 +435,27 @@ async def make_decision_for_market(
                     estimated_search_cost = 0.0
 
         total_analysis_cost += estimated_search_cost
+
+        # NEWS ANALYST AGENT: augment news_summary with structured sentiment analysis
+        # to boost entry conviction when news confirms our direction
+        if news_summary:
+            try:
+                from src.agents.news_analyst_agent import NewsAnalystAgent
+                _agent = NewsAnalystAgent()
+                _md = {"title": market.title, "yes_price": market.yes_price, "no_price": market.no_price}
+                _ctx = {"additional_news": news_summary}
+
+                async def _completion(prompt):
+                    return await xai_client.get_completion(prompt)
+
+                _ns = await _agent.analyze(_md, _ctx, _completion)
+                if _ns and _ns.get("relevance", 0) > 0.5:
+                    _dir = _ns.get("impact_direction", "neutral")
+                    _sent = _ns.get("sentiment", 0.0)
+                    news_summary += f"\n[NEWS SIGNAL] sentiment={_sent:.2f}, direction={_dir}, relevance={_ns.get('relevance', 0):.2f}"
+                    logger.info(f"News sentiment for {market.market_id}: {_dir} ({_sent:.2f})")
+            except Exception:
+                pass  # news analysis never blocks
 
         # Check if we're approaching cost limits before making the decision
         if total_analysis_cost > settings.trading.max_ai_cost_per_decision:

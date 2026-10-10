@@ -52,9 +52,9 @@ async def test_concurrent_fills_do_not_lose_a_cash_movement(tmp_path):
 
     accepted = len(buys)
     spent = round(accepted * 1.0, 2)
-    assert round(account["cash"], 2) == pytest.approx(200.0 - spent, abs=0.01), (
+    assert round(account["cash"], 2) == pytest.approx(300.0 - spent, abs=0.01), (
         f"{accepted} ledger rows recorded but cash moved by "
-        f"{200.0 - account['cash']:.2f} - a lost update"
+        f"{300.0 - account['cash']:.2f} - a lost update"
     )
 
 
@@ -90,7 +90,7 @@ async def test_the_balance_never_follows_a_lost_update(tmp_path):
     credits = sum(float(r["amount"]) for r in ledger if r.get("action") == "sell")
     account = await mgr.dry_account()
 
-    assert round(account["cash"], 2) == pytest.approx(200.0 - debits + credits, abs=0.01)
+    assert round(account["cash"], 2) == pytest.approx(300.0 - debits + credits, abs=0.01)
     assert account["cash"] >= 0.0
 
 
