@@ -73,10 +73,13 @@ ASSET_TUNING: Dict[str, Dict[str, float]] = {
     },
     "XAU-USD": {
         "noise_pct": 0.0003,          # ~0.03% of price (~$0.90): Gold moves steadily
-        "max_entry_price": 0.60,
-        "max_entry_price_maker": 0.75,
-        "sweet_band_low": 0.20,
-        "sweet_band_high": 0.50,
+        "max_entry_price": 0.85,      # Gold markets quote 0.64-0.88 (verified live)
+        "max_entry_price_maker": 0.85,
+        # Sweet band widened: gold markets live in 0.60-0.80 (near-certain
+        # quote is dominant because gold's volatility is much smaller than
+        # BTC's); the 0.20-0.50 band refuses every real trade.
+        "sweet_band_low": 0.55,
+        "sweet_band_high": 0.80,
     },
     "ETH-USD": {
         "noise_pct": 0.0002,          # ~0.02% of price (~$0.51): ETH/XAU are large
