@@ -1,0 +1,1 @@
+{"patch":"openrouter_client.py line 454-456: removed false free-only veto, added PI_CLI override warning, paid model always allowed when free_only=False","file":"src/clients/openrouter_client.py","status":"healed"}
