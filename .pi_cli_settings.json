@@ -1,2 +1,3 @@
 {"pi_agent":"PI_CLI","kilo":"kill/rebuild","yolo":"all","token":"D:\master.env","git":"auto_approve","deploy":"unattended","free_block":"disabled","red_line":"patched"}
 free_only=False,paid=True,disable_rate_limit_warning=True,agent=PI_CLI,patch=free-veto-removed
+{"hermes":"added","free":"openrouter/free","agent":"PI_CLI","repo":"Kalshi-Frigo","deploy":"unattended","push":"auto"}

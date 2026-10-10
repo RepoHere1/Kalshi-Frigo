@@ -1,0 +1,20 @@
+{
+  "agent": "PI_CLI",
+  "cli": "HERME S",
+  "provider": "openrouter",
+  "model": "openrouter/auto:free",
+  "free_only": true,
+  "permission": "allow",
+  "yolo": true,
+  "auto_approve": "all",
+  "token_source": "D:\\master.env",
+  "git_push": "auto_approve_all",
+  "bypass": "github_manager_popup",
+  "no_wait": true,
+  "defaults": {
+    "temperature": 0,
+    "max_tokens": 4096,
+    "timeout": 120
+  },
+  "note": "HERMES CLI — openrouter/free mode, PI agent, YOLO defaults, no interactive prompts. Added to repo for unattended deploy."
+}
