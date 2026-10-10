@@ -2771,7 +2771,7 @@ def _mode_payload() -> Dict[str, Any]:
             "reason": "",
         }
     assert MODE_DRY  # keeps the import meaningful for readers
-    time_order={"btc_updown":0,"xrp_updown":0,"xau_updown":0,"hyperliquid_updown":0,"btc_1h_updown":1,"eth_1h_updown":1,"xrp_1h_updown":1,"ai_directional":2,"safe_compounder":3,"beast_mode":4,"market_making":5,"quick_flip":6}
+    time_order={"btc_updown":0,"xrp_updown":0,"xau_updown":0,"hyperliquid_updown":0,"btc_1h_updown":1,"eth_1h_updown":1,"xrp_1h_updown":1}
     payload["cards"]=dict(sorted(payload.get("cards",{}).items(),key=lambda iv:(time_order.get(iv[0],99),iv[0])))
     return payload
 
@@ -5537,10 +5537,8 @@ button.loading.yellow::after {
   </div>
   {%- endif %}
   <div class="pb">
-    <div class="cards" id="cards-15min">
-            <div class="cards">
-      <h3 style="font-weight:bold;color:#4d9fff;margin:4px 0 4px 0">15-MIN LINES</h3>
-      {%- for c in s.strategy_cards %}{%- if c.name in ('btc_updown','xrp_updown','xau_updown','hyperliquid_updown') %}
+    <div class="cards">
+      {%- for c in s.strategy_cards %}
       <div class="card{{ ' hot' if c.running else '' }}" id="card-{{ c.name }}" onclick="openStrategy('{{ c.name }}')">
         <div class="ctop">
           <div>
@@ -5565,41 +5563,9 @@ button.loading.yellow::after {
            </span>
          </div>
       </div>
-      {%- endif %}{%- endfor %}
-      <h3 style="font-weight:bold;color:#f0a030;margin:10px 0 4px 0">1-HOUR LINES</h3>
-      {%- for c in s.strategy_cards %}{%- if c.name in ('btc_1h_updown','eth_1h_updown','xrp_1h_updown') %}
-      <div class="card{{ ' hot' if c.running else '' }}" id="card-{{ c.name }}" onclick="openStrategy('{{ c.name }}')">
-        <div class="ctop">
-          <div>
-            <div class="clabel">{{ c.label }}{% if c.heavy_api_abuser %} <span class="pill no" title="{{ c.heavy_api_abuser_reason }}">HEAVY API ABUSER</span>{% endif %}</div>
-            <div class="mono cname">{{ c.name }}</div>
-          </div>
-          <span class="pill {{ 'warn' if c.stuck else ('ok' if c.running else 'no') }}" id="pill-{{ c.name }}">{% if c.stuck %}<span class="dot"></span>stuck{% elif c.running %}<span class="dot pulse"></span>running{% elif c.stop_reason %}stopped{% else %}not started{% endif %}</span>
-        </div>
-        <div class="cproof mono" id="hb-{{ c.name }}">{% if c.running and c.heartbeat_age_sec is not none %}proof: cycle {{ c.heartbeat_age_sec }}s ago{% elif c.stuck %}stuck: last cycle {{ c.heartbeat_age_sec }}s ago{% endif %}</div>
-        <div class="cchart"><canvas id="spark-{{ c.name }}" height="104"></canvas></div>
-        <div class="cstats">
-          <div><b id="c-{{ c.name }}-trades">{{ c.trades }}</b><span>trades</span></div>
-          <div><b id="c-{{ c.name }}-pnl" class="{{ 'up' if c.realized > 0 else ('down' if c.realized < 0 else 'flat') }}">${{ '%.2f'|format(c.realized) }}</b><span>realized</span></div>
-          <div><b id="c-{{ c.name }}-win">{{ c.win_rate }}%</b><span>win rate</span></div>
-          <div><b id="c-{{ c.name }}-open">{{ c.open_positions }}</b><span>open</span></div>
-        </div>
-         <div class="cfoot">
-           <span class="mono" style="color:var(--faint)">BUY AMT <span id="c-{{ c.name }}-dep">${{ '%.2f'|format(c.deployed) }}</span>{% if not c.running and c.stop_reason %} &middot; {{ c.stop_reason }}{% endif %}</span>
-           <span class="bar" onclick="event.stopPropagation()">
-             <button id="btn-{{ c.name }}" onclick="toggleStrategy('{{ c.name }}')">{% if c.running %}Stop{% else %}Start{% endif %}</button>
-             <button onclick="showAnalysis('{{ c.name }}')">ANALYSIS OF</button>
-           </span>
-         </div>
-      </div>
-      {%- endif %}{%- endfor %}
+      {%- endfor %}
     </div>
     <p style="color:var(--faint);font-size:11.5px;margin-top:10px">
-      Curves are rebuilt from <code>trade_logs</code>, so a strategy keeps its history across restarts and deploys.
-      Cards show the <b>{{ s.book|upper }}</b> book only.
-    </p>
-  </div>
-</div>;font-size:11.5px;margin-top:10px">
       Curves are rebuilt from <code>trade_logs</code>, so a strategy keeps its history across restarts and deploys.
       Cards show the <b>{{ s.book|upper }}</b> book only.
     </p>
