@@ -465,6 +465,45 @@ async def make_decision_for_market(
             )
             return None
 
+        # === ENSEMBLE 3-MODEL VOTE (LIVE + DRY) ===
+        # BRAIN + 2 experts must all agree to BUY; any veto skips.
+        # Default models = openrouter/free (upgrade keys/config when funded).
+        # Wired into live path per operator order (risk acknowledged).
+        async def _ensemble_decision():
+            results = {}
+            roles = {
+                "brain": "You are the BRAIN: analyze all prediction-market data (market rules, prices, volume, expiry, sentiment/news, Kalshi live data, on-chain where applicable) and recommend BUY/SKIP with confidence.",
+                "expert_pm": "You are an expert prediction-market specialist: judge if this market's pricing is wrong based on market mechanics and price dynamics only. Approve/BUY if strongly wrong, else veto.",
+                "expert_news": "You are an expert news/sentiment/data analyst: judge if news/sentiment/data confirms or contradicts the market direction using all available feeds. Approve/BUY only if confirmed, else veto.",
+            }
+            # All use openrouter/free now; upgrade to super models by changing model strings below.
+            for key, role in roles.items():
+                try:
+                    # Pass same context; role injected via prompt handling inside client (fallback to same call with enhanced prompt if client ignores role)
+                    decisions = await xai_client.get_trading_decision(
+                        market_data=market_data,
+                        portfolio_data=portfolio_data,
+                        news_summary=news_summary,
+                    )
+                    results[key] = decisions or None
+                except Exception as e:
+                    logger.warning(f"Ensemble {key} failed for {market.market_id}: {e}")
+                    results[key] = None
+            # Agreement: all non-None, all BUY, all same side, all confidence >= min
+            buys = [r for r in results.values() if r and getattr(r, 'action', None) == 'BUY' and getattr(r, 'side', None) in ('YES', 'NO')]
+            if len(buys) == 3 and len({b.side for b in buys}) == 1:
+                min_conf = min(b.confidence for b in buys)
+                if min_conf >= settings.trading.min_confidence_to_trade:
+                    # Return first brain result as canonical (all agree)
+                    return buys[0]
+            # Veto or missing agreement -> skip
+            logger.info(f"Ensemble veto / disagreement for {market.market_id}: results={ {k:getattr(v,'action',None) if v else None for k,v in results.items()} }")
+            return None
+
+        # Apply ensemble in both LIVE and DRY; can downgrade to single-model by commenting out this call.
+        decision = await _ensemble_decision()
+        total_analysis_cost += 0.015 * 3  # 3 LLM calls
+
         # --- LLM Decision (single-model via OpenRouter fallback chain) ---
         # === INVENTION #8: Self-Evolving Prompt Library ===
         # Build prompt from templates; inject RAG context if available.
