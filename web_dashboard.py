@@ -5486,11 +5486,11 @@ button.loading.yellow::after {
 
 <!-- ============ calibration ============ -->
 <div class="panel" style="margin-bottom:12px">
-  <div class="ph">
+  <div class="ph" style="cursor:pointer" onclick="toggleCalib()">
     <h2>Calibration &mdash; outcomes by entry fair</h2>
-    <span class="note">the model's own report card &middot; closed trades, current book</span>
+    <span class="note"><span id="calibToggle" style="cursor:pointer;font-weight:600">show</span> &middot; the model's own report card &middot; closed trades, current book</span>
   </div>
-  <div class="pb"><div class="scroll">
+  <div class="pb" id="calibBodyWrap" style="display:none"><div class="scroll">
   <table><thead><tr><th>Entry fair band</th><th class="num">Trades</th><th class="num">Wins</th><th class="num">Win %</th><th class="num">Net $</th></tr></thead>
   <tbody id="fairBandsBody">
     {%- for b in (s.trades.by_fair_band if s.trades else []) %}
@@ -5506,7 +5506,7 @@ button.loading.yellow::after {
 <div class="panel" style="margin-bottom:12px">
   <div class="ph" style="cursor:pointer" onclick="toggleLlmUsage()">
     <h2>OpenRouter key usage &mdash; what is actually consuming it</h2>
-    <span class="note"><span id="llmToggle" style="cursor:pointer;font-weight:600">show</span> &middot; lifetime, never reset</span>
+    <span class="note"><span id="llmToggle" style="cursor:pointer;font-weight:600">show</span> &middot; lifetime, never reset &middot; DRY + LIVE together (one key)</span>
   </div>
   <div class="pb" id="llmUsageBodyWrap" style="display:none">
     <div class="cstats" style="grid-template-columns:repeat(auto-fit,minmax(100px,1fr));margin:0 0 12px">
@@ -5523,7 +5523,8 @@ button.loading.yellow::after {
     <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
       "Tracked cost" is the cost the client computes per call; the "AI spend
       today" tile above resets every deploy and under-reports. This table is
-      the lifetime log and does not reset.
+      the lifetime log and does not reset &mdash; one key, both books, so DRY
+      and LIVE read the same account-wide numbers.
     </p>
   </div>
 </div>
@@ -6276,6 +6277,15 @@ function toggleLlmUsage() {
     wrap.style.display = 'none';
     t.textContent = 'show';
   }
+}
+
+function toggleCalib() {
+  const wrap = $('calibBodyWrap');
+  const t = $('calibToggle');
+  if (!wrap || !t) return;
+  const hidden = wrap.style.display === 'none';
+  wrap.style.display = hidden ? '' : 'none';
+  t.textContent = hidden ? 'hide' : 'show';
 }
 
 async function refreshLlmUsage() {
