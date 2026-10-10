@@ -1,0 +1,3 @@
+Config backup (non-secret defaults) — model=openrouter/free, provider=openrouter, footer-widget=enabled
+key_ref: D:/master.env (OPENROUTER_API_KEY) — NOT committed, referenced only
+widget: tui-widgets/model-cost.mjs (cursor-cost footer)
