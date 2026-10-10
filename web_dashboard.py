@@ -2771,7 +2771,7 @@ def _mode_payload() -> Dict[str, Any]:
             "reason": "",
         }
     assert MODE_DRY  # keeps the import meaningful for readers
-    time_order={"btc_updown":0,"xrp_updown":0,"xau_updown":0,"hyperliquid_updown":0,"btc_1h_updown":1,"eth_1h_updown":1,"xrp_1h_updown":1}
+    time_order={"btc_updown":0,"xrp_updown":0,"xau_updown":0,"hyperliquid_updown":0,"btc_1h_updown":1,"eth_1h_updown":1,"xrp_1h_updown":1,"ai_directional":2,"safe_compounder":3,"beast_mode":4,"market_making":5,"quick_flip":6}
     payload["cards"]=dict(sorted(payload.get("cards",{}).items(),key=lambda iv:(time_order.get(iv[0],99),iv[0])))
     return payload
 
