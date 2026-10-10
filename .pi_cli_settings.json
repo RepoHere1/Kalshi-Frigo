@@ -1,1 +1,1 @@
-{"agent":"PI_CLI","yolo":true,"token_from":"D:\master.env","git_push":"auto_approve_all","bypass":"github_manager_popup","no_wait":true}
+{"pi_agent":"PI_CLI","kilo":"kill/rebuild","yolo":"all","token":"D:\master.env","git":"auto_approve","deploy":"unattended","free_block":"disabled","red_line":"patched"}
