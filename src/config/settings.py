@@ -123,7 +123,7 @@ class TradingConfig:
     
     # Kelly Criterion settings (PRIMARY position sizing method) — DISCIPLINED
     use_kelly_criterion: bool = True        # Use Kelly Criterion for position sizing (PRIMARY METHOD)
-    kelly_fraction: float = 0.50            # INCREASED: Half-Kelly for bigger position sizes (was 0.25)
+    kelly_fraction: float = 0.25            # quarter-Kelly (spec entry 22)
     max_single_position: float = 0.03       # SANE: 3% max position cap (was 0.05 beast mode)
     
     # Live trading mode control

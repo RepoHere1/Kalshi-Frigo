@@ -105,7 +105,7 @@ class UpDownConfig:
 
     notional_usd: float = 5.0
     # Required disagreement with Kalshi's own price before trading.
-    min_edge: float = 0.045  # lowered from 0.06: captures 25% more marginal +EV edges per calibration card
+    min_edge: float = 0.06  # canonical spec value (was 0.045)
     # STANDARD TUNING, learned from the forever trade log (283 closes):
     #   - entries at $0.90 and up win 4% of the time ($-110.82): hard-blocked
     #   - the $0.25-$0.50 band wins 100% ($363.34): entries outside it need
