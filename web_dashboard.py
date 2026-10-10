@@ -103,6 +103,11 @@ dashboard_state = {
     "positions": [],
     "trades": [],
     "strategies": {},
+    "strategies": {
+        "btc_1h_updown": {"desired": 0, "running": False, "mode": "paper", "pid": None, "command": " ".join(STRATEGY_COMMANDS.get("btc_1h_updown", []))},
+        "eth_1h_updown": {"desired": 0, "running": False, "mode": "paper", "pid": None, "command": " ".join(STRATEGY_COMMANDS.get("eth_1h_updown", []))},
+        "xrp_1h_updown": {"desired": 0, "running": False, "mode": "paper", "pid": None, "command": " ".join(STRATEGY_COMMANDS.get("xrp_1h_updown", []))},
+    },
     "last_update": None,
     "errors": [],
     "sse_listeners": [],
@@ -184,6 +189,8 @@ STRATEGY_ALIASES = {
     "xau_updown": "xau_updown",
     "xau_updown": "xau_updown",
     "btc_1h_updown": "btc_1h_updown",
+    "eth_1h_updown": "eth_1h_updown",
+    "xrp_1h_updown": "xrp_1h_updown",
     "hyperliquid_updown": "hyperliquid_updown",
     "ai_directional": "ai_directional",
     "ai directional": "ai_directional",
@@ -902,10 +909,23 @@ STRATEGY_DOCS = {
         "keeps running until you press Stop - nothing re-arms it for you.",
     ),
     "btc_1h_updown": (
-        "ETH 15-Min Up/Down",
-        'Reads Kalshi\'s ETH 15-min up/down contract (KXETH15M) and compares its Up/Down '
-        "price against live Coinbase ETH-USD spot. Takes one $5 clip when profitable "
-        "edge detected. "
+        "BTC 1-Hour Up/Down",
+        'Reads Kalshi\'s BTC 1-hour up/down contract (KXBTC1H) and compares its '
+        "Up/Down price against live Coinbase BTC-USD spot. Manual control. "
+        "MANUAL CONTROL: starts only when you press Start in this book, and "
+        "keeps running until you press Stop - nothing re-arms it for you.",
+    ),
+    "eth_1h_updown": (
+        "ETH 1-Hour Up/Down",
+        'Reads Kalshi\'s ETH 1-hour up/down contract (KXETH1H) and compares its '
+        "Up/Down price against live Coinbase ETH-USD spot. Manual control. "
+        "MANUAL CONTROL: starts only when you press Start in this book, and "
+        "keeps running until you press Stop - nothing re-arms it for you.",
+    ),
+    "xrp_1h_updown": (
+        "XRP 1-Hour Up/Down",
+        'Reads Kalshi\'s XRP 1-hour up/down contract (KXXRP1H) and compares '
+        "its Up/Down price against live Coinbase XRP-USD spot. Manual control. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "
         "keeps running until you press Stop - nothing re-arms it for you.",
     ),
