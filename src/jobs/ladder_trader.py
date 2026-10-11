@@ -480,8 +480,8 @@ class UpDownConfig:
     # floor: a 1-cent contract is a valid $0.01 order. The old $1.00 minimum
     # made it impossible for a tiny account to ever place an order.
     min_order_usd: float = 0.0
-    # OPERATOR LAW (no micro trades): no buy deploys less than $8.00.
-    min_clip_usd: float = 8.0
+    # OPERATOR LAW (no micro trades): no buy deploys less than $3.00.
+    min_clip_usd: float = 3.0
     # Stop opening new positions this close to expiry: the settlement window is
     # the 60 seconds before close, and a fill inside it is a coin toss.
     min_seconds_left: float = 45.0

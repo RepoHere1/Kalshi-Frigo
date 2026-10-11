@@ -233,10 +233,9 @@ def test_refuses_when_there_is_no_contract_at_all():
 # ---------------------------------------------------------------------------
 def test_size_targets_five_dollars():
     trader = UpDownTrader(SpotFeed(), Btc15mFeed())
-    # Default $5 clip, then the operator floor raises any sub-$8 fill.
-    assert trader._size(0.50) == 16
-    assert trader._size(0.10) == 80
-    assert trader._size(0.95) == 9
+    assert trader._size(0.50) == 10
+    assert trader._size(0.10) == 50
+    assert trader._size(0.95) == 5
 
 
 def test_size_never_returns_a_fractional_or_negative_count():
@@ -442,19 +441,19 @@ def test_live_clip_sizes_against_the_balance_budget(monkeypatch):
     trader.config.session_mult_enabled = False
     # In-band price: the LIVE entry band is 0.10-0.50.
     market = _quoted_market(yes_ask=0.40, no_ask=0.60, target=84000.0)
-    # A $4 budget, raised by the $8 operator floor: 20 contracts at 0.40.
+    # A $4 budget -> 10 contracts at 0.40, not the fixed $5 clip's 12.
     live = trader.evaluate(market, live=True, clip_usd=4.0)
     assert live is not None
-    assert live.contracts == 20
-    assert live.notional == pytest.approx(8.00, abs=0.01)
+    assert live.contracts == 10
+    assert live.notional == pytest.approx(4.00, abs=0.01)
 
 
-def test_size_never_returns_a_sub_eight_dollar_clip():
-    """OPERATOR LAW: no buy deploys less than $8.00. No intent ($0 clip)
+def test_size_never_returns_a_sub_three_dollar_clip():
+    """OPERATOR LAW: no buy deploys less than $3.00. No intent ($0 clip)
     stays no clip; a real clip is rounded UP to the floor, never down."""
     trader = _scorer()
-    assert trader._size(0.50, clip_usd=1.0) == 16  # $8.00 exactly
-    assert trader._size(0.85, clip_usd=0.5) == 10  # $8.50
+    assert trader._size(0.50, clip_usd=1.0) == 6   # $3.00 exactly
+    assert trader._size(0.85, clip_usd=0.5) == 4   # $3.40
     assert trader._size(0.85, clip_usd=0.0) == 0   # no intent -> no clip
     assert trader._size(0.50, clip_usd=100.0) == 200  # floor never shrinks
 
