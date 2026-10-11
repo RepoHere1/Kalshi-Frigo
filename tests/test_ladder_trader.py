@@ -51,7 +51,11 @@ def _trader(db):
     [
         ("KXBTC15M-26OCT011715-15", ("KXBTC15M-26OCT011715", "26OCT011715", 15)),
         ("KXBTC15M-26OCT011715-30", ("KXBTC15M-26OCT011715", "26OCT011715", 30)),
-        ("KXBTC-26OCT0117-T73250", (None, None, 0)),
+        ("KXBTC-26OCT0117-T73250", ("KXBTC-26OCT0117", "26OCT0117", 0)),
+        # Hourly above/below ladder: 9-char stamp + strike suffix (T/B).
+        ("KXBTCD-26OCT1100-T82899.99", ("KXBTCD-26OCT1100", "26OCT1100", 0)),
+        ("KXBTC-26OCT1101-B91750", ("KXBTC-26OCT1101", "26OCT1101", 0)),
+        ("KXBTCD-26OCT1100-TNOTASTRIKE", (None, None, 0)),
         # An event ticker has no horizon suffix, so it is not a market.
         ("KXBTC15M-26OCT011715", (None, None, 0)),
         ("garbage", (None, None, 0)),
@@ -67,6 +71,12 @@ def test_bucket_is_a_quarter_hour_stamp():
     assert horizon == 15
     # YY MON DD HH MM - the minute field is the last two characters.
     assert bucket[9:11] in ("00", "15", "30", "45"), "bucket must be a 15-minute step"
+
+
+def test_bucket_accepts_hourly_stamp():
+    _, bucket, horizon = Btc15mFeed._parse("KXBTCD-26OCT1100-T82899.99")
+    assert bucket == "26OCT1100"
+    assert horizon == 0
 
 
 def _dollars(**kw):

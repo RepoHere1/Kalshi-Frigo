@@ -149,6 +149,18 @@ class UpDownConfig:
     kelly_cap: float = 0.35    # never more than 35% of the book in one clip
     kelly_confidence_pivot: float = 0.70  # fair probability at which kelly_scale begins scaling up
     kelly_confidence_max_mult: float = 2.0  # max multiplier on kelly_scale (capped at 0.50)
+    # ROLL-FORWARD IQ (additive upgrade, LIVE + DRY): the book already reads
+    # drift from the spot tape every cycle; roll turns that read into a clip
+    # on the successor window the moment the venue lists it - before its
+    # quote discovers the move. One clip per event. Purpose: higher win rate
+    # (entered early at the cheap price) and larger dollar wins (same Kelly
+    # law, wider runway).
+    roll_enabled: bool = True
+    roll_lookback_sec: float = 300.0  # drift measured over the last 5 minutes
+    roll_min_prob: float = 0.56       # the IQ must be at least this sure
+    roll_min_edge: float = 0.05       # price must still lag the IQ by 5c+
+    roll_max_ask: float = 0.55        # never overpay for arriving early
+    roll_clip_mult: float = 2.0       # operator directive: larger dollar wins
     # High-probability convergence entries: a resting maker bid at $0.60-$0.85
     # pays a quarter fee and, with the diffusion fair value demanding real
     # edge over it, is the steadiest compounding trade this book has. Taker
@@ -377,6 +389,14 @@ class UpDownConfig:
             )
         except ValueError:
             pass
+        if _os.environ.get("ROLL_ENABLED", "1") != "1":
+            self.roll_enabled = False
+        try:
+            self.roll_clip_mult = float(_os.environ.get("ROLL_CLIP_MULT", self.roll_clip_mult))
+            self.roll_min_edge = float(_os.environ.get("ROLL_MIN_EDGE", self.roll_min_edge))
+            self.roll_max_ask = float(_os.environ.get("ROLL_MAX_ASK", self.roll_max_ask))
+        except ValueError:
+            pass
         _vg = _os.environ.get("VENUE_GUARD_PCT", "")
         if _vg:
             try:
@@ -498,6 +518,11 @@ class UpDownBook:
     skipped_shadow: int = 0
     skipped_drawdown: int = 0
     skipped_quick_win: int = 0
+    # ROLL-FORWARD IQ counters (additive path).
+    roll_clips: int = 0
+    skipped_roll_cold: int = 0
+    skipped_roll_ask: int = 0
+    skipped_roll_edge: int = 0
     skipped_news_sentiment: int = 0
     last_error: str = ""
     blocked: str = ""
@@ -753,6 +778,17 @@ class UpDownTrader:
         self._peak_balance: Optional[float] = None
         self._realized_vol: Optional[float] = None
         self.book = UpDownBook(max_open_notional=self.config.max_open_notional)
+        # ROLL-FORWARD IQ: state for the additive next-window path. One
+        # tracker per lane; paper and live share the same logic.
+        try:
+            from src.jobs.roll_iq import RollTracker
+
+            self._roll = RollTracker(
+                series=getattr(self.feed, "series", ""),
+                lookback_sec=self.config.roll_lookback_sec,
+            )
+        except Exception:  # noqa: BLE001 - roll is additive, never fatal
+            self._roll = None
 
     def evaluate(
         self,
@@ -1909,6 +1945,123 @@ class UpDownTrader:
             )
         return False
 
+    async def _roll_maybe_buy(
+        self, live: bool, held: List[Dict[str, Any]], market: Optional[UpDownMarket]
+    ) -> Optional[Dict[str, Any]]:
+        """ROLL-FORWARD IQ: buy the successor window at its first listing.
+
+        The legacy scorer cannot see a contract whose floor strike is spot
+        itself; this path reads the drift the book already carries and prices
+        the NEXT window before the venue's quote discovers it. One clip per
+        event, sized by the same Kelly rule, placed through the same
+        canonical order path - additive to the legacy scorer, identical in
+        paper and live.
+        """
+        if self._roll is None or not self.config.roll_enabled:
+            return None
+        from src.jobs.roll_iq import drift_read as _drift_read
+        from src.jobs.roll_iq import next_window_market as _next_window_market
+
+        _now = time.time()
+        spot = float(getattr(self.spot, "price", 0.0) or 0.0)
+        if spot > 0:
+            self._roll.note(_now, spot)
+        try:
+            self._roll.prune(self.feed.markets)
+        except Exception:  # noqa: BLE001
+            pass
+        window = self._roll.window_sec
+        nxt = _next_window_market(self.feed.markets, window, _now, spot)
+        if nxt is None:
+            return None
+        if self._roll.already(nxt.event_ticker):
+            return None
+        if any(h.get("ticker") == nxt.ticker for h in held):
+            return None
+        sigma_win = None
+        try:
+            sigma_win = self.rv.sigma_dollars(
+                horizon_seconds=window or 900.0, last_price=spot
+            )
+        except Exception:  # noqa: BLE001 - cold vol degrades to momentum mode
+            sigma_win = None
+        read = _drift_read(
+            list(self._roll.samples),
+            self._roll.lookback_sec,
+            _now,
+            window or 900.0,
+            sigma_win,
+            self.config.roll_min_prob,
+        )
+        if read.side not in ("up", "down"):
+            self.book.skipped_roll_cold += 1
+            return None
+        ask = float(nxt.yes_ask if read.side == "up" else (nxt.no_ask or 0.0))
+        if ask <= 0.01 or ask > self.config.roll_max_ask:
+            self.book.skipped_roll_ask += 1
+            return None
+        p_win = read.p_up if read.side == "up" else 1.0 - read.p_up
+        edge = p_win - ask
+        if edge < self.config.roll_min_edge:
+            self.book.skipped_roll_edge += 1
+            return None
+        _bal = self._live_balance if live else self._dry_cash_cache
+        if not _bal or _bal <= 0:
+            return None
+        _k = max(
+            0.0,
+            min(self.config.kelly_cap, self.config.kelly_scale * edge / (1.0 - ask)),
+        )
+        _clip = round(float(_bal) * _k * self.config.roll_clip_mult, 2)
+        # The same ceilings that bound a legacy clip bound the roll clip.
+        _clip = min(_clip, float(_bal) * self.config.conviction_max_fraction)
+        if (
+            sum(float(h.get("notional") or 0.0) for h in held) + _clip
+            > self.book.max_open_notional
+        ):
+            self.book.skipped_roll_ask += 1
+            return None
+        seconds_left = float(nxt.close_ts - _now) if nxt.close_ts else None
+        contracts = self._size(ask, clip_usd=_clip)
+        if contracts < 1:
+            return None
+        signal = UpDownSignal(
+            ticker=nxt.ticker,
+            bucket=nxt.bucket,
+            side=read.side,
+            target=nxt.target,
+            spot=spot,
+            spot_vs_target=(spot - float(nxt.target)) if nxt.target else 0.0,
+            fair=read.p_up,
+            kalshi_price=ask,
+            edge=round(edge, 4),
+            ask=ask,
+            contracts=contracts,
+            notional=round(contracts * ask, 2),
+            seconds_left=seconds_left,
+            reason=(
+                f"ROLL-IQ arrival: tape drift {read.drift_frac * 100:+.2f}% over "
+                f"{self._roll.lookback_sec:.0f}s -> next-window P(up)={read.p_up:.2f} "
+                f"vs ask {ask:.2f} (edge {edge:.2f})"
+            ),
+            truth="roll-iq",
+        )
+        placed = await self._place(signal, live)
+        if not placed:
+            return None
+        self._roll.mark(nxt.event_ticker, read.side)
+        self.book.trades_today += 1
+        self.book.roll_clips += 1
+        return {
+            "ticker": nxt.ticker,
+            "side": read.side,
+            "contracts": contracts,
+            "notional": round(contracts * ask, 2),
+            "edge": round(edge, 4),
+            "reason": signal.reason,
+            "mode": "live" if live else "dry",
+        }
+
     async def cycle(self) -> Dict[str, Any]:
         """One pass: refresh the series, score it, take at most one trade."""
         from src.jobs.broker import should_trade_live
@@ -2011,7 +2164,9 @@ class UpDownTrader:
                 self.book.last_error = f"series fetch: {_msg}"
                 return self.book.summary()
 
-        market = self.feed.nearest()
+        market = self.feed.nearest(
+            float(getattr(self.spot, "price", 0.0) or 0.0) or None
+        )
 
         # Sizes the clip against the real balance, so the account keeps
         # trading on every edge instead of spending itself dark in one or two
@@ -2288,6 +2443,17 @@ class UpDownTrader:
                     "mode": mode,
                 }
 
+        # ROLL-FORWARD IQ (additive): the legacy scorer above only sees the
+        # contract already in play. The roll path reads the same tape and
+        # buys the NEXT window the first moment the venue lists it - while
+        # the current one is still ticking down.
+        roll_took: Optional[Dict[str, Any]] = None
+        if self.config.roll_enabled:
+            try:
+                roll_took = await self._roll_maybe_buy(live, held, market)
+            except Exception as exc:  # noqa: BLE001 - additive, never fatal
+                self.book.last_error = f"roll-iq: {type(exc).__name__}: {exc}"
+
         # One flat summary: the book counters plus this cycle's reading.
         # No time-of-day session bump: a "losing hour" edge surcharge is an
         # arbitrary lock that a minute later is just an impediment.
@@ -2313,6 +2479,7 @@ class UpDownTrader:
         result.update(
             {
                 "took": took,
+                "roll": roll_took,
                 "blocked": blocked,
                 "contract": market.ticker if market else None,
                 "bucket": market.bucket if market else None,

@@ -95,8 +95,13 @@ def _parse_bucket(event_ticker: str, series_prefix: str = None) -> Optional[str]
         stamp = parts[1]
     else:
         stamp = raw
-    digits = (slice(0, 2), slice(5, 7), slice(7, 9), slice(9, 11))
-    if len(stamp) != 11 or not stamp[2:5].isalpha():
+    if len(stamp) == 11:
+        digits = (slice(0, 2), slice(5, 7), slice(7, 9), slice(9, 11))
+    elif len(stamp) == 9:  # hourly ladder stamps (KXBTCD): 26OCT1100, no minute field
+        digits = (slice(0, 2), slice(5, 7), slice(7, 9))
+    else:
+        return None
+    if not stamp[2:5].isalpha():
         return None
     if not all(stamp[s].isdigit() for s in digits):
         return None
@@ -290,14 +295,29 @@ class Btc15mFeed:
 
     @staticmethod
     def _parse(ticker: str, prefix: str = None) -> Tuple[Optional[str], Optional[str], int]:
-        """`KXBTC15M-26OCT011715-15` -> (event_ticker, bucket, horizon_minutes)."""
+        """`KXBTC15M-26OCT011715-15` -> (event_ticker, bucket, horizon_minutes).
+
+        Two listing shapes exist:
+        - 15-minute up/down: the third segment is the horizon in minutes.
+        - hourly above/below ladders (KXBTCD/KXETHD/KXXRPD): the third segment
+          is a strike (`-T82899.99` greater, `-B91750` between) and carries no
+          horizon; those parse with horizon 0.
+        """
         parts = (ticker or "").split("-")
         if len(parts) != 3 or not parts[0].startswith(prefix or "KX"):
             return None, None, 0
-        try:
-            horizon = int(parts[2])
-        except ValueError:
-            return None, None, 0
+        third = parts[2]
+        if third[:1] in ("T", "B"):
+            try:
+                float(third[1:])
+            except ValueError:
+                return None, None, 0
+            horizon = 0
+        else:
+            try:
+                horizon = int(third)
+            except ValueError:
+                return None, None, 0
         event_ticker = f"{parts[0]}-{parts[1]}"
         return event_ticker, _parse_bucket(parts[1], parts[0]), horizon
 
@@ -310,7 +330,7 @@ class Btc15mFeed:
         try:
             async with session.get(
                 f"{KALSHI_API}/markets",
-                params={"limit": 500, "status": "open", "series_ticker": self.series},
+                params={"limit": 1000, "status": "open", "series_ticker": self.series},
             ) as r:
                 r.raise_for_status()
                 payload = await r.json()
@@ -350,12 +370,24 @@ class Btc15mFeed:
         self.refreshes += 1
         return markets
 
-    def nearest(self) -> Optional[UpDownMarket]:
-        """The next contract to expire - the one a strategy trades."""
+    def nearest(self, spot: Optional[float] = None) -> Optional[UpDownMarket]:
+        """The next contract to expire - the one a strategy trades.
+
+        With a spot price, and when several contracts share the soonest close
+        (a strike ladder like KXBTCD), the contract nearest the money wins:
+        its quote is the first one a spot move reprices, and it is the only
+        strike where the up/down scorer's anchor is meaningful.
+        """
         tradable = [m for m in self.markets if m.tradable]
         if not tradable:
             return None
-        return tradable[0]
+        soonest = tradable[0].close_ts
+        group = [m for m in tradable if m.close_ts == soonest]
+        if spot and spot > 0 and len(group) > 1:
+            priced = [m for m in group if m.target is not None]
+            if priced:
+                return min(priced, key=lambda m: abs(float(m.target) - float(spot)))
+        return group[0]
 
     def for_bucket(self, bucket: str) -> List[UpDownMarket]:
         return [m for m in self.markets if m.bucket == bucket]

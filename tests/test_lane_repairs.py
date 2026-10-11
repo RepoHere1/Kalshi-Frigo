@@ -136,7 +136,9 @@ def test_every_crypto_lane_carries_its_own_series_and_feed():
     for lane, series in (
         ("xrp_updown", "KXXRP15M"),
         ("xau_updown", "KXGOLD15M"),
-        ("btc_1h_updown", "KXETH15M"),
+        ("btc_1h_updown", "KXBTCD"),
+        ("eth_1h_updown", "KXETHD"),
+        ("xrp_1h_updown", "KXXRPD"),
         ("hyperliquid_updown", "KXHYPE15M"),
     ):
         assert series in cmds[lane], lane

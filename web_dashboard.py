@@ -103,10 +103,13 @@ dashboard_state = {
     "positions": [],
     "trades": [],
     "strategies": {
-        "btc_1h_updown": {"desired": 1, "running": True, "mode": "paper", "pid": 99, "command": "cli.py run --btc-updown --series KXBTC1H --spot-product BTC-USD --paper --loop --interval 0"},
-            "eth_1h_updown": {"desired": 1, "running": True, "mode": "paper", "pid": 99, "command": "cli.py run --btc-updown --series KXETH1H --spot-product ETH-USD --paper --loop --interval 0"},
-            "xrp_1h_updown": {"desired": 1, "running": True, "mode": "paper", "pid": 99, "command": "cli.py run --btc-updown --series KXXRP1H --spot-product XRP-USD --paper --loop --interval 0"},
-    },
+            "btc_1h_updown": {"desired": 0, "running": False, "mode": "paper", "pid": None,
+                              "command": "cli.py run --btc-updown --series KXBTCD --spot-product BTC-USD --paper --loop --interval 0"},
+            "eth_1h_updown": {"desired": 0, "running": False, "mode": "paper", "pid": None,
+                              "command": "cli.py run --btc-updown --series KXETHD --spot-product ETH-USD --paper --loop --interval 0"},
+            "xrp_1h_updown": {"desired": 0, "running": False, "mode": "paper", "pid": None,
+                              "command": "cli.py run --btc-updown --series KXXRPD --spot-product XRP-USD --paper --loop --interval 0"},
+        },
     "last_update": None,
     "errors": [],
     "sse_listeners": [],
@@ -154,9 +157,9 @@ STRATEGY_COMMANDS: Dict[str, List[str]] = {
     "btc_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTC15M", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
     "xrp_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRP15M", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
     "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXGOLD15M", "--spot-product", "PAXG-USD", "--paper", "--loop", "--interval", "0"],
-    "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTC1H", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
-    "eth_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETH1H", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
-    "xrp_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRP1H", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
+    "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTCD", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
+        "eth_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETHD", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
+        "xrp_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRPD", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
     "hyperliquid_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPE15M", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
     "ai_directional": ["cli.py", "run", "--paper", "--loop", "--interval", "300"],
     "safe_compounder": [
@@ -911,22 +914,22 @@ STRATEGY_DOCS = {
     ),
     "btc_1h_updown": (
         "BTC 1-Hour Up/Down",
-        'Reads Kalshi\'s BTC 1-hour up/down contract (KXBTC1H) and compares its '
-        "Up/Down price against live Coinbase BTC-USD spot. Manual control. "
+        'Reads Kalshi\'s BTC 1-hour above/below ladder (KXBTCD) and compares its '
+                "strike nearest the money against live Coinbase BTC-USD spot. Manual control. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "
         "keeps running until you press Stop - nothing re-arms it for you.",
     ),
     "eth_1h_updown": (
         "ETH 1-Hour Up/Down",
-        'Reads Kalshi\'s ETH 1-hour up/down contract (KXETH1H) and compares its '
-        "Up/Down price against live Coinbase ETH-USD spot. Manual control. "
+        'Reads Kalshi\'s ETH 1-hour above/below ladder (KXETHD) and compares its '
+                "strike nearest the money against live Coinbase ETH-USD spot. Manual control. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "
         "keeps running until you press Stop - nothing re-arms it for you.",
     ),
     "xrp_1h_updown": (
         "XRP 1-Hour Up/Down",
-        'Reads Kalshi\'s XRP 1-hour up/down contract (KXXRP1H) and compares '
-        "its Up/Down price against live Coinbase XRP-USD spot. Manual control. "
+        'Reads Kalshi\'s XRP 1-hour above/below ladder (KXXRPD) and compares '
+                "its strike nearest the money against live Coinbase XRP-USD spot. Manual control. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "
         "keeps running until you press Stop - nothing re-arms it for you.",
     ),
