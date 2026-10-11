@@ -46,5 +46,3 @@ def binary_market_payout_odds(market_probability: float, bet_yes: bool = True) -
     if bet_yes:
         return (1 - market_probability) / market_probability
     return market_probability / (1 - market_probability)
-# TEMP DRY ONLY: flat $5 per new buy; suspend Kelly/sizing
-POSITION_SIZE_FLAT_USD = 5.0  # TEMP DRY-SUSPEND
