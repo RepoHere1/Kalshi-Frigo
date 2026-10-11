@@ -703,3 +703,60 @@ async def test_execute_refuses_a_position_that_was_never_saved():
     )
     assert position.id is None
     assert await execute_position(position, False, None, None) is False
+
+def test_pick_ladder_strike_takes_the_cheap_strike_when_the_model_is_sure():
+    """A sure model (small sigma, spot far past deeper strikes) walks the
+    band to the cheaper contract: bigger payoff, same edge bar."""
+    from src.jobs.ladder_trader import pick_ladder_strike
+
+    band = [
+        _dollars(ticker="L-T84899.99", target=84899.99, yes_bid=0.48, yes_ask=0.50, no_bid=0.50, no_ask=0.51),
+        _dollars(ticker="L-T84999.99", target=84999.99, yes_bid=0.28, yes_ask=0.30, no_bid=0.52, no_ask=0.53),
+        _dollars(ticker="L-T85099.99", target=85099.99, yes_bid=0.20, yes_ask=0.22, no_bid=0.54, no_ask=0.55),
+    ]
+    picked = pick_ladder_strike(
+        band, spot=84900.0, seconds_left=900.0, sigma_dollars=120.0,
+        noise_pct=0.0002, min_ask=0.40, max_ask=0.55,
+    )
+    assert picked is not None and picked.ticker == "L-T85099.99"
+
+
+def test_pick_ladder_strike_falls_back_nearest_when_the_tape_is_quiet():
+    """No strike prices a real edge -> the nearest strike, so the scorer's
+    own bars decide exactly as before the strike band existed."""
+    from src.jobs.ladder_trader import pick_ladder_strike
+
+    band = [
+        _dollars(ticker="L-T84899.99", target=84899.99, yes_bid=0.48, yes_ask=0.50, no_bid=0.50, no_ask=0.51),
+        _dollars(ticker="L-T84999.99", target=84999.99, yes_bid=0.28, yes_ask=0.30, no_bid=0.52, no_ask=0.53),
+        _dollars(ticker="L-T85099.99", target=85099.99, yes_bid=0.20, yes_ask=0.22, no_bid=0.56, no_ask=0.57),
+    ]
+    picked = pick_ladder_strike(
+        band, spot=84900.0, seconds_left=900.0, sigma_dollars=800.0,
+        noise_pct=0.0002, min_ask=0.40, max_ask=0.55,
+    )
+    assert picked is not None and picked.ticker == "L-T84899.99"
+
+
+def test_feed_ladder_isolates_the_soonest_group():
+    """A ladder feed hands back the tradable contracts of the soonest close
+    only - the group the strike band walks."""
+    from src.jobs.market_data import UpDownMarket
+
+    feed = Btc15mFeed(series="KXBTCD")
+    now = time.time()
+
+    def m(tick, ev, target, close_in):
+        return UpDownMarket(
+            ticker=tick, event_ticker=ev, bucket="b", horizon=0, title="",
+            target=target, close_ts=now + close_in,
+            yes_bid=0.40, yes_ask=0.42, no_bid=0.55, no_ask=0.57,
+        )
+
+    feed.markets = [
+        m("KXBTCD-A-T1", "EV-A", 100.0, 45),
+        m("KXBTCD-A-T2", "EV-A", 101.0, 45),
+        m("KXBTCD-B-T1", "EV-B", 100.0, 3600 + 45),
+    ]
+    grp = feed.ladder()
+    assert [g.ticker for g in grp] == ["KXBTCD-A-T1", "KXBTCD-A-T2"]

@@ -99,6 +99,26 @@ def test_less_time_makes_the_same_distance_more_decisive():
     assert far > 0.5 > 0.0
 
 
+def test_hourly_windows_do_not_double_scale_sigma():
+    """One-hour windows use the sigma exactly as measured - no second
+    sqrt(t/900) scaling, which halved z and hid every early-hour edge."""
+    t_hour = fair_up_probability(84800, 84609.34, sigma_dollars=200.0, seconds_left=3600.0)
+    t_ref = fair_up_probability(84800, 84609.34, sigma_dollars=200.0, seconds_left=900.0)
+    assert t_hour == t_ref
+    # The old code behaved like a 2x sigma for t > 900: it must now be
+    # strictly more decisive than that blind read.
+    old_style = fair_up_probability(84800, 84609.34, sigma_dollars=400.0, seconds_left=900.0)
+    assert t_hour > old_style
+
+
+def test_15m_windows_keep_the_historic_scaling():
+    """t <= 900 is the old regime, byte for byte: effective sigma is still
+    sigma * sqrt(t/900)."""
+    t = fair_up_probability(84659.34, 84609.34, sigma_dollars=200.0, seconds_left=450.0)
+    expected = 0.5 * (1.0 + math.erf((50.0 / (200.0 * math.sqrt(0.5))) / math.sqrt(2.0)))
+    assert t == pytest.approx(expected, abs=1e-12)
+
+
 def test_higher_volatility_pulls_the_price_toward_half():
     calm = fair_up_probability(84700, 84609.34, sigma_dollars=80.0)
     wild = fair_up_probability(84700, 84609.34, sigma_dollars=800.0)

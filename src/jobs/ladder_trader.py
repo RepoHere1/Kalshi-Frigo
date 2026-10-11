@@ -161,6 +161,12 @@ class UpDownConfig:
     roll_min_edge: float = 0.05       # price must still lag the IQ by 5c+
     roll_max_ask: float = 0.55        # never overpay for arriving early
     roll_clip_mult: float = 2.0       # operator directive: larger dollar wins
+    # LADDER STRIKE-BAND (hourly products): score the strike whose modeled
+    # edge is widest among the near-money band - nearest when the tape is
+    # quiet (win-rate play), a cheaper deeper contract when the model is
+    # sure (payoff play). 15m series have one contract per close: no-op.
+    strike_band_enabled: bool = True
+    strike_band_n: int = 5              # strikes walked around the money
     # High-probability convergence entries: a resting maker bid at $0.60-$0.85
     # pays a quarter fee and, with the diffusion fair value demanding real
     # edge over it, is the steadiest compounding trade this book has. Taker
@@ -400,6 +406,8 @@ class UpDownConfig:
             )
         except ValueError:
             pass
+        if _os.environ.get("STRIKE_BAND", "1") != "1":
+            self.strike_band_enabled = False
         _vg = _os.environ.get("VENUE_GUARD_PCT", "")
         if _vg:
             try:
@@ -694,7 +702,12 @@ def fair_up_probability(
 
     At the target both are exactly 0.5; far past it, both saturate.
     """
-    time_scale = math.sqrt(max(seconds_left, 1.0) / 900.0)
+    # Windows longer than the 15-minute reference scale sigma exactly as the
+    # realized-vol estimate measured it. Re-scaling AGAIN by sqrt(t/900) would
+    # inflate an hourly sigma up to 2x and blind the scorer for the first
+    # ~45 minutes of a one-hour window (z halved -> edges invisible). The
+    # 15-minute regime is untouched: t <= 900 keeps the historic scaling.
+    time_scale = min(1.0, math.sqrt(max(seconds_left, 1.0) / 900.0))
     if sigma_dollars is not None and sigma_dollars > 0:
         effective = float(sigma_dollars) * time_scale
         z = max(-6.0, min(6.0, (spot - target) / effective))
@@ -705,6 +718,51 @@ def fair_up_probability(
     z = max(-6.0, min(6.0, (spot - target) / effective_noise))
     return float(1.0 / (1.0 + math.exp(-z)))
 
+
+
+def pick_ladder_strike(
+    band: List[UpDownMarket],
+    spot: float,
+    seconds_left: float,
+    sigma_dollars: Optional[float],
+    noise_pct: float,
+    min_ask: float,
+    max_ask: float,
+    edge_probe: float = 0.03,
+) -> Optional[UpDownMarket]:
+    """The ladder strike this pass should be scored.
+
+    An hourly ladder expires a whole grid of strikes at once. The strike
+    nearest the money only ever offers ~even-money fills; when the model is
+    sure, the cheaper contracts deeper in the grid pay 2-3x per dollar and
+    clear the same edge bar. This walks the near-money band (the caller
+    sorts nearest-first), prices both sides with the same fair-value curve
+    the scorer uses, and returns the strike with the widest modeled edge.
+
+    When nothing in the band prices a real edge, the nearest strike is
+    returned - the scorer's own bars then decide, exactly as before.
+    """
+    if not band or spot <= 0:
+        return band[0] if band else None
+    best: Optional[UpDownMarket] = band[0]
+    best_edge = -math.inf
+    for m in band:
+        t = m.target
+        if t is None or t <= 0:
+            continue
+        fair = fair_up_probability(
+            spot, t, t * noise_pct, seconds_left, sigma_dollars
+        )
+        for p_win, ask in ((fair, m.yes_ask), (1.0 - fair, m.no_ask)):
+            if ask is None or ask < min_ask or ask > max_ask:
+                continue
+            edge = p_win - ask
+            if edge > best_edge:
+                best_edge = edge
+                best = m
+    if best_edge < edge_probe:
+        return band[0]
+    return best
 
 class UpDownTrader:
     """Scores the next 15-minute contract against live spot and takes one clip."""
@@ -2196,6 +2254,39 @@ class UpDownTrader:
         market = self.feed.nearest(
             float(getattr(self.spot, "price", 0.0) or 0.0) or None
         )
+        # LADDER STRIKE-BAND: an hourly ladder expires a whole grid of
+        # strikes at once. Score the strike whose modeled edge is widest -
+        # nearest the money when the tape is quiet (win-rate play), a
+        # cheaper contract when the model is sure (payoff play) - instead of
+        # always the closest strike, which only offers even-money fills.
+        if self.config.strike_band_enabled:
+            try:
+                _grp = self.feed.ladder()
+                _now_sp = float(getattr(self.spot, "price", 0.0) or 0.0)
+                if len(_grp) > 1 and _now_sp > 0:
+                    _sl = market.seconds_left if market is not None else None
+                    _sig = None
+                    try:
+                        _sig = self.rv.sigma_dollars(
+                            horizon_seconds=_sl or 900.0, last_price=_now_sp
+                        )
+                    except Exception:  # noqa: BLE001 - cold vol -> logistic fallback
+                        _sig = None
+                    _grp.sort(key=lambda m: abs(float(m.target or 0.0) - _now_sp))
+                    _band = _grp[: max(1, self.config.strike_band_n)]
+                    _pick = pick_ladder_strike(
+                        _band,
+                        _now_sp,
+                        _sl or 900.0,
+                        _sig,
+                        self.config.noise_pct,
+                        self.config.min_entry_price,
+                        self.config.max_entry_price,
+                    )
+                    if _pick is not None:
+                        market = _pick
+            except Exception as exc:  # noqa: BLE001 - never block the cycle
+                self.book.last_error = f"strike-band: {type(exc).__name__}: {exc}"
 
         # Sizes the clip against the real balance, so the account keeps
         # trading on every edge instead of spending itself dark in one or two

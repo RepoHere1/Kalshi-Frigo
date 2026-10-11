@@ -389,6 +389,19 @@ class Btc15mFeed:
                 return min(priced, key=lambda m: abs(float(m.target) - float(spot)))
         return group[0]
 
+    def ladder(self) -> List[UpDownMarket]:
+        """The tradable contracts sharing the soonest close.
+
+        One contract for 15-minute series (empty selection: nothing to
+        band-walk); a whole strike grid for the hourly ladders (KXBTCD,
+        KXETHD, KXXRPD).
+        """
+        tradable = [m for m in self.markets if m.tradable]
+        if not tradable:
+            return []
+        soonest = tradable[0].close_ts
+        return [m for m in tradable if m.close_ts == soonest]
+
     def for_bucket(self, bucket: str) -> List[UpDownMarket]:
         return [m for m in self.markets if m.bucket == bucket]
 
