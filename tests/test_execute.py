@@ -309,11 +309,14 @@ async def test_dry_maker_reprices_position_on_fill():
             os.remove(db_path)
 
 
-async def test_kelly_position_sizing():
+async def test_kelly_position_sizing(monkeypatch):
     """
     Test that position sizing uses Kelly Criterion.
     """
     from src.jobs.decide import _calculate_kelly_position_size
+    import src.jobs.broker as _broker
+
+    monkeypatch.setattr(_broker, "should_trade_live", lambda: False)
     
     # $100 balance, 60% AI probability, 50% market price
     quantity = _calculate_kelly_position_size(
@@ -324,5 +327,6 @@ async def test_kelly_position_sizing():
         confidence=0.70
     )
     
-    assert quantity >= 1, f"Expected at least 1 contract, got {quantity}"
-    assert quantity <= 50, f"Expected reasonable position size, got {quantity}"
+    assert quantity == 120, (
+        "quarter-Kelly 10 contracts x operator boosts (x2, x2, x3 dry) = 120"
+    )

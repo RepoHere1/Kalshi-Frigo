@@ -253,7 +253,7 @@ def test_limits_are_hard_defaults():
     # contract are allowed while the model still favours it. What caps risk now
     # is money (total open notional) and probability (min_win_prob).
     assert not hasattr(c, "max_open_positions")
-    assert c.max_open_notional == 25.0
+    assert c.max_open_notional == 75.0
     assert c.min_win_prob == 0.55
 
 
@@ -263,7 +263,7 @@ def test_book_summary_reports_the_limits_it_enforces():
     s = trader.book.summary()
     assert s["open_positions"] == 2
     assert s["open_notional"] == 10.0
-    assert s["max_open_notional"] == 25.0
+    assert s["max_open_notional"] == 75.0
     assert "max_open_positions" not in s
 
 
@@ -317,15 +317,15 @@ def test_the_notional_cap_stops_accumulation():
     tickers - the one-clip-per-flip rule is separate from this."""
     trader = UpDownTrader(SpotFeed(), Btc15mFeed())
     held = [
-        {"ticker": "KXBTC15M-26OCT061200-00", "side": "YES", "notional": 12.0},
-        {"ticker": "KXBTC15M-26OCT061215-15", "side": "YES", "notional": 12.0},
+        {"ticker": "KXBTC15M-26OCT061200-00", "side": "YES", "notional": 36.0},
+        {"ticker": "KXBTC15M-26OCT061215-15", "side": "YES", "notional": 36.0},
     ]
     clip = _signal("KXBTC15M-26OCT011715-15", side="up", ask=0.5, contracts=8)
     # BOTH books: the cap blocks.
     blocked_live = trader._entry_block(clip, held, live=True)
-    assert "exceed" in blocked_live and "$25.00" in blocked_live
+    assert "exceed" in blocked_live and "$75.00" in blocked_live
     blocked_dry = trader._entry_block(clip, held, live=False)
-    assert "exceed" in blocked_dry and "$25.00" in blocked_dry
+    assert "exceed" in blocked_dry and "$75.00" in blocked_dry
 
 
 def test_under_one_clip_per_window_a_repeat_is_refused():
@@ -431,7 +431,11 @@ def test_the_no_side_is_preferred_when_edges_are_close(monkeypatch):
     assert out2 is not None and out2.side == "up"
 
 
-def test_live_clip_sizes_against_the_balance_budget():
+def test_live_clip_sizes_against_the_balance_budget(monkeypatch):
+    # Emulate a real live process: buy_boost() stays 1x in LIVE until funded.
+    import src.jobs.broker as _broker
+
+    monkeypatch.setattr(_broker, "should_trade_live", lambda: True)
     trader = _scorer()
     trader.spot.price = 85000.0
     trader.config.session_mult_enabled = False

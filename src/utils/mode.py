@@ -910,3 +910,34 @@ def run(coro: Any, timeout: float = DB_TIMEOUT_SEC) -> Any:
     from src.utils.async_bridge import run as _bridge_run
 
     return _bridge_run(coro, timeout=timeout)
+
+
+def buy_boost() -> float:
+    """Per-clip spend multiplier (operator directive): 3x the buy amount.
+
+    Active in DRY only for now - the DRY experiment earns the multiplier;
+    LIVE keeps 1x until the operator flips it, so a lane that is ever armed
+    live cannot suddenly buy 3x behind the operator's back. Overrides:
+    BUY_MULT (both books), BUY_MULT_DRY, BUY_MULT_LIVE.
+    """
+    import os
+
+    _forced = os.environ.get("BUY_MULT")
+    if _forced:
+        try:
+            return float(_forced)
+        except ValueError:
+            pass
+    try:
+        from src.jobs.broker import should_trade_live
+
+        _live = should_trade_live()
+    except Exception:  # noqa: BLE001 - assume paper when the broker cannot say
+        _live = False
+    _val = os.environ.get("BUY_MULT_LIVE" if _live else "BUY_MULT_DRY")
+    if _val:
+        try:
+            return float(_val)
+        except ValueError:
+            pass
+    return 1.0 if _live else 3.0

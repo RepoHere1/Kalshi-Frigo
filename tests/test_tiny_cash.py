@@ -209,6 +209,9 @@ def test_kelly_scales_the_clip_with_the_edge():
         yes_bid=0.55, yes_ask=0.56, no_bid=0.44, no_ask=0.45,
     )
     with pytest.MonkeyPatch.context() as mp:
+        import src.jobs.broker as _broker
+
+        mp.setattr(_broker, "should_trade_live", lambda: True)  # emulated live: x1
         mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.75)
         signal = trader.evaluate(market, live=True)
     assert signal is not None and signal.side == "up"
@@ -230,6 +233,9 @@ def test_kelly_cap_bounds_a_single_clip():
         yes_bid=0.70, yes_ask=0.71, no_bid=0.29, no_ask=0.30,
     )
     with pytest.MonkeyPatch.context() as mp:
+        import src.jobs.broker as _broker
+
+        mp.setattr(_broker, "should_trade_live", lambda: True)  # emulated live: x1
         mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.95)
         signal = trader.evaluate(market, live=True)
     assert signal is not None and signal.side == "up"
@@ -301,7 +307,8 @@ def test_dry_mirrors_kelly_on_its_own_cash():
     """The law: the same sizing rule, on the DRY book's own money.
     Kelly with confidence-weighting (pivot=0.70): scale = 0.25 + 0.25*(fair-pivot)/(1-pivot)
     = 0.2917; k = 0.2917*0.444 = 0.1296; clip = 300*0.1296 = $38.88; with conviction
-    doubling -> $77.76 -> 141 contracts at 0.55, under the 0.5-of-book ceiling."""
+    doubling -> $77.76; operator x3 dry boost -> $233.28, then the
+    0.5-of-book ceiling caps it at $150.00 -> 272 contracts at 0.55."""
     import src.jobs.ladder_trader as lt
 
     trader = _trader_no_session_mult()
@@ -311,10 +318,13 @@ def test_dry_mirrors_kelly_on_its_own_cash():
         yes_bid=0.55, yes_ask=0.56, no_bid=0.44, no_ask=0.45,
     )
     with pytest.MonkeyPatch.context() as mp:
+        import src.jobs.broker as _broker
+
+        mp.setattr(_broker, "should_trade_live", lambda: False)  # emulated dry: x3
         mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.75)
         signal = trader.evaluate(market, live=False)
     assert signal is not None and signal.side == "up"
-    assert signal.contracts == 141
+    assert signal.contracts == 272
     assert signal.notional <= 300.0 * trader.config.conviction_max_fraction + 0.01
 
 

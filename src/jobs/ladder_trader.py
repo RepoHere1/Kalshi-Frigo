@@ -395,6 +395,9 @@ class UpDownConfig:
             self.roll_clip_mult = float(_os.environ.get("ROLL_CLIP_MULT", self.roll_clip_mult))
             self.roll_min_edge = float(_os.environ.get("ROLL_MIN_EDGE", self.roll_min_edge))
             self.roll_max_ask = float(_os.environ.get("ROLL_MAX_ASK", self.roll_max_ask))
+            self.max_open_notional = float(
+                _os.environ.get("MAX_OPEN_NOTIONAL", self.max_open_notional)
+            )
         except ValueError:
             pass
         _vg = _os.environ.get("VENUE_GUARD_PCT", "")
@@ -431,7 +434,7 @@ class UpDownConfig:
     # including multiple clips of the same contract. This replaces the old
     # max_open_positions position COUNT, which forbade a second clip of the same
     # market even when the odds justified it.
-    max_open_notional: float = 25.0
+    max_open_notional: float = 75.0  # 3x (operator directive), env MAX_OPEN_NOTIONAL
     # Deadband around the target, as a fraction of the target price.
     # Settlement is a 60-second average of a composite index, so sub-noise
     # moves are not information. The effective dollar noise scales with
@@ -499,7 +502,7 @@ class UpDownSignal:
 class UpDownBook:
     signals: List[UpDownSignal] = field(default_factory=list)
     open_positions: List[Dict[str, Any]] = field(default_factory=list)
-    max_open_notional: float = 25.0
+    max_open_notional: float = 75.0  # 3x (operator directive), env MAX_OPEN_NOTIONAL
     trades_today: int = 0
     skipped_no_edge: int = 0
     skipped_stale: int = 0
@@ -1398,6 +1401,25 @@ class UpDownTrader:
                 if _signal_count >= 3:
                     _clip = round(_clip * (_mult / self.config.conviction_mult), 2)
                     reason += f" | multi-signal ({_signal_count}x/{_mult:.1f}x)"
+            # 3x more spent per clip (operator directive), same source of
+            # truth as the LLM Kelly path: active in DRY, 1x in LIVE for now.
+            try:
+                from src.utils.mode import buy_boost
+
+                _buy_x = buy_boost()
+                if _buy_x != 1.0:
+                    # A None clip means "use the config default clip" - scale
+                    # that too, instead of collapsing a None clip to zero.
+                    _base = (
+                        float(_clip)
+                        if _clip is not None
+                        else float(self.config.notional_usd)
+                    )
+                    _clip = round(_base * _buy_x, 2)
+                    reason += f" | buy-x{_buy_x:.0f}"
+            except Exception:  # noqa: BLE001 - sizing must never break an entry
+                pass
+
             if _bal and _bal > 0.0:
                 _clip = min(
                     _clip if _clip is not None else 0.0,
@@ -2013,6 +2035,13 @@ class UpDownTrader:
             min(self.config.kelly_cap, self.config.kelly_scale * edge / (1.0 - ask)),
         )
         _clip = round(float(_bal) * _k * self.config.roll_clip_mult, 2)
+        # 3x per-clip multiplier (operator directive) - DRY only for now.
+        try:
+            from src.utils.mode import buy_boost
+
+            _clip = round(float(_clip) * buy_boost(), 2)
+        except Exception:  # noqa: BLE001
+            pass
         # The same ceilings that bound a legacy clip bound the roll clip.
         _clip = min(_clip, float(_bal) * self.config.conviction_max_fraction)
         if (

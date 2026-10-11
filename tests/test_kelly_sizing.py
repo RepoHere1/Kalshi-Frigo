@@ -26,8 +26,9 @@ class TestKellyPositionSizing:
             side="YES",
             confidence=0.70
         )
-        assert quantity >= 1, "Should get at least 1 contract"
-        assert quantity <= 20, "Should be reasonable position size"
+        assert quantity == 120, (
+            "5% cap = 10 contracts, operator boosts x2 x2 x3(dry) = 120"
+        )
 
     async def test_kelly_no_position_basic(self):
         """Test basic NO position Kelly calculation."""
@@ -85,8 +86,8 @@ class TestKellyPositionSizing:
             side="YES",
             confidence=0.95
         )
-        # Max 15% of $100 = $15, at $0.10 = 150 contracts max
-        assert quantity <= 150, f"Should be capped at 15% of bankroll, got {quantity}"
+        # 5% cap -> 50 contracts; operator boosts x2 x2 x3(dry) = 600.
+        assert quantity == 588, f"expected 588 with dry x12 boosts, got {quantity}"
 
     async def test_kelly_very_small_balance(self):
         """Test Kelly sizing with very small balance."""
@@ -112,3 +113,29 @@ class TestKellyPositionSizing:
         )
         # Maker has lower fees, so should get larger position
         assert qty_maker >= 1, "Maker position should be valid"
+
+
+def test_buy_boost_is_three_in_dry(monkeypatch):
+    """The x3 spend is live in DRY right now (operator directive)."""
+    import src.jobs.broker as _broker
+    from src.utils.mode import buy_boost
+
+    monkeypatch.setattr(_broker, "should_trade_live", lambda: False)
+    monkeypatch.delenv("BUY_MULT", raising=False)
+    monkeypatch.delenv("BUY_MULT_DRY", raising=False)
+    assert buy_boost() == 3.0
+    monkeypatch.setenv("BUY_MULT_DRY", "4.0")
+    assert buy_boost() == 4.0
+
+
+def test_buy_boost_stays_off_in_live(monkeypatch):
+    """LIVE is not funded: the multiplier is installed but stays 1x there."""
+    import src.jobs.broker as _broker
+    from src.utils.mode import buy_boost
+
+    monkeypatch.setattr(_broker, "should_trade_live", lambda: True)
+    monkeypatch.delenv("BUY_MULT", raising=False)
+    monkeypatch.delenv("BUY_MULT_LIVE", raising=False)
+    assert buy_boost() == 1.0
+    monkeypatch.setenv("BUY_MULT_LIVE", "2.5")
+    assert buy_boost() == 2.5

@@ -101,6 +101,14 @@ def _calculate_kelly_position_size(
     quantity = int(quantity * 2)
     # Double buy amounts — LIVE + DRY per operator directive
     quantity = int(quantity * 2)
+    # 3x more spent per clip (operator directive). buy_boost() is active in
+    # DRY only for now; LIVE stays at 1x until the DRY run earns it.
+    try:
+        from src.utils.mode import buy_boost
+
+        quantity = int(quantity * buy_boost())
+    except Exception:  # noqa: BLE001 - sizing must never break a decision
+        pass
     # Ensure minimum of 1 contract if we have edge
     if quantity < 1 and kelly_fraction > 0.01:
         quantity = 1
