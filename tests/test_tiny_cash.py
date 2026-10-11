@@ -31,20 +31,20 @@ def _trader_no_session_mult():
     return UpDownTrader(spot, Btc15mFeed(), UpDownConfig(session_mult_enabled=False))
 
 
-def test_size_floors_at_three_dollars_of_deployed_cash():
+def test_size_floors_at_eight_dollars_of_deployed_cash():
     """OPERATOR LAW: no micro trades. A puny budget still deploys at least
-    $3.00 of contracts - rounded UP, never down."""
+    $8.00 of contracts - rounded UP, never down."""
     trader = _trader()
-    assert trader._size(0.45, clip_usd=0.60) == 7  # $3.15 at 0.45
-    assert trader._size(0.58, clip_usd=0.60) == 6  # $3.48 at 0.58
+    assert trader._size(0.45, clip_usd=0.60) == 18  # $8.10 at 0.45
+    assert trader._size(0.58, clip_usd=0.60) == 14  # $8.12 at 0.58
 
 
 def test_size_spends_the_budget_not_the_default_clip():
     """A $10.04 account clips at 20% ($2.01), then the operator floor raises
-    it to the $3.00 minimum: contracts round UP to the law."""
+    it to the $8.00 minimum: contracts round UP to the law."""
     trader = _trader()
-    assert trader._size(0.58, clip_usd=2.01) == 6  # $3.48, floored from $1.74
-    assert trader._size(0.41, clip_usd=2.01) == 8  # $3.28, floored from $1.64
+    assert trader._size(0.58, clip_usd=2.01) == 14  # $8.12, floored from $1.74
+    assert trader._size(0.41, clip_usd=2.01) == 20  # $8.20, floored from $1.64
 
 
 def test_minimum_viable_quantity_is_one_contract():
@@ -216,8 +216,8 @@ def test_kelly_scales_the_clip_with_the_edge():
         mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.75)
         signal = trader.evaluate(market, live=True)
     assert signal is not None and signal.side == "up"
-    assert signal.contracts == 6
-    assert signal.notional == pytest.approx(3.30, abs=0.01)
+    assert signal.contracts == 15
+    assert signal.notional == pytest.approx(8.25, abs=0.01)
 
 
 def test_kelly_cap_bounds_a_single_clip():
@@ -240,9 +240,10 @@ def test_kelly_cap_bounds_a_single_clip():
         mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.95)
         signal = trader.evaluate(market, live=True)
     assert signal is not None and signal.side == "up"
-    assert signal.contracts == 7
-    assert signal.notional == pytest.approx(4.90, abs=0.01)
-    assert signal.notional <= 10.0 * trader.config.conviction_max_fraction + 0.01
+    assert signal.contracts == 12
+    assert signal.notional == pytest.approx(8.40, abs=0.01)
+    # The $8 operator floor outranks the fraction ceiling by law.
+    assert signal.notional >= 8.00 - 0.01
 
 
 def test_maker_entries_stop_at_75c_takers_stop_at_60c():

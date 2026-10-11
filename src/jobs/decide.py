@@ -112,9 +112,15 @@ def _calculate_kelly_position_size(
     # Ensure minimum of 1 contract if we have edge
     if quantity < 1 and kelly_fraction > 0.01:
         quantity = 1
-    # OPERATOR LAW (no micro trades): a buy never deploys less than $3.00.
+    # OPERATOR LAW (no micro trades): a buy never deploys less than $8.00.
+    try:
+        import os as _os
+
+        _floor = float(_os.environ.get("MIN_CLIP_USD", "8.0"))
+    except Exception:  # noqa: BLE001
+        _floor = 8.0
     if quantity > 0:
-        quantity = max(quantity, int(-(-3.0 // market_price)))
+        quantity = max(quantity, int(-(-_floor // market_price)))
 
     return quantity
 
@@ -151,9 +157,15 @@ def _calculate_dynamic_quantity(
     final_investment = min(investment_amount, max_investment)
     
     quantity = int(final_investment // market_price)
-    # OPERATOR LAW (no micro trades): a buy never deploys less than $3.00.
+    # OPERATOR LAW (no micro trades): a buy never deploys less than $8.00.
+    try:
+        import os as _os
+
+        _floor = float(_os.environ.get("MIN_CLIP_USD", "8.0"))
+    except Exception:  # noqa: BLE001
+        _floor = 8.0
     if quantity > 0:
-        quantity = max(quantity, int(-(-3.0 // market_price)))
+        quantity = max(quantity, int(-(-_floor // market_price)))
     
     get_trading_logger("decision_engine").info(
         "Calculated dynamic position size.",
