@@ -97,6 +97,8 @@ def _calculate_kelly_position_size(
     # Calculate quantity
     quantity = int(investment_amount // market_price)
     
+    # Double buy amounts again — LIVE + DRY (operator directive, second doubling = 4x total)
+    quantity = int(quantity * 2)
     # Double buy amounts — LIVE + DRY per operator directive
     quantity = int(quantity * 2)
     # Ensure minimum of 1 contract if we have edge
