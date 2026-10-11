@@ -2358,9 +2358,14 @@ class UpDownTrader:
                     round(cents / 100.0 * self.config.live_cash_fraction, 2),
                     _min_viable_notional(cents),
                 )
-                # Raw balance for the Kelly sizer in evaluate().
+                # Raw balance for the Kelly sizer in evaluate(). The LIVE
+                # book sizes off the real account. The DRY book sizes off its
+                # OWN simulated cash (set above from dry_account()) - never
+                # clobber it with the real (tiny) live balance: that flattened
+                # every DRY clip to one contract and made the tallies lie.
                 self._live_balance = cents / 100.0
-                self._dry_cash_cache = cents / 100.0
+                if live:
+                    self._dry_cash_cache = cents / 100.0
                 # === INVENTION #4: Drawdown-Aware Dynamic Kelly ===
                 # Track peak balance; shrink Kelly if drawdown > peak_floor.
                 # Only applies after a peak has been established (i.e., not the
