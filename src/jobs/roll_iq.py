@@ -25,7 +25,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Deque, Dict, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Deque, Dict, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from src.jobs.market_data import UpDownMarket
@@ -149,8 +149,8 @@ class RollTracker:
         self.lookback_sec = lookback_sec
         self.window_sec = window_seconds_for_series(series)
         self.samples: Deque[Tuple[float, float]] = deque(maxlen=sample_max)
-        # event_ticker -> side already bought this window (one clip per event)
-        self.bought: Dict[str, str] = {}
+        # event_ticker -> {"side", "edge", "count"} of clips on this window
+        self.bought: Dict[str, Dict[str, Any]] = {}
 
     def note(self, ts: float, price: float) -> None:
         if price and price > 0:
@@ -159,8 +159,22 @@ class RollTracker:
     def already(self, event_ticker: str) -> bool:
         return event_ticker in self.bought
 
-    def mark(self, event_ticker: str, side: str) -> None:
-        self.bought[event_ticker] = side
+    def clip(self, event_ticker: str) -> Dict[str, Any]:
+        return self.bought.get(event_ticker, {})
+
+    def mark(self, event_ticker: str, side: str, edge: float = 0.0) -> None:
+        self.bought[event_ticker] = {"side": side, "edge": edge, "count": 1}
+
+    def record(self, event_ticker: str, side: str, edge: float) -> None:
+        """A strengthening repeat: same side only; the count grows and the
+        edge keeps the best read seen. A side flip starts a fresh record -
+        the trader refuses cross-side repeats before this is called."""
+        cur = self.bought.get(event_ticker)
+        if cur is not None and cur.get("side") == side:
+            cur["count"] = int(cur.get("count", 1)) + 1
+            cur["edge"] = max(float(cur.get("edge", 0.0)), float(edge))
+            return
+        self.mark(event_ticker, side, edge)
 
     def prune(self, markets: Sequence["UpDownMarket"]) -> None:
         """Forget entries for events that have rotated off the open feed."""

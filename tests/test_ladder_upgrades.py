@@ -441,6 +441,19 @@ def test_tiered_edge_bar_prices_confidence():
     assert tiered_edge_bar(0.58, 0.06, cfg2) == 0.06
 
 
+def test_certified_views_clear_the_cheapest_bar():
+    """fair >= certified_prob drops the bar further than strong (0.40x vs
+    0.50x) - the surest band of the model fires the most."""
+    from src.jobs.ladder_trader import UpDownConfig, tiered_edge_bar
+
+    cfg = UpDownConfig()
+    certified = tiered_edge_bar(0.90, 0.06, cfg)
+    strong = tiered_edge_bar(0.80, 0.06, cfg)
+    assert certified < strong
+    assert certified == pytest.approx(0.06 * cfg.certified_edge_scale, abs=1e-12)
+    assert strong == pytest.approx(0.06 * cfg.strong_edge_scale, abs=1e-12)
+
+
 def test_evaluate_uses_the_tiered_bar_for_both_sides():
     import inspect
 

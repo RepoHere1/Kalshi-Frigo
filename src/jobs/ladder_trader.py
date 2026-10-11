@@ -330,6 +330,20 @@ class UpDownConfig:
     # correlation) still binds the result.
     certified_prob: float = 0.85
     certified_mult: float = 3.0
+    # Certified entries also clear a cheaper edge bar: 0.40x (vs 0.50x for
+    # strong) so the surest band of the model - its best win rate - fires
+    # MORE trades, each still gated at win_prob >= certified_prob.
+    certified_edge_scale: float = 0.40
+
+    # RE-ROLL (strengthening, roll path): the arrival clip buys the next
+    # window the moment it lists. A SECOND clip on the same event fires only
+    # when the drift read GREW since clip #1 - the model got surer while the
+    # price barely moved. More trades exactly where the win rate is highest,
+    # never a double-down on a weakening read.
+    reroll_enabled: bool = True
+    reroll_max: int = 2                 # clips per event, per side
+    reroll_strengthen: float = 0.02     # edge must grow this much vs clip #1
+    reroll_min_win: float = 0.60        # and the chosen side stays this sure
 
     # US-EQUITY SESSION BIAS: scale clip size to liquidity. Higher Kalshi
     # volume during the US session means tighter spreads = more edge/trade.
@@ -408,6 +422,17 @@ class UpDownConfig:
             pass
         if _os.environ.get("STRIKE_BAND", "1") != "1":
             self.strike_band_enabled = False
+        if _os.environ.get("REROLL", "1") != "1":
+            self.reroll_enabled = False
+        try:
+            self.certified_edge_scale = float(
+                _os.environ.get("CERTIFIED_EDGE_SCALE", self.certified_edge_scale)
+            )
+            self.reroll_strengthen = float(
+                _os.environ.get("REROLL_STRENGTHEN", self.reroll_strengthen)
+            )
+        except ValueError:
+            pass
         _vg = _os.environ.get("VENUE_GUARD_PCT", "")
         if _vg:
             try:
@@ -648,7 +673,11 @@ def tiered_edge_bar(win_prob: float, base_edge: float, cfg: Any) -> float:
     """
     base = float(base_edge)
     if getattr(cfg, "tiered_edge_enabled", True):
-        if float(win_prob) >= cfg.strong_prob:
+        if float(win_prob) >= getattr(cfg, "certified_prob", 0.85):
+            # CERTIFIED: the model and the price agree with a big cushion -
+            # the highest-win-rate band in the record. Fire MORE of them.
+            base *= getattr(cfg, "certified_edge_scale", 0.40)
+        elif float(win_prob) >= cfg.strong_prob:
             base *= cfg.strong_edge_scale
         elif float(win_prob) < cfg.marginal_prob:
             base *= cfg.marginal_edge_scale
@@ -2054,8 +2083,6 @@ class UpDownTrader:
         nxt = _next_window_market(self.feed.markets, window, _now, spot)
         if nxt is None:
             return None
-        if self._roll.already(nxt.event_ticker):
-            return None
         if any(h.get("ticker") == nxt.ticker for h in held):
             return None
         sigma_win = None
@@ -2085,6 +2112,17 @@ class UpDownTrader:
         if edge < self.config.roll_min_edge:
             self.book.skipped_roll_edge += 1
             return None
+        _prev = self._roll.clip(nxt.event_ticker)
+        if _prev:
+            if not self.config.reroll_enabled:
+                return None
+            if (
+                _prev.get("side") != read.side
+                or int(_prev.get("count", 1)) >= self.config.reroll_max
+                or p_win < self.config.reroll_min_win
+                or edge < float(_prev.get("edge", 0.0)) + self.config.reroll_strengthen
+            ):
+                return None
         _bal = self._live_balance if live else self._dry_cash_cache
         if not _bal or _bal <= 0:
             return None
@@ -2136,7 +2174,10 @@ class UpDownTrader:
         placed = await self._place(signal, live)
         if not placed:
             return None
-        self._roll.mark(nxt.event_ticker, read.side)
+        if _prev:
+            self._roll.record(nxt.event_ticker, read.side, round(edge, 4))
+        else:
+            self._roll.mark(nxt.event_ticker, read.side, edge=round(edge, 4))
         self.book.trades_today += 1
         self.book.roll_clips += 1
         return {

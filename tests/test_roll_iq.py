@@ -121,3 +121,17 @@ def test_tracker_limits_one_clip_per_event():
     assert tr.already("EV-9")
     tr.prune([_market("A-1", "EV-8", 100.0, 60)])
     assert not tr.already("EV-9"), "settled events rotate off the open feed"
+
+
+def test_tracker_records_strengthening_rerolls():
+    tr = RollTracker("KXBTCD")
+    tr.mark("EV-9", "up", edge=0.05)
+    assert tr.clip("EV-9") == {"side": "up", "edge": 0.05, "count": 1}
+    tr.record("EV-9", "up", 0.07)
+    assert tr.clip("EV-9")["count"] == 2
+    assert tr.clip("EV-9")["edge"] == 0.07
+    tr.record("EV-9", "up", 0.04)  # weaker read: count still grows, edge keeps best
+    assert tr.clip("EV-9")["count"] == 3
+    assert tr.clip("EV-9")["edge"] == 0.07
+    tr.record("EV-9", "down", 0.08)  # side flip starts a fresh record
+    assert tr.clip("EV-9") == {"side": "down", "edge": 0.08, "count": 1}
