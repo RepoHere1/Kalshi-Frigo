@@ -2087,12 +2087,16 @@ _SQL_OPEN = (
     " COALESCE(SUM(CASE WHEN live = 1 THEN 1 ELSE 0 END), 0) AS live"
     " FROM positions WHERE status = 'open' AND {book}"
 )
-# The simulated book only. `live = 0` is what marks a DRY position, because
-# execute_position deliberately does not promote DRY fills.
+# The simulated book only. The DRY book is identified by the mode column
+# (COALESCE NULLIF -> 'dry'), the SAME filter book_account() and _book_filter()
+# use - the legacy `live = 0` flag disagreed with those whenever a row carried
+# a mode stamp, so the deployed tile quoted one book while the accounts card
+# quoted another.
 _SQL_OPEN_DRY = (
     "SELECT COUNT(*) AS positions,"
     " COALESCE(SUM(quantity * entry_price), 0.0) AS capital"
-    " FROM positions WHERE status = 'open' AND live = 0"
+    " FROM positions WHERE status = 'open'"
+    " AND COALESCE(NULLIF(mode, ''), 'dry') = 'dry'"
 )
 _SQL_AI = (
     "SELECT COALESCE(SUM(cost_usd), 0.0) AS cost, COUNT(*) AS analyses"
@@ -3686,8 +3690,12 @@ def api_positions():
                     "timestamp": str(p.timestamp),
                 }
             )
-        # Kalshi is the source of truth for anything the local DB missed.
-        if not result and dashboard_state["positions"]:
+        # Kalshi is the source of truth for anything the local DB missed -
+        # but ONLY for the LIVE book. dashboard_state["positions"] is the real
+        # Kalshi account's holdings; showing them under a DRY view is how a
+        # simulated page quoted live sports/futures positions as if the paper
+        # book owned them. A DRY book with no local rows is simply empty.
+        if not result and dashboard_state["positions"] and _current_book_mode() == "live":
             for p in dashboard_state["positions"]:
                 result.append(
                     {

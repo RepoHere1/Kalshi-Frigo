@@ -161,6 +161,13 @@ class UpDownConfig:
     roll_min_edge: float = 0.05       # price must still lag the IQ by 5c+
     roll_max_ask: float = 0.55        # never overpay for arriving early
     roll_clip_mult: float = 2.0       # operator directive: larger dollar wins
+    # Fast wake near a window boundary: the roll clip exists to buy the
+    # successor at its FIRST listing, so the last seconds before a close
+    # poll tighter than the normal 4s cycle. 1s cadence over the final 30s
+    # = a bounded burst per boundary per lane - enough to land the buy
+    # within ~1s of the listing without hammering the venue into 429s.
+    roll_wake_sec: float = 30.0
+    roll_wake_interval: float = 1.0
     # LADDER STRIKE-BAND (hourly products): score the strike whose modeled
     # edge is widest among the near-money band - nearest when the tape is
     # quiet (win-rate play), a cheaper deeper contract when the model is
@@ -415,6 +422,10 @@ class UpDownConfig:
             self.roll_clip_mult = float(_os.environ.get("ROLL_CLIP_MULT", self.roll_clip_mult))
             self.roll_min_edge = float(_os.environ.get("ROLL_MIN_EDGE", self.roll_min_edge))
             self.roll_max_ask = float(_os.environ.get("ROLL_MAX_ASK", self.roll_max_ask))
+            self.roll_wake_sec = float(_os.environ.get("ROLL_WAKE_SEC", self.roll_wake_sec))
+            self.roll_wake_interval = float(
+                _os.environ.get("ROLL_WAKE_INTERVAL", self.roll_wake_interval)
+            )
             self.max_open_notional = float(
                 _os.environ.get("MAX_OPEN_NOTIONAL", self.max_open_notional)
             )
@@ -2848,7 +2859,20 @@ async def run_updown_trader(
 
             if not loop:
                 return
-            await asyncio.sleep(max(sleep_for, backoff))
+            # Roll-forward wake: within roll_wake_sec of a window close the
+            # successor contract appears on the venue's clock, not ours - so
+            # poll at sub-second cadence and let _roll_maybe_buy fire the
+            # moment it lists. Outside the window, the normal cadence.
+            _sleep = sleep_for
+            if config.roll_enabled:
+                try:
+                    _nearest = trader.feed.nearest()
+                    _left = float(_nearest.seconds_left or 0.0) if _nearest else None
+                    if _left is not None and 0.0 < _left <= config.roll_wake_sec:
+                        _sleep = min(sleep_for, config.roll_wake_interval)
+                except Exception:  # noqa: BLE001 - a bad read just sleeps normally
+                    _sleep = sleep_for
+            await asyncio.sleep(max(_sleep, backoff))
     finally:
         try:
             await hub.stop()
