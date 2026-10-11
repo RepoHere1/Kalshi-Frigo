@@ -29,7 +29,7 @@ MODE_DRY = "dry"
 MODE_LIVE = "live"
 VALID_MODES = (MODE_DRY, MODE_LIVE)
 
-DEFAULT_DRY_STARTING_BALANCE = 200.0
+DEFAULT_DRY_STARTING_BALANCE = 300.0
 
 
 async def apply_persisted_trading_config(db_path: Optional[str] = None) -> int:

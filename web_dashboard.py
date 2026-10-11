@@ -259,6 +259,76 @@ def _push_error(message):
         del dashboard_state["errors"][: len(dashboard_state["errors"]) - MAX_ERRORS]
 
 
+MAX_STRATEGY_LOG_MB = int(os.environ.get("MAX_STRATEGY_LOG_MB", "25"))
+
+
+def _trim_log(path, cap_bytes: int = None, keep_tail: int = 1024 * 1024) -> None:
+    """A strategy log may never grow past its cap: the volume died because
+    these files filled 5GB. Keep the last megabyte of tail, drop the rest.
+    The child writes in append mode, so in-place truncation is race-safe."""
+    cap = cap_bytes or MAX_STRATEGY_LOG_MB * 1024 * 1024
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size <= cap:
+        return
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - keep_tail))
+            tail = fh.read()
+        with open(path, "wb") as fh:
+            header = (
+                f"[log rotated: {size} bytes grew past the {cap} byte cap - "
+                f"keeping the last {len(tail)} bytes]\n"
+            )
+            fh.write(header.encode() + tail)
+    except OSError:
+        pass
+
+
+def _log_trim_loop() -> None:
+    """Periodic sweep: enforce the cap on every strategy log."""
+    while True:
+        try:
+            for path in _log_files():
+                _trim_log(path)
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(300)
+
+
+def _one_shot_dry_topup() -> None:
+    """Operator order: bring the DRY fake balance back to $300 WITHOUT
+    touching positions or trade history. One shot - a ledger row marks the
+    top-up done, so future boots never re-fund the book behind the
+    operator's back. Enabled by DRY_TOPUP_ONCE=<amount> in the env."""
+    topup = os.environ.get("DRY_TOPUP_ONCE", "").strip()
+    if not topup:
+        return
+    try:
+        target = float(topup)
+    except ValueError:
+        return
+    try:
+        mgr = TradingMode(db_path=str(DB_PATH))
+        acct = _run_async(mgr.dry_account())
+        cash = float((acct or {}).get("cash") or 0.0)
+        if cash >= target:
+            return
+        for row in (_run_async(mgr.ledger(limit=200000)) or []):
+            if (row.get("note") or "") == "operator top-up once":
+                return
+        _run_async(
+            mgr.adjust_cash(
+                round(target - cash, 2), note="operator top-up once"
+            )
+        )
+        print(f"[dry-topup] DRY cash {cash:.2f} -> {target:.2f} (no history touched)", flush=True)
+    except Exception as exc:  # noqa: BLE001 - a failed top-up must never stop boots
+        _push_error(f"dry top-up failed: {type(exc).__name__}: {exc}")
+
+
 def _log_files():
     """Return log files newest-first.
 
@@ -4564,6 +4634,7 @@ def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
     child_env["STRATEGY_NAME"] = name
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _trim_log(LOG_DIR / f"strategy_{name}.log")
     out = open(LOG_DIR / f"strategy_{name}.log", "ab", buffering=0)
     try:
         proc = subprocess.Popen(
@@ -7233,6 +7304,7 @@ def start_background_workers():
     _workers_started = True
     # Operator config survives redeploys: apply saved dashboard config edits
     # (runtime_config cfg.* keys) before any worker reads settings.
+    _one_shot_dry_topup()
     try:
         from src.utils.mode import apply_persisted_trading_config
 
@@ -7242,6 +7314,7 @@ def start_background_workers():
     for target in (
          _monitor_loop,
          _log_tail_loop,
+         _log_trim_loop,
          _backup_loop,
          _market_data_loop,
          # Button-only control, with restart persistence. This loop NEVER
