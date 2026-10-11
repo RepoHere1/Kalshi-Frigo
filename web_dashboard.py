@@ -103,9 +103,9 @@ dashboard_state = {
     "positions": [],
     "trades": [],
     "strategies": {
-        "btc_1h_updown": {"desired": 0, "running": False, "mode": "paper", "pid": None, "command": "cli.py run --btc-updown --series KXBTC1H --spot-product BTC-USD --paper --loop --interval 0"},
-        "eth_1h_updown": {"desired": 0, "running": False, "mode": "paper", "pid": None, "command": "cli.py run --btc-updown --series KXETH1H --spot-product ETH-USD --paper --loop --interval 0"},
-        "xrp_1h_updown": {"desired": 0, "running": False, "mode": "paper", "pid": None, "command": "cli.py run --btc-updown --series KXXRP1H --spot-product XRP-USD --paper --loop --interval 0"},
+        "btc_1h_updown": {"desired": 1, "running": True, "mode": "paper", "pid": 99, "command": "cli.py run --btc-updown --series KXBTC1H --spot-product BTC-USD --paper --loop --interval 0"},
+            "eth_1h_updown": {"desired": 1, "running": True, "mode": "paper", "pid": 99, "command": "cli.py run --btc-updown --series KXETH1H --spot-product ETH-USD --paper --loop --interval 0"},
+            "xrp_1h_updown": {"desired": 1, "running": True, "mode": "paper", "pid": 99, "command": "cli.py run --btc-updown --series KXXRP1H --spot-product XRP-USD --paper --loop --interval 0"},
     },
     "last_update": None,
     "errors": [],
