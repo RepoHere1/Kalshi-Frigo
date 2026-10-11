@@ -311,6 +311,8 @@ def _one_shot_dry_topup() -> None:
     except ValueError:
         return
     try:
+        from src.utils.mode import TradingMode
+
         mgr = TradingMode(db_path=str(DB_PATH))
         acct = _run_async(mgr.dry_account())
         cash = float((acct or {}).get("cash") or 0.0)
