@@ -31,19 +31,20 @@ def _trader_no_session_mult():
     return UpDownTrader(spot, Btc15mFeed(), UpDownConfig(session_mult_enabled=False))
 
 
-def test_size_floors_at_one_contract_not_a_dollar():
-    """The exchange minimum is one whole contract; a $0.60 budget at 0.45 still
-    submits one contract, never zero and never a fabricated $1 ceiling."""
+def test_size_floors_at_three_dollars_of_deployed_cash():
+    """OPERATOR LAW: no micro trades. A puny budget still deploys at least
+    $3.00 of contracts - rounded UP, never down."""
     trader = _trader()
-    assert trader._size(0.45, clip_usd=0.60) == 1
-    assert trader._size(0.58, clip_usd=0.60) == 1  # 1 @ 0.58 = $0.58
+    assert trader._size(0.45, clip_usd=0.60) == 7  # $3.15 at 0.45
+    assert trader._size(0.58, clip_usd=0.60) == 6  # $3.48 at 0.58
 
 
 def test_size_spends_the_budget_not_the_default_clip():
-    """A $10.04 account clips at 20% ($2.01), not the $5 default."""
+    """A $10.04 account clips at 20% ($2.01), then the operator floor raises
+    it to the $3.00 minimum: contracts round UP to the law."""
     trader = _trader()
-    assert trader._size(0.58, clip_usd=2.01) == 3  # 3 @ 0.58 = $1.74 <= 2.01
-    assert trader._size(0.41, clip_usd=2.01) == 4  # 4 @ 0.41 = $1.64
+    assert trader._size(0.58, clip_usd=2.01) == 6  # $3.48, floored from $1.74
+    assert trader._size(0.41, clip_usd=2.01) == 8  # $3.28, floored from $1.64
 
 
 def test_minimum_viable_quantity_is_one_contract():
@@ -215,8 +216,8 @@ def test_kelly_scales_the_clip_with_the_edge():
         mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.75)
         signal = trader.evaluate(market, live=True)
     assert signal is not None and signal.side == "up"
-    assert signal.contracts == 4
-    assert signal.notional == pytest.approx(2.20, abs=0.01)
+    assert signal.contracts == 6
+    assert signal.notional == pytest.approx(3.30, abs=0.01)
 
 
 def test_kelly_cap_bounds_a_single_clip():

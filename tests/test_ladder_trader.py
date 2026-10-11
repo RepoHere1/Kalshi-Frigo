@@ -448,6 +448,16 @@ def test_live_clip_sizes_against_the_balance_budget(monkeypatch):
     assert live.notional == pytest.approx(4.00, abs=0.01)
 
 
+def test_size_never_returns_a_sub_three_dollar_clip():
+    """OPERATOR LAW: no buy deploys less than $3.00. No intent ($0 clip)
+    stays no clip; a real clip is rounded UP to the floor, never down."""
+    trader = _scorer()
+    assert trader._size(0.50, clip_usd=1.0) == 6   # $3.00 exactly
+    assert trader._size(0.85, clip_usd=0.5) == 4   # $3.40
+    assert trader._size(0.85, clip_usd=0.0) == 0   # no intent -> no clip
+    assert trader._size(0.50, clip_usd=100.0) == 200  # floor never shrinks
+
+
 def test_a_zero_dollar_live_budget_produces_no_clip():
     trader = _scorer()
     trader.spot.price = 85000.0

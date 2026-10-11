@@ -431,6 +431,9 @@ class UpDownConfig:
             self.reroll_strengthen = float(
                 _os.environ.get("REROLL_STRENGTHEN", self.reroll_strengthen)
             )
+            self.min_clip_usd = float(
+                _os.environ.get("MIN_CLIP_USD", self.min_clip_usd)
+            )
         except ValueError:
             pass
         _vg = _os.environ.get("VENUE_GUARD_PCT", "")
@@ -477,6 +480,8 @@ class UpDownConfig:
     # floor: a 1-cent contract is a valid $0.01 order. The old $1.00 minimum
     # made it impossible for a tiny account to ever place an order.
     min_order_usd: float = 0.0
+    # OPERATOR LAW (no micro trades): no buy deploys less than $3.00.
+    min_clip_usd: float = 3.0
     # Stop opening new positions this close to expiry: the settlement window is
     # the 60 seconds before close, and a fill inside it is a coin toss.
     min_seconds_left: float = 45.0
@@ -1593,6 +1598,12 @@ class UpDownTrader:
         # clip must still be a whole contract (a 1-cent contract is $0.01).
         if contracts < 1:
             contracts = 1
+        # OPERATOR LAW (no micro trades): every buy deploys AT LEAST
+        # min_clip_usd. A $2.00 clip is not a trade, it is noise.
+        if self.config.min_clip_usd > 0:
+            contracts = max(
+                contracts, int(math.ceil(self.config.min_clip_usd / price))
+            )
         return max(contracts, 0)
 
     # ------------------------------------------------------------------
@@ -1990,6 +2001,12 @@ class UpDownTrader:
             self.config.max_open_notional,
         )
         contracts = _cw.contracts_for(up_ask, down_ask, budget)
+        # OPERATOR LAW: a certain-win pair also deploys >= min_clip_usd.
+        if self.config.min_clip_usd > 0:
+            contracts = max(
+                contracts,
+                int(math.ceil(self.config.min_clip_usd / (up_ask + down_ask))),
+            )
         if contracts < 1:
             return False
 
