@@ -198,6 +198,38 @@ def test_daily_gold_waits_for_realized_vol_before_scoring():
     assert "realized volatility warm-up" not in warm_signal.reason
 
 
+@pytest.mark.asyncio
+async def test_daily_gold_does_not_bypass_scoring_with_certain_win_pair(monkeypatch):
+    trader = UpDownTrader(
+        SpotFeed(), Btc15mFeed(series="KXGOLDD"), UpDownConfig()
+    )
+    assert trader.config.certain_win_enabled is False
+    trader.config.certain_win_enabled = True
+    market = UpDownMarket(
+        ticker="KXGOLDD-26OCT1317-T4164",
+        event_ticker="KXGOLDD-26OCT1317",
+        bucket="26OCT1317",
+        horizon=0,
+        title="Gold daily close above $4,164",
+        target=4164.0,
+        close_ts=time.time() + 24 * 60 * 60,
+        yes_bid=0.44,
+        yes_ask=0.45,
+        no_bid=0.44,
+        no_ask=0.45,
+    )
+    evaluated = []
+
+    def _evaluate(*args):
+        evaluated.append(args)
+        return False, 0.0
+
+    monkeypatch.setattr("src.jobs.certain_win.evaluate", _evaluate)
+
+    assert await trader._certain_win_pair(market, live=False) is False
+    assert evaluated == []
+
+
 def test_buys_up_when_spot_is_well_past_target_but_kalshi_is_even():
     c = UpDownConfig(noise_pct=0.0002, min_edge=0.06)
     trader = UpDownTrader(SpotFeed(), Btc15mFeed(), c)

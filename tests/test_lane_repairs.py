@@ -116,6 +116,10 @@ def test_gold_lane_does_not_attach_the_bitcoin_benchmark_feed():
     )
     assert gold.brti is None
     assert btc.brti is sentinel
+    assert gold.hl is None
+    assert btc.hl is not None
+    assert gold.config.poly_guard_enabled is False
+    assert gold.config.momentum_filter_enabled is False
 
 
 def test_every_trade_log_carries_the_entry_fair():

@@ -832,12 +832,20 @@ class UpDownTrader:
         # A dislocation read only exists for the asset those feeds carry.
         if getattr(feed, "series", "KXBTC15M") != "KXBTC15M":
             self.config.venue_guard_enabled = False
+        if str(getattr(feed, "series", "")).upper() == "KXGOLDD":
+            # Gold uses scored entries; the pair-arb path has a separate
+            # budget and bypasses both edge scoring and volatility warm-up.
+            self.config.certain_win_enabled = False
+            # The Polymarket window/momentum filters track BTC 15-minute
+            # markets, not Gold's daily settlement window.
+            self.config.poly_guard_enabled = False
+            self.config.momentum_filter_enabled = False
         # Polymarket same-window scanner + Hyperliquid mark (both keyless).
         from src.jobs.cross_venue_poly import PolyScanner
         from src.jobs.vol_edge import HyperliquidMark
 
         self.poly = PolyScanner()
-        self.hl = HyperliquidMark()
+        self.hl = HyperliquidMark() if self._uses_btc_benchmarks else None
         self.poly_arb_last: Optional[Dict[str, Any]] = None
         self._vol_adj: float = 0.0
         # FRESH-BURST flag for this pass: a fresh spot move the quote has
@@ -1538,6 +1546,7 @@ class UpDownTrader:
             # HL fire only when the operator arms them (HL_HEDGE_ENABLED).
             if (
                 self._uses_btc_benchmarks
+                and self.hl is not None
                 and self.config.vol_edge_enabled
                 and self._sigma_used
             ):
@@ -1983,6 +1992,8 @@ class UpDownTrader:
         inserted and funded through the same canonical path as any clip, so
         DRY rehearses exactly what LIVE does.
         """
+        if str(getattr(self.feed, "series", "")).upper() == "KXGOLDD":
+            return False
         from src.jobs import certain_win as _cw
         from src.jobs.execute import execute_position
         from src.utils.database import DatabaseManager, Position
@@ -2125,10 +2136,11 @@ class UpDownTrader:
                 await self.poly.refresh()
             except Exception:  # noqa: BLE001
                 pass
-        try:
-            await self.hl.refresh()
-        except Exception:  # noqa: BLE001
-            pass
+        if self.hl is not None:
+            try:
+                await self.hl.refresh()
+            except Exception:  # noqa: BLE001
+                pass
 
         # This trader used to only ever OPEN positions. Closing them was someone
         # else's job: `run_tracking` lives inside BeastModeBot, so in DRY the
