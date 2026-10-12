@@ -5937,24 +5937,6 @@ button.loading.yellow::after {
   {%- endif %}
   <div class="pb">
     <div class="cards">
-      <div class="card" id="roll-card" style="cursor:default">
-        <div class="ctop">
-          <div><div class="clabel">ROLL IQ</div><div class="mono cname">successor-contract overlay</div></div>
-          <span class="pill {{ 'ok' if s.roll_card.book == 'dry' else 'warn' }}" id="roll-book">{{ s.roll_card.book|upper }}</span>
-        </div>
-        <div class="cstats">
-          <div><b id="roll-closed">{{ s.roll_card.closed_clips }}</b><span>closed clips</span></div>
-          <div><b id="roll-open">{{ s.roll_card.open_clips }}</b><span>open clips</span></div>
-          <div><b id="roll-outcomes">{{ s.roll_card.wins }}W / {{ s.roll_card.losses }}L</b><span>closed outcomes</span></div>
-          <div><b id="roll-win-rate">{{ s.roll_card.win_rate }}%</b><span>win rate</span></div>
-          <div><b id="roll-pnl" class="{{ 'up' if s.roll_card.realized_pnl > 0 else ('down' if s.roll_card.realized_pnl < 0 else 'flat') }}">${{ '%.2f'|format(s.roll_card.realized_pnl) }}</b><span>realized</span></div>
-          <div><b id="roll-deployed">${{ '%.2f'|format(s.roll_card.open_deployed) }}</b><span>open deployed</span></div>
-        </div>
-        <div class="cfoot">
-          <span class="mono" style="color:var(--faint)">ROLL IQ runs inside the UP/DOWN lanes; use those lane controls.</span>
-          <span class="mono" id="roll-total">{{ s.roll_card.total_clips }} total clips</span>
-        </div>
-      </div>
       {%- for c in s.strategy_cards %}
       <div class="card{{ ' hot' if c.running else '' }}" id="card-{{ c.name }}" onclick="openStrategy('{{ c.name }}')">
         <div class="ctop">
@@ -6687,40 +6669,11 @@ function paint(s) {
 
   SNAPSHOT.equity = s.equity || SNAPSHOT.equity;
   paintCards(s.strategy_cards);
-  paintRollCard(s.roll_card);
   const eq = SNAPSHOT.equity || {};
   const closes = (eq.pnl || []).length;
   set('pnlSummary', closes
     ? closes + ' closed trades'
     : 'no closed trades yet');
-}
-
-// Patch the volatile parts of each card in place. The cards themselves are
-// server-rendered, so this only has to keep numbers and state current - it must
-// not rebuild the DOM, or the sparkline canvases would be destroyed.
-function paintRollCard(roll) {
-  if (!roll) return;
-  const set = (id, value) => { const el = $(id); if (el) el.textContent = value; };
-  const wins = Number(roll.wins || 0);
-  const losses = Number(roll.losses || 0);
-  const flats = Number(roll.flats || 0);
-  set('roll-closed', Number(roll.closed_clips || 0));
-  set('roll-open', Number(roll.open_clips || 0));
-  set('roll-outcomes', wins + 'W / ' + losses + 'L' + (flats ? ' / ' + flats + ' flat' : ''));
-  set('roll-win-rate', Number(roll.win_rate || 0).toFixed(1) + '%');
-  set('roll-deployed', money(roll.open_deployed || 0));
-  set('roll-total', Number(roll.total_clips || 0) + ' total clips');
-  const pnl = $('roll-pnl');
-  if (pnl) {
-    const realized = Number(roll.realized_pnl || 0);
-    pnl.textContent = money(realized);
-    pnl.className = realized > 0 ? 'up' : (realized < 0 ? 'down' : 'flat');
-  }
-  const book = $('roll-book');
-  if (book) {
-    book.textContent = String(roll.book || '').toUpperCase();
-    book.className = 'pill ' + (roll.book === 'live' ? 'warn' : 'ok');
-  }
 }
 
 function paintCards(cards) {

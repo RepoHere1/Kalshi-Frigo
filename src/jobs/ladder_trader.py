@@ -43,6 +43,8 @@ from src.jobs.market_data import Btc15mFeed, SpotFeed, UpDownMarket
 # A Kalshi quote older than this is not traded against: the book simply has
 # not repriced yet, so any "edge" versus fresh truth is fiction.
 QUOTE_MAX_AGE_SEC = 30.0
+# ROLL IQ trading is retired. Only a source change should be able to revive it.
+ROLL_IQ_ENABLED = False
 # Every Kelly-sized Up/Down and ROLL-IQ order is capped after sizing boosts.
 MAX_ORDER_NOTIONAL_USD = Decimal("1.00")
 # MAX CLIPS OF ONE TICKER: ONE, both books. Evidence from the live trade log
@@ -421,7 +423,7 @@ class UpDownConfig:
         except ValueError:
             pass
         # Ignore the legacy ROLL_ENABLED variable and constructor overrides.
-        self.roll_enabled = False
+        self.roll_enabled = ROLL_IQ_ENABLED
         try:
             self.roll_clip_mult = float(_os.environ.get("ROLL_CLIP_MULT", self.roll_clip_mult))
             self.roll_min_edge = float(_os.environ.get("ROLL_MIN_EDGE", self.roll_min_edge))
@@ -891,17 +893,17 @@ class UpDownTrader:
         self._peak_balance: Optional[float] = None
         self._realized_vol: Optional[float] = None
         self.book = UpDownBook(max_open_notional=self.config.max_open_notional)
-        # ROLL-FORWARD IQ: state for the additive next-window path. One
-        # tracker per lane; paper and live share the same logic.
-        try:
-            from src.jobs.roll_iq import RollTracker
+        self._roll = None
+        if ROLL_IQ_ENABLED:
+            try:
+                from src.jobs.roll_iq import RollTracker
 
-            self._roll = RollTracker(
-                series=getattr(self.feed, "series", ""),
-                lookback_sec=self.config.roll_lookback_sec,
-            )
-        except Exception:  # noqa: BLE001 - roll is additive, never fatal
-            self._roll = None
+                self._roll = RollTracker(
+                    series=getattr(self.feed, "series", ""),
+                    lookback_sec=self.config.roll_lookback_sec,
+                )
+            except Exception:  # noqa: BLE001 - roll is additive, never fatal
+                self._roll = None
 
     def evaluate(
         self,
@@ -2111,7 +2113,7 @@ class UpDownTrader:
         canonical order path - additive to the legacy scorer, identical in
         paper and live.
         """
-        if self._roll is None or not self.config.roll_enabled:
+        if not ROLL_IQ_ENABLED or self._roll is None:
             return None
         from src.jobs.roll_iq import drift_read as _drift_read
         from src.jobs.roll_iq import next_window_market as _next_window_market
@@ -2672,7 +2674,7 @@ class UpDownTrader:
         # buys the NEXT window the first moment the venue lists it - while
         # the current one is still ticking down.
         roll_took: Optional[Dict[str, Any]] = None
-        if self.config.roll_enabled:
+        if ROLL_IQ_ENABLED:
             try:
                 roll_took = await self._roll_maybe_buy(live, held, market)
             except Exception as exc:  # noqa: BLE001 - additive, never fatal
@@ -2906,12 +2908,8 @@ async def run_updown_trader(
 
             if not loop:
                 return
-            # Roll-forward wake: within roll_wake_sec of a window close the
-            # successor contract appears on the venue's clock, not ours - so
-            # poll at sub-second cadence and let _roll_maybe_buy fire the
-            # moment it lists. Outside the window, the normal cadence.
             _sleep = sleep_for
-            if config.roll_enabled:
+            if ROLL_IQ_ENABLED:
                 try:
                     _nearest = trader.feed.nearest()
                     _left = float(_nearest.seconds_left or 0.0) if _nearest else None

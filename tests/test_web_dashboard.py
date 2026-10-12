@@ -2044,14 +2044,14 @@ def test_card_counts_open_positions_per_strategy(client):
     assert card["deployed"] == 3.6  # 12 contracts at $0.30
 
 
-def test_roll_card_is_always_rendered_as_a_read_only_overlay(client):
+def test_dedicated_roll_card_and_painter_are_removed(client):
     snap = client.get("/api/snapshot").get_json()
     html = client.get("/").get_data(as_text=True)
 
     assert snap["roll_card"]["closed_clips"] == 0
     assert snap["roll_card"]["open_clips"] == 0
-    assert 'id="roll-card"' in html
-    assert "ROLL IQ" in html
+    assert 'id="roll-card"' not in html
+    assert "paintRollCard" not in html
     assert 'onclick="openStrategy(\'roll_iq\')"' not in html
     assert 'id="btn-roll_iq"' not in html
 

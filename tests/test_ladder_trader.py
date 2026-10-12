@@ -57,7 +57,20 @@ async def test_roll_iq_cannot_be_reenabled_by_config_or_environment(monkeypatch)
         def note(self, *_args):
             raise AssertionError("disabled ROLL IQ reached its trading path")
 
-    trader._roll = UnexpectedRollUse()
+    monkeypatch.setattr(trader, "_roll", UnexpectedRollUse())
+    assert await trader._roll_maybe_buy(live=False, held=[], market=None) is None
+
+
+@pytest.mark.asyncio
+async def test_roll_iq_stays_disabled_if_config_is_mutated_after_init(monkeypatch):
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed(), UpDownConfig())
+    trader.config.roll_enabled = True
+
+    class UnexpectedRollUse:
+        def note(self, *_args):
+            raise AssertionError("mutated config revived the ROLL IQ path")
+
+    monkeypatch.setattr(trader, "_roll", UnexpectedRollUse())
     assert await trader._roll_maybe_buy(live=False, held=[], market=None) is None
 
 
