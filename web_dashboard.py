@@ -1854,6 +1854,7 @@ def _strategy_cards(
     curve_rows: List[Dict[str, Any]],
     position_rows: List[Dict[str, Any]],
     book: str,
+    roll_trades_rows: List[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """One card per strategy: headline stats plus its own cumulative P&L curve.
 
@@ -1926,6 +1927,10 @@ def _strategy_cards(
             "best": 0.0,
             "worst": 0.0,
             "open_positions": 0,
+            "roll_clips": 0,
+            "roll_wins": 0,
+            "roll_losses": 0,
+            "roll_rate": 0.0,
             "deployed": 0.0,
             "first_trade": None,
             "last_trade": None,
@@ -1972,9 +1977,29 @@ def _strategy_cards(
             2,
         )
 
+    # Map roll trades by strategy
+    roll_stats = {}
+    for row in (roll_trades_rows or []):
+        if _resolve_book(row.get("mode")) != book:
+            continue
+        name = _strategy_bucket(row.get("strategy"))
+        roll_stats[name] = {
+            "roll_clips": int(row.get("roll_trades") or 0),
+            "roll_wins": int(row.get("roll_wins") or 0),
+            "roll_losses": int(row.get("roll_losses") or 0),
+        }
+
     for card in cards.values():
         card["win_rate"] = (
             round(100.0 * card["wins"] / card["trades"], 1) if card["trades"] else 0.0
+        )
+        # Populate roll stats
+        roll_data = roll_stats.get(card["name"], {})
+        card["roll_clips"] = roll_data.get("roll_clips", 0)
+        card["roll_wins"] = roll_data.get("roll_wins", 0)
+        card["roll_losses"] = roll_data.get("roll_losses", 0)
+        card["roll_rate"] = (
+            round(100.0 * card["roll_wins"] / card["roll_clips"], 1) if card["roll_clips"] else 0.0
         )
     # Horizon grouping: ALL 15-minute cards lead, ALL 1-hour cards follow,
     # then everything else — one sort (shared with _mode_payload) so DRY and
@@ -2159,6 +2184,16 @@ _SQL_STRATEGY_CURVE = (
     " COALESCE(NULLIF(mode, ''), 'dry') AS mode,"
     " exit_timestamp, exit_reason, pnl, market_id FROM trade_logs"
     " ORDER BY COALESCE(exit_timestamp, entry_timestamp) ASC LIMIT 2000"
+)
+# Roll trades: filtered by rationale containing ROLL-IQ marker
+_SQL_ROLL_TRADES = (
+    "SELECT COALESCE(NULLIF(strategy, ''), 'unattributed') AS strategy,"
+    " COALESCE(NULLIF(mode, ''), 'dry') AS mode,"
+    " COUNT(*) AS roll_trades,"
+    " COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS roll_wins,"
+    " COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0) AS roll_losses"
+    " FROM trade_logs WHERE rationale LIKE '%ROLL-IQ%' AND {book}"
+    " GROUP BY strategy, mode"
 )
 _SQL_POSITIONS = (
     "SELECT market_id, side, entry_price, quantity, strategy, stop_loss_price,"
@@ -2517,13 +2552,11 @@ def build_snapshot() -> Dict[str, Any]:
             (_SQL_POSITIONS.format(book=where), ()),
             (_SQL_STRATEGY_CURVE, ()),
             (_SQL_FAIR_BANDS.format(book=where), ()),
+            (_SQL_ROLL_TRADES.format(book=where), ()),
         ]
         + [(f"SELECT COUNT(*) AS n FROM {t}", ()) for t in DATA_TABLES]
     )
-    trades_r, open_r, dry_open_r, ai_r, llm_r, strat_r, recent_r, equity_r, pos_r, curve_r = batch[
-        :10
-    ]
-    fairs_r = batch[10]
+    trades_r, open_r, dry_open_r, ai_r, llm_r, strat_r, recent_r, equity_r, pos_r, curve_r, fairs_r, roll_trades_r = batch[:12]
     counts = batch[11:]
 
     # Equity curve is fetched newest-first; flip it so the chart reads left to right.
@@ -2559,7 +2592,7 @@ def build_snapshot() -> Dict[str, Any]:
     running = _running_strategies()
     errors: List[Dict[str, Any]] = cast(List[Dict[str, Any]], dashboard_state["errors"])
     events: List[Dict[str, Any]] = cast(List[Dict[str, Any]], dashboard_state["events"])
-    cards = _strategy_cards(curve_r, pos_r, book)
+    cards = _strategy_cards(curve_r, pos_r, book, roll_trades_r)
 
     def _count(index: int) -> int:
         """Rows in a count result, tolerating a table that does not exist yet.
@@ -4217,7 +4250,7 @@ def api_strategy_detail(name):
     )
     curve_r, pos_r, _recent_r, trades_r = batch
 
-    cards = _strategy_cards(curve_r, pos_r, book)
+    cards = _strategy_cards(curve_r, pos_r, book, roll_trades_r)
     card = next((c for c in cards if c["name"] == name), None)
     if card is None:
         return jsonify({"error": f"Unknown strategy: {name}"}), 404
@@ -5704,6 +5737,8 @@ button.loading.yellow::after {
           <div><b id="c-{{ c.name }}-pnl" class="{{ 'up' if c.realized > 0 else ('down' if c.realized < 0 else 'flat') }}">${{ '%.2f'|format(c.realized) }}</b><span>realized</span></div>
           <div><b id="c-{{ c.name }}-win">{{ c.win_rate }}%</b><span>win rate</span></div>
           <div><b id="c-{{ c.name }}-open">{{ c.open_positions }}</b><span>open</span></div>
+          <div><b id="c-{{ c.name }}-roll-clips">{{ c.roll_clips }}</b><span>roll trades</span></div>
+          <div><b id="c-{{ c.name }}-roll-rate">{{ (c.roll_wins / c.roll_clips * 100) if c.roll_clips else 0 }}%</b><span>roll rate</span></div>
         </div>
          <div class="cfoot">
            <span class="mono" style="color:var(--faint)">BUY AMT <span id="c-{{ c.name }}-dep">${{ '%.2f'|format(c.deployed) }}</span>{% if not c.running and c.stop_reason %} &middot; {{ c.stop_reason }}{% endif %}</span>
@@ -6343,9 +6378,11 @@ function paintCards(cards) {
   SNAPSHOT.strategy_cards = cards;
   cards.forEach(c => {
     const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
-    set('c-' + c.name + '-trades', c.trades);
-    set('c-' + c.name + '-win', c.win_rate + '%');
-    set('c-' + c.name + '-open', c.open_positions);
+  set('c-' + c.name + '-trades', c.trades);
+  set('c-' + c.name + '-win', c.win_rate + '%');
+  set('c-' + c.name + '-open', c.open_positions);
+  set('c-' + c.name + '-roll-clips', c.roll_clips || 0);
+  set('c-' + c.name + '-roll-rate', ((c.roll_wins || 0) / ((c.roll_clips || 0) || 1) * 100).toFixed(1) + '%');
     set('c-' + c.name + '-dep', Number(c.deployed || 0).toFixed(2));
     const pnl = $('c-' + c.name + '-pnl');
     if (pnl) {

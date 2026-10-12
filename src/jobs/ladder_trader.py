@@ -574,6 +574,8 @@ class UpDownBook:
     skipped_quick_win: int = 0
     # ROLL-FORWARD IQ counters (additive path).
     roll_clips: int = 0
+    roll_wins: int = 0
+    roll_losses: int = 0
     skipped_roll_cold: int = 0
     skipped_roll_ask: int = 0
     skipped_roll_edge: int = 0
@@ -608,6 +610,9 @@ class UpDownBook:
             "skipped_momentum": self.skipped_momentum,
             "skipped_correlated": self.skipped_correlated,
             "skipped_news_sentiment": self.skipped_news_sentiment,
+            "roll_clips": self.roll_clips,
+            "roll_wins": self.roll_wins,
+            "roll_losses": self.roll_losses,
             "last_error": self.last_error,
             "dry": self.dry,
             "certain_wins": self.certain_wins,
@@ -2200,16 +2205,16 @@ class UpDownTrader:
             ),
             truth="roll-iq",
         )
-        placed = await self._place(signal, live)
-        if not placed:
-            return None
-        if _prev:
-            self._roll.record(nxt.event_ticker, read.side, round(edge, 4))
-        else:
-            self._roll.mark(nxt.event_ticker, read.side, edge=round(edge, 4))
-        self.book.trades_today += 1
-        self.book.roll_clips += 1
-        return {
+          placed = await self._place(signal, live)
+          if not placed:
+              return None
+          if _prev:
+              self._roll.record(nxt.event_ticker, read.side, round(edge, 4))
+          else:
+              self._roll.mark(nxt.event_ticker, read.side, edge=round(edge, 4))
+          self.book.trades_today += 1
+          self.book.roll_clips += 1
+          return {
             "ticker": nxt.ticker,
             "side": read.side,
             "contracts": contracts,
