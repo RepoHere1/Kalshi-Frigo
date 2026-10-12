@@ -231,7 +231,10 @@ async def test_daily_gold_does_not_bypass_scoring_with_certain_win_pair(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_cold_daily_gold_cycle_does_not_rank_strikes_with_fallback(monkeypatch):
+@pytest.mark.parametrize("prior_samples,should_rank", [(0, False), (24, True)])
+async def test_daily_gold_cycle_ranks_only_with_realized_vol(
+    prior_samples, should_rank, monkeypatch
+):
     import src.jobs.ladder_trader as lt
     from src.utils.mode import TradingMode
 
@@ -265,12 +268,24 @@ async def test_cold_daily_gold_cycle_does_not_rank_strikes_with_fallback(monkeyp
     trader.db_manager = type(
         "_Database", (), {"get_open_positions": lambda self, mode: []}
     )()
+    if prior_samples:
+        warm_start = time.monotonic() - 60.0
+        for i in range(prior_samples):
+            trader.rv.observe(
+                4167.0 + (i % 3) * 0.07 + i * 0.01,
+                now=warm_start + i * 2.0,
+            )
 
     class _BalanceClient:
         async def get_balance(self):
             return {"balance": 10000}
 
     trader._client = _BalanceClient()
+
+    async def _no_order(_signal, _live):
+        return False
+
+    monkeypatch.setattr(trader, "_place", _no_order)
     strike_calls = []
 
     def _record_pick(*args, **kwargs):
@@ -294,9 +309,14 @@ async def test_cold_daily_gold_cycle_does_not_rank_strikes_with_fallback(monkeyp
 
     result = await trader.cycle()
 
-    assert strike_calls == []
     assert result["contract"] == "KXGOLDD-26OCT1317-T4164"
-    assert result["skipped_vol_warmup"] == 1
+    assert (len(strike_calls) > 0) is should_rank
+    assert (trader._sigma_used is not None) is should_rank
+    assert result["skipped_vol_warmup"] == (0 if should_rank else 1)
+    if not should_rank:
+        assert "realized volatility warm-up" in result["reason"]
+    else:
+        assert strike_calls[0][0][3] == trader._sigma_used
 
 
 def test_buys_up_when_spot_is_well_past_target_but_kalshi_is_even():

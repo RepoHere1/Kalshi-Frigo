@@ -45,6 +45,7 @@ from src.jobs.market_data import Btc15mFeed, SpotFeed, UpDownMarket
 QUOTE_MAX_AGE_SEC = 30.0
 # Every Kelly-sized Up/Down order is capped after sizing boosts.
 MAX_ORDER_NOTIONAL_USD = Decimal("1.00")
+_SIGMA_SNAPSHOT_UNSET = object()
 # MAX CLIPS OF ONE TICKER: ONE, both books. Evidence from the live trade log
 # (2026-10-06, 145 closed trades): every dollar-large loss (-$8.16, -$6.27,
 # -$4.87, -$4.31) was a PYRAMID - two or three clips stacked on the SAME
@@ -875,6 +876,7 @@ class UpDownTrader:
         market: Optional[UpDownMarket],
         live: bool = False,
         clip_usd: Optional[float] = None,
+        sigma_snapshot: Any = _SIGMA_SNAPSHOT_UNSET,
     ) -> Optional[UpDownSignal]:
         """Score the next contract. Read-only: no orders here.
 
@@ -884,7 +886,8 @@ class UpDownTrader:
         actually pays. An edge that clears DRY but not the fee is
         a losing trade with real money. `clip_usd` overrides the
         fixed clip size (used in LIVE to size down against the
-        available balance).
+        available balance). Daily Gold passes a shared `sigma_snapshot` so
+        strike ranking and scoring use the same volatility readiness state.
         """
         # The old 18-UTC "losing hour" skip was removed: a time-of-day block is an
         # arbitrary impediment - the trade the model sees now is what matters, and
@@ -928,7 +931,8 @@ class UpDownTrader:
         # Every print feeds the realized-vol window; the fair value below
         # switches from the fixed-band logistic to the measured diffusion
         # once enough of the tape has been seen.
-        self.rv.observe(spot)
+        if sigma_snapshot is _SIGMA_SNAPSHOT_UNSET:
+            self.rv.observe(spot)
         # No entries inside the no-entry window (both books): the settlement
         # window is the final 60 seconds, and a fill in there is a coin toss
         # whether the truth is spot or the windowed average.
@@ -1153,11 +1157,14 @@ class UpDownTrader:
             return signal
 
         seconds_left = market.seconds_left or 900.0
-        # Realized $-vol for exactly the time that is left. None until the
-        # window has enough tape; the legacy logistic covers the cold start.
-        self._sigma_used = self.rv.sigma_dollars(
-            horizon_seconds=seconds_left, last_price=spot
-        )
+        # Realized $-vol for exactly the time that is left. Most lanes use the
+        # legacy logistic during cold start; daily Gold blocks until this exists.
+        if sigma_snapshot is _SIGMA_SNAPSHOT_UNSET:
+            self._sigma_used = self.rv.sigma_dollars(
+                horizon_seconds=seconds_left, last_price=spot
+            )
+        else:
+            self._sigma_used = sigma_snapshot
         if (
             str(getattr(self.feed, "series", "")).upper() == "KXGOLDD"
             and self._sigma_used is None
@@ -2206,7 +2213,24 @@ class UpDownTrader:
         market = self.feed.nearest(
             float(getattr(self.spot, "price", 0.0) or 0.0) or None
         )
-        # LADDER STRIKE-BAND: an hourly ladder expires a whole grid of
+        _gold_daily = (
+            str(getattr(self.feed, "series", "")).upper() == "KXGOLDD"
+        )
+        _sigma_snapshot: Any = _SIGMA_SNAPSHOT_UNSET
+        if _gold_daily:
+            _gold_spot = float(getattr(self.spot, "price", 0.0) or 0.0)
+            if _gold_spot > 0.0 and self.spot.age <= self.config.max_spot_age:
+                self.rv.observe(_gold_spot)
+            _sigma_snapshot = None
+            if market is not None:
+                try:
+                    _sigma_snapshot = self.rv.sigma_dollars(
+                        horizon_seconds=market.seconds_left or 900.0,
+                        last_price=_gold_spot,
+                    )
+                except Exception:  # noqa: BLE001 - cold vol remains a hard gate
+                    _sigma_snapshot = None
+        # LADDER STRIKE-BAND: an hourly/daily ladder expires a whole grid of
         # strikes at once. Score the strike whose modeled edge is widest -
         # nearest the money when the tape is quiet (win-rate play), a
         # cheaper contract when the model is sure (payoff play) - instead of
@@ -2218,18 +2242,18 @@ class UpDownTrader:
                 if len(_grp) > 1 and _now_sp > 0:
                     _sl = market.seconds_left if market is not None else None
                     _sig = None
-                    try:
-                        _sig = self.rv.sigma_dollars(
-                            horizon_seconds=_sl or 900.0, last_price=_now_sp
-                        )
-                    except Exception:  # noqa: BLE001 - cold vol -> logistic fallback
-                        _sig = None
+                    if _gold_daily:
+                        _sig = _sigma_snapshot
+                    else:
+                        try:
+                            _sig = self.rv.sigma_dollars(
+                                horizon_seconds=_sl or 900.0, last_price=_now_sp
+                            )
+                        except Exception:  # noqa: BLE001 - cold vol -> logistic fallback
+                            _sig = None
                     _grp.sort(key=lambda m: abs(float(m.target or 0.0) - _now_sp))
                     _band = _grp[: max(1, self.config.strike_band_n)]
-                    _gold_cold = (
-                        str(getattr(self.feed, "series", "")).upper() == "KXGOLDD"
-                        and _sig is None
-                    )
+                    _gold_cold = _gold_daily and _sig is None
                     if not _gold_cold:
                         _pick = pick_ladder_strike(
                             _band,
@@ -2400,7 +2424,12 @@ class UpDownTrader:
             if live_budget is not None:
                 live_budget = min(live_budget, self._live_balance)
             self._live_balance = min(self._live_balance, _surv_cap)
-        signal = self.evaluate(market, live=live, clip_usd=live_budget if live else None)
+        signal = self.evaluate(
+            market,
+            live=live,
+            clip_usd=live_budget if live else None,
+            sigma_snapshot=_sigma_snapshot,
+        )
         # Clear stale errors, but never wipe the explanation of a failed LIVE
         # balance read - that is the difference between "no edge" and "cannot
         # read the account".
