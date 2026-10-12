@@ -1854,7 +1854,7 @@ def _strategy_cards(
     curve_rows: List[Dict[str, Any]],
     position_rows: List[Dict[str, Any]],
     book: str,
-    roll_trades_rows: List[Dict[str, Any]] = None,
+    roll_trades_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """One card per strategy: headline stats plus its own cumulative P&L curve.
 
@@ -2137,7 +2137,9 @@ _SQL_STRATEGY = (
     " COALESCE(SUM(pnl), 0.0) AS pnl,"
     " COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,"
     " COALESCE(MAX(pnl), 0.0) AS best,"
-    " COALESCE(MIN(pnl), 0.0) AS worst"
+    " COALESCE(MIN(pnl), 0.0) AS worst,"
+    " COALESCE(SUM(CASE WHEN rationale LIKE '%ROLL-IQ%' THEN 1 ELSE 0 END), 0) AS roll_clips,"
+    " COALESCE(SUM(CASE WHEN rationale LIKE '%ROLL-IQ%' AND pnl > 0 THEN 1 ELSE 0 END), 0) AS roll_wins"
     " FROM trade_logs WHERE {book} GROUP BY strategy ORDER BY pnl DESC"
 )
 _SQL_RECENT = (
@@ -2288,6 +2290,8 @@ def _row_breakdown(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for r in rows:
         trades = int(r.get("trades") or 0)
         wins = int(r.get("wins") or 0)
+        roll_clips = int(r.get("roll_clips") or 0)
+        roll_wins = int(r.get("roll_wins") or 0)
         out.append(
             {
                 "strategy": r.get("strategy") or "unattributed",
@@ -2298,6 +2302,9 @@ def _row_breakdown(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "best": round(float(r.get("best") or 0.0), 2),
                 "worst": round(float(r.get("worst") or 0.0), 2),
                 "win_rate": round(wins / trades * 100, 1) if trades else 0.0,
+                "roll_clips": roll_clips,
+                "roll_wins": roll_wins,
+                "roll_rate": round(roll_wins / roll_clips * 100, 1) if roll_clips else 0.0,
             }
         )
     return out
@@ -6061,7 +6068,7 @@ button.loading.yellow::after {
   <div class="panel">
     <div class="ph"><h2>Strategy performance</h2><span class="note">closed trades by strategy</span></div>
     {%- if s.by_strategy %}
-    <table><thead><tr><th>Strategy</th><th class="num">Trades</th><th class="num">Win rate</th><th class="num">P&amp;L</th><th class="num">Best</th><th class="num">Worst</th></tr></thead><tbody>
+    <table><thead><tr><th>Strategy</th><th class="num">Trades</th><th class="num">Win rate</th><th class="num">P&amp;L</th><th class="num">Best</th><th class="num">Worst</th><th class="num">Roll trades</th><th class="num">Roll rate</th></tr></thead><tbody>
     {%- for r in s.by_strategy %}
       <tr>
         <td><span class="tag">{{ r.strategy }}</span></td>
@@ -6069,7 +6076,7 @@ button.loading.yellow::after {
         <td class="num">{{ r.win_rate }}%</td>
         <td class="num {{ 'up' if r.pnl > 0 else ('down' if r.pnl < 0 else 'flat') }}">{{ r.pnl }}</td>
         <td class="num up">{{ r.best }}</td>
-        <td class="num down">{{ r.worst }}</td>
+        <td class="num down">{{ r.worst }}</td><td class="num">{{ r.roll_clips }}</td><td class="num">{{ r.roll_rate }}%</td>
       </tr>
     {%- endfor %}
     </tbody></table>
