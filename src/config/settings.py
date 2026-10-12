@@ -122,7 +122,7 @@ class TradingConfig:
     position_size_multiplier: float = 1.0  # Multiplier for AI confidence
     
     # Kelly Criterion settings (PRIMARY position sizing method) — DISCIPLINED
-    use_kelly_criterion: bool = True        # Use Kelly Criterion for position sizing (PRIMARY METHOD)
+    use_kelly_criterion: bool = False        # Use fixed default_position_size (reverted from Kelly)
     kelly_fraction: float = 0.25            # quarter-Kelly (spec entry 22)
     max_single_position: float = 0.03       # SANE: 3% max position cap (was 0.05 beast mode)
     
