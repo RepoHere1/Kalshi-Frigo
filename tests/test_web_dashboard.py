@@ -1305,6 +1305,24 @@ def test_token_accepted_from_json_body(client):
     assert r.status_code == 200
 
 
+def test_dry_cash_endpoint_sets_balance_and_rebases(client, auth):
+    """The operator refunds the simulated book to an exact figure; the
+    cash moves, the starting baseline moves with it, and history stays."""
+    r = client.post("/api/dry/cash", json={"amount": 250.0}, headers=auth)
+    assert r.status_code == 200, r.get_json()
+    dry = r.get_json()["dry"]
+    assert dry["cash"] == 250.0
+    assert dry["starting_balance"] == 250.0
+    # The reset baseline follows the new figure, not the old default.
+    assert client.get("/api/mode").get_json()["dry"]["starting_balance"] == 250.0
+
+
+def test_dry_cash_endpoint_refuses_bad_amounts(client, auth):
+    for bad in ({"amount": 0}, {"amount": -5}, {"amount": "x"}, {}):
+        r = client.post("/api/dry/cash", json=bad, headers=auth)
+        assert r.status_code == 400, bad
+
+
 # ---------------------------------------------------------------------------
 # DRY / LIVE mode
 # ---------------------------------------------------------------------------

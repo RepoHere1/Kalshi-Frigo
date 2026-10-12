@@ -2964,6 +2964,56 @@ def api_mode_set():
     return jsonify({"ok": True, **_mode_payload()})
 
 
+@app.route("/api/dry/cash", methods=["POST"])
+def api_dry_cash():
+    """Set the simulated DRY cash to an exact amount, auditing the move.
+
+    Unlike /api/dry/reset this does NOT wipe positions, closes or the
+    ledge r - it only refunds the book (the account ran the balance down
+    to cents while positions were still open, and every further fill was
+    being refused for lack of funds). The starting figure is rebased to
+    the same amount so "P&L since reset" measures from the new
+    baseline. Token-gated like every mutating route.
+    """
+    denied = require_token()
+    if denied is not None:
+        return denied
+    from src.utils.mode import run
+
+    data = request.get_json(silent=True) or {}
+    try:
+        amount = round(float(data.get("amount", 0.0)), 2)
+    except (TypeError, ValueError):
+        return jsonify({"error": "amount must be a number"}), 400
+    if amount <= 0.0 or amount > 100000.0:
+        return jsonify({"error": f"amount  out of range"}), 400
+    mgr = _mode_manager()
+    try:
+        acct = run(mgr.dry_account())
+        cash = float((acct or {}).get("cash") or 0.0)
+        delta = round(amount - cash, 2)
+        if abs(delta) >= 0.005:
+            run(mgr.adjust_cash(delta, note=f"operator cash set to {amount:.2f}"))
+        else:
+            run(mgr.set_dry_cash(amount))
+        # Rebase the starting figure so the book's baseline matches its
+        # actual funding; without this the P&L line measures from a stale
+        # 200/300 that no longer describes the book.
+        from src.utils import mode as _mode
+
+        async def _rebase() -> None:
+            async with mgr._conn() as conn:
+                await mgr._set(conn, _mode._START_KEY, f"{amount:.2f}")
+                await conn.commit()
+
+        run(_rebase())
+    except Exception as e:
+        _push_error(f"DRY cash set: {e}")
+        return jsonify({"error": str(e)}), 500
+    _broadcast("mode", {"mode": "dry", "action": "dry_cash"})
+    return jsonify({"ok": True, "dry": run(mgr.dry_account())})
+
+
 @app.route("/api/dry/reset", methods=["POST"])
 def api_dry_reset():
     """Top the DRY account back up to its starting balance and clear the ledger."""
