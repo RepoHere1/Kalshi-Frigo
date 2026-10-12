@@ -406,20 +406,21 @@ def test_correlated_cap_blocks_an_over_cap_same_side_clip():
         kalshi_price=0.5,
         edge=0.30,
         ask=0.5,
-        contracts=10,
-        notional=5.0,
+        contracts=60,
+        notional=30.0,
         seconds_left=300.0,
         reason="",
         truth="coinbase",
     )
-    held = [
-        {"ticker": f"KXTEST-{i}", "side": "YES", "notional": 5.0} for i in range(3)
-    ]
-    block = trader._entry_block(signal, held)
+    # Same-side lanes elsewhere in the book already hold $60 (cross-lane
+    # book_same_side is what makes the cap a real correlation gate); adding
+    # a $30 clip takes the book to $90 against the $75 ceiling. The local
+    # held list is empty so only the correlated cap can refuse it.
+    block = trader._entry_block(signal, [], book_same_side={"YES": 60.0})
     assert "correlated" in block
     assert trader.book.skipped_correlated == 1
     # A clip that stays under the cap is not blocked by this gate.
-    ok = trader._entry_block(signal, held[:2])
+    ok = trader._entry_block(signal, [], book_same_side={"YES": 40.0})
     assert "correlated" not in ok
 
 

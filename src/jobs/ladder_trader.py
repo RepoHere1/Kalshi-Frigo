@@ -272,11 +272,15 @@ class UpDownConfig:
     burst_sigma_mult: float = 2.5
     burst_min_seconds_left: float = 180.0
 
-    # CORRELATED-CRYPTO CAP (new): BTC/ETH/XRP/HYPE move together - four
+    # CORRELATED-CRYPTO CAP: BTC/ETH/XRP/HYPE move together - four
     # same-direction lanes are ONE bet wearing four hats. Cap the total
-    # same-side up/down exposure so a single reversal cannot hit every
-    # lane at once.
-    correlated_cap_usd: float = 15.0
+    # same-side up/down exposure across ALL lanes of a book so a single
+    # reversal cannot hit every lane at once. Scaled to the sizing law:
+    # a first Kelly clip must always fit, so the cap equals the same
+    # 5 notional ceiling the operator set for max_open_notional (the
+    # old 5 was tuned for the flat 50-cent-clip era and vetoed every
+    # real clip). Env: CORRELATED_CAP_USD.
+    correlated_cap_usd: float = 75.0
 
     # === INVENTION #3: Order-Flow + Liquidity Sentinel ===
     # Veto entries when the book is too wide or shows adverse imbalance.
@@ -428,6 +432,9 @@ class UpDownConfig:
             )
             self.max_open_notional = float(
                 _os.environ.get("MAX_OPEN_NOTIONAL", self.max_open_notional)
+            )
+            self.correlated_cap_usd = float(
+                _os.environ.get("CORRELATED_CAP_USD", self.correlated_cap_usd)
             )
         except ValueError:
             pass
@@ -1615,7 +1622,11 @@ class UpDownTrader:
         return os.environ.get("DB_PATH", "").strip() or "trading_system.db"
 
     def _entry_block(
-        self, signal: UpDownSignal, held: List[Dict[str, Any]], live: bool = False
+        self,
+        signal: UpDownSignal,
+        held: List[Dict[str, Any]],
+        live: bool = False,
+        book_same_side: Optional[Dict[str, float]] = None,
     ) -> str:
         """Why this clip may not be taken - or "" when it may.
 
@@ -1684,10 +1695,17 @@ class UpDownTrader:
         # single reversal cannot hit every lane at once. Money risk, not
         # trade counting.
         _want = "YES" if signal.side == "up" else "NO"
-        _same_side = sum(
-            float(p.get("notional") or 0.0)
-            for p in held
-            if str(p.get("side") or "").upper() == _want
+        # Book-wide sum when the caller supplies it (the whole point of the
+        # cap is cross-lane correlation); fall back to the local held list
+        # for direct/test callers that have no book context.
+        _same_side = (
+            float((book_same_side or {}).get(_want, 0.0))
+            if book_same_side is not None
+            else sum(
+                float(p.get("notional") or 0.0)
+                for p in held
+                if str(p.get("side") or "").upper() == _want
+            )
         )
         if _same_side + float(signal.notional or 0.0) > self.config.correlated_cap_usd:
             self.book.skipped_correlated += 1
@@ -2552,10 +2570,21 @@ class UpDownTrader:
         # positions on long-expired buckets.
         held: List[Dict[str, Any]] = []
         stale_count = 0
+        # Cross-lane same-side notional for the CORRELATED-CRYPTO cap: the
+        # cap exists because BTC/ETH/XRP/HYPE are one bet wearing four hats,
+        # so it must count every lane of this book - not just the current
+        # lane's rows (which is all `held` carries). Accumulated before the
+        # lane filter below.
+        book_same_side = {"YES": 0.0, "NO": 0.0}
         if self.db_manager is not None:
             try:
                 book_mode = "live" if live else "dry"
                 for p in await self.db_manager.get_open_positions(mode=book_mode):
+                    _pside = str(p.side or "").upper()
+                    if _pside in book_same_side:
+                        book_same_side[_pside] += (
+                            (p.entry_price or 0.0) * (p.quantity or 0)
+                        )
                     if (p.strategy or "") != self.lane:
                         continue
                     # A 15-minute contract that is not the current one has rolled:
@@ -2595,7 +2624,9 @@ class UpDownTrader:
             # there too), so re-raise them for the guard and restore after.
             if survival:
                 self.config.min_win_prob = max(self.config.min_win_prob, self.config.survival_min_win_prob)
-            blocked = self._entry_block(signal, held, live=live)
+            blocked = self._entry_block(
+                signal, held, live=live, book_same_side=book_same_side
+            )
             if not blocked:
                 blocked = await self._ai_guards(signal, live)
             if not blocked and await self._place(signal, live):
