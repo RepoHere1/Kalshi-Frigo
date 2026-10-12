@@ -153,13 +153,9 @@ class UpDownConfig:
     kelly_cap: float = 0.35    # never more than 35% of the book in one clip
     kelly_confidence_pivot: float = 0.70  # fair probability at which kelly_scale begins scaling up
     kelly_confidence_max_mult: float = 2.0  # max multiplier on kelly_scale (capped at 0.50)
-    # ROLL-FORWARD IQ (additive upgrade, LIVE + DRY): the book already reads
-    # drift from the spot tape every cycle; roll turns that read into a clip
-    # on the successor window the moment the venue lists it - before its
-    # quote discovers the move. One clip per event. Purpose: higher win rate
-    # (entered early at the cheap price) and larger dollar wins (same Kelly
-    # law, wider runway).
-    roll_enabled: bool = True
+    # ROLL IQ is permanently retired; this remains false regardless of env or
+    # constructor values so deployments cannot accidentally revive it.
+    roll_enabled: bool = False
     roll_lookback_sec: float = 300.0  # drift measured over the last 5 minutes
     roll_min_prob: float = 0.56       # the IQ must be at least this sure
     roll_min_edge: float = 0.05       # price must still lag the IQ by 5c+
@@ -424,8 +420,8 @@ class UpDownConfig:
             )
         except ValueError:
             pass
-        if _os.environ.get("ROLL_ENABLED", "1") != "1":
-            self.roll_enabled = False
+        # Ignore the legacy ROLL_ENABLED variable and constructor overrides.
+        self.roll_enabled = False
         try:
             self.roll_clip_mult = float(_os.environ.get("ROLL_CLIP_MULT", self.roll_clip_mult))
             self.roll_min_edge = float(_os.environ.get("ROLL_MIN_EDGE", self.roll_min_edge))

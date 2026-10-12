@@ -43,6 +43,24 @@ def _trader(db):
     return UpDownTrader(spot, Btc15mFeed(), UpDownConfig())
 
 
+@pytest.mark.asyncio
+async def test_roll_iq_cannot_be_reenabled_by_config_or_environment(monkeypatch):
+    monkeypatch.setenv("ROLL_ENABLED", "1")
+    config = UpDownConfig(roll_enabled=True)
+    assert config.roll_enabled is False
+
+    spot = SpotFeed()
+    spot.price = 84900.0
+    trader = UpDownTrader(spot, Btc15mFeed(), config)
+
+    class UnexpectedRollUse:
+        def note(self, *_args):
+            raise AssertionError("disabled ROLL IQ reached its trading path")
+
+    trader._roll = UnexpectedRollUse()
+    assert await trader._roll_maybe_buy(live=False, held=[], market=None) is None
+
+
 # ---------------------------------------------------------------------------
 # Ticker shape
 # ---------------------------------------------------------------------------
