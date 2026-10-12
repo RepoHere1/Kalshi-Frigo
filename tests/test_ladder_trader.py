@@ -152,6 +152,52 @@ def test_noise_band_is_respected():
     assert not signal.actionable
 
 
+def test_daily_gold_waits_for_realized_vol_before_scoring():
+    config = UpDownConfig()
+    config.apply_asset("PAXG-USD")
+    spot = SpotFeed()
+    spot.price = 4168.42
+    spot.ts = time.time()
+    spot.source = "test"
+    trader = UpDownTrader(spot, Btc15mFeed(series="KXGOLDD"), config)
+    market = UpDownMarket(
+        ticker="KXGOLDD-26OCT1317-T4164",
+        event_ticker="KXGOLDD-26OCT1317",
+        bucket="26OCT1317",
+        horizon=0,
+        title="Gold daily close above $4,164",
+        target=4164.0,
+        close_ts=time.time() + 24 * 60 * 60,
+        yes_bid=0.61,
+        yes_ask=0.62,
+        no_bid=0.38,
+        no_ask=0.39,
+    )
+
+    signal = trader.evaluate(market, live=False)
+
+    assert signal is not None
+    assert not signal.actionable
+    assert signal.fair == 0.5
+    assert "realized volatility warm-up" in signal.reason
+    assert trader.book.skipped_vol_warmup == 1
+    assert trader.book.summary()["skipped_vol_warmup"] == 1
+
+    warm_config = UpDownConfig()
+    warm_config.apply_asset("PAXG-USD")
+    warm_trader = UpDownTrader(spot, Btc15mFeed(series="KXGOLDD"), warm_config)
+    warm_start = time.monotonic() - 60.0
+    for i in range(25):
+        warm_trader.rv.observe(
+            4167.0 + (i % 3) * 0.07 + i * 0.01,
+            now=warm_start + i * 2.0,
+        )
+    warm_signal = warm_trader.evaluate(market, live=False)
+    assert warm_signal is not None
+    assert warm_trader._sigma_used is not None
+    assert "realized volatility warm-up" not in warm_signal.reason
+
+
 def test_buys_up_when_spot_is_well_past_target_but_kalshi_is_even():
     c = UpDownConfig(noise_pct=0.0002, min_edge=0.06)
     trader = UpDownTrader(SpotFeed(), Btc15mFeed(), c)

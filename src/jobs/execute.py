@@ -684,7 +684,7 @@ def _updown_recycle_ready(position, market_data: dict) -> bool:
 
 
 def _rides_to_settlement(position) -> bool:
-    """True when a position belongs to an up/down 15-minute lane.
+    """True when a position belongs to an up/down or strike-ladder lane.
 
     Winners in these lanes ride to the $1.00 print: the trade record showed
     scalp exits (+$0.08-0.11) making a 70%-win book LOSE money while
@@ -857,7 +857,7 @@ async def place_profit_taking_orders(
                 ):
                     logger.debug(
                         f"Skipping mid-bucket profit-take for {position.market_id}: "
-                        "15m binary rides to settlement (payoff lives there)"
+                        "binary threshold position rides to settlement (payoff lives there)"
                     )
                     continue
                 if _rides_to_settlement(position):

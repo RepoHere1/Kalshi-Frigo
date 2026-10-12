@@ -523,6 +523,7 @@ class UpDownBook:
     max_open_notional: float = 75.0  # 3x (operator directive), env MAX_OPEN_NOTIONAL
     trades_today: int = 0
     skipped_no_edge: int = 0
+    skipped_vol_warmup: int = 0
     skipped_stale: int = 0
     skipped_too_close: int = 0
     skipped_unquoted: int = 0
@@ -565,6 +566,7 @@ class UpDownBook:
             "max_open_notional": self.max_open_notional,
             "trades_today": self.trades_today,
             "skipped_no_edge": self.skipped_no_edge,
+            "skipped_vol_warmup": self.skipped_vol_warmup,
             "skipped_stale": self.skipped_stale,
             "skipped_too_close": self.skipped_too_close,
             "skipped_unquoted": self.skipped_unquoted,
@@ -1148,6 +1150,33 @@ class UpDownTrader:
         self._sigma_used = self.rv.sigma_dollars(
             horizon_seconds=seconds_left, last_price=spot
         )
+        if (
+            str(getattr(self.feed, "series", "")).upper() == "KXGOLDD"
+            and self._sigma_used is None
+        ):
+            self.book.skipped_vol_warmup += 1
+            signal = UpDownSignal(
+                ticker=market.ticker,
+                bucket=market.bucket,
+                side="",
+                target=target,
+                spot=spot,
+                spot_vs_target=delta,
+                fair=0.5,
+                kalshi_price=market.up_price,
+                edge=0.0,
+                ask=None,
+                contracts=0,
+                notional=0.0,
+                seconds_left=round(seconds_left, 1),
+                reason=(
+                    "waiting for realized volatility warm-up; daily Gold "
+                    "entries are blocked until the estimate is available"
+                ),
+                truth=truth_kind,
+            )
+            self.book.signals = [signal]
+            return signal
         # IMPLIED sigma: Kalshi's own price inverted through the diffusion.
         # A RICH implied vs realized is usually momentum - the diffusion fair
         # value already prices the move, so penalizing it again would
