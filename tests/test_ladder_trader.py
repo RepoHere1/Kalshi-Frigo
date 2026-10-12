@@ -231,7 +231,9 @@ async def test_daily_gold_does_not_bypass_scoring_with_certain_win_pair(monkeypa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("prior_samples,should_rank", [(0, False), (24, True)])
+@pytest.mark.parametrize(
+    "prior_samples,should_rank", [(0, False), (23, False), (24, True)]
+)
 async def test_daily_gold_cycle_ranks_only_with_realized_vol(
     prior_samples, should_rank, monkeypatch
 ):
