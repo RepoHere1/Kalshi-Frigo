@@ -25,14 +25,16 @@ looks.
 
 MONEY
 -----
-`$5` notional per clip and at most one open position at a time, as specified.
-Both are hard limits in `UpDownConfig`. Orders route through the canonical
-`execute_position` path, so DRY runs identical validation and cannot transmit.
+The Kelly budget is bounded by a $1 maximum order notional after all sizing
+and DRY multipliers. The $75 open-book cap still limits aggregate exposure.
+Orders route through the canonical `execute_position` path, so DRY runs
+identical validation and cannot transmit.
 """
 import asyncio
 import math
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from typing import Any, Dict, List, Optional
 
 from src.config.settings import settings
@@ -41,6 +43,8 @@ from src.jobs.market_data import Btc15mFeed, SpotFeed, UpDownMarket
 # A Kalshi quote older than this is not traded against: the book simply has
 # not repriced yet, so any "edge" versus fresh truth is fiction.
 QUOTE_MAX_AGE_SEC = 30.0
+# Every Kelly-sized Up/Down and ROLL-IQ order is capped after sizing boosts.
+MAX_ORDER_NOTIONAL_USD = Decimal("1.00")
 # MAX CLIPS OF ONE TICKER: ONE, both books. Evidence from the live trade log
 # (2026-10-06, 145 closed trades): every dollar-large loss (-$8.16, -$6.27,
 # -$4.87, -$4.31) was a PYRAMID - two or three clips stacked on the SAME
@@ -1596,7 +1600,7 @@ class UpDownTrader:
         return signal
 
     def _size(self, ask: Optional[float], clip_usd: Optional[float] = None) -> int:
-        """Contracts for one clip. Zero when the price cannot clear the floor.
+        """Size one clip, applying the $1 cap after all Kelly multipliers.
 
         `clip_usd` overrides the default clip size; LIVE passes a fraction of the
         available balance so a small account keeps firing instead of emptying in
@@ -1611,7 +1615,18 @@ class UpDownTrader:
         target_notional = self.config.notional_usd if clip_usd is None else max(clip_usd, 0.0)
         if target_notional <= 0:
             return 0
-        contracts = int(target_notional / price)
+        try:
+            price_dec = Decimal(str(price))
+            budget_dec = Decimal(str(target_notional))
+            if not price_dec.is_finite() or not budget_dec.is_finite():
+                return 0
+            contracts = int((budget_dec / price_dec).to_integral_value(rounding=ROUND_FLOOR))
+            max_contracts = int(
+                (MAX_ORDER_NOTIONAL_USD / price_dec).to_integral_value(rounding=ROUND_FLOOR)
+            )
+        except (InvalidOperation, ZeroDivisionError):
+            return 0
+        contracts = min(contracts, max_contracts)
         # Exchange minimum is ONE CONTRACT, not any dollar figure. A sub-$1
         # clip must still be a whole contract (a 1-cent contract is $0.01).
         if contracts < 1:

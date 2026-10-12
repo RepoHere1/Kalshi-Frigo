@@ -40,10 +40,10 @@ def test_size_floors_at_one_contract_not_a_dollar():
 
 
 def test_size_spends_the_budget_not_the_default_clip():
-    """A $10.04 account clips at 20% ($2.01), not the $5 default."""
+    """The $1 cap applies after the budget is translated into contracts."""
     trader = _trader()
-    assert trader._size(0.58, clip_usd=2.01) == 3  # 3 @ 0.58 = $1.74 <= 2.01
-    assert trader._size(0.41, clip_usd=2.01) == 4  # 4 @ 0.41 = $1.64
+    assert trader._size(0.58, clip_usd=2.01) == 1  # 1 @ 0.58 = $0.58
+    assert trader._size(0.41, clip_usd=2.01) == 2  # 2 @ 0.41 = $0.82
 
 
 def test_minimum_viable_quantity_is_one_contract():
@@ -197,8 +197,8 @@ def test_vol_rich_never_raises_the_bar_only_annotates():
 def test_kelly_scales_the_clip_with_the_edge():
     """Quarter-Kelly on a real edge, THEN conviction on top: $10 book,
     fair 0.75 at 0.55 -> k* = 0.20/0.45 = 0.444, k_quarter = 0.111 ->
-    clip $1.11; the view is >= strong_prob so conviction doubles it to
-    ~$2.22 -> 4 contracts."""
+    clip $1.11; conviction and DRY sizing exceed the per-order cap, so the
+    final maker-priced order is one contract at $0.55."""
     import src.jobs.ladder_trader as lt
 
     trader = _trader_no_session_mult()
@@ -215,15 +215,12 @@ def test_kelly_scales_the_clip_with_the_edge():
         mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.75)
         signal = trader.evaluate(market, live=True)
     assert signal is not None and signal.side == "up"
-    assert signal.contracts == 4
-    assert signal.notional == pytest.approx(2.20, abs=0.01)
+    assert signal.contracts == 1
+    assert signal.notional == pytest.approx(0.55, abs=0.01)
 
 
 def test_kelly_cap_bounds_a_single_clip():
-    """Fair 0.95 at 0.70: certified tier (>=85%) triples the 0.208 quarter-
-    Kelly clip to ~$6.24, and the 0.5-of-book ceiling ($5 on a $10 book)
-    clips it to $5.00 -> 7 contracts at 0.70 ($4.90). The fraction ceiling
-    is the binding money law; kelly_cap never binds at quarter scale."""
+    """Even certified conviction cannot exceed $1 on a single order."""
     import src.jobs.ladder_trader as lt
 
     trader = _trader_no_session_mult()
@@ -239,8 +236,8 @@ def test_kelly_cap_bounds_a_single_clip():
         mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.95)
         signal = trader.evaluate(market, live=True)
     assert signal is not None and signal.side == "up"
-    assert signal.contracts == 7
-    assert signal.notional == pytest.approx(4.90, abs=0.01)
+    assert signal.contracts == 1
+    assert signal.notional == pytest.approx(0.70, abs=0.01)
     assert signal.notional <= 10.0 * trader.config.conviction_max_fraction + 0.01
 
 
@@ -303,12 +300,8 @@ def test_ninety_cents_hard_block_holds_for_makers_too():
     assert signal is None or signal.side == ""
 
 
-def test_dry_mirrors_kelly_on_its_own_cash():
-    """The law: the same sizing rule, on the DRY book's own money.
-    Kelly with confidence-weighting (pivot=0.70): scale = 0.25 + 0.25*(fair-pivot)/(1-pivot)
-    = 0.2917; k = 0.2917*0.444 = 0.1296; clip = 300*0.1296 = $38.88; with conviction
-    doubling -> $77.76; operator x3 dry boost -> $233.28, then the
-    0.5-of-book ceiling caps it at $150.00 -> 272 contracts at 0.55."""
+def test_dry_kelly_clip_is_capped_after_its_boost():
+    """DRY uses its own balance but the final boosted order stays <= $1."""
     import src.jobs.ladder_trader as lt
 
     trader = _trader_no_session_mult()
@@ -324,8 +317,9 @@ def test_dry_mirrors_kelly_on_its_own_cash():
         mp.setattr(lt, "fair_up_probability", lambda s, t, n, sl=900.0, *a, **k: 0.75)
         signal = trader.evaluate(market, live=False)
     assert signal is not None and signal.side == "up"
-    assert signal.contracts == 272
-    assert signal.notional <= 300.0 * trader.config.conviction_max_fraction + 0.01
+    assert signal.contracts == 1
+    assert signal.notional == pytest.approx(0.55, abs=0.01)
+    assert signal.notional <= 1.00
 
 
 # ---------------------------------------------------------------------------

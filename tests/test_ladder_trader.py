@@ -231,11 +231,24 @@ def test_refuses_when_there_is_no_contract_at_all():
 # ---------------------------------------------------------------------------
 # Sizing and limits
 # ---------------------------------------------------------------------------
-def test_size_targets_five_dollars():
+def test_size_caps_the_final_order_at_one_dollar():
     trader = UpDownTrader(SpotFeed(), Btc15mFeed())
-    assert trader._size(0.50) == 10
-    assert trader._size(0.10) == 50
-    assert trader._size(0.95) == 5
+    assert trader._size(0.50) == 2
+    assert trader._size(0.10) == 10
+    assert trader._size(0.95) == 1
+
+
+def test_size_caps_after_kelly_and_dry_boosts():
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed())
+    for price in (0.01, 0.05, 0.30, 0.50, 0.99):
+        contracts = trader._size(price, clip_usd=75.0)
+        assert contracts >= 1
+        assert contracts * price <= 1.00 + 1e-9
+
+
+def test_size_keeps_the_exchange_minimum_at_one_contract_not_one_dollar():
+    trader = UpDownTrader(SpotFeed(), Btc15mFeed())
+    assert trader._size(0.01, clip_usd=0.01) == 1
 
 
 def test_size_never_returns_a_fractional_or_negative_count():
@@ -441,11 +454,11 @@ def test_live_clip_sizes_against_the_balance_budget(monkeypatch):
     trader.config.session_mult_enabled = False
     # In-band price: the LIVE entry band is 0.10-0.50.
     market = _quoted_market(yes_ask=0.40, no_ask=0.60, target=84000.0)
-    # A $4 budget -> 10 contracts at 0.40, not the fixed $5 clip's 12.
+    # A $4 Kelly budget still cannot exceed the $1 per-order cap.
     live = trader.evaluate(market, live=True, clip_usd=4.0)
     assert live is not None
-    assert live.contracts == 10
-    assert live.notional == pytest.approx(4.00, abs=0.01)
+    assert live.contracts == 2
+    assert live.notional == pytest.approx(0.80, abs=0.01)
 
 
 def test_a_zero_dollar_live_budget_produces_no_clip():
