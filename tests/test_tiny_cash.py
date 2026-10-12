@@ -1,8 +1,8 @@
 """Tiny-account competence: $10.04 is LIVE now - every clip is life or death.
 
-Kalshi's $1.00 order minimum, its ceil-to-the-cent fee, and the 20%-of-balance
-clip all interact at this scale. These tests pin the arithmetic that keeps a
-tiny account trading on every edge instead of stalling or overpaying.
+Kalshi's one-contract order minimum, its ceil-to-the-cent fee, and the
+20%-of-balance clip all interact at this scale. These tests pin the arithmetic
+that keeps a tiny account trading on every edge instead of stalling or overpaying.
 """
 import math
 import time

@@ -167,9 +167,8 @@ async def test_the_two_books_can_coexist(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# DRY mirrors LIVE: a fresh book is seeded with the real Kalshi balance
-# through the live credentials, so the only difference from LIVE is that
-# fills are simulated.
+# DRY is an independent fixed-$300 simulated book; it never mirrors the LIVE
+# account balance, even when live credentials are available.
 # ---------------------------------------------------------------------------
 
 
@@ -182,7 +181,7 @@ def _mirror_env(monkeypatch, balance: float):
             "connected": True,
             "balance": round(balance, 2),
             "balance_cents": int(round(balance * 100)),
-            "can_fund": balance >= 1.0,
+            "can_fund": balance >= 0.01,
             "reason": "",
         }
 

@@ -321,12 +321,12 @@ async def test_kelly_position_sizing(monkeypatch):
     # $100 balance, 60% AI probability, 50% market price
     quantity = _calculate_kelly_position_size(
         balance=100.0,
-        market_price=0.50,
+        market_yes_price=0.50,
+        contract_price=0.50,
         ai_probability=0.60,
         side="YES",
         confidence=0.70
     )
     
-    assert quantity == 120, (
-        "quarter-Kelly 10 contracts x operator boosts (x2, x2, x3 dry) = 120"
-    )
+    assert quantity == 2
+    assert quantity * 0.50 <= 1.00

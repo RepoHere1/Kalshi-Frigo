@@ -11,9 +11,11 @@ build it for real (see src/agents/ for the runner skeletons).
 
 import asyncio
 import time
-import numpy as np
-from typing import Optional, Dict, Any
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
+from typing import Any, Dict, Optional
+
+import numpy as np
 
 from src.utils.database import DatabaseManager, Market, Position
 from src.config.settings import settings
@@ -24,7 +26,8 @@ from src.clients.kalshi_client import KalshiClient
 
 def _calculate_kelly_position_size(
     balance: float,
-    market_price: float,
+    market_yes_price: float,
+    contract_price: float,
     ai_probability: float,
     side: str,
     confidence: float,
@@ -48,7 +51,8 @@ def _calculate_kelly_position_size(
     
     Args:
         balance: Current available portfolio balance
-        market_price: The price of the contract (0.01-0.99)
+        market_yes_price: YES price used to calculate the Kelly probability edge
+        contract_price: Actual price paid for the selected YES or NO contract
         ai_probability: AI's estimated probability (0.0-1.0)
         side: "YES" or "NO"
         confidence: AI confidence level (0.0-1.0)
@@ -57,7 +61,20 @@ def _calculate_kelly_position_size(
     Returns:
         Number of contracts to purchase
     """
-    if balance <= 0 or market_price <= 0 or market_price >= 1.0:
+    if (
+        balance <= 0
+        or market_yes_price <= 0
+        or market_yes_price >= 1.0
+        or contract_price <= 0
+        or contract_price >= 1.0
+    ):
+        return 0
+
+    try:
+        contract_price_dec = Decimal(str(contract_price))
+        if not contract_price_dec.is_finite() or contract_price_dec <= 0:
+            return 0
+    except (InvalidOperation, ValueError):
         return 0
     
     from src.utils.edge_filter import calculate_roundtrip_fees_dollars
@@ -66,7 +83,7 @@ def _calculate_kelly_position_size(
     if side.upper() == "YES":
         # YES position: buy when AI prob > market price
         p = ai_probability
-        c = market_price
+        c = market_yes_price
         if p <= c:
             return 0  # No edge
         # f* = (p - c) / (1 - c)
@@ -74,7 +91,7 @@ def _calculate_kelly_position_size(
     else:
         # NO position: sell when AI prob for NO > market price for NO
         p = ai_probability
-        c = market_price
+        c = market_yes_price
         q = 1.0 - p  # Probability of NO
         c_no = 1.0 - c  # Market price for NO (if YES is c)
         if q <= c_no:
@@ -94,8 +111,13 @@ def _calculate_kelly_position_size(
     # Calculate dollar amount
     investment_amount = balance * kelly_fraction
     
-    # Calculate quantity
-    quantity = int(investment_amount // market_price)
+    # Use the actual side's contract price and decimal arithmetic so whole-
+    # contract counts do not drift at cent boundaries.
+    quantity = int(
+        (Decimal(str(investment_amount)) / contract_price_dec).to_integral_value(
+            rounding=ROUND_FLOOR
+        )
+    )
     
     # Double buy amounts again — LIVE + DRY (operator directive, second doubling = 4x total)
     quantity = int(quantity * 2)
@@ -113,7 +135,12 @@ def _calculate_kelly_position_size(
     if quantity < 1 and kelly_fraction > 0.01:
         quantity = 1
 
-    return quantity
+    # The operator cap is on the final order, after every sizing multiplier.
+    # Contracts are indivisible, so floor the maximum at the actual YES/NO cost.
+    max_contracts = int(
+        (Decimal("1.00") / contract_price_dec).to_integral_value(rounding=ROUND_FLOOR)
+    )
+    return min(quantity, max_contracts)
 
 
 def _calculate_dynamic_quantity(
@@ -346,11 +373,12 @@ async def make_decision_for_market(
                     
                     # Use Kelly Criterion for position sizing
                     quantity = _calculate_kelly_position_size(
-                        available_balance,
-                        market.yes_price,
-                        decision.confidence,
-                        decision.side,
-                        confidence,
+                        balance=available_balance,
+                        market_yes_price=market.yes_price,
+                        contract_price=market.yes_price,
+                        ai_probability=decision.confidence,
+                        side=decision.side,
+                        confidence=confidence,
                         is_maker=True  # Maker fees apply for high-confidence strategy
                     )
 
@@ -614,11 +642,12 @@ async def make_decision_for_market(
             is_maker = _maker_wait > 0
             
             initial_quantity = _calculate_kelly_position_size(
-                available_balance,
-                price,
-                decision.confidence,
-                decision.side,
-                confidence,
+                balance=available_balance,
+                market_yes_price=market.yes_price,
+                contract_price=price,
+                ai_probability=decision.confidence,
+                side=decision.side,
+                confidence=confidence,
                 is_maker=is_maker
             )
             initial_position_value = initial_quantity * price

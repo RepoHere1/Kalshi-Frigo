@@ -612,7 +612,7 @@ def test_switching_to_live_is_not_blocked_by_the_balance(client, auth, monkeypat
             "balance": 0.0,
             "balance_cents": 0,
             "can_fund": False,
-            "reason": "$0.00 is below Kalshi's $1.00 minimum order size",
+            "reason": "balance $0.00 cannot buy even one 1-cent contract",
         }
 
     monkeypatch.setattr(TradingMode, "funding", broke)
@@ -1004,6 +1004,16 @@ def test_toggle_refuses_without_kalshi_credentials(client, auth, monkeypatch):
     assert not any(s["pid"] for s in client.get("/api/bots").get_json())
 
 
+def test_toggle_client_stops_polling_after_server_rejects_start():
+    source = wd._TEMPLATE
+    start = source.index("async function toggleStrategy")
+    end = source.index("async function saveAlerts", start)
+    toggle = source[start:end]
+
+    assert "if (!r.ok || d.error)" in toggle
+    assert toggle.index("if (!r.ok || d.error)") < toggle.index("let maxWait")
+
+
 def test_toggle_refuses_when_only_api_key_present(client, auth, monkeypatch):
     monkeypatch.setenv("KALSHI_API_KEY", "kid")
     monkeypatch.delenv("KALSHI_PRIVATE_KEY", raising=False)
@@ -1323,6 +1333,16 @@ def test_dry_cash_endpoint_refuses_bad_amounts(client, auth):
         assert r.status_code == 400, bad
 
 
+def test_dry_funding_recognizes_a_one_cent_contract_as_fundable(client, auth):
+    set_cash = client.post("/api/dry/cash", json={"amount": 0.07}, headers=auth)
+    assert set_cash.status_code == 200, set_cash.get_json()
+
+    dry = client.get("/api/mode").get_json()["dry_funding"]
+    assert dry["balance"] == 0.07
+    assert dry["can_fund"] is True
+    assert dry["reason"] == ""
+
+
 # ---------------------------------------------------------------------------
 # DRY / LIVE mode
 # ---------------------------------------------------------------------------
@@ -1367,7 +1387,7 @@ def test_going_live_with_no_balance_is_reported_not_refused(client, auth, monkey
             "balance": 0.0,
             "balance_cents": 0,
             "can_fund": False,
-            "reason": "balance $0.00 is below Kalshi's $1.00 minimum",
+            "reason": "balance $0.00 cannot buy even one 1-cent contract",
         }
 
     monkeypatch.setattr(TradingMode, "funding", unfunded)
@@ -1742,8 +1762,8 @@ async def test_trackers_see_dry_positions(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_tradelog_records_strategy_exit_reason_and_mode(tmp_path):
-    """track.py omitted all three, so P&L was unattributable."""
+async def test_tradelog_preserves_roll_marker_and_attribution(tmp_path):
+    """A closed ROLL-IQ position retains its marker for durable roll stats."""
     from datetime import datetime
 
     from src.utils.database import DatabaseManager, TradeLog
@@ -1761,16 +1781,17 @@ async def test_tradelog_records_strategy_exit_reason_and_mode(tmp_path):
             pnl=1.5,
             entry_timestamp=datetime(2026, 1, 1),
             exit_timestamp=datetime(2026, 1, 2),
-            rationale="r",
-            strategy="ai_directional",
+            rationale="BTC_UPDOWN ROLL-IQ successor",
+            strategy="btc_updown",
             exit_reason="take_profit",
             mode="dry",
         )
     )
     got = (await db.get_all_trade_logs())[0]
-    assert got.strategy == "ai_directional"
+    assert got.strategy == "btc_updown"
     assert got.exit_reason == "take_profit"
     assert got.mode == "dry"
+    assert "ROLL-IQ" in got.rationale
 
 
 @pytest.mark.asyncio
@@ -2021,6 +2042,70 @@ def test_card_counts_open_positions_per_strategy(client):
     card = _cards(client)["market_making"]
     assert card["open_positions"] == 1
     assert card["deployed"] == 3.6  # 12 contracts at $0.30
+
+
+def test_roll_card_is_always_rendered_as_a_read_only_overlay(client):
+    snap = client.get("/api/snapshot").get_json()
+    html = client.get("/").get_data(as_text=True)
+
+    assert snap["roll_card"]["closed_clips"] == 0
+    assert snap["roll_card"]["open_clips"] == 0
+    assert 'id="roll-card"' in html
+    assert "ROLL IQ" in html
+    assert 'onclick="openStrategy(\'roll_iq\')"' not in html
+    assert 'id="btn-roll_iq"' not in html
+
+
+def test_roll_card_aggregates_only_current_book_real_roll_trades(client):
+    import asyncio
+
+    _db()
+
+    async def seed():
+        async with aiosqlite.connect(wd.DB_PATH) as conn:
+            for market_id, pnl, mode, exit_reason in (
+                ("KXROLLDRY", 0.75, "dry", "market_resolution"),
+                ("KXROLLPHANTOM", 0.0, "dry", "no_kalshi_position"),
+                ("KXROLLLIVE", 9.0, "live", "market_resolution"),
+            ):
+                await conn.execute(
+                    "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
+                    " quantity, pnl, entry_timestamp, exit_timestamp, rationale,"
+                    " strategy, mode, exit_reason) VALUES (?, 'yes', 0.40, 0.55, 5, ?,"
+                    " '2026-01-01T00:00:00', '2026-01-02T00:00:00', 'ROLL-IQ successor',"
+                    " 'btc_updown', ?, ?)",
+                    (market_id, pnl, mode, exit_reason),
+                )
+            for market_id, mode in (("KXROLLOPEN", "dry"), ("KXROLLLIVEOPEN", "live")):
+                await conn.execute(
+                    "INSERT INTO positions (market_id, side, entry_price, quantity,"
+                    " timestamp, live, status, strategy, mode, rationale)"
+                    " VALUES (?, 'YES', 0.20, 3, '2026-01-01T00:00:00', ?, 'open',"
+                    " 'btc_updown', ?, 'ROLL-IQ successor')",
+                    (market_id, int(mode == "live"), mode),
+                )
+            await conn.commit()
+
+    asyncio.run(seed())
+    snap = client.get("/api/snapshot").get_json()
+    roll = snap["roll_card"]
+    btc = {card["name"]: card for card in snap["strategy_cards"]}["btc_updown"]
+
+    assert snap["book"] == "dry"
+    assert roll["closed_clips"] == 1
+    assert roll["open_clips"] == 1
+    assert roll["total_clips"] == 2
+    assert roll["wins"] == 1
+    assert roll["losses"] == 0
+    assert roll["win_rate"] == 100.0
+    assert roll["realized_pnl"] == 0.75
+    assert roll["open_deployed"] == 0.6
+    assert btc["roll_clips"] == 1
+    assert btc["roll_open"] == 1
+    assert btc["roll_rate"] == 100.0
+    strategy = {row["strategy"]: row for row in snap["by_strategy"]}["btc_updown"]
+    assert strategy["roll_clips"] == 1
+    assert strategy["roll_rate"] == 100.0
 
 
 def test_card_reports_its_own_command(client):
@@ -3379,6 +3464,111 @@ def test_api_trades_lists_rows_with_entry_fair(client, monkeypatch, tmp_path):
     assert r.status_code == 200, r.get_data(as_text=True)
     trades = r.get_json()["trades"]
     assert trades and trades[0]["entry_fair"] == 0.8
+
+
+def test_recent_closed_trades_api_paginates_current_book(client):
+    import asyncio
+
+    _db()
+
+    async def seed():
+        async with aiosqlite.connect(wd.DB_PATH) as conn:
+            for index in range(27):
+                await conn.execute(
+                    "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
+                    " quantity, pnl, entry_timestamp, exit_timestamp, rationale,"
+                    " strategy, mode, exit_reason) VALUES (?, 'yes', 0.40, 0.50, 2, 0.20,"
+                    " '2026-01-01T00:00:00', ?, 'pagination test', 'btc_updown',"
+                    " 'dry', 'market_resolution')",
+                    (f"KXPAGE{index:02d}", f"2026-01-{index + 1:02d}T00:00:00"),
+                )
+            await conn.execute(
+                "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
+                " quantity, pnl, entry_timestamp, exit_timestamp, rationale, strategy,"
+                " mode, exit_reason) VALUES ('KXPHANTOM', 'yes', 0.4, 0.4, 1, 0,"
+                " '2026-01-01', '2026-01-29', 'not filled', 'btc_updown', 'dry',"
+                " 'no_kalshi_position')"
+            )
+            await conn.execute(
+                "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
+                " quantity, pnl, entry_timestamp, exit_timestamp, rationale, strategy,"
+                " mode, exit_reason) VALUES ('KXLIVEPAGE', 'yes', 0.4, 0.5, 2, 0.2,"
+                " '2026-01-01', '2026-01-30', 'live', 'btc_updown', 'live',"
+                " 'market_resolution')"
+            )
+            await conn.commit()
+
+    asyncio.run(seed())
+    pages = [
+        client.get(f"/api/recent-trades?page={page}&per_page=10")
+        for page in (1, 2, 3)
+    ]
+    assert all(response.status_code == 200 for response in pages)
+    data = [response.get_json() for response in pages]
+
+    assert [page["total"] for page in data] == [27, 27, 27]
+    assert [page["pages"] for page in data] == [3, 3, 3]
+    assert [len(page["trades"]) for page in data] == [10, 10, 7]
+    assert data[0]["trades"][0]["market_id"] == "KXPAGE26"
+    assert not {trade["market_id"] for page in data for trade in page["trades"]} & {
+        "KXPHANTOM",
+        "KXLIVEPAGE",
+    }
+    page_ids = [
+        {trade["market_id"] for trade in page["trades"]}
+        for page in data
+    ]
+    assert not (page_ids[0] & page_ids[1] or page_ids[0] & page_ids[2] or page_ids[1] & page_ids[2])
+
+
+def test_rtf_download_is_current_book_scoped_and_escapes_content(client):
+    import asyncio
+
+    _db()
+
+    async def seed():
+        async with aiosqlite.connect(wd.DB_PATH) as conn:
+            for market_id, mode, exit_reason in (
+                ("KX{DRY}\\ROLL", "dry", "market_resolution"),
+                ("KXLIVEONLY", "live", "market_resolution"),
+                ("KXNOTFILLED", "dry", "no_kalshi_position"),
+            ):
+                await conn.execute(
+                    "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
+                    " quantity, pnl, entry_timestamp, exit_timestamp, rationale,"
+                    " strategy, mode, exit_reason) VALUES (?, 'yes', 0.4, 0.5, 2, 0.2,"
+                    " '2026-01-01', '2026-01-02', 'rtf test', 'btc_updown', ?, ?)",
+                    (market_id, mode, exit_reason),
+                )
+            await conn.commit()
+
+    asyncio.run(seed())
+    response = client.get("/api/trades/rtf")
+    html = client.get("/").get_data(as_text=True)
+    content = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert response.mimetype == "application/rtf"
+    assert "attachment;" in response.headers["Content-Disposition"]
+    assert content.startswith("{\\rtf1")
+    assert "KX\\{DRY\\}\\\\ROLL" in content
+    assert "KXLIVEONLY" not in content
+    assert "KXNOTFILLED" not in content
+    assert 'href="/api/trades/rtf"' in html
+    assert "Download RTF" in html
+    assert 'id="recentTradesBody"' in html
+    assert 'id="recentTradesPrev"' in html
+    assert 'id="recentTradesNext"' in html
+    assert "function loadRecentTrades" in html
+
+
+def test_recent_trade_renderer_can_format_money_outside_snapshot_paint():
+    template = wd._TEMPLATE
+    renderer_start = template.index("async function loadRecentTrades")
+    paint_start = template.index("function paint(s)", renderer_start)
+
+    assert "function money(v)" in template[:renderer_start]
+    assert "const money =" not in template[paint_start:]
 
 
 def test_reconcile_dry_credits_the_missing_close_money(

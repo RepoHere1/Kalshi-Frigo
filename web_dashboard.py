@@ -1837,8 +1837,8 @@ def _current_book_mode() -> Optional[str]:
 # then the rest (alphabetical tail, so future strategies land predictably).
 # DRY and LIVE both render this exact sequence.
 _CARD_GROUPS: Tuple[Tuple[str, ...], ...] = (
-    ("btc_updown", "xrp_updown", "xau_updown", "hyperliquid_updown"),  # 15-minute
-    ("btc_1h_updown", "eth_1h_updown", "xrp_1h_updown"),  # 1-hour
+    ("btc_updown", "xrp_updown", "xau_updown"),  # 15-minute
+    ("btc_1h_updown", "hyperliquid_updown", "eth_1h_updown", "xrp_1h_updown"),
 )
 
 
@@ -1855,6 +1855,7 @@ def _strategy_cards(
     position_rows: List[Dict[str, Any]],
     book: str,
     roll_trades_rows: Optional[List[Dict[str, Any]]] = None,
+    roll_open_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """One card per strategy: headline stats plus its own cumulative P&L curve.
 
@@ -1930,6 +1931,8 @@ def _strategy_cards(
             "roll_clips": 0,
             "roll_wins": 0,
             "roll_losses": 0,
+            "roll_open": 0,
+            "roll_realized": 0.0,
             "roll_rate": 0.0,
             "deployed": 0.0,
             "first_trade": None,
@@ -1977,17 +1980,20 @@ def _strategy_cards(
             2,
         )
 
-    # Map roll trades by strategy
-    roll_stats = {}
+    # Closed roll outcomes are persisted on trade_logs; open clips remain in
+    # positions until their normal close path writes the trade log.
+    roll_stats: Dict[str, Dict[str, Any]] = {}
     for row in (roll_trades_rows or []):
         if _resolve_book(row.get("mode")) != book:
             continue
         name = _strategy_bucket(row.get("strategy"))
-        roll_stats[name] = {
-            "roll_clips": int(row.get("roll_trades") or 0),
-            "roll_wins": int(row.get("roll_wins") or 0),
-            "roll_losses": int(row.get("roll_losses") or 0),
-        }
+        roll_stats[name] = row
+
+    roll_open_stats: Dict[str, Dict[str, Any]] = {}
+    for row in (roll_open_rows or []):
+        if _resolve_book(row.get("mode")) != book:
+            continue
+        roll_open_stats[_strategy_bucket(row.get("strategy"))] = row
 
     for card in cards.values():
         card["win_rate"] = (
@@ -1995,17 +2001,47 @@ def _strategy_cards(
         )
         # Populate roll stats
         roll_data = roll_stats.get(card["name"], {})
-        card["roll_clips"] = roll_data.get("roll_clips", 0)
-        card["roll_wins"] = roll_data.get("roll_wins", 0)
-        card["roll_losses"] = roll_data.get("roll_losses", 0)
+        open_data = roll_open_stats.get(card["name"], {})
+        card["roll_clips"] = int(roll_data.get("roll_trades") or 0)
+        card["roll_wins"] = int(roll_data.get("roll_wins") or 0)
+        card["roll_losses"] = int(roll_data.get("roll_losses") or 0)
+        card["roll_open"] = int(open_data.get("roll_open") or 0)
+        card["roll_realized"] = round(float(roll_data.get("roll_realized") or 0.0), 2)
+        roll_decisions = card["roll_wins"] + card["roll_losses"]
         card["roll_rate"] = (
-            round(100.0 * card["roll_wins"] / card["roll_clips"], 1) if card["roll_clips"] else 0.0
+            round(100.0 * card["roll_wins"] / roll_decisions, 1) if roll_decisions else 0.0
         )
     # Horizon grouping: ALL 15-minute cards lead, ALL 1-hour cards follow,
     # then everything else — one sort (shared with _mode_payload) so DRY and
     # LIVE can never disagree, and the single page loop stays intact.
     ordered = sorted(cards.values(), key=lambda c: _card_sort_key(c["name"]))
     return ordered
+
+
+def _roll_card_payload(
+    closed_rows: List[Dict[str, Any]], open_rows: List[Dict[str, Any]], book: str
+) -> Dict[str, Any]:
+    """Aggregate persisted ROLL-IQ results for the selected book."""
+    closed = [row for row in (closed_rows or []) if _resolve_book(row.get("mode")) == book]
+    opened = [row for row in (open_rows or []) if _resolve_book(row.get("mode")) == book]
+    closed_clips = sum(int(row.get("roll_trades") or 0) for row in closed)
+    open_clips = sum(int(row.get("roll_open") or 0) for row in opened)
+    wins = sum(int(row.get("roll_wins") or 0) for row in closed)
+    losses = sum(int(row.get("roll_losses") or 0) for row in closed)
+    flats = sum(int(row.get("roll_flats") or 0) for row in closed)
+    decisions = wins + losses
+    return {
+        "book": book,
+        "closed_clips": closed_clips,
+        "open_clips": open_clips,
+        "total_clips": closed_clips + open_clips,
+        "wins": wins,
+        "losses": losses,
+        "flats": flats,
+        "win_rate": round(100.0 * wins / decisions, 1) if decisions else 0.0,
+        "realized_pnl": round(sum(float(row.get("roll_realized") or 0.0) for row in closed), 2),
+        "open_deployed": round(sum(float(row.get("roll_deployed") or 0.0) for row in opened), 2),
+    }
 
 
 def _resolve_book(value: Optional[str]) -> str:
@@ -2138,13 +2174,18 @@ _SQL_STRATEGY = (
     " COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,"
     " COALESCE(MAX(pnl), 0.0) AS best,"
     " COALESCE(MIN(pnl), 0.0) AS worst,"
-    " COALESCE(SUM(CASE WHEN rationale LIKE '%ROLL-IQ%' THEN 1 ELSE 0 END), 0) AS roll_clips,"
-    " COALESCE(SUM(CASE WHEN rationale LIKE '%ROLL-IQ%' AND pnl > 0 THEN 1 ELSE 0 END), 0) AS roll_wins"
+    " COALESCE(SUM(CASE WHEN rationale LIKE '%ROLL-IQ%'"
+    " AND COALESCE(exit_reason, '') != 'no_kalshi_position' THEN 1 ELSE 0 END), 0) AS roll_clips,"
+    " COALESCE(SUM(CASE WHEN rationale LIKE '%ROLL-IQ%' AND pnl > 0"
+    " AND COALESCE(exit_reason, '') != 'no_kalshi_position' THEN 1 ELSE 0 END), 0) AS roll_wins,"
+    " COALESCE(SUM(CASE WHEN rationale LIKE '%ROLL-IQ%' AND pnl < 0"
+    " AND COALESCE(exit_reason, '') != 'no_kalshi_position' THEN 1 ELSE 0 END), 0) AS roll_losses"
     " FROM trade_logs WHERE {book} GROUP BY strategy ORDER BY pnl DESC"
 )
 _SQL_RECENT = (
     "SELECT market_id, side, entry_price, exit_price, quantity, pnl,"
     " entry_price * quantity AS cost_basis, exit_timestamp, rationale, strategy FROM trade_logs WHERE {book}"
+    " AND exit_timestamp IS NOT NULL AND COALESCE(exit_reason, '') != 'no_kalshi_position'"
     " ORDER BY exit_timestamp DESC LIMIT 25"
 )
 _SQL_EQUITY = (
@@ -2193,8 +2234,18 @@ _SQL_ROLL_TRADES = (
     " COALESCE(NULLIF(mode, ''), 'dry') AS mode,"
     " COUNT(*) AS roll_trades,"
     " COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS roll_wins,"
-    " COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0) AS roll_losses"
+    " COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) AS roll_losses,"
+    " COALESCE(SUM(CASE WHEN pnl = 0 THEN 1 ELSE 0 END), 0) AS roll_flats,"
+    " COALESCE(SUM(pnl), 0.0) AS roll_realized"
     " FROM trade_logs WHERE rationale LIKE '%ROLL-IQ%' AND {book}"
+    " AND COALESCE(exit_reason, '') != 'no_kalshi_position'"
+    " GROUP BY strategy, mode"
+)
+_SQL_ROLL_OPEN = (
+    "SELECT COALESCE(NULLIF(strategy, ''), 'unattributed') AS strategy,"
+    " COALESCE(NULLIF(mode, ''), 'dry') AS mode, COUNT(*) AS roll_open,"
+    " COALESCE(SUM(quantity * entry_price), 0.0) AS roll_deployed"
+    " FROM positions WHERE status = 'open' AND rationale LIKE '%ROLL-IQ%' AND {book}"
     " GROUP BY strategy, mode"
 )
 _SQL_POSITIONS = (
@@ -2292,6 +2343,7 @@ def _row_breakdown(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         wins = int(r.get("wins") or 0)
         roll_clips = int(r.get("roll_clips") or 0)
         roll_wins = int(r.get("roll_wins") or 0)
+        roll_losses = int(r.get("roll_losses") or 0)
         out.append(
             {
                 "strategy": r.get("strategy") or "unattributed",
@@ -2304,7 +2356,12 @@ def _row_breakdown(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "win_rate": round(wins / trades * 100, 1) if trades else 0.0,
                 "roll_clips": roll_clips,
                 "roll_wins": roll_wins,
-                "roll_rate": round(roll_wins / roll_clips * 100, 1) if roll_clips else 0.0,
+                "roll_losses": roll_losses,
+                "roll_rate": (
+                    round(roll_wins / (roll_wins + roll_losses) * 100, 1)
+                    if roll_wins + roll_losses
+                    else 0.0
+                ),
             }
         )
     return out
@@ -2560,11 +2617,26 @@ def build_snapshot() -> Dict[str, Any]:
             (_SQL_STRATEGY_CURVE, ()),
             (_SQL_FAIR_BANDS.format(book=where), ()),
             (_SQL_ROLL_TRADES.format(book=where), ()),
+            (_SQL_ROLL_OPEN.format(book=where), ()),
         ]
         + [(f"SELECT COUNT(*) AS n FROM {t}", ()) for t in DATA_TABLES]
     )
-    trades_r, open_r, dry_open_r, ai_r, llm_r, strat_r, recent_r, equity_r, pos_r, curve_r, fairs_r, roll_trades_r = batch[:12]
-    counts = batch[11:]
+    (
+        trades_r,
+        open_r,
+        dry_open_r,
+        ai_r,
+        llm_r,
+        strat_r,
+        recent_r,
+        equity_r,
+        pos_r,
+        curve_r,
+        fairs_r,
+        roll_trades_r,
+        roll_open_r,
+    ) = batch[:13]
+    counts = batch[13:]
 
     # Equity curve is fetched newest-first; flip it so the chart reads left to right.
     equity_rows = list(reversed(equity_r))
@@ -2599,7 +2671,8 @@ def build_snapshot() -> Dict[str, Any]:
     running = _running_strategies()
     errors: List[Dict[str, Any]] = cast(List[Dict[str, Any]], dashboard_state["errors"])
     events: List[Dict[str, Any]] = cast(List[Dict[str, Any]], dashboard_state["events"])
-    cards = _strategy_cards(curve_r, pos_r, book, roll_trades_r)
+    cards = _strategy_cards(curve_r, pos_r, book, roll_trades_r, roll_open_r)
+    roll_card = _roll_card_payload(roll_trades_r, roll_open_r, book)
 
     def _count(index: int) -> int:
         """Rows in a count result, tolerating a table that does not exist yet.
@@ -2650,6 +2723,7 @@ def build_snapshot() -> Dict[str, Any]:
         "running_count": len(running),
         "book": book,
         "strategy_cards": cards,
+        "roll_card": roll_card,
         "config": _config_payload(),
         "strategy_docs": [
             {
@@ -2864,12 +2938,12 @@ def _mode_payload() -> Dict[str, Any]:
         "dry_funding": {
             "connected": True,
             "balance": dry["cash"],
-            "can_fund": dry["cash"] >= 1.0,
+            "can_fund": dry["cash"] >= 0.01,
             "reason": ""
-            if dry["cash"] >= 1.0
+            if dry["cash"] >= 0.01
             else (
-                f"DRY cash ${dry['cash']:.2f} is below Kalshi's $1.00 minimum order "
-                "size - reset the DRY account to keep rehearsing"
+                f"DRY cash ${dry['cash']:.2f} cannot fund even one 1-cent contract - "
+                "add DRY cash to keep rehearsing"
             ),
         },
     }
@@ -3430,6 +3504,139 @@ def api_trades():
             return {"trades": trades, "mode_filter": mode_filter or "all"}
         
         return jsonify(asyncio.run(_fetch()))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/recent-trades")
+def api_recent_trades():
+    """Return one page of actual closed trades from the selected book."""
+    try:
+        page = int(request.args.get("page", "1"))
+        per_page = int(request.args.get("per_page", "25"))
+        if page < 1 or per_page < 1 or per_page > 100:
+            return jsonify({"error": "page must be positive and per_page must be 1..100"}), 400
+
+        book = _current_book_mode()
+        where = _book_filter(book)
+        eligible = (
+            f"{where} AND exit_timestamp IS NOT NULL"
+            " AND COALESCE(exit_reason, '') != 'no_kalshi_position'"
+        )
+        count_rows, trade_rows = _db_many(
+            [
+                (f"SELECT COUNT(*) AS total FROM trade_logs WHERE {eligible}", ()),
+                (
+                    "SELECT market_id, side, entry_price, exit_price, quantity, pnl,"
+                    " entry_price * quantity AS cost_basis, exit_timestamp, strategy"
+                    f" FROM trade_logs WHERE {eligible}"
+                    " ORDER BY exit_timestamp DESC LIMIT ? OFFSET ?",
+                    (per_page, (page - 1) * per_page),
+                ),
+            ]
+        )
+        total = int((count_rows[0].get("total") if count_rows else 0) or 0)
+        pages = max(1, (total + per_page - 1) // per_page)
+        trades = []
+        for row in trade_rows:
+            row["pnl"] = round(float(row.get("pnl") or 0.0), 2)
+            row["cost_basis"] = round(float(row.get("cost_basis") or 0.0), 2)
+            row["strategy"] = row.get("strategy") or "unattributed"
+            trades.append(row)
+        return jsonify(
+            {
+                "book": book,
+                "page": page,
+                "per_page": per_page,
+                "total": total,
+                "pages": pages,
+                "trades": trades,
+            }
+        )
+    except (TypeError, ValueError):
+        return jsonify({"error": "page and per_page must be integers"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _rtf_escape(value: Any) -> str:
+    """Escape plain text as RTF, including Unicode and structural characters."""
+    escaped: List[str] = []
+    for char in str(value if value is not None else ""):
+        code = ord(char)
+        if char == "\\":
+            escaped.append(r"\\")
+        elif char == "{":
+            escaped.append(r"\{")
+        elif char == "}":
+            escaped.append(r"\}")
+        elif char in "\r\n":
+            escaped.append(r"\line ")
+        elif char == "\t":
+            escaped.append(" ")
+        elif code > 0xFFFF:
+            scalar = code - 0x10000
+            for unit in (0xD800 + (scalar >> 10), 0xDC00 + (scalar & 0x3FF)):
+                escaped.append(r"\u" + str(unit - 0x10000) + "?")
+        elif code > 0x7F:
+            escaped.append(r"\u" + str(code if code < 0x8000 else code - 0x10000) + "?")
+        else:
+            escaped.append(char)
+    return "".join(escaped)
+
+
+@app.route("/api/trades/rtf")
+def api_trades_rtf():
+    """Download all real closed trades for the selected book as an RTF ledger."""
+    try:
+        from flask import Response
+
+        book = _current_book_mode()
+        where = _book_filter(book)
+        rows = _db_many(
+            [
+                (
+                    "SELECT market_id, side, entry_price, exit_price, quantity, pnl,"
+                    " strategy, exit_timestamp FROM trade_logs"
+                    f" WHERE {where} AND exit_timestamp IS NOT NULL"
+                    " AND COALESCE(exit_reason, '') != 'no_kalshi_position'"
+                    " ORDER BY exit_timestamp DESC",
+                    (),
+                )
+            ]
+        )[0]
+        lines = [
+            f"Kalshi-Frigo {book.upper()} closed trades",
+            f"Exported {_now()}",
+            f"Trades: {len(rows)}",
+            "",
+            "Market | Side | Qty | Entry | Exit | Buy amount | P&L | Strategy | Exited",
+        ]
+        for row in rows:
+            entry = float(row.get("entry_price") or 0.0)
+            quantity = float(row.get("quantity") or 0.0)
+            lines.append(
+                " | ".join(
+                    (
+                        str(row.get("market_id") or ""),
+                        str(row.get("side") or ""),
+                        str(row.get("quantity") or 0),
+                        f"{entry:.3f}",
+                        f"{float(row.get('exit_price') or 0.0):.3f}",
+                        f"{entry * quantity:.2f}",
+                        f"{float(row.get('pnl') or 0.0):.2f}",
+                        str(row.get("strategy") or "unattributed"),
+                        str(row.get("exit_timestamp") or ""),
+                    )
+                )
+            )
+        body = r"{\rtf1\ansi\deff0{\fonttbl{\f0 Courier New;}}\f0\fs18 "
+        body += r"\line ".join(_rtf_escape(line) for line in lines) + "}"
+        return Response(
+            body,
+            content_type="application/rtf; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="kalshi-{book}-closed-trades.rtf"'},
+        )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -4253,11 +4460,13 @@ def api_strategy_detail(name):
                 " ORDER BY COALESCE(exit_timestamp, entry_timestamp) DESC LIMIT 400",
                 (),
             ),
+            (_SQL_ROLL_TRADES.format(book=where), ()),
+            (_SQL_ROLL_OPEN.format(book=where), ()),
         ]
     )
-    curve_r, pos_r, _recent_r, trades_r = batch
+    curve_r, pos_r, _recent_r, trades_r, roll_trades_r, roll_open_r = batch
 
-    cards = _strategy_cards(curve_r, pos_r, book, roll_trades_r)
+    cards = _strategy_cards(curve_r, pos_r, book, roll_trades_r, roll_open_r)
     card = next((c for c in cards if c["name"] == name), None)
     if card is None:
         return jsonify({"error": f"Unknown strategy: {name}"}), 404
@@ -5728,6 +5937,24 @@ button.loading.yellow::after {
   {%- endif %}
   <div class="pb">
     <div class="cards">
+      <div class="card" id="roll-card" style="cursor:default">
+        <div class="ctop">
+          <div><div class="clabel">ROLL IQ</div><div class="mono cname">successor-contract overlay</div></div>
+          <span class="pill {{ 'ok' if s.roll_card.book == 'dry' else 'warn' }}" id="roll-book">{{ s.roll_card.book|upper }}</span>
+        </div>
+        <div class="cstats">
+          <div><b id="roll-closed">{{ s.roll_card.closed_clips }}</b><span>closed clips</span></div>
+          <div><b id="roll-open">{{ s.roll_card.open_clips }}</b><span>open clips</span></div>
+          <div><b id="roll-outcomes">{{ s.roll_card.wins }}W / {{ s.roll_card.losses }}L</b><span>closed outcomes</span></div>
+          <div><b id="roll-win-rate">{{ s.roll_card.win_rate }}%</b><span>win rate</span></div>
+          <div><b id="roll-pnl" class="{{ 'up' if s.roll_card.realized_pnl > 0 else ('down' if s.roll_card.realized_pnl < 0 else 'flat') }}">${{ '%.2f'|format(s.roll_card.realized_pnl) }}</b><span>realized</span></div>
+          <div><b id="roll-deployed">${{ '%.2f'|format(s.roll_card.open_deployed) }}</b><span>open deployed</span></div>
+        </div>
+        <div class="cfoot">
+          <span class="mono" style="color:var(--faint)">ROLL IQ runs inside the UP/DOWN lanes; use those lane controls.</span>
+          <span class="mono" id="roll-total">{{ s.roll_card.total_clips }} total clips</span>
+        </div>
+      </div>
       {%- for c in s.strategy_cards %}
       <div class="card{{ ' hot' if c.running else '' }}" id="card-{{ c.name }}" onclick="openStrategy('{{ c.name }}')">
         <div class="ctop">
@@ -5745,7 +5972,7 @@ button.loading.yellow::after {
           <div><b id="c-{{ c.name }}-win">{{ c.win_rate }}%</b><span>win rate</span></div>
           <div><b id="c-{{ c.name }}-open">{{ c.open_positions }}</b><span>open</span></div>
           <div><b id="c-{{ c.name }}-roll-clips">{{ c.roll_clips }}</b><span>roll trades</span></div>
-          <div><b id="c-{{ c.name }}-roll-rate">{{ (c.roll_wins / c.roll_clips * 100) if c.roll_clips else 0 }}%</b><span>roll rate</span></div>
+          <div><b id="c-{{ c.name }}-roll-rate">{{ c.roll_rate }}%</b><span>roll win rate</span></div>
         </div>
          <div class="cfoot">
            <span class="mono" style="color:var(--faint)">BUY AMT <span id="c-{{ c.name }}-dep">${{ '%.2f'|format(c.deployed) }}</span>{% if not c.running and c.stop_reason %} &middot; {{ c.stop_reason }}{% endif %}</span>
@@ -6086,10 +6313,16 @@ button.loading.yellow::after {
   </div>
 
   <div class="panel">
-    <div class="ph"><h2>Recent closed trades</h2><span class="note">{{ s.recent_trades|length }} most recent &middot; every close is kept forever</span><span class="bar"><button onclick="showAnalysis()">ANALYSIS OF</button></span></div>
-    {%- if s.recent_trades %}
+    <div class="ph">
+      <h2>Recent closed trades</h2>
+      <span class="note" id="recentTradesSummary">{{ s.recent_trades|length }} most recent</span>
+      <span class="bar">
+        <button onclick="showAnalysis()">ANALYSIS OF</button>
+        <a class="tag" href="/api/trades/rtf">Download RTF</a>
+      </span>
+    </div>
     <div class="scroll">
-    <table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Qty</th><th class="num">BUY AMT $$$</th><th class="num">P&amp;L</th><th>Strategy</th><th>Exited</th></tr></thead><tbody>
+    <table><thead><tr><th>Market</th><th>Title</th><th>Side</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Qty</th><th class="num">BUY AMT $$$</th><th class="num">P&amp;L</th><th>Strategy</th><th>Exited</th></tr></thead><tbody id="recentTradesBody">
     {%- for t in s.recent_trades %}
       <tr>
         <td class="mono" title="{{ t.market_id }}">{{ t.market_id[:24] }}</td>
@@ -6103,12 +6336,16 @@ button.loading.yellow::after {
         <td><span class="tag">{{ t.strategy }}</span></td>
         <td class="mono" style="color:var(--faint)">{{ (t.exit_timestamp or '')[:16] }}</td>
       </tr>
+    {%- else %}
+      <tr><td colspan="10" class="empty">No closed trades recorded yet.</td></tr>
     {%- endfor %}
     </tbody></table>
     </div>
-    {%- else %}
-    <div class="empty">No closed trades recorded yet.</div>
-    {%- endif %}
+    <div class="bar" style="justify-content:flex-end;padding:10px 14px">
+      <span class="note" id="recentTradesPageLabel">Page 1</span>
+      <button id="recentTradesPrev" type="button" onclick="loadRecentTrades(recentTradesPage - 1)" disabled>Previous</button>
+      <button id="recentTradesNext" type="button" onclick="loadRecentTrades(recentTradesPage + 1)" disabled>Next</button>
+    </div>
   </div>
 </div>
 
@@ -6214,6 +6451,8 @@ const EQUITY = { labels: [], pnl: [] };
 Object.assign(EQUITY, SNAPSHOT.equity || {});
 const $ = id => document.getElementById(id);
 const esc = v => String(v == null ? '' : v);
+let recentTradesPage = 1;
+let recentTradesRequest = 0;
 
 // --- live event feed ---
 const feed = [];
@@ -6243,13 +6482,92 @@ function rows(cells, emptyMsg, colspan) {
 }
 function num(v) { return v == null ? '-' : v; }
 function sgn(v) { return v > 0 ? 'up' : (v < 0 ? 'down' : 'flat'); }
+function money(v) { return '$' + Number(v || 0).toFixed(2); }
 
 function mktTitle(ticker) {
   return (SNAPSHOT.market_titles || {})[ticker] || ticker || '';
 }
 
+async function loadRecentTrades(page) {
+  const requestId = ++recentTradesRequest;
+  const requestedPage = Math.max(1, Number.parseInt(page, 10) || 1);
+  try {
+    const response = await fetch('/api/recent-trades?page=' + requestedPage + '&per_page=25');
+    const data = await response.json().catch(() => ({}));
+    if (requestId !== recentTradesRequest) return;
+    if (!response.ok || data.error) {
+      note('Closed trades: ' + (data.error || ('request failed (' + response.status + ')')));
+      return;
+    }
+
+    recentTradesPage = Number(data.page) || 1;
+    const body = $('recentTradesBody');
+    if (body) {
+      body.replaceChildren();
+      const trades = data.trades || [];
+      if (!trades.length) {
+        const row = document.createElement('tr');
+        const empty = document.createElement('td');
+        empty.colSpan = 10;
+        empty.className = 'empty';
+        empty.textContent = 'No closed trades recorded yet.';
+        row.appendChild(empty);
+        body.appendChild(row);
+      } else {
+        for (const trade of trades) {
+          const row = document.createElement('tr');
+          const addCell = (value, className, title) => {
+            const cell = document.createElement('td');
+            cell.textContent = value == null ? '' : String(value);
+            if (className) cell.className = className;
+            if (title) cell.title = title;
+            row.appendChild(cell);
+            return cell;
+          };
+          const market = String(trade.market_id || '?');
+          addCell(market.slice(0, 24), 'mono', market);
+          addCell(mktTitle(market));
+          addCell(trade.side);
+          addCell(trade.entry_price == null ? '-' : Number(trade.entry_price).toFixed(3), 'num');
+          addCell(trade.exit_price == null ? '-' : Number(trade.exit_price).toFixed(3), 'num');
+          addCell(trade.quantity, 'num');
+          addCell(money(trade.cost_basis), 'num');
+          addCell(money(trade.pnl), 'num ' + sgn(trade.pnl));
+          const strategyCell = addCell('');
+          const strategyTag = document.createElement('span');
+          strategyTag.className = 'tag';
+          strategyTag.textContent = trade.strategy || 'unattributed';
+          strategyCell.appendChild(strategyTag);
+          const exited = addCell(String(trade.exit_timestamp || '').slice(0, 16), 'mono');
+          exited.style.color = 'var(--faint)';
+          body.appendChild(row);
+        }
+      }
+    }
+
+    const pages = Math.max(1, Number(data.pages) || 1);
+    const pageLabel = $('recentTradesPageLabel');
+    if (pageLabel) pageLabel.textContent = 'Page ' + recentTradesPage + ' of ' + pages;
+    const summary = $('recentTradesSummary');
+    if (summary) {
+      const total = Number(data.total) || 0;
+      const first = total ? ((recentTradesPage - 1) * Number(data.per_page || 25) + 1) : 0;
+      const last = Math.min(recentTradesPage * Number(data.per_page || 25), total);
+      summary.textContent = 'Showing ' + first + '-' + last + ' of ' + total +
+        ' closed trades (' + String(data.book || '').toUpperCase() + ')';
+    }
+    const previous = $('recentTradesPrev');
+    const next = $('recentTradesNext');
+    if (previous) previous.disabled = recentTradesPage <= 1;
+    if (next) next.disabled = recentTradesPage >= pages;
+  } catch (error) {
+    note('Closed trades: ' + error.message);
+  }
+}
+
 function paint(s) {
   if (!s) return;
+  loadRecentTrades(recentTradesPage);
   const k = s.kalshi || {};
 
   const mk = k.markets || [], ev = k.events || [];
@@ -6293,7 +6611,6 @@ function paint(s) {
   }
 
   const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
-  const money = v => '$' + Number(v || 0).toFixed(2);
 
   // The headline tiles are mode-specific markup, and each set of ids is written
   // from its OWN book. The DRY and LIVE tiles previously shared element ids, so
@@ -6370,6 +6687,7 @@ function paint(s) {
 
   SNAPSHOT.equity = s.equity || SNAPSHOT.equity;
   paintCards(s.strategy_cards);
+  paintRollCard(s.roll_card);
   const eq = SNAPSHOT.equity || {};
   const closes = (eq.pnl || []).length;
   set('pnlSummary', closes
@@ -6380,6 +6698,31 @@ function paint(s) {
 // Patch the volatile parts of each card in place. The cards themselves are
 // server-rendered, so this only has to keep numbers and state current - it must
 // not rebuild the DOM, or the sparkline canvases would be destroyed.
+function paintRollCard(roll) {
+  if (!roll) return;
+  const set = (id, value) => { const el = $(id); if (el) el.textContent = value; };
+  const wins = Number(roll.wins || 0);
+  const losses = Number(roll.losses || 0);
+  const flats = Number(roll.flats || 0);
+  set('roll-closed', Number(roll.closed_clips || 0));
+  set('roll-open', Number(roll.open_clips || 0));
+  set('roll-outcomes', wins + 'W / ' + losses + 'L' + (flats ? ' / ' + flats + ' flat' : ''));
+  set('roll-win-rate', Number(roll.win_rate || 0).toFixed(1) + '%');
+  set('roll-deployed', money(roll.open_deployed || 0));
+  set('roll-total', Number(roll.total_clips || 0) + ' total clips');
+  const pnl = $('roll-pnl');
+  if (pnl) {
+    const realized = Number(roll.realized_pnl || 0);
+    pnl.textContent = money(realized);
+    pnl.className = realized > 0 ? 'up' : (realized < 0 ? 'down' : 'flat');
+  }
+  const book = $('roll-book');
+  if (book) {
+    book.textContent = String(roll.book || '').toUpperCase();
+    book.className = 'pill ' + (roll.book === 'live' ? 'warn' : 'ok');
+  }
+}
+
 function paintCards(cards) {
   if (!cards) return;
   SNAPSHOT.strategy_cards = cards;
@@ -6389,7 +6732,7 @@ function paintCards(cards) {
   set('c-' + c.name + '-win', c.win_rate + '%');
   set('c-' + c.name + '-open', c.open_positions);
   set('c-' + c.name + '-roll-clips', c.roll_clips || 0);
-  set('c-' + c.name + '-roll-rate', ((c.roll_wins || 0) / ((c.roll_clips || 0) || 1) * 100).toFixed(1) + '%');
+   set('c-' + c.name + '-roll-rate', Number(c.roll_rate || 0).toFixed(1) + '%');
     set('c-' + c.name + '-dep', Number(c.deployed || 0).toFixed(2));
     const pnl = $('c-' + c.name + '-pnl');
     if (pnl) {
@@ -6655,14 +6998,15 @@ async function toggleStrategy(name, quiet) {
   const card = (SNAPSHOT.strategy_cards || []).find(c => c.name === name);
   const btn = document.getElementById('btn-' + name);
   const body = {};
-  const wantedRunning = card && !card.running; // true if we're starting, false if stopping
+  const wantedRunning = !!card && !card.running; // true if we're starting, false if stopping
   
   // Add loading animation to button - keep it spinning until state actually changes
   if (btn) btn.classList.add('loading');
   
   try {
+    let r;
     if (card && card.running) {
-      await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
+      r = await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
         method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
       });
     } else {
@@ -6674,12 +7018,21 @@ async function toggleStrategy(name, quiet) {
         note(name + ': left off (HEAVY API ABUSER)');
         return;
       }
-      const r = await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
+      r = await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
         method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
       });
-      const d = await r.json().catch(() => ({}));
-      if (!quiet) note(d.error ? name + ': ' + d.error : name + ': ' + (d.running ? 'started' : 'stopped'));
     }
+
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) {
+      if (!quiet) note(name + ': ' + (d.error || ('request failed (' + r.status + ')')));
+      return;
+    }
+    if (typeof d.running === 'boolean' && d.running !== wantedRunning) {
+      if (!quiet) note(name + ': server did not accept the requested state change');
+      return;
+    }
+    if (!quiet) note(name + ': ' + (wantedRunning ? 'start accepted' : 'stop accepted'));
     
     // Poll for actual state change - keep spinner on until running status matches what we want
     let maxWait = 120; // Max 120 seconds of polling (increased from 60)
