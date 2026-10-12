@@ -2226,17 +2226,22 @@ class UpDownTrader:
                         _sig = None
                     _grp.sort(key=lambda m: abs(float(m.target or 0.0) - _now_sp))
                     _band = _grp[: max(1, self.config.strike_band_n)]
-                    _pick = pick_ladder_strike(
-                        _band,
-                        _now_sp,
-                        _sl or 900.0,
-                        _sig,
-                        self.config.noise_pct,
-                        self.config.min_entry_price,
-                        self.config.max_entry_price,
+                    _gold_cold = (
+                        str(getattr(self.feed, "series", "")).upper() == "KXGOLDD"
+                        and _sig is None
                     )
-                    if _pick is not None:
-                        market = _pick
+                    if not _gold_cold:
+                        _pick = pick_ladder_strike(
+                            _band,
+                            _now_sp,
+                            _sl or 900.0,
+                            _sig,
+                            self.config.noise_pct,
+                            self.config.min_entry_price,
+                            self.config.max_entry_price,
+                        )
+                        if _pick is not None:
+                            market = _pick
             except Exception as exc:  # noqa: BLE001 - never block the cycle
                 self.book.last_error = f"strike-band: {type(exc).__name__}: {exc}"
 

@@ -230,6 +230,75 @@ async def test_daily_gold_does_not_bypass_scoring_with_certain_win_pair(monkeypa
     assert evaluated == []
 
 
+@pytest.mark.asyncio
+async def test_cold_daily_gold_cycle_does_not_rank_strikes_with_fallback(monkeypatch):
+    import src.jobs.ladder_trader as lt
+    from src.utils.mode import TradingMode
+
+    spot = SpotFeed()
+    spot.price = 4168.42
+    spot.ts = time.time()
+    spot.source = "test"
+    feed = Btc15mFeed(series="KXGOLDD")
+    close_ts = time.time() + 24 * 60 * 60
+    feed.markets = [
+        UpDownMarket(
+            ticker=ticker,
+            event_ticker="KXGOLDD-26OCT1317",
+            bucket="26OCT1317",
+            horizon=0,
+            title="Gold daily close threshold",
+            target=target,
+            close_ts=close_ts,
+            yes_bid=yes_bid,
+            yes_ask=yes_ask,
+            no_bid=no_bid,
+            no_ask=no_ask,
+        )
+        for ticker, target, yes_bid, yes_ask, no_bid, no_ask in (
+            ("KXGOLDD-26OCT1317-T4164", 4164.0, 0.61, 0.62, 0.38, 0.39),
+            ("KXGOLDD-26OCT1317-T4174", 4174.0, 0.50, 0.51, 0.49, 0.50),
+        )
+    ]
+    feed.ts = time.time()
+    trader = UpDownTrader(spot, feed, UpDownConfig())
+    trader.db_manager = type(
+        "_Database", (), {"get_open_positions": lambda self, mode: []}
+    )()
+
+    class _BalanceClient:
+        async def get_balance(self):
+            return {"balance": 10000}
+
+    trader._client = _BalanceClient()
+    strike_calls = []
+
+    def _record_pick(*args, **kwargs):
+        strike_calls.append((args, kwargs))
+        return None
+
+    async def _current(_self):
+        return "dry"
+
+    async def _dry_account(_self):
+        return {"cash": 100.0}
+
+    async def _track(_db):
+        return None
+
+    monkeypatch.setattr(lt, "pick_ladder_strike", _record_pick)
+    monkeypatch.setattr("src.jobs.track.run_tracking", _track)
+    monkeypatch.setattr("src.jobs.broker.should_trade_live", lambda: False)
+    monkeypatch.setattr(TradingMode, "current", _current)
+    monkeypatch.setattr(TradingMode, "dry_account", _dry_account)
+
+    result = await trader.cycle()
+
+    assert strike_calls == []
+    assert result["contract"] == "KXGOLDD-26OCT1317-T4164"
+    assert result["skipped_vol_warmup"] == 1
+
+
 def test_buys_up_when_spot_is_well_past_target_but_kalshi_is_even():
     c = UpDownConfig(noise_pct=0.0002, min_edge=0.06)
     trader = UpDownTrader(SpotFeed(), Btc15mFeed(), c)
