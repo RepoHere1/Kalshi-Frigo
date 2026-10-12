@@ -615,9 +615,23 @@ async def place_sell_limit_order(
         return False
 
 
-# KXGOLD15M is the LIVE gold series (KXXAU15M is dead: zero markets ever).
-# KXXAU15M stays listed so legacy positions still ride/recycle correctly.
-_UPDOWN_SERIES = ("KXBTC15M", "KXBTC1H", "KXXRP15M", "KXXRP1H", "KXGOLD15M", "KXXAU15M", "KXETH15M", "KXETH1H", "KXHYPE15M", "KXBTCD", "KXETHD", "KXXRPD")
+# KXGOLDD is the currently active Gold ladder. Keep older Gold tickers here so
+# positions opened before the series switch retain the same exit policy.
+_UPDOWN_SERIES = (
+    "KXBTC15M",
+    "KXBTC1H",
+    "KXXRP15M",
+    "KXXRP1H",
+    "KXGOLDD",
+    "KXGOLD15M",
+    "KXXAU15M",
+    "KXETH15M",
+    "KXETH1H",
+    "KXHYPE15M",
+    "KXBTCD",
+    "KXETHD",
+    "KXXRPD",
+)
 
 
 def _recycle_config() -> Tuple[bool, float, float]:

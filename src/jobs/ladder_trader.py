@@ -1,4 +1,4 @@
-"""BTC 15-minute up/down trader: a fast spot feed against Kalshi's own quotes.
+"""Spot-backed Kalshi UP/DOWN trader for interval and strike-ladder markets.
 
 THE MARKET
 ----------
@@ -57,6 +57,12 @@ MAX_CLIPS_PER_TICKER = 1
 # NOTE: a LIVE-only 0.10-0.50 entry band lived here and was removed: it cut
 # LIVE to 52 skips and 0 trades an hour. Both books now share the sweet-band
 # surcharge in UpDownConfig; LIVE adds only the real fee.
+
+
+def _series_uses_brti(series: Optional[str]) -> bool:
+    """BRTI is a BTC benchmark; never apply it to another underlying."""
+    return str(series or "").strip().upper().startswith("KXBTC")
+
 
 # Per-asset tuning. BTC's class defaults were derived from BTC's market
 # microstructure: a ~$84,000 asset whose "sweet band" sits at 0.20-0.50 and
@@ -153,8 +159,8 @@ class UpDownConfig:
     kelly_cap: float = 0.35    # never more than 35% of the book in one clip
     kelly_confidence_pivot: float = 0.70  # fair probability at which kelly_scale begins scaling up
     kelly_confidence_max_mult: float = 2.0  # max multiplier on kelly_scale (capped at 0.50)
-    # LADDER STRIKE-BAND (hourly products): score the strike whose modeled
-    # edge is widest among the near-money band - nearest when the tape is
+    # LADDER STRIKE-BAND (threshold/hourly products): score the strike with
+    # widest modeled edge in the near-money band - nearest when the tape is
     # quiet (win-rate play), a cheaper deeper contract when the model is
     # sure (payoff play). 15m series have one contract per close: no-op.
     strike_band_enabled: bool = True
@@ -778,7 +784,7 @@ def pick_ladder_strike(
     return best
 
 class UpDownTrader:
-    """Scores the next 15-minute contract against live spot and takes one clip."""
+    """Scores a spot-backed binary contract and takes at most one clip."""
 
     def __init__(
         self,
@@ -793,14 +799,15 @@ class UpDownTrader:
         self.feed = feed
         self.config = config or UpDownConfig()
         self.db_manager = db_manager
-        # This process's own lane identity. Each crypto (BTC/XRP/XAU/ETH) is a
+        # This process's own lane identity. Each asset (BTC/XRP/XAU/ETH) is a
         # SEPARATE book and must attribute its positions and veto streaks to its
         # own lane, never to a shared "btc_updown" bucket - otherwise the four
         # lanes fight over one position table and one guard.
         self.lane = lane
         # BRTI truth feed (Kalshi's own CF Benchmarks index). None means
         # Coinbase spot only -- every existing caller keeps working.
-        self.brti = brti
+        self._uses_btc_benchmarks = _series_uses_brti(getattr(feed, "series", ""))
+        self.brti = brti if self._uses_btc_benchmarks else None
         self._client: Any = None
         # Lazy OpenRouter client for the veto judge. Built only when
         # ai_veto_enabled, so DRY never pays for it.
@@ -1500,7 +1507,11 @@ class UpDownTrader:
             # sized from the binary delta and marked against the public BTC
             # mid. Planned and logged on every entry in both books; orders on
             # HL fire only when the operator arms them (HL_HEDGE_ENABLED).
-            if self.config.vol_edge_enabled and self._sigma_used:
+            if (
+                self._uses_btc_benchmarks
+                and self.config.vol_edge_enabled
+                and self._sigma_used
+            ):
                 try:
                     from src.jobs.vol_edge import hedge_btc_qty
 
@@ -2570,7 +2581,7 @@ async def run_updown_trader(
 ) -> None:
     """Run the up/down trader, optionally on a loop until interrupted.
 
-    `series` is the Kalshi series ticker (e.g. KXXRP15M, KXGOLD15M, KXBTC15M, KXETH15M).
+    `series` is the Kalshi series ticker (e.g. KXXRP15M, KXGOLDD, KXBTC15M, KXETH15M).
     `spot_product` is the Coinbase pair (e.g. XRP-USD, XAU-USD, BTC-USD, ETH-USD).
     """
     from src.jobs.market_data import MarketDataHub
@@ -2579,17 +2590,15 @@ async def run_updown_trader(
     # Grade each lane against its own asset, not BTC's defaults.
     config.apply_asset(spot_product)
     hub = MarketDataHub(spot_product=spot_product, series=series)
-    # BRTI truth: Kalshi's own settlement index over its own socket. Starts
-    # degraded without keys and the trader falls back to Coinbase; never fatal.
-    # DRY no longer uses BRTI — both books use Coinbase spot only.
+    # BRTI is the BTC settlement index; other assets use their own Coinbase spot.
     brti = None
-    try:
-        from src.jobs.brti_feed import BrtiFeed
+    if _series_uses_brti(series):
+        try:
+            from src.jobs.brti_feed import BrtiFeed
 
-        brti = BrtiFeed()
-    except Exception as exc:  # noqa: BLE001
-        print(f"{series}: BRTI feed unavailable ({exc}); coinbase-spot only", flush=True)
-        brti = None
+            brti = BrtiFeed()
+        except Exception as exc:  # noqa: BLE001
+            print(f"{series}: BRTI feed unavailable ({exc}); coinbase-spot only", flush=True)
     trader = UpDownTrader(
         hub.spot,
         hub.feed,
@@ -2613,13 +2622,13 @@ async def run_updown_trader(
                                 await brti.start()
                             except Exception as exc2:  # noqa: BLE001 - degraded ok
                                 print(
-                                    f"BTC 15m: BRTI start failed "
+                                    f"{series}: BRTI start failed "
                                     f"({type(exc2).__name__}); coinbase-spot only",
                                     flush=True,
                                 )
                     except Exception as exc:  # noqa: BLE001 - start may be retried
                         print(
-                            f"BTC 15m: market data hub failed to start "
+                            f"{series}: market data hub failed to start "
                             f"({type(exc).__name__}: {exc}); retrying in {backoff:.0f}s",
                             flush=True,
                         )
@@ -2631,7 +2640,7 @@ async def run_updown_trader(
                 backoff = 1.0
             except Exception as exc:  # noqa: BLE001 - the loop must never die
                 print(
-                    f"BTC 15m pass failed ({type(exc).__name__}: {exc}); "
+                    f"{series} pass failed ({type(exc).__name__}: {exc}); "
                     f"retrying in {backoff:.0f}s",
                     flush=True,
                 )
@@ -2672,7 +2681,7 @@ async def run_updown_trader(
                     lane, book_word
                 )
             except Exception as exc:  # noqa: BLE001 - proof must not kill the loop
-                print(f"BTC 15m: heartbeat write failed: {type(exc).__name__}: {exc}", flush=True)
+                print(f"{series}: heartbeat write failed: {type(exc).__name__}: {exc}", flush=True)
 
             # Book reaper: every 15 minutes, kill local rows Kalshi
             # holds nothing behind (freeing the strategy slot they occupied) and
@@ -2704,7 +2713,7 @@ async def run_updown_trader(
                                 flush=True,
                             )
             except Exception as exc:  # noqa: BLE001 - reaping never kills the loop
-                print(f"BTC 15m: reaper pass failed: {type(exc).__name__}: {exc}", flush=True)
+                print(f"{series}: reaper pass failed: {type(exc).__name__}: {exc}", flush=True)
 
             if not loop:
                 return

@@ -1,4 +1,4 @@
-"""Real-time BTC market data for the dashboard and the 15-minute trader.
+"""Real-time spot and Kalshi market data for the generic UP/DOWN trader.
 
 THE MARKET THAT ACTUALLY EXISTS
 -------------------------------
@@ -97,7 +97,7 @@ def _parse_bucket(event_ticker: str, series_prefix: str = None) -> Optional[str]
         stamp = raw
     if len(stamp) == 11:
         digits = (slice(0, 2), slice(5, 7), slice(7, 9), slice(9, 11))
-    elif len(stamp) == 9:  # hourly ladder stamps (KXBTCD): 26OCT1100, no minute field
+    elif len(stamp) == 9:  # hourly/daily ladder stamps: 26OCT1100, no minute field
         digits = (slice(0, 2), slice(5, 7), slice(7, 9))
     else:
         return None
@@ -133,7 +133,7 @@ class SpotTick:
 
 @dataclass
 class UpDownMarket:
-    """One 15-minute up/down contract."""
+    """One binary up/down or strike-threshold contract."""
 
     ticker: str
     event_ticker: str
@@ -281,8 +281,8 @@ class SpotFeed:
 class Btc15mFeed:
     """Kalshi up/down markets for any series, read over REST.
 
-    One request returns every open horizon in the series, so a poll is a single
-    call regardless of how many 15-minute buckets are live.
+    One request returns every open contract in the series, including every
+    strike in a threshold ladder.
     """
 
     def __init__(self, series: str = BTC15M_SERIES):
@@ -297,10 +297,10 @@ class Btc15mFeed:
     def _parse(ticker: str, prefix: str = None) -> Tuple[Optional[str], Optional[str], int]:
         """`KXBTC15M-26OCT011715-15` -> (event_ticker, bucket, horizon_minutes).
 
-        Two listing shapes exist:
+        Listing shapes include:
         - 15-minute up/down: the third segment is the horizon in minutes.
-        - hourly above/below ladders (KXBTCD/KXETHD/KXXRPD): the third segment
-          is a strike (`-T82899.99` greater, `-B91750` between) and carries no
+        - strike ladders (KXBTCD/KXETHD/KXXRPD/KXGOLDD): the third segment is a
+          strike (`-T82899.99` greater, `-B91750` between) and carries no
           horizon; those parse with horizon 0.
         """
         parts = (ticker or "").split("-")
@@ -393,8 +393,8 @@ class Btc15mFeed:
         """The tradable contracts sharing the soonest close.
 
         One contract for 15-minute series (empty selection: nothing to
-        band-walk); a whole strike grid for the hourly ladders (KXBTCD,
-        KXETHD, KXXRPD).
+        band-walk); a whole strike grid for the ladder series (KXBTCD, KXETHD,
+        KXXRPD, KXGOLDD).
         """
         tradable = [m for m in self.markets if m.tradable]
         if not tradable:

@@ -156,7 +156,7 @@ strategy_state = {
 STRATEGY_COMMANDS: Dict[str, List[str]] = {
     "btc_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTC15M", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
     "xrp_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRP15M", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
-    "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXGOLD15M", "--spot-product", "PAXG-USD", "--paper", "--loop", "--interval", "0"],
+    "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXGOLDD", "--spot-product", "PAXG-USD", "--paper", "--loop", "--interval", "0"],
     "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTCD", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
         "eth_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETHD", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
         "xrp_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRPD", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
@@ -977,10 +977,10 @@ STRATEGY_DOCS = {
         "keeps running until you press Stop - nothing re-arms it for you.",
     ),
     "xau_updown": (
-        "GOLD 15-Min Up/Down",
-        'Reads Kalshi\'s GOLD 15-min up/down contract (KXGOLD15M) and compares its Up/Down price '
-        "against live Coinbase PAXG-USD spot (the tradable gold proxy - "
-        "by more than the configured edge. "
+        "GOLD Daily Close Ladder",
+        'Reads Kalshi\'s active daily GOLD strike markets (KXGOLDD) and compares their '
+        "thresholds against live Coinbase PAXG-USD spot. Orders still require the "
+        "configured edge and risk checks. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "
         "keeps running until you press Stop - nothing re-arms it for you.",
     ),
@@ -1833,17 +1833,19 @@ def _current_book_mode() -> Optional[str]:
 
 # Card ordering by market horizon — the ONE source of truth for both the page
 # render (build_snapshot -> _strategy_cards) and the /api payload sort
-# (_mode_payload). All 15-minute strategies lead, then all 1-hour strategies,
-# then the rest (alphabetical tail, so future strategies land predictably).
+# (_mode_payload). 15-minute strategies lead, then daily Gold, then 1-hour
+# strategies, then the rest (alphabetical tail, so new strategies land
+# predictably).
 # DRY and LIVE both render this exact sequence.
 _CARD_GROUPS: Tuple[Tuple[str, ...], ...] = (
-    ("btc_updown", "xrp_updown", "xau_updown"),  # 15-minute
+    ("btc_updown", "xrp_updown"),  # 15-minute
+    ("xau_updown",),  # daily Gold
     ("btc_1h_updown", "hyperliquid_updown", "eth_1h_updown", "xrp_1h_updown"),
 )
 
 
 def _card_sort_key(name: str):
-    """15m cards on top, 1h second, the rest last — stable within groups."""
+    """15m cards first, daily Gold next, hourly cards third, stable in groups."""
     for group_index, group in enumerate(_CARD_GROUPS):
         if name in group:
             return (group_index, group.index(name), "")

@@ -11,7 +11,9 @@ production:
 
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 
+from src.jobs.execute import _rides_to_settlement
 from src.jobs.ladder_trader import UpDownConfig, UpDownTrader
 from src.jobs.market_data import Btc15mFeed, SpotFeed
 
@@ -70,8 +72,50 @@ def test_quick_win_no_longer_reads_the_environment():
 
 
 def test_gold_lane_prices_against_the_paxg_proxy():
-    src = inspect.getsource(UpDownConfig.apply_asset)
-    assert "PAXG-USD" in src
+    from web_dashboard import STRATEGY_COMMANDS, STRATEGY_DOCS
+
+    config = UpDownConfig()
+    config.apply_asset("PAXG-USD")
+    assert config.noise_pct == 0.0003
+    assert config.max_entry_price == 0.85
+
+    command = STRATEGY_COMMANDS["xau_updown"]
+    assert "KXGOLDD" in command
+    assert "PAXG-USD" in command
+    label, description = STRATEGY_DOCS["xau_updown"]
+    assert label == "GOLD Daily Close Ladder"
+    assert "KXGOLDD" in description
+
+
+def test_gold_daily_strike_ticker_is_supported_by_the_existing_market_feed():
+    event, bucket, horizon = Btc15mFeed._parse(
+        "KXGOLDD-26OCT1317-T4164", "KXGOLDD"
+    )
+    assert (event, bucket, horizon) == (
+        "KXGOLDD-26OCT1317",
+        "26OCT1317",
+        0,
+    )
+
+
+def test_gold_daily_contract_uses_updown_settlement_exit_policy():
+    position = SimpleNamespace(
+        strategy="gold_daily_ladder",
+        market_id="KXGOLDD-26OCT1317-T4164",
+    )
+    assert _rides_to_settlement(position) is True
+
+
+def test_gold_lane_does_not_attach_the_bitcoin_benchmark_feed():
+    sentinel = object()
+    gold = UpDownTrader(
+        SpotFeed(), Btc15mFeed(series="KXGOLDD"), brti=sentinel
+    )
+    btc = UpDownTrader(
+        SpotFeed(), Btc15mFeed(series="KXBTC15M"), brti=sentinel
+    )
+    assert gold.brti is None
+    assert btc.brti is sentinel
 
 
 def test_every_trade_log_carries_the_entry_fair():
@@ -122,7 +166,7 @@ def test_no_strategy_reads_the_env_live_gate():
     assert offenders == [], offenders
 
 
-def test_every_crypto_lane_carries_its_own_series_and_feed():
+def test_every_updown_lane_carries_its_own_series_and_feed():
     """No lane may inherit another lane's default series again.
 
     The btc_updown command shipped without --series/--spot-product, so it
@@ -135,7 +179,7 @@ def test_every_crypto_lane_carries_its_own_series_and_feed():
     assert "BTC-USD" in cmds["btc_updown"]
     for lane, series in (
         ("xrp_updown", "KXXRP15M"),
-        ("xau_updown", "KXGOLD15M"),
+        ("xau_updown", "KXGOLDD"),
         ("btc_1h_updown", "KXBTCD"),
         ("eth_1h_updown", "KXETHD"),
         ("xrp_1h_updown", "KXXRPD"),
@@ -152,6 +196,7 @@ def test_series_normalization_never_mangles_real_tickers():
     assert _normalize_updown_series("KXBTC15M") == "KXBTC15M"
     assert _normalize_updown_series("KXETH15M") == "KXETH15M"
     assert _normalize_updown_series("KXXAU15M") == "KXXAU15M"
+    assert _normalize_updown_series("KXGOLDD") == "KXGOLDD"
     assert _normalize_updown_series("btc15m") == "KXBTC15M"
     assert _normalize_updown_series("XRP15M") == "KXXRP15M"
     assert _normalize_updown_series("") == "KXBTC15M"
