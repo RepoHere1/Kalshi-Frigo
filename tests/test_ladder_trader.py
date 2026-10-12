@@ -43,35 +43,15 @@ def _trader(db):
     return UpDownTrader(spot, Btc15mFeed(), UpDownConfig())
 
 
-@pytest.mark.asyncio
-async def test_roll_iq_cannot_be_reenabled_by_config_or_environment(monkeypatch):
+def test_roll_iq_runtime_path_and_enable_config_are_removed(monkeypatch):
     monkeypatch.setenv("ROLL_ENABLED", "1")
-    config = UpDownConfig(roll_enabled=True)
-    assert config.roll_enabled is False
-
-    spot = SpotFeed()
-    spot.price = 84900.0
-    trader = UpDownTrader(spot, Btc15mFeed(), config)
-
-    class UnexpectedRollUse:
-        def note(self, *_args):
-            raise AssertionError("disabled ROLL IQ reached its trading path")
-
-    monkeypatch.setattr(trader, "_roll", UnexpectedRollUse())
-    assert await trader._roll_maybe_buy(live=False, held=[], market=None) is None
-
-
-@pytest.mark.asyncio
-async def test_roll_iq_stays_disabled_if_config_is_mutated_after_init(monkeypatch):
     trader = UpDownTrader(SpotFeed(), Btc15mFeed(), UpDownConfig())
-    trader.config.roll_enabled = True
 
-    class UnexpectedRollUse:
-        def note(self, *_args):
-            raise AssertionError("mutated config revived the ROLL IQ path")
-
-    monkeypatch.setattr(trader, "_roll", UnexpectedRollUse())
-    assert await trader._roll_maybe_buy(live=False, held=[], market=None) is None
+    assert not hasattr(trader.config, "roll_enabled")
+    assert not hasattr(trader, "_roll")
+    assert not hasattr(trader, "_roll_maybe_buy")
+    with pytest.raises(TypeError, match="roll_enabled"):
+        UpDownConfig(roll_enabled=True)
 
 
 # ---------------------------------------------------------------------------
