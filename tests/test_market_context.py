@@ -91,17 +91,18 @@ def test_one_invalid_baseline_window_is_excluded_not_fatal():
     assert rc.available
 
 
-def test_parse_candles_keeps_the_trailing_day_and_overwrites_duplicates():
+def test_parse_candles_keeps_settled_bars_in_the_trailing_day_and_overwrites_duplicates():
     rows = [
-        [NOW - 24 * 3600 - 300, 99, 101, 100, 100, 1],  # outside 24h
-        [NOW - 300, 98, 102, 100, 100, 1],
-        [NOW - 300, 97, 103, 100, 100, 1],  # duplicate: later copy wins
+        [NOW - 24 * 3600 - 600, 99, 101, 100, 100, 1],  # outside 24h
+        [NOW - 900, 98, 102, 100, 100, 1],  # settled
+        [NOW - 900, 97, 103, 100, 100, 1],  # duplicate: later copy wins
+        [NOW - 300, 98, 102, 100, 100, 1],  # still forming: excluded
         [NOW + 300, 98, 102, 100, 100, 1],  # future bar
-        [NOW - 600, 99, 98, 100, 100, 1],  # high below low: rejected
+        [NOW - 1200, 99, 98, 100, 100, 1],  # high below low: rejected
     ]
     bars = mc.parse_candles(rows, NOW)
-    assert list(bars) == [int(NOW - 300)]
-    assert bars[int(NOW - 300)].high == 103
+    assert list(bars) == [int(NOW - 900)]
+    assert bars[int(NOW - 900)].high == 103
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +302,7 @@ def test_kill_switch_yields_a_neutral_state(monkeypatch):
     ctx = mc.MarketContext("PAXG-USD")
     state = ctx.state(NOW, 100.0, 0.0, 0.5)
     assert not state.enabled
-    assert (state.fair_delta, state.edge_add, state.size_mult) == (0.0, 0.0, 1.0)
+    assert (state.edge_add, state.size_mult) == (0.0, 1.0)
 
 
 def _candle_rows(now=NOW, end=END, low=99.0, high=101.0):
@@ -336,18 +337,19 @@ def test_refresh_then_state_combines_range_calendar_and_cited_news():
         feeds=("https://www.coindesk.com/arc/outboundfeeds/rss/", "https://dead.example/rss"),
     )
     ctx._first_due = 0.0
-    asyncio.run(ctx.refresh())
+    asyncio.run(ctx.refresh_now())
     state = ctx.state(NOW, 100.0, 0.0, 0.5)
 
-    assert state.fair_delta == pytest.approx(0.02 * 0.72)
+    assert not hasattr(state, "fair_delta")
     assert state.edge_add == pytest.approx(0.02)
     assert state.size_mult == pytest.approx(0.50)
     assert state.event_tier == "high"
-    assert "news bias" in state.text and "calendar high" in state.text
+    assert state.calendar_status == "fresh"
+    assert "headline bias" in state.text and "calendar high" in state.text
     assert "dead.example" in ctx.last_error
 
 
-def test_sentiment_failure_leaves_fair_value_untouched():
+def test_sentiment_failure_adds_no_headline_risk():
     async def fake_get(url, params):
         if "candles" in url:
             return json.dumps(_candle_rows())
@@ -368,7 +370,79 @@ def test_sentiment_failure_leaves_fair_value_untouched():
         feeds=("https://www.coindesk.com/arc/outboundfeeds/rss/",),
     )
     ctx._first_due = 0.0
-    asyncio.run(ctx.refresh())
+    asyncio.run(ctx.refresh_now())
     state = ctx.state(NOW, 100.0, 0.0, 0.5)
-    assert state.fair_delta == 0.0
+    assert "headlines no_fresh_headlines" in state.text
     assert "sentiment" in ctx.last_error
+
+
+def _drop_current(bars, count):
+    current = sorted(ts for ts in bars if END - mc.WINDOW_S <= ts < END)
+    for ts in current[:count]:
+        del bars[ts]
+
+
+def test_thirty_nine_bars_is_valid_and_thirty_eight_is_not():
+    bars = _history()
+    _drop_current(bars, 9)  # 39 of 48 remain
+    assert mc.range_context(bars, NOW, 100.0).available
+    bars = _history()
+    _drop_current(bars, 10)  # 38 of 48 remain
+    assert not mc.range_context(bars, NOW, 100.0).available
+
+
+def test_breakout_candidate_does_not_start_on_stale_spot():
+    tracker = mc.BreakoutTracker()
+    assert tracker.update(1000.0, 101.2, 60.0, _rc()) == 0
+    assert tracker.frozen is None
+
+
+def test_calendar_that_parses_to_nothing_is_unavailable_not_fresh():
+    async def fake_get(url, params):
+        if url.endswith(".ics"):
+            return "BEGIN:VCALENDAR\nEND:VCALENDAR"
+        return "<html>maintenance</html>"
+
+    ctx = mc.MarketContext(
+        "PAXG-USD", enabled=True, clock=lambda: NOW,
+        http_get=fake_get, classify=None, feeds=(),
+    )
+    ctx._first_due = 0.0
+    asyncio.run(ctx.refresh_now())
+    state = ctx.state(NOW, 100.0, 0.0, 0.5)
+    assert state.calendar_status == "unavailable"
+    assert state.edge_add == pytest.approx(mc.UNKNOWN_CALENDAR_EDGE)
+
+
+def test_state_faults_degrade_to_base_scoring(monkeypatch):
+    ctx = mc.MarketContext("PAXG-USD", enabled=True, clock=lambda: NOW, classify=None)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("bad bars")
+
+    monkeypatch.setattr(mc, "range_context", boom)
+    state = ctx.state(NOW, 100.0, 0.0, 0.5)
+    assert state.enabled
+    assert (state.edge_add, state.size_mult) == (0.0, 1.0)
+    assert "internal error" in state.text
+    assert "state:" in ctx.last_error
+
+
+def test_conflicting_headlines_raise_the_bar_without_moving_price():
+    ctx = mc.MarketContext("PAXG-USD", enabled=True, clock=lambda: NOW, classify=None)
+    ctx._articles = {
+        "feed": (NOW, [
+            mc.Headline("https://x/a", "Gold surges", NOW - 60, 1.0, "feed"),
+            mc.Headline("https://x/b", "Gold slumps", NOW - 60, 1.0, "feed"),
+        ]),
+    }
+    ctx._sentiment = {"https://x/a": (0.9, 0.9), "https://x/b": (-0.9, 0.9)}
+    ctx._events = {
+        "BEA": (NOW, [mc.Event("BEA", "later release", "medium", ts=NOW + 10**6)]),
+        "FED": (NOW, [mc.Event("FED", "later meeting", "high", day=date(2030, 1, 1))]),
+    }
+    state = ctx.state(NOW, 100.0, 0.0, 0.5)
+    assert state.calendar_status == "fresh"
+    assert state.edge_add == pytest.approx(mc.NEWS_CONFLICT_EDGE)
+    assert state.size_mult == 1.0
+    assert "headlines conflicting" in state.text

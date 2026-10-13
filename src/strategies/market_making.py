@@ -18,7 +18,7 @@ import asyncio
 import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
@@ -75,17 +75,6 @@ class MarketMakingOpportunity:
     optimal_no_size: int
 
 
-def normalize_market_payload(payload: Any) -> Any:
-    """Kalshi's ``GET /markets/{ticker}`` wraps the quote under ``market``.
-
-    Quote fields are read from the unwrapped object; reading the wrapper left
-    every quote at zero, so the strategy discarded each candidate.
-    """
-    if isinstance(payload, dict) and isinstance(payload.get("market"), dict):
-        return payload["market"]
-    return payload
-
-
 class AdvancedMarketMaker:
     """
     Advanced market making strategy that provides liquidity while capturing edge.
@@ -135,9 +124,7 @@ class AdvancedMarketMaker:
         for market in markets:
             try:
                 # Get current market data
-                market_data = normalize_market_payload(
-                    await self.kalshi_client.get_market(market.market_id)
-                )
+                market_data = await self.kalshi_client.get_market(market.market_id)
                 if not market_data:
                     continue
 
@@ -655,9 +642,7 @@ class AdvancedMarketMaker:
         """
         try:
             # Get current market data
-            market_data = normalize_market_payload(
-                await self.kalshi_client.get_market(order.market_id)
-            )
+            market_data = await self.kalshi_client.get_market(order.market_id)
             if not market_data:
                 return False
 

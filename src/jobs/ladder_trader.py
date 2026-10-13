@@ -1255,7 +1255,7 @@ class UpDownTrader:
             float(getattr(self.spot, "age", 0.0) or 0.0),
             fair,
         )
-        fair = min(max(fair + _ctx.fair_delta, 0.0), 1.0)
+        # Context never moves fair value: it only raises the edge bar and trims size.
         self._ctx_edge_add = _ctx.edge_add
         self._ctx_size_mult = _ctx.size_mult
         self._ctx_event_tier = _ctx.event_tier
@@ -1566,6 +1566,9 @@ class UpDownTrader:
                     _clip = round(_clip * self._ctx_size_mult, 2)
                 if _sm != 1.00:
                     reason += f" | session_mult {_sm:.2f}"
+            elif self._ctx_size_mult < 1.0:
+                # No live budget: size from the configured notional, then trim it.
+                _clip = round(float(self.config.notional_usd) * self._ctx_size_mult, 2)
             contracts = self._size(fill_price, clip_usd=_clip)
         if side and contracts > 0:
             # The Hyperliquid perp hedge that flattens this clip's direction,
@@ -2048,6 +2051,9 @@ class UpDownTrader:
             return False
         if _ctx.event_tier == "medium" and net < self.config.certain_win_min_net + 0.01:
             return False
+        if _ctx.calendar_status == "unavailable":
+            # No official calendar read at all: do not open new pairs blind.
+            return False
 
         import time as _time
 
@@ -2157,9 +2163,15 @@ class UpDownTrader:
 
         live = should_trade_live()
         self.book.dry = not live
-        # Shared market context refresh (throttled per source; never blocks).
+        # Shared market context: one background refresh (never blocks) and a
+        # breakout observation on every pass.
         try:
-            await self._context.refresh()
+            self._context.schedule_refresh()
+            self._context.observe(
+                time.time(),
+                float(getattr(self.spot, "price", 0.0) or 0.0),
+                float(getattr(self.spot, "age", 0.0) or 0.0),
+            )
         except Exception:  # noqa: BLE001 - context is additive
             pass
         # Awaited directly: mode.run() builds a fresh event loop, which raises
