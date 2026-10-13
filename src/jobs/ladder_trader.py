@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional
 
 from src.config.settings import settings
 from src.jobs.market_data import Btc15mFeed, SpotFeed, UpDownMarket
+from src.jobs.market_context import MarketContext
 
 # A Kalshi quote older than this is not traded against: the book simply has
 # not repriced yet, so any "edge" versus fresh truth is fiction.
@@ -869,6 +870,13 @@ class UpDownTrader:
         # INVENTION #12: risk overlay state for drawdown and vol target.
         self._peak_balance: Optional[float] = None
         self._realized_vol: Optional[float] = None
+        # Shared market context: 4h range, official calendar, cited headlines.
+        # Additive only; the state below is read by evaluate() and the pair path.
+        self._context = MarketContext(getattr(spot, "product", "BTC-USD"))
+        self._ctx_edge_add = 0.0
+        self._ctx_size_mult = 1.0
+        self._ctx_event_tier: Optional[str] = None
+        self._ctx_text = ""
         self.book = UpDownBook(max_open_notional=self.config.max_open_notional)
 
     def evaluate(
@@ -1241,6 +1249,17 @@ class UpDownTrader:
         fair = fair_up_probability(
             spot, target, target * self.config.noise_pct, seconds_left, self._sigma_used
         )
+        _ctx = self._context.state(
+            time.time(),
+            float(getattr(self.spot, "price", 0.0) or 0.0),
+            float(getattr(self.spot, "age", 0.0) or 0.0),
+            fair,
+        )
+        fair = min(max(fair + _ctx.fair_delta, 0.0), 1.0)
+        self._ctx_edge_add = _ctx.edge_add
+        self._ctx_size_mult = _ctx.size_mult
+        self._ctx_event_tier = _ctx.event_tier
+        self._ctx_text = _ctx.text
 
         up_ask = market.up_price
         down_ask = market.down_price
@@ -1318,7 +1337,7 @@ class UpDownTrader:
             else:
                 # TIERED BAR: the model's confidence prices the cushion.
                 _base = tiered_edge_bar(win_prob, self.config.min_edge, self.config)
-            return max(_base + kalshi_fee + self._vol_adj, 0.0)
+            return max(_base + kalshi_fee + self._vol_adj + self._ctx_edge_add, 0.0)
 
         # The band check and sizing run on the price the entry actually pays:
         # the maker bid when resting, else the taker ask.
@@ -1543,6 +1562,8 @@ class UpDownTrader:
             _sm = session_multiplier(self.config)
             if _clip is not None:
                 _clip = round(_clip * _sm, 2)
+                if self._ctx_size_mult < 1.0:
+                    _clip = round(_clip * self._ctx_size_mult, 2)
                 if _sm != 1.00:
                     reason += f" | session_mult {_sm:.2f}"
             contracts = self._size(fill_price, clip_usd=_clip)
@@ -1581,6 +1602,8 @@ class UpDownTrader:
                         reason += f" | poly arb +{_arb['edge']:.2f} ({_arb['legs']})"
             except Exception:  # noqa: BLE001 - annotation only
                 pass
+        if self._ctx_text:
+            reason += self._ctx_text
         signal = UpDownSignal(
             ticker=market.ticker,
             bucket=market.bucket,
@@ -2012,6 +2035,19 @@ class UpDownTrader:
         ok, net = _cw.evaluate(up_ask, down_ask, self.config.certain_win_min_net)
         if not ok:
             return False
+        # Shared context gate for NEW pairs: a high-impact release blocks the
+        # pair; a medium one demands a wider net and a smaller budget. Exits and
+        # the second leg of an open pair are never blocked here.
+        _ctx = self._context.state(
+            time.time(),
+            float(getattr(self.spot, "price", 0.0) or 0.0),
+            float(getattr(self.spot, "age", 0.0) or 0.0),
+            0.5,
+        )
+        if _ctx.event_tier == "high":
+            return False
+        if _ctx.event_tier == "medium" and net < self.config.certain_win_min_net + 0.01:
+            return False
 
         import time as _time
 
@@ -2042,7 +2078,9 @@ class UpDownTrader:
             avail * self.config.certain_win_cash_fraction,
             self.config.max_open_notional,
         )
-        contracts = _cw.contracts_for(up_ask, down_ask, budget)
+        if _ctx.event_tier == "medium":
+            budget *= 0.75
+        contracts = _cw.contracts_within_leg_cap(up_ask, down_ask, budget)
         if contracts < 1:
             return False
 
@@ -2119,6 +2157,11 @@ class UpDownTrader:
 
         live = should_trade_live()
         self.book.dry = not live
+        # Shared market context refresh (throttled per source; never blocks).
+        try:
+            await self._context.refresh()
+        except Exception:  # noqa: BLE001 - context is additive
+            pass
         # Awaited directly: mode.run() builds a fresh event loop, which raises
         # from inside this coroutine.
         mode = await TradingMode(db_path=self._db_path()).current()

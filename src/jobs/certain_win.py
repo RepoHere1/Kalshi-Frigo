@@ -50,3 +50,19 @@ def contracts_for(up_ask: float, down_ask: float, budget_usd: float) -> int:
     if pair_cost <= 0.0 or float(budget_usd) <= 0.0:
         return 0
     return max(0, int(float(budget_usd) // pair_cost))
+
+
+def contracts_within_leg_cap(
+    up_ask: float, down_ask: float, budget_usd: float, leg_cap_usd: float = 1.0
+) -> int:
+    """Pairs that fit the budget AND keep each leg's notional at or under the cap.
+
+    The per-order cap applies to every leg, so the dearer side bounds the pair
+    count even when the budget would buy more.
+    """
+    by_budget = contracts_for(up_ask, down_ask, budget_usd)
+    dearer = max(float(up_ask), float(down_ask))
+    if dearer <= 0.0:
+        return 0
+    by_leg = int(float(leg_cap_usd) // dearer)
+    return max(0, min(by_budget, by_leg))

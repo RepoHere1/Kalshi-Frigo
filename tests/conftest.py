@@ -33,6 +33,10 @@ def _isolate_the_repo_db(tmp_path, monkeypatch):
     monkeypatch applies after this one.
     """
     monkeypatch.setenv("DB_PATH", str(tmp_path / "trading_system.db"))
+    # The shared market context (candles, calendars, RSS, LLM sentiment) makes
+    # network calls. Off by default in tests; tests that exercise it construct
+    # MarketContext with explicit fakes.
+    monkeypatch.setenv("MARKET_CONTEXT_ENABLED", "0")
 
 
 def pytest_collection_modifyitems(config, items):
