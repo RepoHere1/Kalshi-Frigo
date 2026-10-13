@@ -61,38 +61,50 @@ def test_parse_prices_list_and_string():
 
 
 def test_window_question_is_parsed_into_a_priced_bucket():
+    # Use a rolling date: the scanner drops windows older than a week, so a
+    # hardcoded calendar date goes stale and this test rots (see _parse_events).
+    today = datetime.now(timezone.utc)
     scanner = PolyScanner()
     events = [
         {
             "markets": [
                 {
-                    "question": "Bitcoin Up or Down - October 6, 8:45AM-9:00AM ET",
+                    "question": (
+                        f"Bitcoin Up or Down - {today.strftime('%B')} {today.day},"
+                        " 8:45AM-9:00AM ET"
+                    ),
                     "outcomePrices": ["0.62", "0.38"],
                 }
             ]
         }
     ]
     scanner._parse_events(events)
-    end = et_to_utc(10, 6, 9, 0, "AM")
+    end = et_to_utc(today.month, today.day, 9, 0, "AM")
     w = scanner.window_for(end)
     assert w is not None
     assert w.up == 0.62 and w.down == 0.38
 
 
 def test_strike_question_is_parsed():
+    # Rolling date for the same reason as test_window_question_is_parsed...:
+    # strikes older than a week are dropped by _parse_events.
+    today = datetime.now(timezone.utc)
     scanner = PolyScanner()
     events = [
         {
             "markets": [
                 {
-                    "question": "Bitcoin above 87,400 on October 6, 4AM ET?",
+                    "question": (
+                        f"Bitcoin above 87,400 on {today.strftime('%B')} {today.day},"
+                        " 4AM ET?"
+                    ),
                     "outcomePrices": ["0.5", "0.5"],
                 }
             ]
         }
     ]
     scanner._parse_events(events)
-    end = et_to_utc(10, 6, 4, 0, "AM")
+    end = et_to_utc(today.month, today.day, 4, 0, "AM")
     got = scanner.strike_price(end, 87400.0)
     assert got is not None
     assert got[0] == 0.5
