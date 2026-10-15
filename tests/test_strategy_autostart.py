@@ -291,7 +291,6 @@ def test_hyperliquid_is_a_real_toggleable_lane():
     """Hyperliquid is enabled by operator order and obeys its buttons."""
     assert "hyperliquid_updown" in wd.strategy_state
     assert "hyperliquid_updown" in wd.STRATEGY_COMMANDS
-    assert "hyperliquid_updown" not in wd.HEAVY_API_ABUSERS
     cmd = wd.STRATEGY_COMMANDS["hyperliquid_updown"]
     assert "KXHYPE15M" in cmd and "HYPE-USD" in cmd and "--paper" in cmd
 
@@ -373,9 +372,9 @@ def test_only_the_button_writes_the_latch():
     assert "AUTO_START_ALL" not in src
 
 
-def test_hyper_card_sits_right_of_eth(monkeypatch, tmp_path):
+def test_btc_1h_card_sits_right_after_btc_15m(monkeypatch, tmp_path):
     monkeypatch.setattr(wd, "DB_PATH", str(tmp_path / "cards.db"))
     monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
     cards = wd._strategy_cards([], [], "dry")
     names = [c["name"] for c in cards]
-    assert names.index("hyperliquid_updown") == names.index("btc_1h_updown") + 1
+    assert names.index("btc_1h_updown") == names.index("btc_updown") + 1

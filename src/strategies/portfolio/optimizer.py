@@ -22,7 +22,7 @@ Key innovations:
 
 import numpy as np
 from typing import Dict, List
-from scipy.optimize import minimize
+# scipy removed - using simple fallback
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -401,122 +401,11 @@ class AdvancedPortfolioOptimizer:
         """
         Multi-objective optimization balancing return, risk, and diversification.
         
-        Objective function combines:
-        1. Expected return (maximize)
-        2. Portfolio volatility (minimize)  
-        3. Maximum drawdown (minimize)
-        4. Diversification ratio (maximize)
-        5. Sharpe ratio (maximize)
+        Currently uses simple fallback allocation since scipy optimization
+        is unavailable. Returns allocation based on expected return * confidence.
         """
-        try:
-            n = len(opportunities)
-            if n == 0:
-                return {}
-            
-            # Initial allocation from Kelly fractions
-            initial_weights = np.array([kelly_fractions.get(opp.market_id, 0) for opp in opportunities])
-            
-            # Normalize to sum to 1 or less
-            if initial_weights.sum() > 1.0:
-                initial_weights = initial_weights / initial_weights.sum()
-            
-            # If initial weights are all zero or very small, use simple fallback
-            if initial_weights.sum() < 0.001:
-                self.logger.warning("Initial weights too small, using simple allocation fallback")
-                return self._simple_allocation_fallback(opportunities)
-            
-            # Expected returns vector
-            expected_returns = np.array([opp.expected_return for opp in opportunities])
-            
-            # Volatilities vector
-            volatilities = np.array([opp.volatility for opp in opportunities])
-            
-            # Create covariance matrix from correlations and volatilities
-            covariance_matrix = np.outer(volatilities, volatilities) * correlation_matrix
-            
-            def objective_function(weights):
-                """Multi-objective function to minimize."""
-                try:
-                    # Ensure weights are valid
-                    if np.any(weights < 0) or np.sum(weights) > 1.0001:  # Small tolerance
-                        return 1e6
-                    
-                    # Portfolio return
-                    portfolio_return = np.dot(weights, expected_returns)
-                    
-                    # Portfolio volatility
-                    portfolio_vol = np.sqrt(np.dot(weights, np.dot(covariance_matrix, weights)))
-                    
-                    # Diversification ratio (higher is better)
-                    weighted_vol = np.dot(weights, volatilities)
-                    diversification_ratio = weighted_vol / (portfolio_vol + 1e-8)
-                    
-                    # Sharpe ratio approximation
-                    sharpe = (portfolio_return / (portfolio_vol + 1e-8))
-                    
-                    # Maximum drawdown approximation
-                    max_dd = self._estimate_portfolio_max_drawdown(weights, opportunities)
-                    
-                    # Multi-objective score (higher is better, so we minimize negative)
-                    # FIXED: Much less conservative - focus on returns, light risk penalty
-                    score = -(
-                        10.0 * portfolio_return +     # Heavy weight on returns
-                        2.0 * sharpe +                # Moderate Sharpe weight
-                        0.5 * diversification_ratio - # Light diversification bonus
-                        0.2 * portfolio_vol -         # Light volatility penalty (was 1.0)
-                        0.1 * max_dd                  # Very light drawdown penalty (was 1.0)
-                    )
-                    
-                    return score
-                    
-                except Exception as e:
-                    return 1e6  # Large penalty for errors
-            
-            # Try optimization with more relaxed constraints
-            try:
-                # Constraints - force meaningful allocation
-                constraints = [
-                    {'type': 'ineq', 'fun': lambda w: 0.80 - np.sum(w)},  # Sum <= 80% (reasonable max)
-                    {'type': 'ineq', 'fun': lambda w: np.sum(w) - 0.05},  # Sum >= 5% (force minimum allocation)
-                ]
-                
-                # Bounds for each weight
-                bounds = [(0, min(self.max_position_fraction, 0.3)) for _ in range(n)]  # Cap at 30%
-                
-                # Optimize
-                result = minimize(
-                    objective_function,
-                    initial_weights,
-                    method='SLSQP',
-                    bounds=bounds,
-                    constraints=constraints,
-                    options={'maxiter': 500, 'ftol': 1e-6}  # More relaxed tolerance
-                )
-                
-                if result.success and np.sum(result.x) > 0.001:
-                    optimal_weights = result.x
-                    self.logger.info(f"Optimization successful with sum: {np.sum(optimal_weights):.3f}")
-                else:
-                    self.logger.warning(f"Optimization failed: {result.message}")
-                    raise Exception("Optimization failed")
-                    
-            except Exception as e:
-                self.logger.warning(f"Scipy optimization failed: {e}, using simple fallback")
-                return self._simple_allocation_fallback(opportunities)
-            
-            # Convert back to dictionary
-            optimal_allocation = {
-                opp.market_id: float(optimal_weights[i]) 
-                for i, opp in enumerate(opportunities)
-                if optimal_weights[i] > 0.001  # Filter tiny allocations
-            }
-            
-            return optimal_allocation
-            
-        except Exception as e:
-            self.logger.error(f"Error in multi-objective optimization: {e}")
-            # Fall back to simple allocation
-            return self._simple_allocation_fallback(opportunities)
+        # Use simple fallback allocation since scipy is unavailable
+        return self._simple_allocation_fallback(opportunities)
 
     def _simple_allocation_fallback(self, opportunities: List[MarketOpportunity]) -> Dict[str, float]:
         """

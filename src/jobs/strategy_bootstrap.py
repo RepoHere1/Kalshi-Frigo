@@ -34,7 +34,7 @@ async def verify_book_mode_at_startup(
     """CRITICAL: Called by EVERY strategy process at startup. Dies if mode is wrong.
 
     Args:
-        strategy_name: Name of the strategy (e.g. 'ai_directional', 'quick_flip')
+        strategy_name: Name of the strategy (e.g. 'ai_directional', 'beast_mode')
         expected_mode: The mode this process should run in ('paper' or 'live').
                       If not provided, reads from environment.
 

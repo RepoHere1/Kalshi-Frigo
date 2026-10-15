@@ -40,7 +40,6 @@ python cli.py health
 
 # 4. Run an example strategy in paper mode
 python cli.py run --paper                  # AI directional (LLM-driven)
-python cli.py run --safe-compounder        # Edge-based NO-side, no LLM
 ```
 
 Open the dashboard in another terminal:
@@ -92,21 +91,7 @@ python cli.py run --live           # live trading (real money)
 
 Defaults: 15% max drawdown, 45% min confidence, 3% max position size, 30% max sector concentration, quarter-Kelly. All configurable in `src/config/settings.py`.
 
-### 2. Safe Compounder — `python cli.py run --safe-compounder`
-
-Pure edge-based math, no LLM required. Scans every active Kalshi market for NO-side asks above a price threshold with a positive expected-value edge, then places resting maker orders one cent below the ask.
-
-```bash
-python cli.py run --safe-compounder              # dry-run preview
-python cli.py run --safe-compounder --live       # live execution
-
-# Run continuously instead of one cycle and exit:
-python cli.py run --safe-compounder --live --loop --interval 300
-```
-
-Rules: NO side only, YES last ≤ 20¢, NO ask > 80¢, edge > 5¢, max 10%/position, skips sports/entertainment/"mention" markets.
-
-### 3. Beast Mode — `python cli.py run --beast`
+### 2. Beast Mode — `python cli.py run --beast`
 
 Aggressive settings with no category guardrails. Available for comparison and experimentation — **not recommended for live trading**. Running this with real money historically led to significant losses on this repo.
 
@@ -363,7 +348,6 @@ The bot did not kill itself — something external ended the process.
 This is expected behavior, not a bug. The example strategies are conservative by design:
 
 - **AI Directional** requires confidence ≥ 45%, category score ≥ 30, and is gated by drawdown / sector caps. On many days, no markets clear all four filters.
-- **Safe Compounder** requires NO ask > 80¢ AND edge > 5¢. Most NO-side markets don't meet both.
 
 If you want more activity, lower the thresholds in `src/config/settings.py` (or the relevant strategy file) — but that means taking lower-edge bets. Or write your own strategy that targets the markets you actually have an edge on. This repo is a toolkit; the example thresholds are starting points.
 

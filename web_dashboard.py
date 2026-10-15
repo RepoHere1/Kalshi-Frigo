@@ -17,6 +17,7 @@ Railway-ready: listens on $PORT, healthcheck on /health.
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
 import secrets
@@ -64,17 +65,6 @@ _SUPERVISOR_STABLE_SECONDS = 120
 # factually dead or wedged, whatever its pid says. The supervisor kills and
 # respawns it; the page refuses to render it as "running".
 _HEARTBEAT_STALE_SECONDS = 120
-# Strategies that burn the OpenRouter key out of proportion to their value.
-# quick_flip is the #1 spender (3,079 calls, $14.61 tracked, half the lifetime
-# burn) - the Start button on its card is blocked with a popup so it stays off,
-# in BOTH books. The block lives in the client, so the operator is reminded,
-# not secretly overridden.
-HEAVY_API_ABUSERS = {
-    "quick_flip": (
-        "quick_flip is the #1 OpenRouter spender - 3,079 LLM calls and over "
-        "half of the tracked API cost. It is left OFF on purpose."
-    ),
-}
 # Every strategy is wanted from boot. The operator stops lanes by hand; the app
 # does not decide that a strategy it could not start once is better off down.
 # A strategy only stays down when Stop was pressed, which clears `desired`.
@@ -102,13 +92,13 @@ dashboard_state = {
     "balance": None,
     "positions": [],
     "trades": [],
-    "strategies": {
+        "strategies": {
             "btc_1h_updown": {"desired": 0, "running": False, "mode": "paper", "pid": None,
-                              "command": "cli.py run --btc-updown --series KXBTCD --spot-product BTC-USD --paper --loop --interval 0"},
+                              "command": "cli.py run --btc-updown --series KXBTC1H --spot-product BTC-USD --paper --loop --interval 0"},
             "eth_1h_updown": {"desired": 0, "running": False, "mode": "paper", "pid": None,
-                              "command": "cli.py run --btc-updown --series KXETHD --spot-product ETH-USD --paper --loop --interval 0"},
+                              "command": "cli.py run --btc-updown --series KXETH1H --spot-product ETH-USD --paper --loop --interval 0"},
             "xrp_1h_updown": {"desired": 0, "running": False, "mode": "paper", "pid": None,
-                              "command": "cli.py run --btc-updown --series KXXRPD --spot-product XRP-USD --paper --loop --interval 0"},
+                              "command": "cli.py run --btc-updown --series KXXRP1H --spot-product XRP-USD --paper --loop --interval 0"},
         },
     "last_update": None,
     "errors": [],
@@ -131,99 +121,57 @@ dashboard_state = {
 strategy_state = {
     "btc_updown": {"running": False, "pid": None, "mode": "paper"},
     "xrp_updown": {"running": False, "pid": None, "mode": "paper"},
-    "xau_updown": {"running": False, "pid": None, "mode": "paper"},
-    "xau_updown": {"running": False, "pid": None, "mode": "paper"},
     "btc_1h_updown": {"running": False, "pid": None, "mode": "paper"},
+    "eth_updown": {"running": False, "pid": None, "mode": "paper"},
     "eth_1h_updown": {"running": False, "pid": None, "mode": "paper"},
     "xrp_1h_updown": {"running": False, "pid": None, "mode": "paper"},
     "hyperliquid_updown": {"running": False, "pid": None, "mode": "paper"},
-    "ai_directional": {"running": False, "pid": None, "mode": "paper"},
-    "safe_compounder": {"running": False, "pid": None, "mode": "paper"},
-    "beast_mode": {"running": False, "pid": None, "mode": "paper"},
-    "market_making": {"running": False, "pid": None, "mode": "paper"},
-    "quick_flip": {"running": False, "pid": None, "mode": "paper"},
+    "hyperliquid_1h_updown": {"running": False, "pid": None, "mode": "paper"},
 }
+
+# Lanes removed by operator order (cards, commands and strategy code gone).
+# Their strategy_runtime rows still exist on the volume and must be disarmed:
+# a stale desired=1 row is the ONE thing that can auto-start a lane if the same
+# name is ever re-added. The latch reset below is the operator's existing
+# button for exactly that class of row.
+RETIRED_LANES: Tuple[str, ...] = (
+    "ai_directional",
+    "market_making",
+    "safe_compounder",
+    "quick_flip",
+    "xau_updown",
+)
 
 # The command each strategy is actually run with. Every one is a distinct
 # process and writes its own log.
-#
-# Two of these used to be fiction. `market_making` and `quick_flip` had no CLI
-# entry point, so their buttons spawned the AI directional loop: two "strategies"
-# on the page were the same bot twice, with one shared log. And `safe_compounder`
-# ran a single pass and exited, so its button reported "started" for a process
-# that was already gone. `--loop` is what makes a strategy continuous, so it is
-# now part of the command rather than an afterthought.
 STRATEGY_COMMANDS: Dict[str, List[str]] = {
     "btc_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTC15M", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
     "xrp_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRP15M", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
-    "xau_updown": ["cli.py", "run", "--btc-updown", "--series", "KXGOLDD", "--spot-product", "PAXG-USD", "--paper", "--loop", "--interval", "0"],
-    "btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTCD", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
-        "eth_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETHD", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
-        "xrp_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRPD", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
+    "eth_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETH15M", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
+"btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTC1H", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
+    "eth_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETH1H", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
+    "xrp_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRP1H", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
     "hyperliquid_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPE15M", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
-    "ai_directional": ["cli.py", "run", "--paper", "--loop", "--interval", "300"],
-    "safe_compounder": [
-        "cli.py",
-        "run",
-        "--safe-compounder",
-        "--paper",
-        "--loop",
-        "--interval",
-        "300",
-    ],
-    "beast_mode": ["cli.py", "run", "--beast", "--paper", "--loop", "--interval", "300"],
-    "market_making": [
-        "cli.py",
-        "run",
-        "--market-making",
-        "--paper",
-        "--loop",
-        "--interval",
-        "180",
-    ],
-    "quick_flip": ["cli.py", "run", "--quick-flip", "--paper", "--loop", "--interval", "120"],
+    "hyperliquid_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPED", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
 }
 
 # `trade_logs.strategy` and `positions.strategy` are written by the strategies
 # themselves and are not consistent with the dashboard's button names. Without
-# this map every card would read "unattributed" except ai_directional.
+# this map every card would read "unattributed".
 STRATEGY_ALIASES = {
     "btc_updown": "btc_updown",
     "xrp_updown": "xrp_updown",
-    "xau_updown": "xau_updown",
-    "xau_updown": "xau_updown",
     "btc_1h_updown": "btc_1h_updown",
+    "eth_updown": "eth_updown",
+    "eth_15m": "eth_updown",
     "eth_1h_updown": "eth_1h_updown",
     "xrp_1h_updown": "xrp_1h_updown",
     "hyperliquid_updown": "hyperliquid_updown",
-    "ai_directional": "ai_directional",
-    "ai directional": "ai_directional",
-    "directional_trading": "ai_directional",
-    "directional": "ai_directional",
-    # The AI directional strategy records its trades under the name of the
-    # routine that produced them. Without this, every trade and position it made
-    # landed in "unattributed" and the ai_directional card read 0 trades / $0.00
-    # realized while the bot had in fact been trading.
-    # immediate_portfolio_optimization disabled - 0% win rate, $0 PnL
-    "portfolio_optimization": "ai_directional",
-    "safe_compounder": "safe_compounder",
-    "safe compounding": "safe_compounder",
-    "safe_compounding": "safe_compounder",
-    "beast_mode": "beast_mode",
-    "beast": "beast_mode",
-    "market_making": "market_making",
-    "market making": "market_making",
-    "market_maker": "market_making",
-    "quick_flip": "quick_flip",
-    "quick_flip_scalping": "quick_flip",
-    "quick flip": "quick_flip",
-    "quick_flip_scalping_strategy": "quick_flip",
-    "xau": "xau_updown",
-    "xau_15m": "xau_updown",
+    "hyperliquid_1h_updown": "hyperliquid_1h_updown",
+    "hyperliquid": "hyperliquid_updown",
+    "hype": "hyperliquid_updown",
     "xrp": "xrp_updown",
     "xrp_15m": "xrp_updown",
-    "xau": "xau_updown",
-    "xau_15m": "xau_updown",
 }
 
 # Alert webhooks
@@ -260,6 +208,31 @@ def _push_error(message):
 
 
 MAX_STRATEGY_LOG_MB = int(os.environ.get("MAX_STRATEGY_LOG_MB", "25"))
+# Session logs (logs/trading_system_<ts>.log) are written once per process
+# start. The per-file size cap never removes them, so a day of lane restarts
+# leaves hundreds of files (647 files / 311MB at the time this was added).
+# Keep the newest N; the log viewer only ever reads recent ones.
+MAX_SESSION_LOGS = int(os.environ.get("MAX_SESSION_LOGS", "150"))
+
+
+def _prune_session_logs() -> int:
+    """Delete the oldest trading_system_<ts>.log files beyond the keep-count."""
+    try:
+        files = sorted(
+            LOG_DIR.glob("trading_system_*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return 0
+    removed = 0
+    for path in files[MAX_SESSION_LOGS:]:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            break
+    return removed
 
 
 def _trim_log(path, cap_bytes: int = None, keep_tail: int = 1024 * 1024) -> None:
@@ -293,42 +266,10 @@ def _log_trim_loop() -> None:
         try:
             for path in _log_files():
                 _trim_log(path)
+            _prune_session_logs()
         except Exception:  # noqa: BLE001
             pass
         time.sleep(300)
-
-
-def _one_shot_dry_topup() -> None:
-    """Operator order: bring the DRY fake balance back to $300 WITHOUT
-    touching positions or trade history. One shot - a ledger row marks the
-    top-up done, so future boots never re-fund the book behind the
-    operator's back. Enabled by DRY_TOPUP_ONCE=<amount> in the env."""
-    topup = os.environ.get("DRY_TOPUP_ONCE", "").strip()
-    if not topup:
-        return
-    try:
-        target = float(topup)
-    except ValueError:
-        return
-    try:
-        from src.utils.mode import TradingMode
-
-        mgr = TradingMode(db_path=str(DB_PATH))
-        acct = _run_async(mgr.dry_account())
-        cash = float((acct or {}).get("cash") or 0.0)
-        if cash >= target:
-            return
-        for row in (_run_async(mgr.ledger(limit=200000)) or []):
-            if (row.get("note") or "") == "operator top-up once":
-                return
-        _run_async(
-            mgr.adjust_cash(
-                round(target - cash, 2), note="operator top-up once"
-            )
-        )
-        print(f"[dry-topup] DRY cash {cash:.2f} -> {target:.2f} (no history touched)", flush=True)
-    except Exception as exc:  # noqa: BLE001 - a failed top-up must never stop boots
-        _push_error(f"dry top-up failed: {type(exc).__name__}: {exc}")
 
 
 def _log_files():
@@ -336,11 +277,20 @@ def _log_files():
 
     setup_logging() writes logs/trading_system_<timestamp>.log plus
     logs/latest.log, so there is no single stable 'trading_system.log'.
+
+    mtime resolution is coarse enough that a rotated file and latest.log can
+    carry identical timestamps, which made the order filesystem-dependent: on
+    a tie `latest.log` wins, because that is the file whose whole purpose is
+    to be the current one.
     """
     if not LOG_DIR.is_dir():
         return []
     try:
-        return sorted(LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return sorted(
+            LOG_DIR.glob("*.log"),
+            key=lambda p: (p.stat().st_mtime, p.name == "latest.log"),
+            reverse=True,
+        )
     except OSError:
         return []
 
@@ -976,31 +926,31 @@ STRATEGY_DOCS = {
         "MANUAL CONTROL: starts only when you press Start in this book, and "
         "keeps running until you press Stop - nothing re-arms it for you.",
     ),
-    "xau_updown": (
-        "GOLD Daily Close Ladder",
-        'Reads Kalshi\'s active daily GOLD strike markets (KXGOLDD) and compares their '
-        "thresholds against live Coinbase PAXG-USD spot. Orders still require the "
-        "configured edge and risk checks. "
+    "btc_1h_updown": (
+        "BTC 1-Hour Up/Down",
+        'Reads Kalshi\'s BTC 1-hour above/below ladder (KXBTC1H) and compares its '
+                "strike nearest the money against live Coinbase BTC-USD spot. Manual control. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "
         "keeps running until you press Stop - nothing re-arms it for you.",
     ),
-    "btc_1h_updown": (
-        "BTC 1-Hour Up/Down",
-        'Reads Kalshi\'s BTC 1-hour above/below ladder (KXBTCD) and compares its '
-                "strike nearest the money against live Coinbase BTC-USD spot. Manual control. "
+    "eth_updown": (
+        "ETH 15-Min Up/Down",
+        'Reads Kalshi\'s ETH 15-min up/down contract (KXETH15M) and compares its '
+        "Up/Down price against live Coinbase ETH-USD spot. Takes one clip only when "
+        "the two disagree by more than the configured edge. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "
         "keeps running until you press Stop - nothing re-arms it for you.",
     ),
     "eth_1h_updown": (
         "ETH 1-Hour Up/Down",
-        'Reads Kalshi\'s ETH 1-hour above/below ladder (KXETHD) and compares its '
+        'Reads Kalshi\'s ETH 1-hour above/below ladder (KXETH1H) and compares its '
                 "strike nearest the money against live Coinbase ETH-USD spot. Manual control. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "
         "keeps running until you press Stop - nothing re-arms it for you.",
     ),
     "xrp_1h_updown": (
         "XRP 1-Hour Up/Down",
-        'Reads Kalshi\'s XRP 1-hour above/below ladder (KXXRPD) and compares '
+        'Reads Kalshi\'s XRP 1-hour above/below ladder (KXXRP1H) and compares '
                 "its strike nearest the money against live Coinbase XRP-USD spot. Manual control. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "
         "keeps running until you press Stop - nothing re-arms it for you.",
@@ -1012,29 +962,12 @@ STRATEGY_DOCS = {
         "two disagree by more than the configured edge. Enabled by operator "
         "order; toggled by hand like every other lane.",
     ),
-    "ai_directional": (
-        "LLM Directional",
-        "Ingests Kalshi markets, scores each one with an LLM decision pass, then "
-        "sizes a Kelly-criterion position and places paper or live orders.",
-    ),
-    "safe_compounder": (
-        "Safe Compounder",
-        "No LLM. Pure edge math: only takes trades whose model-implied probability "
-        "beats the market price by more than the configured threshold.",
-    ),
-    "beast_mode": (
-        "Beast Mode",
-        "Aggressive multi-strategy runner (market making + directional + arbitrage) "
-        "with risk-parity allocation. Not the default.",
-    ),
-    "market_making": (
-        "Market Making",
-        "Quotes both sides of the order book and earns the spread, capped by "
-        "inventory-risk and correlation limits.",
-    ),
-    "quick_flip": (
-        "Quick Flip Scalping",
-        "Short-horizon strategy that enters on momentum and exits on a small " "favourable move.",
+    "hyperliquid_1h_updown": (
+        "Hyperliquid (HYPE) 1-Hour Up/Down",
+        'Reads Kalshi\'s HYPE hourly above/below ladder (KXHYPED) and compares its '
+        "strike nearest the money against live HYPE-USD spot. Same trader and exit "
+        "policy as the other 1-hour lanes. Enabled by operator order; toggled by "
+        "hand like every other lane.",
     ),
 }
 
@@ -1123,7 +1056,7 @@ def _current_book_tickers() -> List[Dict[str, Any]]:
                     held.append(r)
         return held or rows
     try:
-        where = _book_filter("dry")
+        where = _book_filter("live")
         rows = _db_many([(_SQL_POSITIONS.format(book=where), ())])
 
         # Inside the try, and tolerant of a row type that is not a dict: this
@@ -1833,19 +1766,21 @@ def _current_book_mode() -> Optional[str]:
 
 # Card ordering by market horizon — the ONE source of truth for both the page
 # render (build_snapshot -> _strategy_cards) and the /api payload sort
-# (_mode_payload). 15-minute strategies lead, then daily Gold, then 1-hour
+# (_mode_payload). 15-minute strategies lead, then 1-hour
 # strategies, then the rest (alphabetical tail, so new strategies land
 # predictably).
 # DRY and LIVE both render this exact sequence.
 _CARD_GROUPS: Tuple[Tuple[str, ...], ...] = (
-    ("btc_updown", "xrp_updown"),  # 15-minute
-    ("xau_updown",),  # daily Gold
-    ("btc_1h_updown", "hyperliquid_updown", "eth_1h_updown", "xrp_1h_updown"),
+    ("btc_updown",),  # BTC 15m
+    ("btc_1h_updown",),  # sits right after BTC 15m (operator order)
+    ("eth_updown", "eth_1h_updown"),  # ETH 15m sits right before ETH 1h
+    ("hyperliquid_updown", "hyperliquid_1h_updown"),  # HYPE 15m then HYPE 1h
+    ("xrp_updown", "xrp_1h_updown"),  # XRP 15m sits right before XRP 1h
 )
 
 
 def _card_sort_key(name: str):
-    """15m cards first, daily Gold next, hourly cards third, stable in groups."""
+    """Operator order: BTC 15m, BTC 1h, ETH 15m, ETH 1h, HYPE, XRP 15m, XRP 1h."""
     for group_index, group in enumerate(_CARD_GROUPS):
         if name in group:
             return (group_index, group.index(name), "")
@@ -1856,8 +1791,6 @@ def _strategy_cards(
     curve_rows: List[Dict[str, Any]],
     position_rows: List[Dict[str, Any]],
     book: str,
-    roll_trades_rows: Optional[List[Dict[str, Any]]] = None,
-    roll_open_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """One card per strategy: headline stats plus its own cumulative P&L curve.
 
@@ -1912,8 +1845,6 @@ def _strategy_cards(
             "description": description,
             "running": bool(running_for_this_book),
             "running_book": db_mode or None,
-            "heavy_api_abuser": name in HEAVY_API_ABUSERS,
-            "heavy_api_abuser_reason": HEAVY_API_ABUSERS.get(name, ""),
             "stuck": bool(bool(db_pid) and _pid_alive(db_pid, db_row) and hb_stale),
             "heartbeat_age_sec": round(hb_age, 1) if hb_age is not None else None,
             "pid": st.get("pid"),
@@ -1930,12 +1861,6 @@ def _strategy_cards(
             "best": 0.0,
             "worst": 0.0,
             "open_positions": 0,
-            "roll_clips": 0,
-            "roll_wins": 0,
-            "roll_losses": 0,
-            "roll_open": 0,
-            "roll_realized": 0.0,
-            "roll_rate": 0.0,
             "deployed": 0.0,
             "first_trade": None,
             "last_trade": None,
@@ -1982,68 +1907,15 @@ def _strategy_cards(
             2,
         )
 
-    # Closed roll outcomes are persisted on trade_logs; open clips remain in
-    # positions until their normal close path writes the trade log.
-    roll_stats: Dict[str, Dict[str, Any]] = {}
-    for row in (roll_trades_rows or []):
-        if _resolve_book(row.get("mode")) != book:
-            continue
-        name = _strategy_bucket(row.get("strategy"))
-        roll_stats[name] = row
-
-    roll_open_stats: Dict[str, Dict[str, Any]] = {}
-    for row in (roll_open_rows or []):
-        if _resolve_book(row.get("mode")) != book:
-            continue
-        roll_open_stats[_strategy_bucket(row.get("strategy"))] = row
-
     for card in cards.values():
         card["win_rate"] = (
             round(100.0 * card["wins"] / card["trades"], 1) if card["trades"] else 0.0
-        )
-        # Populate roll stats
-        roll_data = roll_stats.get(card["name"], {})
-        open_data = roll_open_stats.get(card["name"], {})
-        card["roll_clips"] = int(roll_data.get("roll_trades") or 0)
-        card["roll_wins"] = int(roll_data.get("roll_wins") or 0)
-        card["roll_losses"] = int(roll_data.get("roll_losses") or 0)
-        card["roll_open"] = int(open_data.get("roll_open") or 0)
-        card["roll_realized"] = round(float(roll_data.get("roll_realized") or 0.0), 2)
-        roll_decisions = card["roll_wins"] + card["roll_losses"]
-        card["roll_rate"] = (
-            round(100.0 * card["roll_wins"] / roll_decisions, 1) if roll_decisions else 0.0
         )
     # Horizon grouping: ALL 15-minute cards lead, ALL 1-hour cards follow,
     # then everything else — one sort (shared with _mode_payload) so DRY and
     # LIVE can never disagree, and the single page loop stays intact.
     ordered = sorted(cards.values(), key=lambda c: _card_sort_key(c["name"]))
     return ordered
-
-
-def _roll_card_payload(
-    closed_rows: List[Dict[str, Any]], open_rows: List[Dict[str, Any]], book: str
-) -> Dict[str, Any]:
-    """Aggregate persisted ROLL-IQ results for the selected book."""
-    closed = [row for row in (closed_rows or []) if _resolve_book(row.get("mode")) == book]
-    opened = [row for row in (open_rows or []) if _resolve_book(row.get("mode")) == book]
-    closed_clips = sum(int(row.get("roll_trades") or 0) for row in closed)
-    open_clips = sum(int(row.get("roll_open") or 0) for row in opened)
-    wins = sum(int(row.get("roll_wins") or 0) for row in closed)
-    losses = sum(int(row.get("roll_losses") or 0) for row in closed)
-    flats = sum(int(row.get("roll_flats") or 0) for row in closed)
-    decisions = wins + losses
-    return {
-        "book": book,
-        "closed_clips": closed_clips,
-        "open_clips": open_clips,
-        "total_clips": closed_clips + open_clips,
-        "wins": wins,
-        "losses": losses,
-        "flats": flats,
-        "win_rate": round(100.0 * wins / decisions, 1) if decisions else 0.0,
-        "realized_pnl": round(sum(float(row.get("roll_realized") or 0.0) for row in closed), 2),
-        "open_deployed": round(sum(float(row.get("roll_deployed") or 0.0) for row in opened), 2),
-    }
 
 
 def _resolve_book(value: Optional[str]) -> str:
@@ -2155,12 +2027,6 @@ _SQL_OPEN = (
 # use - the legacy `live = 0` flag disagreed with those whenever a row carried
 # a mode stamp, so the deployed tile quoted one book while the accounts card
 # quoted another.
-_SQL_OPEN_DRY = (
-    "SELECT COUNT(*) AS positions,"
-    " COALESCE(SUM(quantity * entry_price), 0.0) AS capital"
-    " FROM positions WHERE status = 'open'"
-    " AND COALESCE(NULLIF(mode, ''), 'dry') = 'dry'"
-)
 _SQL_AI = (
     "SELECT COALESCE(SUM(cost_usd), 0.0) AS cost, COUNT(*) AS analyses"
     " FROM market_analyses WHERE date(analysis_timestamp) = date('now')"
@@ -2175,13 +2041,7 @@ _SQL_STRATEGY = (
     " COALESCE(SUM(pnl), 0.0) AS pnl,"
     " COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,"
     " COALESCE(MAX(pnl), 0.0) AS best,"
-    " COALESCE(MIN(pnl), 0.0) AS worst,"
-    " COALESCE(SUM(CASE WHEN rationale LIKE '%ROLL-IQ%'"
-    " AND COALESCE(exit_reason, '') != 'no_kalshi_position' THEN 1 ELSE 0 END), 0) AS roll_clips,"
-    " COALESCE(SUM(CASE WHEN rationale LIKE '%ROLL-IQ%' AND pnl > 0"
-    " AND COALESCE(exit_reason, '') != 'no_kalshi_position' THEN 1 ELSE 0 END), 0) AS roll_wins,"
-    " COALESCE(SUM(CASE WHEN rationale LIKE '%ROLL-IQ%' AND pnl < 0"
-    " AND COALESCE(exit_reason, '') != 'no_kalshi_position' THEN 1 ELSE 0 END), 0) AS roll_losses"
+    " COALESCE(MIN(pnl), 0.0) AS worst"
     " FROM trade_logs WHERE {book} GROUP BY strategy ORDER BY pnl DESC"
 )
 _SQL_RECENT = (
@@ -2230,40 +2090,120 @@ _SQL_STRATEGY_CURVE = (
     " exit_timestamp, exit_reason, pnl, market_id FROM trade_logs"
     " ORDER BY COALESCE(exit_timestamp, entry_timestamp) ASC LIMIT 2000"
 )
-# Roll trades: filtered by rationale containing ROLL-IQ marker
-_SQL_ROLL_TRADES = (
-    "SELECT COALESCE(NULLIF(strategy, ''), 'unattributed') AS strategy,"
-    " COALESCE(NULLIF(mode, ''), 'dry') AS mode,"
-    " COUNT(*) AS roll_trades,"
-    " COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS roll_wins,"
-    " COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) AS roll_losses,"
-    " COALESCE(SUM(CASE WHEN pnl = 0 THEN 1 ELSE 0 END), 0) AS roll_flats,"
-    " COALESCE(SUM(pnl), 0.0) AS roll_realized"
-    " FROM trade_logs WHERE rationale LIKE '%ROLL-IQ%' AND {book}"
-    " AND COALESCE(exit_reason, '') != 'no_kalshi_position'"
-    " GROUP BY strategy, mode"
-)
-_SQL_ROLL_OPEN = (
-    "SELECT COALESCE(NULLIF(strategy, ''), 'unattributed') AS strategy,"
-    " COALESCE(NULLIF(mode, ''), 'dry') AS mode, COUNT(*) AS roll_open,"
-    " COALESCE(SUM(quantity * entry_price), 0.0) AS roll_deployed"
-    " FROM positions WHERE status = 'open' AND rationale LIKE '%ROLL-IQ%' AND {book}"
-    " GROUP BY strategy, mode"
-)
 _SQL_POSITIONS = (
     "SELECT market_id, side, entry_price, quantity, strategy, stop_loss_price,"
     " take_profit_price, status, timestamp, mode FROM positions"
     " WHERE status = 'open' AND {book} ORDER BY timestamp DESC"
 )
+# The simulated book's own open positions, so its headline tiles describe
+# rehearsal money instead of the real account's.
+_SQL_OPEN_DRY = (
+    "SELECT COUNT(*) AS positions,"
+    " COALESCE(SUM(quantity * entry_price), 0.0) AS capital"
+    " FROM positions WHERE status = 'open'"
+    " AND COALESCE(NULLIF(mode, ''), 'dry') = 'dry'"
+)
+# ---------------------------------------------------------------------------
+# The ALL NO MARKETS page's own queries: NO-side only, every maker (limit)
+# entry. The lanes enter at the side's bid with a resting limit order (see
+# execute.py's _maker branch: "Maker entry in BOTH BOOKS"), so every row here
+# is a limit order by construction and the price shown is the limit, not the
+# ask the taker would have paid.
+#
+# `side` is stored uppercase ('NO' / 'YES') by the broker.
+#
+# Separated book: every row is tagged strategy='all_no', so a BTC 15-min clip
+# and an ALL NO clip never share a table, a tally or a balance. The original
+# up/down lanes keep whatever they did before, untouched. An unlabelled row is
+# NOT the ALL NO book's - `COALESCE(NULLIF(strategy,''),'') = 'all_no'` is
+# false for it, so a lane that never stamps a strategy cannot leak in.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Operator order: the ALL NO book starts at $250 of fake money. It is NOT the
+# DRY book's $300 and NOT a mirror of the real LIVE balance - a separate book
+# needs its own stable baseline it can compound from, and a $250 start keeps
+# the clip sizes legible (see _all_no_buy_amount below).
+ALL_NO_STARTING_BALANCE = 250.0
+# Quarter-Kelly, the house default (see src/utils/position_sizing.py). Full
+# Kelly on a binary with a thin edge is how a book goes to zero.
+ALL_NO_KELLY_MULTIPLIER = 0.25
+# Hard cap on one clip: 20% of the book. Fractional Kelly already throttles,
+# but a model fair of 0.999 against a 0.50 price returns a Kelly fraction that
+# would stake the whole account without a ceiling.
+ALL_NO_MAX_CLIP_PCT = 0.20
+# Kalshi takes a whole-contract count and has no dollar floor - the exchange
+# minimum is ONE contract. Never round a clip to zero.
+MIN_ORDER_CONTRACTS = 1
 
-
-def _row_open_dry(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """The simulated book's own open positions - never the real ones."""
-    row = rows[0] if rows else {}
-    return {
-        "positions": int(row.get("positions") or 0),
-        "capital": round(float(row.get("capital") or 0.0), 2),
-    }
+_SQL_ALL_NO_BOOK_CREATE = """
+CREATE TABLE IF NOT EXISTS all_no_book (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    amount REAL NOT NULL,
+    balance_after REAL NOT NULL,
+    market_id TEXT,
+    side TEXT,
+    price REAL,
+    quantity INTEGER,
+    note TEXT,
+    timestamp TEXT NOT NULL
+)
+"""
+# The four book-scoped row queries. `strategy = 'all_no'` is the whole point:
+# the lanes' NO rows stay in the lanes. An unlabelled row is NOT the ALL NO
+# book's - COALESCE(NULLIF(strategy,''),'') = 'all_no' is false for it, so a
+# lane that never stamps a strategy cannot leak into this book by accident.
+_SQL_NO_OPEN = (
+    "SELECT id, market_id, side, entry_price, quantity,"
+    " ROUND(quantity * entry_price, 4) AS cost,"
+    " COALESCE(entry_fair, 0) AS entry_fair,"
+    " COALESCE(NULLIF(strategy, ''), 'unattributed') AS strategy,"
+    " COALESCE(stop_loss_price, 0) AS stop_loss_price,"
+    " COALESCE(take_profit_price, 0) AS take_profit_price,"
+    " COALESCE(confidence, 0) AS confidence,"
+    " status, COALESCE(NULLIF(mode, ''), 'dry') AS mode, timestamp"
+    " FROM positions WHERE side = 'NO' AND status != 'closed'"
+    " AND COALESCE(NULLIF(strategy, ''), '') = 'all_no'"
+    " ORDER BY timestamp DESC LIMIT 300"
+)
+_SQL_NO_CLOSED = (
+    "SELECT id, market_id, side, entry_price, exit_price, quantity,"
+    " ROUND(quantity * entry_price, 4) AS cost,"
+    " ROUND(exit_price * quantity, 4) AS proceeds,"
+    " pnl, COALESCE(fee_paid, 0) AS fee_paid,"
+    " COALESCE(entry_fair, 0) AS entry_fair,"
+    " COALESCE(NULLIF(strategy, ''), 'unattributed') AS strategy,"
+    " COALESCE(exit_reason, '') AS exit_reason,"
+    " COALESCE(NULLIF(mode, ''), 'dry') AS mode,"
+    " entry_timestamp, exit_timestamp FROM trade_logs"
+    " WHERE side = 'NO'"
+    " AND COALESCE(exit_reason, '') != 'no_kalshi_position'"
+    " AND COALESCE(NULLIF(strategy, ''), '') = 'all_no'"
+    " ORDER BY COALESCE(exit_timestamp, entry_timestamp) DESC LIMIT 300"
+)
+_SQL_NO_TALLY = (
+    "SELECT COUNT(*) AS closed,"
+    " COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,"
+    " COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0) AS losses,"
+    " COALESCE(SUM(pnl), 0.0) AS pnl,"
+    " COALESCE(SUM(fee_paid), 0.0) AS fees,"
+    " COALESCE(AVG(entry_price), 0.0) AS avg_entry,"
+    " COALESCE(SUM(quantity * entry_price), 0.0) AS cost"
+    " FROM trade_logs WHERE side = 'NO'"
+    " AND COALESCE(exit_reason, '') != 'no_kalshi_position'"
+    " AND COALESCE(NULLIF(strategy, ''), '') = 'all_no'"
+)
+_SQL_NO_OPEN_TALLY = (
+    "SELECT COUNT(*) AS positions,"
+    " COALESCE(SUM(quantity * entry_price), 0.0) AS cost,"
+    " COALESCE(SUM(quantity), 0) AS contracts,"
+    # The 84-92c band is the backtested NO sweet spot: systematically
+    # underpriced by ~4pp, the clearest statistical edge on the board.
+    " COALESCE(SUM(CASE WHEN entry_price >= 0.84 AND entry_price <= 0.92"
+    " THEN 1 ELSE 0 END), 0) AS sweet"
+    " FROM positions WHERE side = 'NO' AND status != 'closed'"
+    " AND COALESCE(NULLIF(strategy, ''), '') = 'all_no'"
+)
 
 
 def _row_trades(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2322,6 +2262,222 @@ def _row_open(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _row_no_tally(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Lifetime NO-side tally: wins, losses, P&L and average limit price."""
+    row = rows[0] if rows else {}
+    wins = int(row.get("wins") or 0)
+    losses = int(row.get("losses") or 0)
+    decided = wins + losses
+    return {
+        "closed": int(row.get("closed") or 0),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / decided * 100, 1) if decided else 0.0,
+        "pnl": round(float(row.get("pnl") or 0.0), 2),
+        "fees": round(float(row.get("fees") or 0.0), 2),
+        "avg_entry": round(float(row.get("avg_entry") or 0.0), 4),
+        "cost": round(float(row.get("cost") or 0.0), 2),
+    }
+
+
+def _row_no_open_tally(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Open NO book: contracts on the board, capital at risk, sweet-spot count."""
+    row = rows[0] if rows else {}
+    return {
+        "positions": int(row.get("positions") or 0),
+        "contracts": int(row.get("contracts") or 0),
+        "cost": round(float(row.get("cost") or 0.0), 2),
+        # Contracts resting inside the 84-92c NO band.
+        "sweet": int(row.get("sweet") or 0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Kelly sizing for the ALL NO book
+#
+# The kernel lives in src/utils/position_sizing.py (the one home, pinned by
+# tests/test_position_sizing.py). This is POLICY, which is where a strategy is
+# allowed its own multiplier and caps: quarter-Kelly, and never more than a
+# fifth of the book on one clip.
+#
+# For a NO contract bought at price P with a model fair of F:
+#   stake P to win (1 - P)   -> net odds b = (1 - P) / P
+#   f* = (F*b - (1 - F)) / b   [kelly_fraction(F, b)]
+# which is the fraction of the book to put at risk on that one clip.
+# ---------------------------------------------------------------------------
+def _all_no_kelly(fair: float, price: float) -> float:
+    """Fraction of the ALL NO book to stake on one clip. Never negative.
+
+    Returns 0.0 rather than raising on an untradeable price, because the page
+    renders this per row and a bad price must not take the table down.
+    """
+    from src.utils.position_sizing import kelly_fraction
+
+    if price <= 0.0 or price >= 1.0 or fair <= 0.0:
+        return 0.0
+    # Net odds for a NO contract bought at `price`.
+    b = (1.0 - price) / price
+    f = kelly_fraction(fair, b) * ALL_NO_KELLY_MULTIPLIER
+    return max(0.0, min(f, ALL_NO_MAX_CLIP_PCT))
+
+
+def _all_no_buy_amount(fair: float, price: float) -> Dict[str, Any]:
+    """Kelly-sized buy for one NO clip: dollars at risk and contract count.
+
+    The contract count is the whole number of contracts the stake actually
+    buys, floored at one: Kalshi takes a whole-contract count with no dollar
+    minimum, so rounding a clip to zero would silently drop a paper bet.
+    """
+    if price <= 0.0 or price >= 1.0:
+        return {"fraction": 0.0, "stake": 0.0, "contracts": 0}
+    fraction = _all_no_kelly(fair, price)
+    if fraction <= 0.0:
+        return {"fraction": 0.0, "stake": 0.0, "contracts": 0}
+    stake = fraction  # a fraction of the book; the caller multiplies by balance
+    # One contract's cost, so the count is the whole contracts the stake buys.
+    contracts = max(MIN_ORDER_CONTRACTS, int(fraction / price))
+    return {"fraction": fraction, "stake": stake, "contracts": contracts}
+
+
+def _all_no_book() -> Dict[str, Any]:
+    """The ALL NO book's own ledger: $250 of fake money, seeded once.
+
+    Separate from the DRY book's $300 and not a mirror of the real LIVE
+    balance. The seed is written once and remembered, so a redeploy never
+    re-funds a book that has already traded - the same one-shot latch pattern
+    the DRY top-up uses. Read-only otherwise: this page never moves money.
+    """
+    import aiosqlite
+
+    async def _run() -> Dict[str, Any]:
+        async with aiosqlite.connect(DB_PATH) as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute(_SQL_ALL_NO_BOOK_CREATE)
+            # Seed once. `note` is the latch: a second boot sees the row and
+            # leaves the balance whatever trading made it.
+            cur = await conn.execute(
+                "SELECT COUNT(*) AS n FROM all_no_book WHERE note = 'seed'"
+            )
+            seeded = int((await cur.fetchone())["n"] or 0)
+            if not seeded:
+                stamp = _now()
+                await conn.execute(
+                    "INSERT INTO all_no_book"
+                    " (kind, amount, balance_after, note, timestamp)"
+                    " VALUES ('deposit', ?, ?, 'seed', ?)",
+                    (ALL_NO_STARTING_BALANCE, ALL_NO_STARTING_BALANCE, stamp),
+                )
+                await conn.commit()
+            cur = await conn.execute(
+                "SELECT amount, balance_after, kind FROM all_no_book"
+                " ORDER BY id DESC LIMIT 1"
+            )
+            row = await cur.fetchone()
+            cur = await conn.execute(
+                "SELECT COUNT(*) AS n FROM all_no_book WHERE note != 'seed'"
+            )
+            entries = int((await cur.fetchone())["n"] or 0)
+            cur = await conn.execute(
+                "SELECT COALESCE(SUM(amount), 0.0) AS moved FROM all_no_book"
+                " WHERE kind IN ('buy', 'settle')"
+            )
+            moved = float((await cur.fetchone())["moved"] or 0.0)
+            return {
+                "balance": round(float(row["balance_after"] or 0.0), 2) if row else 0.0,
+                "starting": ALL_NO_STARTING_BALANCE,
+                "entries": entries,
+                # Realized P&L of the book itself: what its own buy/settle rows
+                # netted, so the number cannot be confused with a lane's.
+                "pnl": round(moved, 2),
+            }
+
+    try:
+        return _run_async(_run())
+    except Exception as e:  # noqa: BLE001 - a missing ledger must not 500 the page
+        _push_error(f"ALL NO book read: {e}")
+        return {
+            "balance": 0.0,
+            "starting": ALL_NO_STARTING_BALANCE,
+            "entries": 0,
+            "pnl": 0.0,
+        }
+
+
+def _row_no_open(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """One dict per open NO contract, ready to render as a table row.
+
+    `edge` is entry_fair minus the limit actually paid - the model's stated
+    edge on the clip. It is shown, never implied, so a reviewer can see which
+    rows sat in the 84-92c band on evidence rather than on assertion.
+    """
+    out: List[Dict[str, Any]] = []
+    for r in rows or []:
+        qty = float(r.get("quantity") or 0)
+        entry = float(r.get("entry_price") or 0.0)
+        fair = float(r.get("entry_fair") or 0.0)
+        out.append(
+            {
+                "id": r.get("id"),
+                "market_id": r.get("market_id") or "",
+                "strategy": r.get("strategy") or "unattributed",
+                "entry_price": entry,
+                "quantity": r.get("quantity") or 0,
+                "cost": round(qty * entry, 2),
+                "entry_fair": fair,
+                "edge": round(fair - entry, 4),
+                "stop_loss": r.get("stop_loss_price") or 0.0,
+                "take_profit": r.get("take_profit_price") or 0.0,
+                "confidence": round(float(r.get("confidence") or 0.0), 2),
+                "status": r.get("status") or "open",
+                "mode": r.get("mode") or "dry",
+                "timestamp": str(r.get("timestamp") or ""),
+                # What Kelly said for this clip, computed now from the same
+                # fair and limit the row records. Shown next to the clip so the
+                # sizing can be checked rather than trusted.
+                "kelly": round(_all_no_kelly(fair, entry) * 100, 2),
+            }
+        )
+    return out
+
+
+def _row_no_closed(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """One dict per closed NO trade: entry, exit, P&L and the reason it closed."""
+    out: List[Dict[str, Any]] = []
+    for r in rows or []:
+        qty = float(r.get("quantity") or 0)
+        entry = float(r.get("entry_price") or 0.0)
+        exit_ = float(r.get("exit_price") or 0.0)
+        cost = qty * entry
+        pnl = round(float(r.get("pnl") or 0.0), 2)
+        out.append(
+            {
+                "id": r.get("id"),
+                "market_id": r.get("market_id") or "",
+                "strategy": r.get("strategy") or "unattributed",
+                "entry_price": entry,
+                "exit_price": exit_,
+                "quantity": r.get("quantity") or 0,
+                "cost": round(cost, 2),
+                "proceeds": round(float(r.get("proceeds") or 0.0), 2),
+                "pnl": pnl,
+                # ROI on capital actually deployed. A settled binary can print
+                # a large percentage on a 1-contract clip, so the raw number is
+                # kept honest against the dollars at risk rather than hidden.
+                "roi": round(pnl / cost * 100, 1) if cost > 0 else 0.0,
+                "entry_fair": round(float(r.get("entry_fair") or 0.0), 4),
+                "fee_paid": round(float(r.get("fee_paid") or 0.0), 4),
+                "exit_reason": r.get("exit_reason") or "",
+                "mode": r.get("mode") or "dry",
+                "entry_timestamp": str(r.get("entry_timestamp") or ""),
+                "exit_timestamp": str(r.get("exit_timestamp") or ""),
+                # The Kelly fraction this clip was sized at, recomputed from the
+                # recorded fair and entry so the closed history is checkable.
+                "kelly": round(_all_no_kelly(float(r.get("entry_fair") or 0.0), float(r.get("entry_price") or 0.0)) * 100, 2),
+            }
+        )
+    return out
+
+
 def _row_data(
     counts: List[List[Dict[str, Any]]], ai: List[Dict[str, Any]], llm: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
@@ -2343,9 +2499,6 @@ def _row_breakdown(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for r in rows:
         trades = int(r.get("trades") or 0)
         wins = int(r.get("wins") or 0)
-        roll_clips = int(r.get("roll_clips") or 0)
-        roll_wins = int(r.get("roll_wins") or 0)
-        roll_losses = int(r.get("roll_losses") or 0)
         out.append(
             {
                 "strategy": r.get("strategy") or "unattributed",
@@ -2356,17 +2509,18 @@ def _row_breakdown(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "best": round(float(r.get("best") or 0.0), 2),
                 "worst": round(float(r.get("worst") or 0.0), 2),
                 "win_rate": round(wins / trades * 100, 1) if trades else 0.0,
-                "roll_clips": roll_clips,
-                "roll_wins": roll_wins,
-                "roll_losses": roll_losses,
-                "roll_rate": (
-                    round(roll_wins / (roll_wins + roll_losses) * 100, 1)
-                    if roll_wins + roll_losses
-                    else 0.0
-                ),
             }
         )
     return out
+
+
+def _row_open_dry(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The simulated book's own open positions - never the real ones."""
+    row = rows[0] if rows else {}
+    return {
+        "positions": int(row.get("positions") or 0),
+        "capital": round(float(row.get("capital") or 0.0), 2),
+    }
 
 
 def _row_positions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2609,36 +2763,36 @@ def build_snapshot() -> Dict[str, Any]:
         [
             (_SQL_TRADES.format(book=where), ()),
             (_SQL_OPEN.format(book=where), ()),
-            (_SQL_OPEN_DRY, ()),
             (_SQL_AI, ()),
             (_SQL_LLM, ()),
             (_SQL_STRATEGY.format(book=where), ()),
             (_SQL_RECENT.format(book=where), ()),
             (_SQL_EQUITY.format(book=where), ()),
             (_SQL_POSITIONS.format(book=where), ()),
+            (_SQL_OPEN_DRY, ()),
             (_SQL_STRATEGY_CURVE, ()),
             (_SQL_FAIR_BANDS.format(book=where), ()),
-            (_SQL_ROLL_TRADES.format(book=where), ()),
-            (_SQL_ROLL_OPEN.format(book=where), ()),
         ]
         + [(f"SELECT COUNT(*) AS n FROM {t}", ()) for t in DATA_TABLES]
     )
     (
         trades_r,
         open_r,
-        dry_open_r,
         ai_r,
         llm_r,
         strat_r,
         recent_r,
         equity_r,
         pos_r,
+        dry_open_r,
         curve_r,
         fairs_r,
-        roll_trades_r,
-        roll_open_r,
-    ) = batch[:13]
-    counts = batch[13:]
+    ) = batch[:11]
+    # The per-table counts follow the eleven book queries. Anything that reorders
+    # this batch must renumber the slice with it: an off-by-one here made
+    # "never_run" read the wrong table's count and report a database with markets
+    # as never having run.
+    counts = batch[11:]
 
     # Equity curve is fetched newest-first; flip it so the chart reads left to right.
     equity_rows = list(reversed(equity_r))
@@ -2673,8 +2827,7 @@ def build_snapshot() -> Dict[str, Any]:
     running = _running_strategies()
     errors: List[Dict[str, Any]] = cast(List[Dict[str, Any]], dashboard_state["errors"])
     events: List[Dict[str, Any]] = cast(List[Dict[str, Any]], dashboard_state["events"])
-    cards = _strategy_cards(curve_r, pos_r, book, roll_trades_r, roll_open_r)
-    roll_card = _roll_card_payload(roll_trades_r, roll_open_r, book)
+    cards = _strategy_cards(curve_r, pos_r, book)
 
     def _count(index: int) -> int:
         """Rows in a count result, tolerating a table that does not exist yet.
@@ -2714,9 +2867,9 @@ def build_snapshot() -> Dict[str, Any]:
         "never_run": never_run,
         "trades": {**_row_trades(trades_r), "by_fair_band": _row_fair_bands(fairs_r)},
         "open": _row_open(open_r),
-        "open_dry": _row_open_dry(dry_open_r),
         "data": _row_data(counts, ai_r, llm_r),
         "positions": positions,
+        "open_dry": _row_open_dry(dry_open_r),
         "stale_live_rows": dashboard_state.get("stale_live_rows", 0),
         "recent_trades": recent,
         "by_strategy": _row_breakdown(strat_r),
@@ -2725,7 +2878,6 @@ def build_snapshot() -> Dict[str, Any]:
         "running_count": len(running),
         "book": book,
         "strategy_cards": cards,
-        "roll_card": roll_card,
         "config": _config_payload(),
         "strategy_docs": [
             {
@@ -2783,37 +2935,8 @@ def _safe_mode_payload() -> Dict[str, Any]:
     except Exception as e:
         _push_error(f"Mode payload: {e}")
         return {
-            "mode": "dry",
+            "mode": "live",
             "token_set": token_required(),
-            "dry": {
-                "starting_balance": 300.0,
-                "cash": 300.0,
-                "deployed": 0.0,
-                "equity": 300.0,
-                "realized": 0.0,
-                "total_pnl": 0.0,
-                "closed_trades": 0,
-                "ledger_entries": 0,
-                "return_pct": 0.0,
-            },
-            "live": {
-                "starting_balance": 0.0,
-                "cash": 0.0,
-                "deployed": 0.0,
-                "open_positions": 0,
-                "equity": 0.0,
-                "realized": 0.0,
-                "total_pnl": 0.0,
-                "closed_trades": 0,
-                "ledger_entries": 0,
-                "return_pct": 0.0,
-            },
-            "dry_funding": {
-                "connected": True,
-                "balance": 300.0,
-                "can_fund": True,
-                "reason": "",
-            },
             "funding": {"connected": False, "balance": 0.0, "can_fund": False, "reason": str(e)},
         }
 
@@ -2921,13 +3044,11 @@ def _mode_payload() -> Dict[str, Any]:
     mgr = _mode_manager()
     mode = run(mgr.current())
     # Reconcile before reporting, so the DRY headline is derived from the
-    # persisted book rather than from a counter that can drift from it.
-    drift = run(mgr.reconcile_dry())
+    # persisted rows rather than from a counter that can drift from them.
     dry = run(mgr.dry_account())
     payload: Dict[str, Any] = {
         "mode": mode,
         "token_set": token_required(),
-        "drift": drift,
         # Both books are reported, always scoped to themselves. The page renders
         # the one it is in, but a DRY view that merely *hid* the real account
         # would still be one refactor away from showing it again.
@@ -2978,7 +3099,6 @@ def _mode_payload() -> Dict[str, Any]:
             "can_fund": False,
             "reason": "",
         }
-    assert MODE_DRY  # keeps the import meaningful for readers
     # Same horizon order as the page grid: 15m top, 1h second, rest last.
     payload["cards"] = dict(
         sorted(payload.get("cards", {}).items(), key=lambda iv: _card_sort_key(iv[0]))
@@ -3075,21 +3195,20 @@ def api_mode_set():
         # the DRY switch erased the ledger, the open positions and the closes, so
         # a profitable book kept snapping back to $300 with nothing to show for
         # the difference. Only the explicit reset endpoint wipes.
-        run(mgr.ensure_dry_account())
+        run(mgr.dry_account())
     _audit(f"trading mode set to {mode.upper()}")
     return jsonify({"ok": True, **_mode_payload()})
 
 
 @app.route("/api/dry/cash", methods=["POST"])
 def api_dry_cash():
-    """Set the simulated DRY cash to an exact amount, auditing the move.
+    """Set the DRY book's funding baseline to an exact amount.
 
-    Unlike /api/dry/reset this does NOT wipe positions, closes or the
-    ledge r - it only refunds the book (the account ran the balance down
-    to cents while positions were still open, and every further fill was
-    being refused for lack of funds). The starting figure is rebased to
-    the same amount so "P&L since reset" measures from the new
-    baseline. Token-gated like every mutating route.
+    DRY cash is DERIVED from the book's rows, so this moves the baseline the
+    identity runs from rather than writing a cash number - every open row and
+    every close stays accounted for. The baseline is rebased to the same amount
+    so "P&L since reset" measures from the new baseline. Token-gated like every
+    mutating route.
     """
     denied = require_token()
     if denied is not None:
@@ -3102,27 +3221,10 @@ def api_dry_cash():
     except (TypeError, ValueError):
         return jsonify({"error": "amount must be a number"}), 400
     if amount <= 0.0 or amount > 100000.0:
-        return jsonify({"error": f"amount  out of range"}), 400
+        return jsonify({"error": f"amount {amount} out of range"}), 400
     mgr = _mode_manager()
     try:
-        acct = run(mgr.dry_account())
-        cash = float((acct or {}).get("cash") or 0.0)
-        delta = round(amount - cash, 2)
-        if abs(delta) >= 0.005:
-            run(mgr.adjust_cash(delta, note=f"operator cash set to {amount:.2f}"))
-        else:
-            run(mgr.set_dry_cash(amount))
-        # Rebase the starting figure so the book's baseline matches its
-        # actual funding; without this the P&L line measures from a stale
-        # 200/300 that no longer describes the book.
-        from src.utils import mode as _mode
-
-        async def _rebase() -> None:
-            async with mgr._conn() as conn:
-                await mgr._set(conn, _mode._START_KEY, f"{amount:.2f}")
-                await conn.commit()
-
-        run(_rebase())
+        run(mgr.set_dry_cash(amount))
     except Exception as e:
         _push_error(f"DRY cash set: {e}")
         return jsonify({"error": str(e)}), 500
@@ -3132,7 +3234,7 @@ def api_dry_cash():
 
 @app.route("/api/dry/reset", methods=["POST"])
 def api_dry_reset():
-    """Top the DRY account back up to its starting balance and clear the ledger."""
+    """Top the DRY account back to its baseline. Positions and closes stay."""
     denied = require_token()
     if denied is not None:
         return denied
@@ -3177,7 +3279,7 @@ def api_strategies_reset_state():
         snapshot = _run_async(store.snapshot())
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e)}), 500
-    for lane in strategy_state:
+    for lane in (*strategy_state, *RETIRED_LANES):
         for book in ("paper", "live"):
             row = snapshot.get(_rk(lane, book))
             if not row:
@@ -3351,107 +3453,6 @@ def api_maintenance_backfill_fair():
             "samples": samples,
         }
     )
-
-
-@app.route("/api/maintenance/reconcile-dry", methods=["POST"])
-def api_maintenance_reconcile_dry():
-    """One-time DRY ledger repair: credit the close money the book never got.
-
-    Reconciliation identity — the simulated cash must equal
-        starting + realized (trade logs) − cost of open positions.
-    The gap is money that was never booked: pre-payout-fix resolution
-    winners, phantom reaper closes (entered, never filled, never credited),
-    and fee drift. This computes the delta from the DB itself and books it
-    as ONE 'adjust' ledger row naming the repair. Idempotent: a second run
-    finds ~$0 and changes nothing.
-    """
-    denied = require_token()
-    if denied is not None:
-        return denied
-    import aiosqlite as _a
-
-    async def _work() -> Dict[str, Any]:
-        mode = _mode_manager()
-        acct = await mode.dry_account()
-        cash = float(acct.get("cash") or 0.0)
-        realized = float(acct.get("realized") or 0.0)
-        starting = float(acct.get("starting_balance") or 200.0)
-        deployed = 0.0
-        phantom_cost = 0.0
-        phantoms = 0
-        async with _a.connect(DB_PATH) as conn:
-            conn.row_factory = lambda c, r: dict(
-                zip([d[0] for d in c.description], r)
-            )
-
-            async def _has(table: str) -> bool:
-                cur = await conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                    (table,),
-                )
-                return await cur.fetchone() is not None
-
-            if await _has("positions"):
-                cur = await conn.execute(
-                    "SELECT COALESCE(ROUND(SUM(entry_price*quantity),2),0) AS cost,"
-                    " COUNT(*) AS n FROM positions WHERE status='open'"
-                    " AND COALESCE(NULLIF(mode,''),'dry')='dry'"
-                )
-                row = await cur.fetchone()
-                deployed = float(row["cost"] or 0.0)
-            if await _has("trade_logs"):
-                cur = await conn.execute(
-                    "SELECT COALESCE(ROUND(SUM(entry_price*quantity),2),0) AS pc,"
-                    " COUNT(*) AS n FROM trade_logs"
-                    " WHERE exit_reason='no_kalshi_position'"
-                    " AND COALESCE(NULLIF(mode,''),'dry')='dry'"
-                )
-                row = await cur.fetchone()
-                phantom_cost = float(row["pc"] or 0.0)
-                phantoms = int(row["n"] or 0)
-        expected = round(starting + realized - deployed, 2)
-        delta = round(expected - cash, 2)
-        if abs(delta) > 1000.0:
-            return {
-                "ok": False,
-                "error": f"refusing a ${delta:.2f} adjustment - outside sanity",
-            }
-        applied = None
-        if abs(delta) > 0.01:
-            note = (
-                "reconciliation repair: close credits missing from the ledger "
-                f"(phantom reaper closes ${phantom_cost:.2f} across {phantoms}; "
-                "pre-payout-fix resolutions and fee drift make up the rest)"
-            )
-            applied = await mode.adjust_cash(delta, note)
-        return {
-            "ok": True,
-            "starting": starting,
-            "realized": realized,
-            "deployed": deployed,
-            "cash_before": cash,
-            "cash_expected": expected,
-            "delta": delta,
-            "phantom_cost": phantom_cost,
-            "phantoms": phantoms,
-            "applied": applied,
-        }
-
-    try:
-        return jsonify(_run_async(_work()))
-    except Exception as e:  # noqa: BLE001
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/dry/ledger")
-def api_dry_ledger():
-    """Recent simulated fills."""
-    try:
-        from src.utils.mode import run
-
-        return jsonify({"ledger": run(_mode_manager().ledger(100))})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/trades")
@@ -3758,27 +3759,67 @@ def api_live_flatten():
     return jsonify(result)
 
 
-@app.route("/api/dry/audit")
-def api_dry_audit():
-    """Check the DRY book against its own ledger and report what disagrees.
-
-    Read-only. Reports orphan positions (rows with no fill behind them),
-    duplicated closes, and a cash balance that cannot be derived from the
-    ledger - the three ways this book's headline numbers came to contradict
-    each other.
-    """
-    try:
-        from src.utils.mode import run
-
-        return jsonify(_run_async(_mode_manager().repair_dry_book()))
-    except Exception as e:
-        _push_error(f"DRY audit: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
 # ---------------------------------------------------------------------------
 # Routes — HTML
 # ---------------------------------------------------------------------------
+@app.route("/all-no-markets")
+def all_no_markets():
+    """Serve the ALL NO MARKETS page — white background, black cards, NO-side only.
+
+    Every row on this page is a NO (limit/maker) order: the lanes rest buys at
+    the side's bid rather than crossing the spread, which is what the backtested
+    NO-side strategy requires (Kalshi taker fees are 7% vs 1.75% maker, and the
+    84-92c NO band carries the favorite-longshot edge). The page is read-only -
+    no order is placed, cancelled or modified from here.
+    """
+    open_rows, closed_rows, tally, open_tally = [], [], {}, {}
+    book = _all_no_book()
+    try:
+        res = _db_many(
+            [
+                (_SQL_NO_OPEN, ()),
+                (_SQL_NO_CLOSED, ()),
+                (_SQL_NO_TALLY, ()),
+                (_SQL_NO_OPEN_TALLY, ()),
+            ]
+        )
+        open_rows = _row_no_open(res[0])
+        closed_rows = _row_no_closed(res[1])
+        tally = _row_no_tally(res[2])
+        open_tally = _row_no_open_tally(res[3])
+    except Exception as e:
+        _push_error(f"DB query for all-no-markets: {e}")
+
+    # The page lives in its own HTML file (static/all_no_markets.html) so the
+    # markup can be edited without touching this module. It is read from disk
+    # and rendered as a Jinja source rather than served raw, because every
+    # tally and every row is real database output interpolated server-side.
+    # A missing file renders the empty state rather than a 500: the numbers are
+    # the point, and an unreadable page hides them worse than an empty one.
+    try:
+        source = (BASE_DIR / "static" / "all_no_markets.html").read_text(errors="replace")
+    except OSError as e:
+        _push_error(f"all_no_markets.html unreadable: {e}")
+        source = "<p class='empty'>all_no_markets.html could not be read.</p>"
+
+    return render_template_string(
+        source,
+        open_rows=open_rows,
+        closed_rows=closed_rows,
+        tally=tally,
+        open_tally=open_tally,
+        book=book,
+        kelly={
+            "multiplier": ALL_NO_KELLY_MULTIPLIER,
+            "max_clip_pct": ALL_NO_MAX_CLIP_PCT,
+            # What a fixture edge at the middle of the sweet spot would size to,
+            # so the rule on the page is a worked example, not a claim.
+            "example": _all_no_buy_amount(0.90, 0.88),
+        },
+        now=_now(),
+    )
+
+
 @app.route("/")
 def dashboard():
     """Server-render the dashboard so the HTML ships populated, not as a shell.
@@ -4452,7 +4493,7 @@ def api_strategy_detail(name):
             (_SQL_POSITIONS.format(book=where), ()),
             (_SQL_RECENT.format(book=where), ()),
             # Not filtered in SQL: `strategy` is written by each strategy under
-            # its own name (quick_flip_scalping, directional_trading, ...), so an
+            # its own name (directional_trading, ...), so an
             # equality filter against the button name would match nothing. The
             # alias map is applied in Python instead.
             (
@@ -4462,13 +4503,11 @@ def api_strategy_detail(name):
                 " ORDER BY COALESCE(exit_timestamp, entry_timestamp) DESC LIMIT 400",
                 (),
             ),
-            (_SQL_ROLL_TRADES.format(book=where), ()),
-            (_SQL_ROLL_OPEN.format(book=where), ()),
         ]
     )
-    curve_r, pos_r, _recent_r, trades_r, roll_trades_r, roll_open_r = batch
+    curve_r, pos_r, _recent_r, trades_r = batch
 
-    cards = _strategy_cards(curve_r, pos_r, book, roll_trades_r, roll_open_r)
+    cards = _strategy_cards(curve_r, pos_r, book)
     card = next((c for c in cards if c["name"] == name), None)
     if card is None:
         return jsonify({"error": f"Unknown strategy: {name}"}), 404
@@ -4552,9 +4591,6 @@ def api_strategy_toggle(name):
         print(f"[api_strategy_toggle] {name} NOT FOUND in strategy_state", flush=True)
         return jsonify({"error": f"Unknown strategy: {name}"}), 404
 
-    # LAW + cost guard: heavy API abusers stay OFF until the operator
-
-    #
     # PERMANENT GUARD: THE OPERATOR'S BUTTON IS LAW. DRY and LIVE are separate
     # forever. If the book mode read fails, refuse the operation rather than
     # guess. A guessed mode is THE EXACT BUG that armed LIVE when DRY was
@@ -4574,32 +4610,7 @@ def api_strategy_toggle(name):
             ),
             503,
         )
-    # deliberately re-enables them in code. The page button already pops an
-    # explanation; the API enforces the same rule so a direct POST or bulk
-    # Start cannot resurrect the lane behind the operator's back. Stops are
-    # always allowed.
-    if name in HEAVY_API_ABUSERS:
-        try:
-            _rec = _run_async(_runtime_store().snapshot())
-            _row = _rec.get(_runtime_key(name)) or {}
-            _pid = _row.get("pid")
-            _running = bool(_pid) and _pid_alive(_pid, _row)
-        except Exception:  # noqa: BLE001
-            _running = False
-        if not _running:
-            return (
-                jsonify(
-                    {
-                        "error": (
-                            f"{name} is locked OFF as a heavy API abuser: "
-                            f"{HEAVY_API_ABUSERS.get(name, '')} Re-enable it in "
-                            f"code if you accept the LLM burn."
-                        )
-                    }
-                ),
-                403,
-            )
-
+    # LAW: the operator's button decides. Nothing else gates a start.
     st = strategy_state[name]
     # The persisted book mode is the SOURCE OF TRUTH for which book we are in.
     # A button pressed while the switch reads DRY cannot spawn a LIVE process,
@@ -4912,7 +4923,8 @@ def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
     # sys.executable guarantees the child uses the same interpreter (and venv)
     # as the dashboard, rather than whatever 'python' resolves to on PATH.
     py = sys.executable or "python"
-    cmd = [py, *STRATEGY_COMMANDS.get(name, STRATEGY_COMMANDS["ai_directional"])]
+    _fallback_cmd = ["cli.py", "run", "--paper"]
+    cmd = [py, *(STRATEGY_COMMANDS.get(name) or _fallback_cmd)]
     if mode == "live":
         # The command tables are written in paper; LIVE is the same process with
         # the real-money flag. should_trade_live() inside the child re-checks the
@@ -5024,17 +5036,15 @@ def _account_payload(mode: str) -> Dict[str, Any]:
 
     The curve is aggregated from `trade_logs` by day and rebuilt from the
     database on every call, so it is persistent across restarts rather than an
-    in-memory buffer that a redeploy would erase. In DRY the book filter selects
-    simulated rows only, which is what keeps the DRY card honest.
-    """
-    from src.utils.mode import MODE_DRY
+    in-memory buffer that a redeploy would erase.
 
-    dry_book = mode == MODE_DRY
-    where = (
-        "COALESCE(NULLIF(mode, ''), 'dry') = 'dry'"
-        if dry_book
-        else ("COALESCE(NULLIF(mode, ''), 'dry') = 'live'")
-    )
+    Everything is scoped to ONE book: DRY reports the simulated book, LIVE the
+    real one. A card that mixed the two showed a $6,700 curve drawn from
+    simulated closes next to the real account's realized figure - two books on
+    one card, which is worse than showing neither.
+    """
+    dry_book = _resolve_book(mode) == "dry"
+    where = _book_filter(mode)
     curve_sql = _SQL_ACCOUNT_CURVE.format(book=where)
     today_sql = (
         "SELECT COALESCE(SUM(pnl), 0.0) AS pnl, COUNT(*) AS trades,"
@@ -5057,52 +5067,55 @@ def _account_payload(mode: str) -> Dict[str, Any]:
     trades_today = int(today.get("trades") or 0)
     wins_today = int(today.get("wins") or 0)
 
+    # DRY funds itself from the derived simulated book. LIVE funds itself from
+    # Kalshi, whose balance is what the account actually holds - mirroring one
+    # into the other is what previously made DRY inherit a $15.41 balance and
+    # read as broken.
     if dry_book:
-        from src.utils.mode import run as mode_run
+        from src.utils.mode import run as _mode_run
 
-        book = mode_run(_mode_manager().dry_account())
-        cash, equity = book["cash"], book["equity"]
-        starting = book["starting_balance"]
-        realized = book["realized"]
-        exposure = book["deployed"]
-        open_positions = book["open_positions"]
-        closed = book["closed_trades"]
-        wins = max(wins_today, 0)
+        account = _mode_run(_mode_manager().dry_account())
+        starting = float(account.get("starting_balance") or 0.0)
+        cash = float(account.get("cash") or 0.0)
+        equity = float(account.get("equity") or 0.0)
+        exposure = float(account.get("deployed") or 0.0)
+        realized = today_pnl
+        total_pnl = float(account.get("total_pnl") or 0.0)
+        label = "DRY account — simulated money"
     else:
         account = _kalshi_account()
+        starting = 0.0
         cash = float(dashboard_state.get("balance") or 0.0)  # type: ignore[arg-type]
         exposure = account["exposure"]
         equity = round(cash + exposure, 2)
-        starting = 0.0
-        realized = round(float(today.get("pnl") or 0.0), 2)
-        open_positions = account["market_count"] + account["event_count"]
-        closed = int(today.get("trades") or 0)
-        wins = wins_today
+        realized = today_pnl
+        total_pnl = round(account.get("realized") or 0.0, 2)
+        label = "LIVE Kalshi account"
+
+    open_positions = int(account.get("open_positions") or 0)
 
     return {
         "book": "dry" if dry_book else "live",
-        "label": "DRY account (simulated)" if dry_book else "LIVE Kalshi account",
+        "label": label,
         "cash": round(cash, 2),
         "equity": round(equity, 2),
+        "exposure": exposure,
         "starting_balance": round(starting, 2),
-        "return_pct": round(100.0 * (equity - starting) / starting, 2) if starting else 0.0,
-        "exposure": round(exposure, 2),
+        "realized": realized,
+        "total_pnl": total_pnl,
         "open_positions": open_positions,
-        "realized_all_time": round(realized, 2),
+        "closed_trades": trades_today,
+        "wins": wins_today,
+        "losses": max(trades_today - wins_today, 0),
         "today": {
             "pnl": today_pnl,
             "trades": trades_today,
-            "wins": wins_today,
-            "losses": max(trades_today - wins_today, 0),
-            "win_rate": round(100.0 * wins_today / trades_today, 1) if trades_today else 0.0,
-            "avg": round(today_pnl / trades_today, 2) if trades_today else 0.0,
+            "win_rate": round(wins_today / trades_today * 100, 1) if trades_today else 0.0,
         },
-        "closed_trades": closed,
         "curve": {"labels": labels, "pnl": values},
     }
 
 
-@app.route("/api/accounts", methods=["GET"])
 def api_accounts():
     """Both account cards. Always both books, each scoped to itself."""
     mode = _current_book_mode()
@@ -5495,6 +5508,12 @@ h1 span{color:var(--dim);font-weight:400}
    RED - the same alarm the flag carries - not the shared green. */
 .modebtn.live.on{background:rgba(161,0,0,.20);color:var(--blood);box-shadow:inset 0 -2px 0 var(--blood);text-shadow:0 0 10px rgba(161,0,0,.55)}
 .modebtn:disabled{opacity:.5;cursor:not-allowed}
+/* ALL NO is a link, not a button, so it needs to inherit the SAME box: same
+   padding, weight, tracking and radius-matched ends, or it reads as a stray
+   link that happens to be parked next to the mode switch. */
+a.modebtn{display:inline-flex;align-items:center;text-decoration:none;line-height:normal}
+.modebtn.allno{color:var(--blue);font-weight:800}
+.modebtn.allno:hover{background:rgba(56,132,255,.14)}
 
 /* ---------- Mode is a whole-page state, not a badge you have to find ----------
    LIVE and DRY now share the same clean green palette (DRY was the visually
@@ -5560,6 +5579,24 @@ body[data-mode="dry"]  .brand .logo{border-color:rgba(77,159,255,.4);box-shadow:
 .row.two{grid-template-columns:1.15fr .85fr}
 .row.half{grid-template-columns:1fr 1fr}
 @media(max-width:1000px){.row.two,.row.half{grid-template-columns:1fr}}
+
+/* ---------- portrait / phone ----------
+   Operator order: every card must be FULLY visible in portrait. A 430px
+   minimum card width overflowed a ~360-410px viewport, so the right-hand
+   columns of every card were clipped. Below this breakpoint the grid is
+   single-column, the stat row halves, and rows are allowed to wrap - no
+   element may exceed the viewport width. */
+@media (max-width:600px){
+  body{padding:14px 10px 40px}
+  .wrap{max-width:100%}
+  .cards{grid-template-columns:1fr;gap:10px}
+  .cstats{grid-template-columns:repeat(2,1fr);gap:8px 6px}
+  .ctop,.cfoot,.ph,.bar{flex-wrap:wrap}
+  .row.three{grid-template-columns:1fr}
+  .tile .v{font-size:22px}
+  .mono,.cname,.recs li{overflow-wrap:anywhere;word-break:break-word}
+  .card{padding:10px}
+}
 .panel{
   background:var(--panel);border:1px solid var(--line);border-radius:var(--r);
   box-shadow:var(--shadow);overflow:hidden;display:flex;flex-direction:column;
@@ -5606,7 +5643,7 @@ tbody tr:hover{background:rgba(255,255,255,.022)}
 .scroll::-webkit-scrollbar{width:8px;height:8px}
 .scroll::-webkit-scrollbar-thumb{background:var(--line2);border-radius:8px}
 
-canvas{max-height:250px}
+canvas{max-height:250px;max-width:100%}
 
 /* ---------- controls ---------- */
 button{
@@ -5642,7 +5679,7 @@ pre{
 }
 .note-box b{color:var(--amber)}
 /* strategy cards: one per strategy, each with its own persistent curve */
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:12px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(430px,100%),1fr));gap:12px}
 .row.three{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}
 .card{
   background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:11px 12px;
@@ -5737,14 +5774,15 @@ button.loading.yellow::after {
       <span class="dot"></span>
       <span id="modeFlagText">{{ 'LIVE MODE' if s.mode.mode == 'live' else 'DRY MODE' }}</span>
     </div>
-    <!-- DRY / LIVE switch -->
+    <!-- DRY / LIVE switch. ALL NO MARKETS sits in the SAME control group with
+         the SAME styling as the two mode buttons: it is the third book of the
+         three, it opens its own page, and it must not read as a stray link
+         parked outside the control it belongs with. -->
     <div class="modeswitch">
       <button id="modeDry"  class="modebtn {{ 'on' if s.mode.mode != 'live' else '' }}" onclick="setMode('dry')">DRY</button>
       <button id="modeLive" class="modebtn live {{ 'on' if s.mode.mode == 'live' else '' }}" onclick="setMode('live')">LIVE</button>
+      <a href="/all-no-markets" class="modebtn allno" id="allNoBtn" title="ALL NO MARKETS — NO-side only, maker entries, $250 of its own simulated money">ALL NO</a>
     </div>
-  </div>
-  <div class="hostcell">
-    <div class="url" onclick="navigator.clipboard.writeText(location.href)" title="Click to copy this URL">{{ s.public_domain or 'localhost' }}</div>
   </div>
   <div class="stamp">Rendered {{ s.generated_at }}</div>
 </header>
@@ -5780,23 +5818,61 @@ button.loading.yellow::after {
 
 <!-- ============ headline tiles ============ -->
 {% set live = s.mode.mode == 'live' %}
-{% set dry = s.mode.dry %}
-<!-- Headline tiles describe the book the bot is ACTUALLY trading.
-     DRY -> the simulated account. LIVE -> the real Kalshi account.
-     Never the other one: in DRY the real balance and real positions sitting in
-     the headline made the page contradict its own DRY MODE flag. -->
+<!-- Headline tiles describe the ONE book: the real Kalshi account. The
+     simulated book is gone, so a headline can never describe a book the
+     bot is not actually trading. -->
 <div class="tiles">
   <div class="tile">
     <div class="k">Engine</div>
     <div class="v">{% if s.status == 'online' %}<span class="pill ok"><span class="dot pulse"></span>ONLINE</span>{% else %}<span class="pill no">OFF</span>{% endif %}</div>
     <div class="s" id="tUptime">up {{ (s.uptime_sec // 60) if s.uptime_sec is defined else 0 }}m</div>
   </div>
+  <div class="tile">
+    <div class="k">AI spend today</div>
+    <div class="v" id="tAiSpend">{{ '$%.2f'|format(s.data.ai_cost_today) if s.data else '$0.00' }}</div>
+    <div class="s">of {{ '$%.2f'|format(s.data.ai_budget) if s.data else '$0.00' }} budget</div>
+  </div>
 
+  {% if not live %}
+  {#- Headline tiles for the book the bot is ACTUALLY trading. Here the bot is
+      in DRY, so the headline must be rehearsal money: the real Kalshi balance
+      and the real positions belong to a book that is not being traded, and a
+      page whose flag reads DRY MODE while its tiles show the real account is
+      the exact contradiction these branches exist to prevent. -#}
+  <div class="tile">
+    <div class="k">DRY cash</div>
+    <div class="v" id="dCashTile">{{ '$%.2f'|format(s.mode.dry.cash) }}</div>
+    <div class="s">of {{ '$%.2f'|format(s.mode.dry.starting_balance) }} simulated baseline &middot; derived from the book's own rows</div>
+  </div>
+  <div class="tile">
+    <div class="k">DRY positions</div>
+    <div class="v" id="dPosTile">{{ s.open_dry.positions }}</div>
+    <div class="s" id="dDepTile">{{ '$%.2f'|format(s.open_dry.capital) }} deployed</div>
+  </div>
+  <div class="tile">
+    <div class="k">DRY book P&amp;L</div>
+    {#- "since reset" is a claim about the BASELINE, and it is stated because a
+        P&L figure with no stated baseline is unreadable: the same number means
+        different things against $300 versus $250. -#}
+    <div class="v" id="dRealTile">{{ '$%.2f'|format(s.mode.dry.total_pnl) }}</div>
+    <div class="s">since reset &middot; realized {{ '$%.2f'|format(s.mode.dry.realized) }} &middot; {{ s.mode.dry.closed_trades }} closed &middot; {{ s.mode.dry.win_rate }}% win rate</div>
+  </div>
+  <div class="tile">
+    <div class="k">DRY cash available</div>
+    <div class="v" id="dAvailTile">{% if s.mode.dry_funding.get('can_fund') %}<span class="pill ok">funded</span>{% else %}<span class="pill no">empty</span>{% endif %}</div>
+    <div class="s">{{ s.mode.dry_funding.get('reason') or 'can fund at least one 1-cent contract' }}</div>
+  </div>
+  {% endif %}
   {% if live %}
   <div class="tile">
     <div class="k">Real balance</div>
     <div class="v" id="tBalance">{{ '$%.2f'|format(s.balance) if s.balance is not none else '-' }}</div>
     <div class="s">live Kalshi account <span id="tBalanceAge">{% if s.kalshi_age_sec is not none and s.kalshi_age_sec >= 0 %}{% if s.kalshi_age_sec > 180 %}· STALE ({{ s.kalshi_age_sec // 60 }}m old){% else %}· updated {{ s.kalshi_age_sec }}s ago{% endif %}{% else %}· syncing…{% endif %}</span></div>
+  </div>
+  <div class="tile">
+    <div class="k">Win rate</div>
+    <div class="v" id="tWinRateLive">{{ s.open.win_rate if s.open else 0 }}%</div>
+    <div class="s" id="tWinRateLiveNote">{{ s.open.wins if s.open else 0 }}W / {{ s.open.losses if s.open else 0 }}L</div>
   </div>
   <div class="tile">
     <div class="k">Live positions</div>
@@ -5822,46 +5898,19 @@ button.loading.yellow::after {
         "fees $50.01" underneath invites the obvious suspicion that the number is
         wrong; showing that it is +$162.71 of sales against -$492.29 of
         settlements over Aug 1 - Oct 4 is what makes it checkable. -#}
-    <div class="s" id="tKalshiPnlNote">{% if s.kalshi and s.kalshi.realized_known %}sales {{ '$%.2f'|format(s.kalshi.ledger.get('sales_realized', 0.0)) }} &middot; settled {{ '$%.2f'|format(s.kalshi.ledger.get('settlement_realized', 0.0)) }} &middot; fees {{ '$%.2f'|format(s.kalshi.fees) }}{% if s.kalshi.ledger.get('window_start') %} &middot; since {{ _format_date(s.kalshi.ledger.get('window_start')[:10]) }}{% endif %}{% else %}fill history unavailable{% endif %}</div>
-  </div>
-  {% else %}
-  <div class="tile">
-    <div class="k">DRY cash</div>
-    <div class="v" id="dCashTile">{{ '$%.2f'|format(dry.cash) }}</div>
-    <div class="s">simulated &middot; no real money</div>
-  </div>
-  <div class="tile">
-    <div class="k">DRY positions</div>
-    <div class="v" id="dPosTile">{{ s.open_dry.positions if s.open_dry else 0 }}</div>
-    <div class="s">simulated fills</div>
-  </div>
-  <div class="tile">
-    <div class="k">DRY deployed</div>
-    <div class="v" id="dDepTile">{{ '$%.2f'|format(s.open_dry.capital) if s.open_dry else '$0.00' }}</div>
-    <div class="s">of {{ '$%.2f'|format(dry.equity) }} equity</div>
-  </div>
-  <div class="tile">
-    <div class="k">DRY book P&amp;L &middot; since reset</div>
-    <div class="v {{ 'up' if dry.total_pnl > 0 else ('down' if dry.total_pnl < 0 else 'flat') }}" id="dRealTile">{{ '$%.2f'|format(dry.total_pnl) }}</div>
-    <div class="s" id="dRealSub">realized {{ '$%.2f'|format(dry.realized) }} &middot; {{ dry.closed_trades }} closed &middot; {{ dry.ledger_entries }} fills</div>
-  </div>
+     <div class="s" id="tKalshiPnlNote">{% if s.kalshi and s.kalshi.realized_known %}sales {{ '$%.2f'|format(s.kalshi.ledger.get('sales_realized', 0.0)) }} &middot; settled {{ '$%.2f'|format(s.kalshi.ledger.get('settlement_realized', 0.0)) }} &middot; fees {{ '$%.2f'|format(s.kalshi.fees) }}{% if s.kalshi.ledger.get('window_start') %} &middot; since {{ _format_date(s.kalshi.ledger.get('window_start')[:10]) }}{% endif %}{% else %}fill history unavailable{% endif %}</div>
+   </div>
   {% endif %}
-
   <div class="tile">
-    <div class="k">Bot realized P&amp;L &middot; closed trades</div>
+    <div class="k">Bot realized P&amp;L</div>
+    {#- The bot's own ledger, next to Kalshi's. When these two disagree, the
+        disagreement IS the finding: the local book is missing a close, a
+        settlement, or a fee. A single number with nothing to compare it to
+        hides that, so this tile exists to be read against the tile above. -#}
     <div class="v {{ 'up' if s.trades and s.trades.realized_pnl > 0 else ('down' if s.trades and s.trades.realized_pnl < 0 else 'flat') }}" id="tBotPnl">{{ '$%.2f'|format(s.trades.realized_pnl) if s.trades else '$0.00' }}</div>
-    <div class="s">{{ s.trades.trades if s.trades else 0 }} closed trades &middot; bot log only, not account history</div>
+    <div class="s" id="tBotPnlNote">{{ s.trades.trades if s.trades else 0 }} closed trades &middot; {{ s.trades.win_rate if s.trades else 0 }}% win rate</div>
   </div>
-  <div class="tile">
-    <div class="k">Win rate</div>
-    <div class="v" id="tWinRate">{{ s.trades.win_rate if s.trades else 0 }}%</div>
-    <div class="s" id="tWinRateNote">{{ s.trades.wins if s.trades else 0 }}W / {{ s.trades.losses if s.trades else 0 }}L</div>
-  </div>
-  <div class="tile">
-    <div class="k">AI spend today</div>
-    <div class="v" id="tAiSpend">{{ '$%.2f'|format(s.data.ai_cost_today) if s.data else '$0.00' }}</div>
-    <div class="s">of {{ '$%.2f'|format(s.data.ai_budget) if s.data else '$0.00' }} budget</div>
-  </div>
+
   <div class="tile">
     <div class="k">Strategies live</div>
     <div class="v" id="tRunning">{{ s.running_count if s.running_count is defined else 0 }}</div>
@@ -5943,7 +5992,7 @@ button.loading.yellow::after {
       <div class="card{{ ' hot' if c.running else '' }}" id="card-{{ c.name }}" onclick="openStrategy('{{ c.name }}')">
         <div class="ctop">
           <div>
-            <div class="clabel">{{ c.label }}{% if c.heavy_api_abuser %} <span class="pill no" title="{{ c.heavy_api_abuser_reason }}">HEAVY API ABUSER</span>{% endif %}</div>
+            <div class="clabel">{{ c.label }}</div>
             <div class="mono cname">{{ c.name }}</div>
           </div>
           <span class="pill {{ 'warn' if c.stuck else ('ok' if c.running else 'no') }}" id="pill-{{ c.name }}">{% if c.stuck %}<span class="dot"></span>stuck{% elif c.running %}<span class="dot pulse"></span>running{% elif c.stop_reason %}stopped{% else %}not started{% endif %}</span>
@@ -5955,8 +6004,6 @@ button.loading.yellow::after {
           <div><b id="c-{{ c.name }}-pnl" class="{{ 'up' if c.realized > 0 else ('down' if c.realized < 0 else 'flat') }}">${{ '%.2f'|format(c.realized) }}</b><span>realized</span></div>
           <div><b id="c-{{ c.name }}-win">{{ c.win_rate }}%</b><span>win rate</span></div>
           <div><b id="c-{{ c.name }}-open">{{ c.open_positions }}</b><span>open</span></div>
-          <div><b id="c-{{ c.name }}-roll-clips">{{ c.roll_clips }}</b><span>roll trades</span></div>
-          <div><b id="c-{{ c.name }}-roll-rate">{{ c.roll_rate }}%</b><span>roll win rate</span></div>
         </div>
          <div class="cfoot">
            <span class="mono" style="color:var(--faint)">BUY AMT <span id="c-{{ c.name }}-dep">${{ '%.2f'|format(c.deployed) }}</span>{% if not c.running and c.stop_reason %} &middot; {{ c.stop_reason }}{% endif %}</span>
@@ -6094,94 +6141,74 @@ button.loading.yellow::after {
   </div>
 </div>
 
-<!-- DRY account: the only simulated thing in the system -->
+<!-- ============ funding ============ -->
 <div class="row two">
+  <!-- DRY: the book funds itself out of simulated cash. The real Kalshi balance
+       never appears here - a funding card that answered with live money under a
+       DRY heading is what made the DRY page "pose" the live account. -->
   <div class="panel">
     <div class="ph">
-      <h2>{{ 'DRY account' if s.mode.mode != 'live' else 'DRY account (paused while LIVE)' }}</h2>
-      <span class="note">
-        <span id="tDryCash">{{ '$%.2f'|format(s.mode.dry.cash) }}</span> cash
-      </span>
+      <h2>DRY account — simulated money</h2>
+      <span class="note">rehearsal only</span>
     </div>
     <div class="pb">
       <dl class="kv">
-        <dt>Starting balance</dt><dd>{{ '$%.2f'|format(s.mode.dry.starting_balance) }}</dd>
-        <dt>Cash</dt><dd id="dCash">{{ '$%.2f'|format(s.mode.dry.cash) }}</dd>
-        <dt>Deployed in open positions</dt><dd id="dDeployed">{{ '$%.2f'|format(s.mode.dry.deployed) }}</dd>
-        <dt>Equity</dt><dd id="dEquity">{{ '$%.2f'|format(s.mode.dry.equity) }}</dd>
-        <dt>Realized</dt><dd id="dRealized">{{ '$%.2f'|format(s.mode.dry.realized) }}</dd>
-        <dt>Total P&amp;L vs start</dt>
-        <dd id="dPnl" class="{{ 'up' if s.mode.dry.total_pnl > 0 else ('down' if s.mode.dry.total_pnl < 0 else 'flat') }}">{{ '$%.2f'|format(s.mode.dry.total_pnl) }}</dd>
-        <dt>Return</dt><dd id="dRet">{{ s.mode.dry.return_pct }}%</dd>
-        <dt>Simulated fills</dt><dd id="dLedger">{{ s.mode.dry.ledger_entries }}</dd>
-      </dl>
-      <div class="bar" style="margin-top:12px">
-        <button onclick="resetDry()">Reset DRY account to {{ '$%.0f'|format(s.mode.dry.starting_balance) }}</button>
-        <span id="dryStatus" style="font-size:11px;color:var(--faint)"></span>
-      </div>
-      <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
-        Prices, markets and P&amp;L inputs are the real production API. Only the
-        order fill and the cash ledger are simulated, so the DRY book exercises
-        the same code path as LIVE without spending money.
-      </p>
-    </div>
-  </div>
-
-  <div class="panel">
-    <div class="ph">
-      <h2>Funding source</h2>
-      <span class="note">{{ 'real Kalshi account' if live else 'DRY account &middot; simulated cash' }}</span>
-    </div>
-    <div class="pb">
-      <dl class="kv">
-        {% if live %}
-        <dt>API connection</dt>
-        <dd>{% if s.mode.funding.get('connected') %}<span class="pill ok">connected</span>{% else %}<span class="pill no">offline</span>{% endif %}</dd>
-        <dt>Available balance</dt><dd id="fBalance">{{ '$%.2f'|format(s.mode.funding.get('balance', 0) or 0) }}</dd>
-        <dt>Can fund an order</dt>
-        <dd>{% if s.mode.funding.get('can_fund') %}<span class="pill ok">yes</span>{% else %}<span class="pill no">no</span>{% endif %}</dd>
-        {% else %}
-        <dt>Source</dt>
-        <dd><span class="pill ok">simulated ledger</span></dd>
-        <dt>DRY cash available</dt><dd id="fBalance">{{ '$%.2f'|format(s.mode.dry_funding.get('balance', 0) or 0) }}</dd>
+        <dt>Simulated cash</dt><dd id="fBalance">{{ '$%.2f'|format(s.mode.dry.cash) }}</dd>
+        <dt>Baseline</dt><dd>{{ '$%.2f'|format(s.mode.dry.starting_balance) }}</dd>
+        <dt>Deployed</dt><dd>{{ '$%.2f'|format(s.mode.dry.deployed) }}</dd>
+        <dt>Equity</dt><dd>{{ '$%.2f'|format(s.mode.dry.equity) }}</dd>
+        <dt>Realized</dt><dd>{{ '$%.2f'|format(s.mode.dry.realized) }}</dd>
+        <dt>Closed trades</dt><dd>{{ s.mode.dry.closed_trades }}</dd>
+        <dt>Open positions</dt><dd>{{ s.mode.dry.open_positions }}</dd>
+        <dt>Win rate</dt><dd>{{ s.mode.dry.win_rate }}%</dd>
+        <dt>Return</dt><dd>{{ s.mode.dry.return_pct }}%</dd>
         <dt>Can fund an order</dt>
         <dd>{% if s.mode.dry_funding.get('can_fund') %}<span class="pill ok">yes</span>{% else %}<span class="pill no">no</span>{% endif %}</dd>
+      </dl>
+      <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
+        Cash is <b>derived</b>, not stored: baseline + realized &minus; deployed.
+        Nothing is accumulated, so it cannot drift away from the rows it is
+        computed from.
+      </p>
+      <div class="bar" style="margin-top:10px;gap:6px">
+        <input type="number" id="dryCashAmount" step="0.01" min="1" placeholder="new amount"
+               style="width:120px"><button onclick="setDryCash()">Set amount</button>
+        <button onclick="resetDry()">Reset baseline</button>
+      </div>
+      {% if s.mode.dry_funding.get('reason') %}
+      <div class="note-box" style="margin-top:12px"><b>DRY cannot place orders:</b> {{ s.mode.dry_funding.get('reason') }}</div>
+      {% endif %}
+    </div>
+  </div>
+  <!-- LIVE: the real account, real balance, real money. -->
+  <div class="panel">
+    <div class="ph">
+      <h2>LIVE account — real Kalshi</h2>
+      <span class="note">real money</span>
+    </div>
+    <div class="pb">
+      <dl class="kv">
+        <dt>API connection</dt>
+        <dd>{% if s.mode.funding.get('connected') %}<span class="pill ok">connected</span>{% else %}<span class="pill no">offline</span>{% endif %}</dd>
+        <dt>Available balance</dt><dd id="liveBalance">{{ '$%.2f'|format(s.mode.funding.get('balance', 0) or 0) }}</dd>
+        <dt>Can fund an order</dt>
+        <dd>{% if s.mode.funding.get('can_fund') %}<span class="pill ok">yes</span>{% else %}<span class="pill no">no</span>{% endif %}</dd>
+        {% if live %}
+        <dt>Real exposure</dt><dd>{{ '$%.2f'|format(s.kalshi.exposure) if s.kalshi else '$0.00' }}</dd>
         {% endif %}
       </dl>
-      {% if not live and s.mode.dry_funding.get('reason') %}
-      <div class="note-box" style="margin-top:12px"><b>DRY cannot place orders:</b> {{ s.mode.dry_funding.get('reason') }}</div>
-      {% elif live and s.mode.funding.get('reason') %}
+      {% if live and s.mode.funding.get('reason') %}
       <div class="note-box" style="margin-top:12px"><b>Cannot trade LIVE:</b> {{ s.mode.funding.get('reason') }}</div>
       {% elif not live %}
       <p class="note" style="margin-top:10px;color:var(--faint);font-size:11px">
-        This is the DRY book's own money: the simulated ledger that starts at
-        {{ '$%.2f'|format(s.mode.dry.starting_balance) }}. The real Kalshi balance is
-        never spent while the switch reads DRY.
+        In DRY this card is informational only. No order is placed and no real
+        balance is read until the switch is moved to LIVE.
       </p>
       {% endif %}
     </div>
   </div>
 </div>
 
-{% if not s.public_domain %}
-<div class="note-box" style="margin-bottom:14px">
-  <b>Heads up:</b> you are viewing this over a hostname other than the Railway public domain.
-  The canonical address is <code>kalshi-frigo-production.up.railway.app</code> &mdash;
-  <code>kalshi-frigo.up.railway.app</code> does not exist, because Railway always names
-  service domains <code>&lt;service&gt;-&lt;environment&gt;.up.railway.app</code>.
-</div>
-{% endif %}
-
-{% if s.errors %}
-<div class="panel" style="margin-bottom:12px">
-  <div class="ph"><h2>Recent errors</h2><span class="note">{{ s.errors|length }} most recent</span></div>
-  <div class="pb"><div class="bar">
-    {%- for e in s.errors[-6:]|reverse %}<span class="pill warn"><span class="mono">{{ e.time }}</span> {{ e.error }}</span>{% endfor %}
-  </div></div>
-</div>
-{% endif %}
-
-{%- if live %}
 <!-- ============ Kalshi account ============ -->
 <!-- LIVE ONLY. This panel is real money: real positions, real P&L, real fees.
      Rendering it while the switch reads DRY put the production account's
@@ -6239,7 +6266,6 @@ button.loading.yellow::after {
   </div>
   {%- endif %}
 </div>
-{%- endif %}
 
 <!-- ============ positions + equity ============ -->
 <div class="row two">
@@ -6279,7 +6305,7 @@ button.loading.yellow::after {
   <div class="panel">
     <div class="ph"><h2>Strategy performance</h2><span class="note">closed trades by strategy</span></div>
     {%- if s.by_strategy %}
-    <table><thead><tr><th>Strategy</th><th class="num">Trades</th><th class="num">Win rate</th><th class="num">P&amp;L</th><th class="num">Best</th><th class="num">Worst</th><th class="num">Roll trades</th><th class="num">Roll rate</th></tr></thead><tbody>
+    <table><thead><tr><th>Strategy</th><th class="num">Trades</th><th class="num">Win rate</th><th class="num">P&amp;L</th><th class="num">Best</th><th class="num">Worst</th></tr></thead><tbody>
     {%- for r in s.by_strategy %}
       <tr>
         <td><span class="tag">{{ r.strategy }}</span></td>
@@ -6287,7 +6313,7 @@ button.loading.yellow::after {
         <td class="num">{{ r.win_rate }}%</td>
         <td class="num {{ 'up' if r.pnl > 0 else ('down' if r.pnl < 0 else 'flat') }}">{{ r.pnl }}</td>
         <td class="num up">{{ r.best }}</td>
-        <td class="num down">{{ r.worst }}</td><td class="num">{{ r.roll_clips }}</td><td class="num">{{ r.roll_rate }}%</td>
+        <td class="num down">{{ r.worst }}</td>
       </tr>
     {%- endfor %}
     </tbody></table>
@@ -6372,8 +6398,6 @@ button.loading.yellow::after {
     </ol>
     <div class="bar" style="margin-top:12px">
       <span class="tag">python cli.py run --paper</span>
-      <span class="tag">--safe-compounder</span>
-      <span class="tag">--beast</span>
       <span class="tag">--live</span>
       <span style="font-size:11.5px;color:var(--faint)">Live trading additionally needs <code>LIVE_TRADING_ENABLED=true</code>.</span>
     </div>
@@ -6640,21 +6664,9 @@ function paint(s) {
       ' · settled ' + money(led.settlement_realized) +
       ' · fees ' + money(k.fees) +
       (led.window_start ? ' · since ' + String(led.window_start).slice(0, 10) : ''));
-  } else {
-    const dry = (s.mode && s.mode.dry) || {}, od = s.open_dry || {};
-    set('dCashTile', money(dry.cash));
-    set('dPosTile', od.positions || 0);
-    set('dDepTile', money(od.capital));
-  set('dRealTile', money(dry.total_pnl));
-  const dr = document.getElementById('dRealTile');
-  if (dr) dr.className = 'v ' + sgn(dry.total_pnl || 0);
-  set('dRealSub', 'realized ' + money(dry.realized) + ' \u00b7 ' + (dry.closed_trades || 0) + ' closed \u00b7 ' + (dry.ledger_entries || 0) + ' fills');
   }
 
   const t = s.trades || {}, d = s.data || {};
-  set('tBotPnl', money(t.realized_pnl));
-  const br = document.getElementById('tBotPnl');
-  if (br) br.className = 'v ' + sgn(t.realized_pnl || 0);
   const fb = document.getElementById('fairBandsBody');
   if (fb && t.by_fair_band) {
     fb.innerHTML = t.by_fair_band.length
@@ -6665,6 +6677,9 @@ function paint(s) {
   }
   set('tWinRate', (t.win_rate || 0) + '%');
   set('tWinRateNote', (t.wins || 0) + 'W / ' + (t.losses || 0) + 'L');
+  set('tWinRateLive', (t.win_rate || 0) + '%');
+  set('tWinRateLiveNote', (t.wins || 0) + 'W / ' + (t.losses || 0) + 'L');
+  set('dRet', (d.dry && d.dry.win_rate ? d.dry.win_rate : 0) + '%');
   set('tAiSpend', money(d.ai_cost_today));
   set('tRunning', s.running_count || 0);
   set('tUptime', Math.floor((s.uptime_sec || 0) / 60) + 'm');
@@ -6686,9 +6701,7 @@ function paintCards(cards) {
   set('c-' + c.name + '-trades', c.trades);
   set('c-' + c.name + '-win', c.win_rate + '%');
   set('c-' + c.name + '-open', c.open_positions);
-  set('c-' + c.name + '-roll-clips', c.roll_clips || 0);
-   set('c-' + c.name + '-roll-rate', Number(c.roll_rate || 0).toFixed(1) + '%');
-    set('c-' + c.name + '-dep', Number(c.deployed || 0).toFixed(2));
+  set('c-' + c.name + '-dep', Number(c.deployed || 0).toFixed(2));
     const pnl = $('c-' + c.name + '-pnl');
     if (pnl) {
       pnl.textContent = money(c.realized);
@@ -6879,14 +6892,6 @@ function flashBanner(text, isLive) {
   bannerTimer = setTimeout(() => { el.remove(); }, 6000);
 }
 
-async function resetDry() {
-  const r = await fetch('/api/dry/reset', { method: 'POST', headers: authHeaders() });
-  const d = await r.json().catch(() => ({}));
-  if (d.error) { $('dryStatus').textContent = d.error; return; }
-  $('dryStatus').textContent = 'reset to ' + money(d.dry.starting_balance);
-  paintMode(d);
-}
-
 function money(v) { return '$' + Number(v || 0).toFixed(2); }
 
 // One function owns every mode indicator: frame colour, body attribute, flag
@@ -6894,8 +6899,8 @@ function money(v) { return '$' + Number(v || 0).toFixed(2); }
 let lastMode = document.body.dataset.mode || 'dry';
 function paintMode(d) {
   if (!d) return;
-  // Missing mode must read as DRY, never as an ambiguous third state.
-  const m = d.mode === undefined ? 'dry' : d.mode;
+  // Missing mode must read as LIVE, never as an ambiguous third state.
+  const m = d.mode === undefined ? 'live' : d.mode;
   const live = m === 'live';
 
   document.body.dataset.mode = live ? 'live' : 'dry';
@@ -6928,24 +6933,48 @@ function paintMode(d) {
 
   const dry = d.dry || {};
   const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
-  set('dCash', money(dry.cash));
-  set('dDeployed', money(dry.deployed));
-  set('dEquity', money(dry.equity));
-  set('dRealized', money(dry.realized));
-  set('tDryCash', money(dry.cash));
-  set('dLedger', dry.ledger_entries);
-  set('dRet', (dry.return_pct || 0) + '%');
-  const pnl = dry.total_pnl || 0;
-  set('dPnl', money(pnl));
-  const p = $('dPnl');
-  if (p) p.className = pnl > 0 ? 'up' : (pnl < 0 ? 'down' : 'flat');
+  set('dCashTile', money(dry.cash));
+  set('dPosTile', dry.open_positions || 0);
+  set('dDepTile', money((d.open_dry || {}).capital));
+  set('dAvailTile', dry.cash >= 0.01 ? 'funded' : 'empty');
+  set('dRealTile', money(dry.total_pnl || 0));
+  const dr = $('dRealTile');
+  if (dr) dr.className = 'v ' + sgn(dry.total_pnl || 0);
   // The funding card answers with the money the CURRENT book can actually spend:
-  // the real Kalshi balance in LIVE, the simulated ledger in DRY. Reading the
+  // the real Kalshi balance in LIVE, the simulated book in DRY. Reading the
   // real balance into the DRY card is what made DRY "pose" the live account.
-  set('fBalance', money((d.mode === 'live' ? d.funding : d.dry_funding || {}).balance));
+  set('fBalance', money(live ? (d.funding || {}).balance : dry.cash));
+  set('liveBalance', money((d.funding || {}).balance));
   // The bulk-start button must say - and do - what the switch says.
   const sab = $('startAllBtn');
-  if (sab) sab.textContent = d.mode === 'live' ? 'Start all LIVE' : 'Start all in DRY';
+  if (sab) sab.textContent = d.mode === 'live' ? 'Start all in LIVE' : 'Start all in DRY';
+}
+
+// --- DRY book controls ---
+// DRY cash is DERIVED (baseline + realized - deployed), so "set amount" moves
+// the BASELINE the identity runs from rather than writing a cash number. Every
+// open row and every close stays accounted for by the same arithmetic, which is
+// what the old running-counter cash could never promise.
+async function setDryCash() {
+  const raw = $('dryCashAmount') ? $('dryCashAmount').value : '';
+  const amount = Number(raw);
+  if (!amount || amount <= 0) { note('enter a positive amount first'); return; }
+  const r = await fetch('/api/dry/cash', {
+    method: 'POST', headers: authHeaders(),
+    body: JSON.stringify({ amount: amount }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (d.error) { note('DRY cash set failed: ' + d.error); return; }
+  note('DRY baseline set to ' + money(d.dry.cash));
+  paintMode(d);
+}
+
+async function resetDry() {
+  const r = await fetch('/api/dry/reset', { method: 'POST', headers: authHeaders() });
+  const d = await r.json().catch(() => ({}));
+  if (d.error) { note('DRY reset failed: ' + d.error); return; }
+  note('DRY book reset to ' + money(d.dry.starting_balance));
+  paintMode(d);
 }
 
 // --- controls ---
@@ -6965,14 +6994,6 @@ async function toggleStrategy(name, quiet) {
         method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
       });
     } else {
-      if (card && card.heavy_api_abuser) {
-        if (!quiet) {
-          alert('HEAVY API ABUSER\n\n' + (card.heavy_api_abuser_reason || '') +
-            '\n\nThis strategy stays OFF. Not started.');
-        }
-        note(name + ': left off (HEAVY API ABUSER)');
-        return;
-      }
       r = await fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {
         method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
       });
@@ -7716,7 +7737,6 @@ def start_background_workers():
     _workers_started = True
     # Operator config survives redeploys: apply saved dashboard config edits
     # (runtime_config cfg.* keys) before any worker reads settings.
-    _one_shot_dry_topup()
     try:
         from src.utils.mode import apply_persisted_trading_config
 
@@ -7741,6 +7761,7 @@ def start_background_workers():
           _strategy_supervisor_loop,
     ):
         threading.Thread(target=target, daemon=True).start()
+
 
 
 def main():
@@ -7770,7 +7791,13 @@ def main():
 
     start_background_workers()
 
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 8501))
+    # Self-quieting request log: werkzeug's access log prints one line per
+    # request and the page polls several endpoints every few seconds, so the
+    # terminal fills with "GET /api/... 200 -" and buries the app's own output.
+    # Keep warnings/errors; drop the OK chatter. (gunicorn has its own access
+    # log and can be quieted with --access-logfile -.)
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
     print(f"[web_dashboard] Kalshi-Frigo dashboard starting on port {port}", flush=True)
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
 

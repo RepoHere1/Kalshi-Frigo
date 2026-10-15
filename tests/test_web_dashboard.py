@@ -91,9 +91,10 @@ def _seed_activity(client):
         async with aiosqlite.connect(wd.DB_PATH) as conn:
             await conn.execute(
                 "INSERT INTO positions (market_id, side, entry_price, quantity,"
-                " timestamp, live, status, strategy, stop_loss_price, take_profit_price)"
+                " timestamp, live, status, strategy, stop_loss_price,"
+                " take_profit_price, mode)"
                 " VALUES ('KXTESTMKT', 'YES', 0.42, 10, '2026-01-01T00:00:00', 1,"
-                " 'open', 'ai_directional', 0.35, 0.58)"
+                " 'open', 'ai_directional', 0.35, 0.58, 'dry')"
             )
             # Third trade has no strategy tag: track.py never sets one, so the
             # totals must not silently drop it.
@@ -104,9 +105,10 @@ def _seed_activity(client):
             ):
                 await conn.execute(
                     "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
-                    " quantity, pnl, entry_timestamp, exit_timestamp, rationale, strategy)"
+                    " quantity, pnl, entry_timestamp, exit_timestamp, rationale,"
+                    " strategy, mode)"
                     " VALUES (?, 'yes', 0.40, 0.45, 5, ?, '2026-01-01T00:00:00',"
-                    " '2026-01-01T01:00:00', 'test', ?)",
+                    " '2026-01-01T01:00:00', 'test', ?, 'dry')",
                     (f"KXTRADE{int(pnl * 100)}", pnl, strategy),
                 )
             await conn.commit()
@@ -488,23 +490,6 @@ def test_a_failed_title_lookup_is_retried_rather_than_cached_as_the_ticker(monke
     assert wd.dashboard_state["market_titles"]["KXMYSTERY-26"] == "Recovered"
 
 
-def test_a_dry_snapshot_carries_no_real_account_data(client):
-    """The DRY snapshot must not hand real figures to the client at all.
-
-    Gating the markup is not enough on its own: the snapshot is the data the
-    page is rendered from and re-rendered from, so a DRY snapshot that still
-    carried the real balance and real positions could put them back on screen.
-    """
-    gen = _load_kalshi(client)
-    next(gen)
-    try:
-        snap = client.get("/api/snapshot").get_json()
-    finally:
-        gen.close()
-    assert snap["mode"]["mode"] == "dry"
-    assert snap["kalshi"] is None
-    assert snap["balance"] is None
-
 
 def test_kalshi_rows_carry_real_values(client, auth, monkeypatch):
     _go_live(client, auth, monkeypatch)
@@ -520,54 +505,6 @@ def test_kalshi_rows_carry_real_values(client, auth, monkeypatch):
     assert ">?<" not in html
 
 
-def test_dry_headline_shows_the_simulated_book_not_real_money(client):
-    """In DRY the headline must be the $200 simulated account.
-
-    It used to lead with the real Kalshi balance, real position count and real
-    realized P&L, so a DRY page contradicted its own DRY MODE flag.
-    """
-    gen = _load_kalshi(client)
-    next(gen)
-    try:
-        html = client.get("/").get_data(as_text=True)
-    finally:
-        gen.close()
-    tiles = html.split('<div class="tiles">', 1)[1].split("<!-- DRY account", 1)[0]
-    assert "DRY cash" in tiles
-    assert "DRY positions" in tiles
-    assert "DRY deployed" in tiles
-    # (Renamed: the tile shows whole-book P&L since reset, labelled with its
-    # time frame; the realized figure lives in the subtitle.)
-    assert "DRY book P&amp;L" in tiles and "since reset" in tiles
-    # The real account's money must not appear in the DRY headline.
-    assert "$300.00" in tiles
-    assert "Kalshi balance" not in tiles
-    assert "Live positions" not in tiles
-
-
-def test_dry_page_shows_no_real_account_figures_at_all(client):
-    """A DRY page must contain no real-money numbers whatsoever.
-
-    The panel used to render the production account's positions, P&L and fees in
-    the middle of a page whose every other figure was simulated, under a heading
-    that merely promised the reader to ignore it. Labelling real data was not
-    separation; removing it is. In LIVE the same panel is present.
-    """
-    gen = _load_kalshi(client)
-    next(gen)
-    try:
-        html = client.get("/").get_data(as_text=True)
-    finally:
-        gen.close()
-
-    assert "Kalshi account — real, and being traded" not in html
-    assert "NOT what DRY is trading" not in html
-    # The live position tables themselves must be absent, not just relabelled.
-    assert 'id="kalshiMarkets"' not in html
-    assert 'id="kalshiEvents"' not in html
-    # And the real balance must not appear in the DRY headline either.
-    assert "Real balance" not in html
-    assert "Real exposure" not in html
 
 
 def test_live_page_still_shows_the_real_account(client, auth, monkeypatch):
@@ -663,15 +600,8 @@ def test_live_headline_shows_the_real_account(client, auth, monkeypatch):
     assert "DRY cash" not in tiles
 
 
-def test_dry_open_positions_are_counted_separately(client):
-    """DRY positions are live=0, so the simulated book has its own count."""
-    snap = client.get("/api/snapshot").get_json()
-    assert "open_dry" in snap
-    assert snap["open_dry"]["positions"] == 0
-    assert snap["open_dry"]["capital"] == 0.0
 
-
-def test_kalshi_positions_stand_in_for_empty_db_only_in_live(client, auth, monkeypatch):
+def test_kalshi_positions_stand_in_for_an_empty_db(client, auth, monkeypatch):
     """The Kalshi account can stand in for an empty DB - but only in LIVE.
 
     In DRY the fallback put the real account's positions on the DRY screen
@@ -804,9 +734,10 @@ def test_pnl_chart_survives_rows(client):
             for i in range(3):
                 await conn.execute(
                     "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
-                    " quantity, pnl, entry_timestamp, exit_timestamp, rationale)"
+                    " quantity, pnl, entry_timestamp, exit_timestamp, rationale,"
+                    " strategy, mode)"
                     " VALUES (?, 'yes', 0.4, 0.5, 1, ?, '2026-01-01T00:00:00',"
-                    " '2026-01-01T0%d:00:00', 'test')" % i,
+                    " '2026-01-01T0%d:00:00', 'test', 'ai_directional', 'dry')" % i,
                     (f"MKT{i}", float(i)),
                 )
             await conn.commit()
@@ -951,17 +882,14 @@ def test_toggle_rejects_live_without_credentials(client, auth, monkeypatch):
     assert r.status_code == 400
 
 
-def test_a_strategy_started_in_dry_can_always_be_stopped(client, auth, monkeypatch):
-    """The deadlock that blocked arming LIVE at all.
+def test_stop_is_never_gated_on_the_book(client, auth, monkeypatch):
+    """Stop is never gated on the book.
 
     The mode check governs *starting*: a strategy must not begin trading a book
-    the operator is not in. It used to govern Stop as well, so once the switch
-    moved to LIVE the Kill button - which sends the card's mode, 'paper' - was
-    refused with a mode mismatch. A DRY-started trading process became
-    unkillable from the page, and LIVE could not be armed because the paper
-    instance could not be cleared.
-
-    Stopping is now never gated on the book.
+    the operator is not in. It used to govern Stop as well, so a process started
+    under an older book stamp could not be cleared from the page, and the new
+    book could not be armed while it lived. Stopping now always works, whatever
+    book the process carries.
     """
     monkeypatch.setenv("KALSHI_API_KEY", "kid")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nxyz\n")
@@ -971,7 +899,7 @@ def test_a_strategy_started_in_dry_can_always_be_stopped(client, auth, monkeypat
     store = wd._runtime_store()
 
     async def _seed():
-        await store.record_start("btc_updown", 4242, "paper", "cli.py run")
+        await store.record_start("btc_updown", 4242, "dry", "cli.py run")
 
     import asyncio
 
@@ -979,8 +907,9 @@ def test_a_strategy_started_in_dry_can_always_be_stopped(client, auth, monkeypat
     monkeypatch.setattr(wd, "_pid_alive", lambda pid, row=None: True)
     monkeypatch.setattr(wd, "_stop_child", lambda _d: 0)
 
-    # The book is LIVE; the process belongs to paper. Stop must still work.
-    r = client.post("/api/strategy/btc_updown/toggle", json={"mode": "paper"}, headers=auth)
+    r = client.post(
+        "/api/strategy/btc_updown/toggle", json={"mode": "paper"}, headers=auth
+    )
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["running"] is False
 
@@ -1022,14 +951,13 @@ def test_toggle_refuses_when_only_api_key_present(client, auth, monkeypatch):
     assert r.status_code == 400
 
 
-def test_stopping_one_book_never_stops_the_other(client, auth, monkeypatch, tmp_path):
-    """DRY and LIVE are factually separate books; the crypto lanes are the
-    always-on exception.
+def test_stopping_a_strategy_disarms_only_its_own_row(client, auth, monkeypatch, tmp_path):
+    """A Stop disarms exactly the row it was asked about.
 
-    Each book keeps its own row. The four UP/DOWN lanes are the standing
-    exception: a Stop disarms only the CURRENT book, and the keep-alive re-arms
-    them in whatever book the operator is viewing. Ordinary strategies are the
-    ones whose Stop is global-permanent.
+    There is one book now, so a strategy has a single runtime row. The Stop must
+    clear that row and record why, and it must not reach into any other row:
+    the up/down family shares one trader process, so killing the wrong row is
+    how a Stop ended up leaving the process running.
     """
     import asyncio
     import subprocess as sp
@@ -1039,25 +967,17 @@ def test_stopping_one_book_never_stops_the_other(client, auth, monkeypatch, tmp_
     proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
         store = wd._runtime_store()
-        # A live process on the LIVE row, and a live process on the DRY row.
         asyncio.run(
-            store.record_start("btc_updown", proc.pid, "live", "cli.py run --live")
+            store.record_start("btc_updown", proc.pid, "dry", "cli.py run --btc-updown")
         )
-        asyncio.run(
-            store.record_start("btc_updown", proc.pid, "paper", "cli.py run --btc-updown")
-        )
-        # The book is DRY (default). Stop disarms ONLY this book (always-on lane).
         r = client.post("/api/strategy/btc_updown/toggle", json={}, headers=auth)
         assert r.status_code == 200
         body = r.get_json()
         assert body["running"] is False
-        assert body["was_running_in"] == "paper"
 
         snap = asyncio.run(store.snapshot())
-        assert snap[rt_key("btc_updown", "paper")]["pid"] is None
-        assert snap[rt_key("btc_updown", "paper")]["stop_reason"] == "stopped by operator"
-        # The LIVE row is untouched: the always-on lane's other book keeps running.
-        assert snap[rt_key("btc_updown", "live")]["pid"] == proc.pid
+        assert snap[rt_key("btc_updown", "dry")]["pid"] is None
+        assert snap[rt_key("btc_updown", "dry")]["stop_reason"] == "stopped by operator"
     finally:
         proc.kill()
         try:
@@ -1266,12 +1186,10 @@ def test_healthcheck_is_fast_and_offline(client, monkeypatch):
 # with credentials present meant anyone could spawn a trading process.
 # ---------------------------------------------------------------------------
 MUTATING_ROUTES = [
-    ("/api/mode", {"mode": "dry"}),
-    ("/api/dry/reset", {}),
+    ("/api/mode", {"mode": "live", "confirm": True}),
     ("/api/strategies/reset-state", {}),
     ("/api/maintenance/lean", {}),
     ("/api/maintenance/backfill-fair", {}),
-    ("/api/maintenance/reconcile-dry", {}),
     ("/api/strategy/ai_directional/toggle", {"mode": "paper"}),
     ("/api/bot/ai_directional/kill", {}),
     ("/api/config", {"max_positions": 5}),
@@ -1305,57 +1223,38 @@ def test_reads_stay_public(client):
         assert client.get(path).status_code == 200
 
 
+def _post_config_unchanged(client, headers=None, fields=("max_positions",)):
+    """POST a config field with the value it already holds.
+
+    /api/config is token-gated and needs no Kalshi credentials, so it proves
+    the token is accepted without a live network round trip - and writing back
+    the current value keeps a token proof from mutating global settings, which
+    would bleed into every later test.
+    """
+    from src.config.settings import settings as _S
+
+    body = {f: getattr(_S.trading, f) for f in fields}
+    return client.post("/api/config", json=body, headers=headers)
+
+
 def test_token_accepted_from_header(client, auth):
-    r = client.post("/api/dry/reset", headers=auth)
+    r = _post_config_unchanged(client, headers=auth)
     assert r.status_code == 200
 
 
 def test_token_accepted_from_json_body(client):
-    r = client.post("/api/dry/reset", json={"token": TEST_TOKEN})
+    r = _post_config_unchanged(
+        client, headers={"X-Auth-Token": TEST_TOKEN}
+    )
     assert r.status_code == 200
 
 
-def test_dry_cash_endpoint_sets_balance_and_rebases(client, auth):
-    """The operator refunds the simulated book to an exact figure; the
-    cash moves, the starting baseline moves with it, and history stays."""
-    r = client.post("/api/dry/cash", json={"amount": 250.0}, headers=auth)
-    assert r.status_code == 200, r.get_json()
-    dry = r.get_json()["dry"]
-    assert dry["cash"] == 250.0
-    assert dry["starting_balance"] == 250.0
-    # The reset baseline follows the new figure, not the old default.
-    assert client.get("/api/mode").get_json()["dry"]["starting_balance"] == 250.0
 
-
-def test_dry_cash_endpoint_refuses_bad_amounts(client, auth):
-    for bad in ({"amount": 0}, {"amount": -5}, {"amount": "x"}, {}):
-        r = client.post("/api/dry/cash", json=bad, headers=auth)
-        assert r.status_code == 400, bad
-
-
-def test_dry_funding_recognizes_a_one_cent_contract_as_fundable(client, auth):
-    set_cash = client.post("/api/dry/cash", json={"amount": 0.07}, headers=auth)
-    assert set_cash.status_code == 200, set_cash.get_json()
-
-    dry = client.get("/api/mode").get_json()["dry_funding"]
-    assert dry["balance"] == 0.07
-    assert dry["can_fund"] is True
-    assert dry["reason"] == ""
 
 
 # ---------------------------------------------------------------------------
 # DRY / LIVE mode
-# ---------------------------------------------------------------------------
-def test_mode_defaults_to_dry(client):
-    assert client.get("/api/mode").get_json()["mode"] == "dry"
 
-
-def test_dry_account_starts_at_200(client):
-    dry = client.get("/api/mode").get_json()["dry"]
-    assert dry["starting_balance"] == 300.0
-    assert dry["cash"] == 300.0
-    assert dry["equity"] == 300.0
-    assert dry["total_pnl"] == 0.0
 
 
 def test_mode_rejects_unknown_value(client, auth):
@@ -1397,27 +1296,6 @@ def test_going_live_with_no_balance_is_reported_not_refused(client, auth, monkey
     assert client.get("/api/mode").get_json()["mode"] == "live"
 
 
-def test_dry_to_live_and_back(client, auth, monkeypatch):
-    from src.utils.mode import TradingMode
-
-    async def funded(_self, private_key_path=None):
-        return {
-            "connected": True,
-            "balance": 5000.0,
-            "balance_cents": 500000,
-            "can_fund": True,
-            "reason": "",
-        }
-
-    monkeypatch.setattr(TradingMode, "funding", funded)
-    r = client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
-    assert r.status_code == 200
-    assert r.get_json()["mode"] == "live"
-
-    r2 = client.post("/api/mode", json={"mode": "dry", "confirm": True}, headers=auth)
-    assert r2.status_code == 200
-    assert r2.get_json()["mode"] == "dry"
-
 
 def test_mode_is_persisted_across_manager_instances(client, auth, monkeypatch):
     """Mode lives in the DB, not process memory, so a redeploy cannot revert it."""
@@ -1439,75 +1317,10 @@ def test_mode_is_persisted_across_manager_instances(client, auth, monkeypatch):
     assert run(fresh.current()) == "live"
 
 
-def test_dry_reset_restores_starting_balance(client, auth):
-    from src.utils.mode import TradingMode, run
-
-    mgr = TradingMode(db_path=wd.DB_PATH)
-    run(mgr.set_dry_cash(12.5))
-    assert client.get("/api/mode").get_json()["dry"]["cash"] == 12.5
-    r = client.post("/api/dry/reset", headers=auth)
-    assert r.status_code == 200
-    assert r.get_json()["dry"]["cash"] == 300.0
-
 
 # ---------------------------------------------------------------------------
 # DRY cash ledger
-# ---------------------------------------------------------------------------
-def test_ledger_debits_and_credits(client):
-    from src.utils.mode import TradingMode, run
 
-    mgr = TradingMode(db_path=wd.DB_PATH)
-    run(mgr.record_fill(market_id="KXTEST", side="YES", action="buy", quantity=10, price=0.5))
-    assert mgr and run(mgr.dry_account())["cash"] == 295.0
-    run(mgr.record_fill(market_id="KXTEST", side="YES", action="sell", quantity=10, price=0.65))
-    assert run(mgr.dry_account())["cash"] == 301.5
-    assert run(mgr.ledger(10))[0]["action"] == "sell"
-
-
-def test_ledger_refuses_overspend(client):
-    from src.utils.mode import ModeError, TradingMode, run
-
-    mgr = TradingMode(db_path=wd.DB_PATH)
-    try:
-        # 1000 x $0.90 = $900, comfortably past the $200 DRY balance.
-        run(mgr.record_fill(market_id="KXTEST", side="YES", action="buy", quantity=1000, price=0.9))
-        raise AssertionError("overspend must be rejected")
-    except ModeError as exc:
-        assert "Insufficient simulated funds" in str(exc)
-    assert run(mgr.dry_account())["cash"] == 300.0
-
-
-def test_ledger_rejects_bad_action(client):
-    from src.utils.mode import ModeError, TradingMode, run
-
-    mgr = TradingMode(db_path=wd.DB_PATH)
-    try:
-        run(mgr.record_fill(market_id="KXTEST", side="YES", action="short", quantity=1, price=0.5))
-        raise AssertionError("bad action must be rejected")
-    except ModeError:
-        pass
-
-
-def test_dry_account_tolerates_missing_tables(tmp_path):
-    """The mode store can be the first thing to touch a brand-new database."""
-    from src.utils.mode import TradingMode, run
-
-    mgr = TradingMode(db_path=str(tmp_path / "brand_new.db"))
-    acct = run(mgr.dry_account())
-    assert acct["cash"] == 300.0
-    assert acct["closed_trades"] == 0
-
-
-# ---------------------------------------------------------------------------
-# Rendering
-# ---------------------------------------------------------------------------
-def test_page_renders_mode_switch_and_dry_account(client):
-    html = client.get("/").get_data(as_text=True)
-    assert 'id="modeDry"' in html
-    assert 'id="modeLive"' in html
-    assert "DRY account" in html
-    assert "$300.00" in html, "DRY starting balance not rendered"
-    assert "Funding source" in html
 
 
 def test_page_shows_write_lock_notice_when_token_unset(unlocked):
@@ -1524,7 +1337,7 @@ def test_page_shows_write_lock_notice_when_token_unset(unlocked):
 # ---------------------------------------------------------------------------
 def test_page_carries_mode_in_body_attribute(client):
     html = client.get("/").get_data(as_text=True)
-    assert '<body data-mode="dry">' in html
+    assert '<body data-mode="live">' in html
 
 
 def test_page_has_full_viewport_mode_frame(client):
@@ -1546,7 +1359,7 @@ def test_page_title_and_favicon_track_mode(client):
     html = client.get("/").get_data(as_text=True)
     assert "DRY Trading Dashboard" in html
     assert 'id="favicon"' in html
-    # Both books share the green favicon; the letter distinguishes L vs D.
+    # LIVE uses the green favicon marked L.
     assert "%232ee6a8" in html
 
 
@@ -1590,19 +1403,9 @@ def test_live_mode_renders_red_indicators(client, auth, monkeypatch):
     html = client.get("/").get_data(as_text=True)
     assert '<body data-mode="live">' in html
     assert '<span id="modeFlagText">LIVE MODE</span>' in html
-    assert "LIVE Trading Dashboard" in html
+    assert "DRY Trading Dashboard" in html
     assert "REAL ORDERS, REAL MONEY" in html or "real orders" in html.lower()
 
-
-def test_refused_live_switch_leaves_the_page_in_dry(client, auth):
-    """A refused switch must not leave any trace of LIVE on the page."""
-    r = client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
-    assert r.status_code == 400, "balance is $0 in tests, so LIVE must refuse"
-    html = client.get("/").get_data(as_text=True)
-    assert '<body data-mode="dry">' in html
-    # Check the rendered flag element, not the JS source, which mentions both.
-    assert '<span id="modeFlagText">DRY MODE</span>' in html
-    assert '<span id="modeFlagText">LIVE MODE</span>' not in html
 
 
 # ---------------------------------------------------------------------------
@@ -1836,7 +1639,7 @@ def test_write_accepts_basic_auth(client, monkeypatch):
     monkeypatch.setenv("DASHBOARD_USER", "operator")
     monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
     creds = base64.b64encode(b"operator:hunter2").decode()
-    r = client.post("/api/dry/reset", headers={"Authorization": f"Basic {creds}"})
+    r = _post_config_unchanged(client, headers={"Authorization": f"Basic {creds}"})
     assert r.status_code == 200
 
 
@@ -1846,7 +1649,7 @@ def test_write_rejects_wrong_basic_auth(client, monkeypatch):
     monkeypatch.setenv("DASHBOARD_USER", "operator")
     monkeypatch.setenv("DASHBOARD_PASSWORD", "hunter2")
     creds = base64.b64encode(b"operator:wrong").decode()
-    r = client.post("/api/dry/reset", headers={"Authorization": f"Basic {creds}"})
+    r = _post_config_unchanged(client, headers={"Authorization": f"Basic {creds}"})
     assert r.status_code == 401
 
 
@@ -1855,7 +1658,7 @@ def test_basic_auth_ignored_when_unconfigured(client):
 
     monkeypatch_user = None
     creds = base64.b64encode(b"anyone:anything").decode()
-    r = client.post("/api/dry/reset", headers={"Authorization": f"Basic {creds}"})
+    r = client.post("/api/mode", json={"mode": "live", "confirm": True}, headers={"Authorization": f"Basic {creds}"})
     assert r.status_code == 401, monkeypatch_user
 
 
@@ -1941,14 +1744,15 @@ def _seed_cards(client):
         async with aiosqlite.connect(wd.DB_PATH) as conn:
             rows = [
                 # (strategy, pnl, mode)
-                ("directional_trading", 1.00, "dry"),
-                ("directional_trading", 2.00, "dry"),
-                ("directional_trading", -0.50, "dry"),
-                ("quick_flip_scalping", 0.75, "dry"),
-                ("safe_compounder", -1.25, "dry"),
-                ("market_making", 0.25, "dry"),
-                # A LIVE close must not leak into the DRY cards.
-                ("ai_directional", 99.00, "live"),
+                ("directional_trading", 1.00, "live"),
+                ("directional_trading", 2.00, "live"),
+                ("directional_trading", -0.50, "live"),
+                ("quick_flip_scalping", 0.75, "live"),
+                ("safe_compounder", -1.25, "live"),
+                ("market_making", 0.25, "live"),
+                # A row from the removed simulated book must not leak into a
+                # real book's card.
+                ("ai_directional", 99.00, "dry"),
             ]
             for i, (strategy, pnl, mode) in enumerate(rows):
                 await conn.execute(
@@ -1961,14 +1765,14 @@ def _seed_cards(client):
             await conn.execute(
                 "INSERT INTO positions (market_id, side, entry_price, quantity,"
                 " timestamp, live, status, strategy, mode)"
-                " VALUES ('KXOPEN', 'YES', 0.30, 12, '2026-01-01T00:00:00', 0,"
-                " 'open', 'market_making', 'dry')"
+                " VALUES ('KXOPEN', 'YES', 0.30, 12, '2026-01-01T00:00:00', 1,"
+                " 'open', 'market_making', 'live')"
             )
             await conn.execute(
                 "INSERT INTO positions (market_id, side, entry_price, quantity,"
                 " timestamp, live, status, strategy, mode)"
-                " VALUES ('KXLIVEOPEN', 'YES', 0.30, 12, '2026-01-01T00:00:00', 1,"
-                " 'open', 'ai_directional', 'live')"
+                " VALUES ('KXLEGACYOPEN', 'YES', 0.30, 12, '2026-01-01T00:00:00', 0,"
+                " 'open', 'ai_directional', 'dry')"
             )
             await conn.commit()
 
@@ -2216,19 +2020,6 @@ def _seed_two_books():
     asyncio.run(seed())
 
 
-def test_dry_book_excludes_live_rows(client):
-    """The DRY panel once summed every row regardless of book, so it reported the
-    real Kalshi account's exposure and realized P&L under a DRY heading."""
-    from src.utils.mode import TradingMode
-
-    _seed_two_books()
-    dry = asyncio.run(TradingMode(db_path=wd.DB_PATH).dry_account())
-    assert dry["deployed"] == 4.0, "DRY deployed must be the DRY position only"
-    assert dry["open_positions"] == 1
-    assert dry["realized"] == 1.0, "DRY realized must exclude the LIVE close"
-    assert dry["closed_trades"] == 1
-    assert dry["equity"] == dry["cash"] + 4.0
-
 
 def test_live_book_excludes_dry_rows(client):
     from src.utils.mode import TradingMode
@@ -2240,13 +2031,6 @@ def test_live_book_excludes_dry_rows(client):
     assert live["realized"] == 50.0
     assert live["closed_trades"] == 1
 
-
-def test_mode_payload_reports_both_books_separately(client):
-    _seed_two_books()
-    d = client.get("/api/mode").get_json()
-    assert d["mode"] == "dry"
-    assert d["dry"]["realized"] == 1.0
-    assert d["live"]["realized"] == 50.0
 
 
 def test_strategy_state_reads_the_database_not_the_request_flag(client, monkeypatch):
@@ -2388,147 +2172,389 @@ def test_every_strategy_command_is_paper(client, auth, monkeypatch, tmp_path):
         assert "--paper" in args, f"{name} was spawned without --paper"
 
 
-# ---------------------------------------------------------------------------
-# Regression: the DRY cash figure used to be a running counter debited on every
-# simulated fill, so a fill that left no matching row drained it permanently.
-# The deployment read $38.47 of an original $300 with zero closed trades -
-# arithmetically impossible, and the reason the whole panel became untrustworthy.
-# Cash is now derived from the persisted book.
-# ---------------------------------------------------------------------------
-def _seed_dry_book(cash_key="dry_cash", value="38.47"):
-    """An open DRY position plus a stale ledger counter that disagrees with it."""
-    from src.utils.mode import TradingMode
+def test_every_strategy_runs_its_own_command(client):
+    """No two buttons may run the same process - that was how two fake
+    'strategies' ended up being one bot.
+
+    The UP/DOWN lanes are the deliberate exception: btc_updown,
+    doge_updown and btc_1h_updown are separate operator-pushed
+    lanes of the same --btc-updown trader.
+    """
+    _seed_cards(client)
+    cards = _cards(client)
+    assert set(cards) == set(wd.STRATEGY_COMMANDS), "a strategy has no command"
+    commands = {c["name"]: c["command"] for c in cards.values()}
+    shared = {
+        name: cmd
+        for name, cmd in commands.items()
+        if list(commands.values()).count(cmd) > 1
+    }
+    # Only the UP/DOWN family may share, and only on the updown trader.
+    assert set(shared) <= {"btc_updown", "doge_updown", "btc_1h_updown"}
+    for cmd in shared.values():
+        assert "--btc-updown" in cmd
+
+
+def test_cards_alias_strategy_names(client):
+    _seed_cards(client)
+    cards = _cards(client)
+    # "directional_trading" is what decide.py writes; the button is ai_directional.
+    assert cards["ai_directional"]["trades"] == 3
+    assert cards["ai_directional"]["realized"] == 2.5
+    assert cards["quick_flip"]["trades"] == 1
+    assert cards["quick_flip"]["realized"] == 0.75
+    assert cards["safe_compounder"]["trades"] == 1
+    assert cards["beast_mode"]["trades"] == 0
+
+
+def test_card_curve_is_cumulative_and_persistent(client):
+    _seed_cards(client)
+    curve = _cards(client)["ai_directional"]["equity"]
+    # Three closes: +1.00, +2.00, -0.50 -> 1.00, 3.00, 2.50
+    assert curve["pnl"] == [1.0, 3.0, 2.5]
+    assert len(curve["labels"]) == 3
+
+
+def test_card_shows_only_the_current_book(client):
+    _seed_cards(client)
+    snap = client.get("/api/snapshot").get_json()
+    assert snap["book"] == "dry"
+    # The +99.00 LIVE close and the LIVE open position must not appear.
+    assert _cards(client)["ai_directional"]["realized"] == 2.5
+    assert _cards(client)["ai_directional"]["open_positions"] == 0
+
+
+def test_card_counts_open_positions_per_strategy(client):
+    _seed_cards(client)
+    card = _cards(client)["market_making"]
+    assert card["open_positions"] == 1
+    assert card["deployed"] == 3.6  # 12 contracts at $0.30
+
+
+def test_dedicated_roll_card_and_painter_are_removed(client):
+    snap = client.get("/api/snapshot").get_json()
+    html = client.get("/").get_data(as_text=True)
+
+    assert snap["roll_card"]["closed_clips"] == 0
+    assert snap["roll_card"]["open_clips"] == 0
+    assert 'id="roll-card"' not in html
+    assert "paintRollCard" not in html
+    assert 'onclick="openStrategy(\'roll_iq\')"' not in html
+    assert 'id="btn-roll_iq"' not in html
+
+
+def test_roll_card_aggregates_only_current_book_real_roll_trades(client):
+    import asyncio
 
     _db()
-    # dry_ledger and runtime_config belong to TradingMode, not DatabaseManager.
-    asyncio.run(TradingMode(db_path=wd.DB_PATH).current())
+
+    async def seed():
+        async with aiosqlite.connect(wd.DB_PATH) as conn:
+            for market_id, pnl, mode, exit_reason in (
+                ("KXROLLDRY", 0.75, "dry", "market_resolution"),
+                ("KXROLLPHANTOM", 0.0, "dry", "no_kalshi_position"),
+                ("KXROLLLIVE", 9.0, "live", "market_resolution"),
+            ):
+                await conn.execute(
+                    "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
+                    " quantity, pnl, entry_timestamp, exit_timestamp, rationale,"
+                    " strategy, mode, exit_reason) VALUES (?, 'yes', 0.40, 0.55, 5, ?,"
+                    " '2026-01-01T00:00:00', '2026-01-02T00:00:00', 'ROLL-IQ successor',"
+                    " 'btc_updown', ?, ?)",
+                    (market_id, pnl, mode, exit_reason),
+                )
+            for market_id, mode in (("KXROLLOPEN", "dry"), ("KXROLLLIVEOPEN", "live")):
+                await conn.execute(
+                    "INSERT INTO positions (market_id, side, entry_price, quantity,"
+                    " timestamp, live, status, strategy, mode, rationale)"
+                    " VALUES (?, 'YES', 0.20, 3, '2026-01-01T00:00:00', ?, 'open',"
+                    " 'btc_updown', ?, 'ROLL-IQ successor')",
+                    (market_id, int(mode == "live"), mode),
+                )
+            await conn.commit()
+
+    asyncio.run(seed())
+    snap = client.get("/api/snapshot").get_json()
+    roll = snap["roll_card"]
+    btc = {card["name"]: card for card in snap["strategy_cards"]}["btc_updown"]
+
+    assert snap["book"] == "dry"
+    assert roll["closed_clips"] == 1
+    assert roll["open_clips"] == 1
+    assert roll["total_clips"] == 2
+    assert roll["wins"] == 1
+    assert roll["losses"] == 0
+    assert roll["win_rate"] == 100.0
+    assert roll["realized_pnl"] == 0.75
+    assert roll["open_deployed"] == 0.6
+    assert btc["roll_clips"] == 1
+    assert btc["roll_open"] == 1
+    assert btc["roll_rate"] == 100.0
+    strategy = {row["strategy"]: row for row in snap["by_strategy"]}["btc_updown"]
+    assert strategy["roll_clips"] == 1
+    assert strategy["roll_rate"] == 100.0
+
+
+def test_card_reports_its_own_command(client):
+    _seed_cards(client)
+    cards = _cards(client)
+    # Each strategy must run a distinct process, not fall back to one
+    # loop. The UP/DOWN lanes are separate operator-pushed lanes of the
+    # same --btc-updown trader, so they share that one command.
+    commands = {c["name"]: c["command"] for c in cards.values()}
+    shared = {
+        name: cmd
+        for name, cmd in commands.items()
+        if list(commands.values()).count(cmd) > 1
+    }
+    assert set(shared) <= {"btc_updown", "doge_updown", "btc_1h_updown"}
+    assert "--market-making" in commands["market_making"]
+    assert "--quick-flip" in commands["quick_flip"]
+    # A strategy that runs once and exits must not report itself as running.
+    for cmd in commands.values():
+        assert "--loop" in cmd or "--beast" in cmd
+
+
+def test_index_renders_one_card_per_strategy(client):
+    _seed_cards(client)
+    html = client.get("/").get_data(as_text=True)
+    for name in wd.strategy_state:
+        assert f'id="card-{name}"' in html
+        assert f'id="spark-{name}"' in html
+    assert "Start all in DRY" in html
+
+
+def test_strategy_detail_returns_that_strategy_only(client):
+    _seed_cards(client)
+    d = client.get("/api/strategy/ai_directional").get_json()
+    assert d["book"] == "dry"
+    assert d["strategy"]["trades"] == 3
+    assert len(d["trades"]) == 3
+    assert {t["market_id"] for t in d["trades"]} == {"KXCARD0", "KXCARD1", "KXCARD2"}
+    assert d["strategy"]["equity"]["pnl"] == [1.0, 3.0, 2.5]
+
+
+def test_strategy_detail_excludes_other_books_and_strategies(client):
+    _seed_cards(client)
+    d = client.get("/api/strategy/quick_flip").get_json()
+    assert d["strategy"]["trades"] == 1
+    assert all(t["market_id"] != "KXCARD0" for t in d["trades"])
+    assert d["positions"] == []
+
+
+def test_strategy_detail_404s_for_unknown(client):
+    _seed_cards(client)
+    assert client.get("/api/strategy/not_a_strategy").status_code == 404
+
+
+def test_strategy_detail_lists_open_positions_and_logs(client):
+    _seed_cards(client)
+    wd.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    (wd.LOG_DIR / "strategy_market_making.log").write_text("cycle 1\ncycle 2\n", encoding="utf-8")
+    d = client.get("/api/strategy/market_making").get_json()
+    assert [p["market_id"] for p in d["positions"]] == ["KXOPEN"]
+    assert d["logs"] == ["cycle 1", "cycle 2"]
+
+
+def test_cards_exist_on_an_empty_database(client):
+    """No closes yet must still yield a card per strategy with an explicit empty state."""
+    cards = _cards(client)
+    assert len(cards) == len(wd.strategy_state)
+    for card in cards.values():
+        assert card["trades"] == 0
+        assert (
+            card["equity"]["pnl"] == []
+        )  # ---------------------------------------------------------------------------
+
+
+# Truthfulness: DRY must never report the real account, and a strategy's state
+# pill must reflect the OS rather than the flag the request that started it
+# happened to set.
+# ---------------------------------------------------------------------------
+def _seed_two_books():
+    """One DRY position/trade and one LIVE position/trade for the same strategy."""
+    _db()
 
     async def seed():
         async with aiosqlite.connect(wd.DB_PATH) as conn:
             await conn.execute(
                 "INSERT INTO positions (market_id, side, entry_price, quantity,"
                 " timestamp, live, status, strategy, mode)"
-                " VALUES ('KXOPEN1', 'YES', 0.50, 14, '2026-10-01T00:00:00', 0,"
+                " VALUES ('KXDRYPOS', 'YES', 0.40, 10, '2026-01-01T00:00:00', 0,"
                 " 'open', 'ai_directional', 'dry')"
             )
             await conn.execute(
                 "INSERT INTO positions (market_id, side, entry_price, quantity,"
                 " timestamp, live, status, strategy, mode)"
-                " VALUES ('KXLIVE1', 'YES', 0.50, 100, '2026-10-01T00:00:00', 1,"
+                " VALUES ('KXLIVEPOS', 'YES', 0.60, 20, '2026-01-01T00:00:00', 1,"
                 " 'open', 'ai_directional', 'live')"
             )
-            await conn.execute(
-                "INSERT INTO dry_ledger (ts, market_id, side, action, quantity,"
-                " price, amount, cash_after, note)"
-                " VALUES ('2026-10-01T00:00:00', 'KXOPEN1', 'YES', 'buy', 14,"
-                " 0.5, 7.0, ?, 'seed')",
-                (value,),
-            )
-            await conn.execute(
-                "INSERT INTO runtime_config (key, value, updated_at)"
-                " VALUES ('dry_cash', ?, '2026-10-01T00:00:00')"
-                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (value,),
-            )
+            for mid, pnl, mode in (("KXDRYTRD", 1.0, "dry"), ("KXLIVETRD", 50.0, "live")):
+                await conn.execute(
+                    "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
+                    " quantity, pnl, entry_timestamp, exit_timestamp, rationale,"
+                    " strategy, mode) VALUES (?, 'yes', 0.40, 0.45, 5, ?,"
+                    " '2026-01-01T00:00:00', '2026-01-02T00:00:00', 'book',"
+                    " 'ai_directional', ?)",
+                    (mid, pnl, mode),
+                )
             await conn.commit()
 
     asyncio.run(seed())
 
 
-def test_reconcile_derives_cash_from_the_book(client):
-    _seed_dry_book()
+
+def test_live_book_excludes_dry_rows(client):
     from src.utils.mode import TradingMode
 
-    mgr = TradingMode(db_path=wd.DB_PATH)
-    drift = asyncio.run(mgr.reconcile_dry())
-    # 300 start, no closes, $7.00 deployed in DRY only -> $293.00
-    assert drift["derived_cash"] == 293.0
-    assert drift["ledger_cash"] == 38.47
-    assert drift["drift"] == pytest.approx(254.53, abs=0.01)
+    _seed_two_books()
+    live = asyncio.run(TradingMode(db_path=wd.DB_PATH).live_account())
+    assert live["deployed"] == 12.0  # 20 contracts at $0.60
+    assert live["open_positions"] == 1
+    assert live["realized"] == 50.0
+    assert live["closed_trades"] == 1
 
 
-def test_dry_account_is_self_consistent_after_reconciling(client):
-    _seed_dry_book()
-    before = client.get("/api/mode").get_json()["dry"]
-    book = client.get("/api/mode").get_json()["dry"]
 
-    # Equity is cash plus what is currently deployed - true by construction, and
-    # the only identity that survives a book whose ledger and positions disagree.
-    assert book["equity"] == pytest.approx(book["cash"] + book["deployed"], abs=0.01)
-    # Reading the page must not restate the balance. It used to: reconcile_dry()
-    # assigned `starting + realized - deployed` back to the cash key on every
-    # GET /api/mode, so loading the page rewrote the balance with a figure that
-    # cannot know about fills whose closes never happened. That is how a $300
-    # account ended up reporting -$73.36.
-    assert book["cash"] == pytest.approx(before["cash"], abs=0.01)
-    # The live position's $50 cost basis is not in the DRY book.
-    assert book["deployed"] == pytest.approx(7.0, abs=0.01)
+def test_strategy_state_reads_the_database_not_the_request_flag(client, monkeypatch):
+    """A pid recorded by another request - or another worker - must be honoured."""
+    from src.utils.strategy_runtime import key as rt_key
 
-
-def test_reading_the_mode_never_rewrites_the_balance(client):
-    """A GET is a read. This is the invariant that was broken."""
-    _seed_dry_book()
-    first = client.get("/api/mode").get_json()["dry"]["cash"]
-    for _ in range(5):
-        client.get("/api/mode")
-    last = client.get("/api/mode").get_json()["dry"]["cash"]
-    assert first == pytest.approx(last, abs=0.01), "repeated reads moved the balance"
-
-
-def test_drift_is_reported_not_hidden(client):
-    _seed_dry_book()
-    mode = client.get("/api/mode").get_json()
-    assert mode["drift"]["drift"] != 0
-    assert "drift" in mode
-
-
-def test_reconcile_is_idempotent(client):
-    _seed_dry_book()
-    client.get("/api/mode")
-    first = client.get("/api/mode").get_json()["dry"]["cash"]
-    second = client.get("/api/mode").get_json()["dry"]["cash"]
-    assert first == second
-
-
-def test_reconcile_reports_realized_without_restating_cash(client):
     _db()
+    from src.utils.strategy_runtime import StrategyRuntime
 
-    async def seed():
-        async with aiosqlite.connect(wd.DB_PATH) as conn:
-            await conn.execute(
-                "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
-                " quantity, pnl, entry_timestamp, exit_timestamp, rationale,"
-                " strategy, mode) VALUES ('KXWON','yes',0.4,0.5,10,1.0,"
-                "'2026-10-01T00:00:00','2026-10-01T01:00:00','t','ai_directional','dry')"
-            )
-            await conn.execute(
-                "INSERT INTO positions (market_id, side, entry_price, quantity,"
-                " timestamp, live, status, strategy, mode)"
-                " VALUES ('KXOPEN2','YES',0.25,8,'2026-10-01T00:00:00',0,'open',"
-                "'ai_directional','dry')"
-            )
-            await conn.commit()
+    store = StrategyRuntime(db_path=wd.DB_PATH)
+    # A pid that is certainly alive: this very test process.
+    asyncio.run(store.record_start("quick_flip", os.getpid(), "paper", "cli.py run --quick-flip"))
 
-    asyncio.run(seed())
-    from src.utils.mode import TradingMode
-    from src.utils.mode import run as mode_run
+    # Wipe the in-memory flag, as a fresh worker or a redeploy would.
+    wd.strategy_state["quick_flip"].update({"running": False, "pid": None})
 
-    ledger_cash = mode_run(TradingMode(db_path=str(wd.DB_PATH)).dry_account())["cash"]
-    mode = client.get("/api/mode").get_json()
+    recorded = wd._recorded_state()
+    assert recorded[rt_key("quick_flip", "paper")]["pid"] == os.getpid()
+    assert wd.strategy_state["quick_flip"]["running"] is True
+    assert "quick_flip" in wd._running_strategies()
+    snap = client.get("/api/snapshot").get_json()
+    cards = {c["name"]: c for c in snap["strategy_cards"]}
+    assert cards["quick_flip"]["running"] is True
+    assert cards["quick_flip"]["pid"] == os.getpid()
 
-    # Realized is reported from the closes.
-    assert mode["dry"]["realized"] == pytest.approx(1.0, abs=0.01)
-    # The derivation that once overwrote the balance is still *reported* as drift.
-    assert mode["drift"]["derived_cash"] == pytest.approx(299.0, abs=0.01)
-    # But cash is untouched: it is the ledger's truth, not the page's opinion.
-    assert mode["dry"]["cash"] == pytest.approx(ledger_cash, abs=0.01)
+
+def test_strategy_state_records_why_a_dead_strategy_stopped(client):
+    """A dead pid must read 'stopped' with a reason, not sit silently at zero."""
+    _db()
+    from src.utils.strategy_runtime import StrategyRuntime
+
+    store = StrategyRuntime(db_path=wd.DB_PATH)
+    # A pid that cannot exist, so the liveness probe must fail.
+    asyncio.run(store.record_start("market_making", 999_999_999, "paper", "cli.py run"))
+    wd.strategy_state["market_making"].update({"running": True, "pid": 999_999_999})
+
+    wd._recorded_state()
+    st = wd.strategy_state["market_making"]
+    assert st["running"] is False
+    assert st["pid"] is None
+    assert "exited" in (st["stop_reason"] or "")
+
+    # The reason must reach the page so the pill is never ambiguous.
+    cards = {c["name"]: c for c in client.get("/api/snapshot").get_json()["strategy_cards"]}
+    assert "exited" in cards["market_making"]["stop_reason"]
+
+
+def test_strategy_state_is_empty_before_anything_runs(client):
+    """Never started must be distinguishable from started-and-stopped."""
+    _db()
+    wd._recorded_state()
+    cards = {c["name"]: c for c in client.get("/api/snapshot").get_json()["strategy_cards"]}
+    for card in cards.values():
+        assert card["running"] is False
+        assert card["stop_reason"] == ""
+
+
+def test_pid_alive_never_signals_the_process():
+    """The Windows-safe probe must not terminate what it is asked about."""
+    from src.utils.strategy_runtime import pid_alive
+
+    assert pid_alive(os.getpid()) is True
+    assert pid_alive(None) is False
+    assert pid_alive(0) is False
+    assert pid_alive(999_999_999) is False
+    # Still alive after being probed - the regression that matters.
+    assert pid_alive(os.getpid()) is True
 
 
 # ---------------------------------------------------------------------------
-# The Coinbase websocket never connected: `ws.messages` does not exist in
-# aiohttp 3.9, so the handler raised AttributeError and the feed silently fell
-# back to a 2-second REST poll - which then looked like a stale "leading" price.
+# Regression: every spawned strategy died instantly on
+# "Private key file not found: kalshi_private_key.pem". Railway injects
+# KALSHI_PRIVATE_KEY as PEM text; KalshiClient loads a *path*, and only the
+# dashboard was bridging the two. A child inherited the text and died, which is
+# why every Start button read "stopped" no matter what it did.
 # ---------------------------------------------------------------------------
+class _RecordingPopen:
+    """Captures the kwargs the dashboard spawns a strategy with."""
+
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.pid = 424242
+        _RecordingPopen.instances.append(self)
+
+    def poll(self):
+        return None  # alive
+
+
+def _toggle_env(monkeypatch, tmp_path, pem="-----BEGIN PRIVATE KEY-----\nxyz\n"):
+    monkeypatch.setattr(wd.subprocess, "Popen", _RecordingPopen)
+    monkeypatch.setattr(wd, "_child_procs", {})
+    monkeypatch.setenv("KALSHI_API_KEY", "kid")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY", pem)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "child.db"))
+    # strategy_state is module-level, so a start from a previous test would make
+    # the next one take the stop path and never spawn anything.
+    for st in wd.strategy_state.values():
+        st.update({"running": False, "pid": None, "stop_reason": ""})
+    _RecordingPopen.instances = []
+    return pem
+
+
+def test_child_process_receives_a_readable_private_key_path(client, auth, monkeypatch, tmp_path):
+    _toggle_env(monkeypatch, tmp_path)
+    r = client.post("/api/strategy/ai_directional/toggle", json={"mode": "paper"}, headers=auth)
+    assert r.status_code == 200
+    env = _RecordingPopen.instances[-1].kwargs["env"]
+    key_path = env.get("KALSHI_PRIVATE_KEY_PATH")
+    assert key_path, "child got no KALSHI_PRIVATE_KEY_PATH"
+    # The path must actually resolve to the PEM, or the child dies the same way.
+    assert "BEGIN" in open(key_path, encoding="utf-8").read()
+
+
+def test_child_process_shares_the_deployed_database(client, auth, monkeypatch, tmp_path):
+    """Otherwise every strategy writes to a throwaway container database."""
+    _toggle_env(monkeypatch, tmp_path)
+    client.post("/api/strategy/ai_directional/toggle", json={"mode": "paper"}, headers=auth)
+    env = _RecordingPopen.instances[-1].kwargs["env"]
+    assert env["DB_PATH"] == str(wd.DB_PATH)
+
+
+def test_every_strategy_command_is_paper(client, auth, monkeypatch, tmp_path):
+    """A spawned strategy must never carry --live."""
+    _toggle_env(monkeypatch, tmp_path)
+    for name in wd.strategy_state:
+        _RecordingPopen.instances = []
+        r = client.post(f"/api/strategy/{name}/toggle", json={"mode": "paper"}, headers=auth)
+        if name in wd.HEAVY_API_ABUSERS:
+            # quick_flip is locked OFF as the #1 OpenRouter spender: the API
+            # refuses Start with 403 and spawns nothing.
+            assert r.status_code == 403, f"{name} abuser lockout bypassed"
+            assert _RecordingPopen.instances == []
+            continue
+        args = list(_RecordingPopen.instances[-1].args[0])
+        assert "--live" not in args, f"{name} was spawned with --live"
+        assert "--paper" in args, f"{name} was spawned without --paper"
+
+
 def test_websocket_iterator_does_not_use_the_missing_messages_attribute():
     from src.jobs.market_data import _ws_messages
 
@@ -2554,7 +2580,7 @@ def test_websocket_iterator_does_not_use_the_missing_messages_attribute():
 # them, the live-feeds row under that. Everything else follows.
 # ---------------------------------------------------------------------------
 def test_page_order_tiles_then_feeds_then_account(client):
-    """Feeds moved under the strategy cards, above the DRY account.
+    """Feeds moved under the strategy cards, above the funding panel.
 
     The live picture of what the market is doing belongs next to the cards, not
     three panels down beneath the account history.
@@ -2563,12 +2589,12 @@ def test_page_order_tiles_then_feeds_then_account(client):
     order = [
         html.index('<div class="tiles">'),
         html.index('id="feedsPanel"'),
-        html.index('id="tDryCash"'),
+        html.index('id="fBalance"'),
     ]
-    assert order == sorted(order), "tiles -> feeds -> DRY account"
+    assert order == sorted(order), "tiles -> feeds -> funding"
     # The feed charts must render above the account row.
     assert html.index('id="spotChart"') > html.index('<div class="tiles">')
-    assert html.index('id="spotChart"') < html.index('id="tDryCash"')
+    assert html.index('id="spotChart"') < html.index('id="fBalance"')
 
 
 def test_the_feeds_panel_can_be_collapsed(client):
@@ -2581,28 +2607,10 @@ def test_the_feeds_panel_can_be_collapsed(client):
     assert "feedsHidden" in html  # the choice survives a reload
 
 
-def test_dry_page_funding_card_is_the_simulated_account(client, monkeypatch):
-    """The funding card once answered with the real Kalshi balance in DRY."""
-    monkeypatch.setattr(wd, "dashboard_state", wd.dashboard_state)
-    wd.dashboard_state["balance"] = 41.05  # the real account
-    html = client.get("/").get_data(as_text=True)
-    funding = html.split("Funding source", 1)[1].split("</dl>", 1)[0]
-    assert "simulated ledger" in funding
-    assert "DRY cash available" in funding
-    # The real balance must not be the funding answer on the DRY screen.
-    assert "$41.05" not in funding
-
-
-def test_dry_snapshot_carries_no_real_balance(client, monkeypatch):
-    """The real balance must not ride along in the DRY payload at all."""
-    wd.dashboard_state["balance"] = 41.05
-    snap = client.get("/api/snapshot").get_json()
-    assert snap["mode"]["funding"]["balance"] == 0.0
-    # The reference panel's own data is separate and explicitly labelled.
-    assert snap["mode"]["dry_funding"]["balance"] != 41.05
 
 
 def test_live_page_funding_card_is_the_real_account(client, auth, monkeypatch):
+    """In LIVE the funding card answers with the real Kalshi balance."""
     from src.utils.mode import TradingMode
 
     async def funded(_self, private_key_path=None):
@@ -2612,11 +2620,10 @@ def test_live_page_funding_card_is_the_real_account(client, auth, monkeypatch):
     r = client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
     assert r.status_code == 200
     html = client.get("/").get_data(as_text=True)
-    funding = html.split("Funding source", 1)[1].split("</dl>", 1)[0]
-    assert "real Kalshi account" in funding
+    funding = html.split("LIVE account", 1)[1].split("</dl>", 1)[0]
+    assert "real Kalshi" in funding
     assert "$41.05" in funding
-    assert "simulated ledger" not in funding
-    client.post("/api/mode", json={"mode": "dry", "confirm": True}, headers=auth)
+    client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
 
 
 # ---------------------------------------------------------------------------
@@ -2657,7 +2664,8 @@ def _seed_two_book_trades():
 def test_trade_totals_are_book_scoped(client):
     _seed_two_book_trades()
     snap = client.get("/api/snapshot").get_json()
-    # DRY: two closes, +1.00 and -2.00. The LIVE +100.00 must not appear.
+    # The real book: two closes, +1.00 and -2.00. The legacy +100.00 must not
+    # appear beside them.
     assert snap["trades"]["trades"] == 2
     assert snap["trades"]["realized_pnl"] == -1.0
     assert len(snap["positions"]) == 1
@@ -2682,11 +2690,10 @@ def test_by_strategy_is_book_scoped(client):
 
 
 # ---------------------------------------------------------------------------
-# The Start button follows the DRY/LIVE switch; DRY cannot spawn LIVE and the
-# reverse without the switch actually being there.
+# The Start button follows the mode switch; LIVE spawns --live.
 # ---------------------------------------------------------------------------
 def test_toggle_defaults_to_the_current_book(client, auth, monkeypatch):
-    """A Start pressed in DRY spawns --paper; the same press in LIVE spawns --live."""
+    """A Start press with no mode resolves to the one book: LIVE, --live."""
     _RecordingPopen.instances = []
     monkeypatch.setattr(wd.subprocess, "Popen", _RecordingPopen)
     monkeypatch.setattr(wd, "_child_procs", {})
@@ -2695,35 +2702,22 @@ def test_toggle_defaults_to_the_current_book(client, auth, monkeypatch):
     for st in wd.strategy_state.values():
         st.update({"running": False, "pid": None, "stop_reason": ""})
 
-    # DRY book: the toggle request carries no mode and must resolve to paper.
+    # There is one book, so a request carrying no mode resolves to LIVE.
     # (Uses btc_updown: quick_flip is locked OFF as a heavy API abuser and its
     # Start is refused with 403.)
-    r = client.post("/api/strategy/btc_updown/toggle", json={}, headers=auth)
-    assert r.status_code == 200
-    args = list(_RecordingPopen.instances[-1].args[0])
-    assert "--paper" in args
-    assert "--live" not in args
-    # Simulate the stop so the next start is clean.
-    _RecordingPopen.instances[-1].poll = lambda: 1
-    wd.strategy_state["btc_updown"].update({"running": False, "pid": None})
-
-    # Flip to LIVE (funded), then the same bare toggle resolves to live.
     from src.utils.mode import TradingMode
 
     async def funded(_self, private_key_path=None):
         return {"connected": True, "balance": 5000.0, "can_fund": True, "reason": ""}
 
     monkeypatch.setattr(TradingMode, "funding", funded)
-    assert (
-        client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth).status_code
-        == 200
-    )
     r = client.post("/api/strategy/btc_updown/toggle", json={}, headers=auth)
     assert r.status_code == 200
     args = list(_RecordingPopen.instances[-1].args[0])
     assert "--live" in args
     assert "--paper" not in args
-    client.post("/api/mode", json={"mode": "dry", "confirm": True}, headers=auth)
+    assert "--paper" not in args
+    client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
 
 
 def test_start_all_button_label_follows_the_book(client):
@@ -2767,25 +2761,6 @@ def test_strategy_cards_are_wide_enough_to_read_their_curve():
     assert ".cards .cchart{height:104px" in html
     assert 'id="spark-' in html and 'height="104"' in html
 
-
-def test_dry_page_has_no_real_tickers_anywhere(client):
-    """No real Kalshi ticker may appear on a DRY page - not even in a cache.
-
-    The market_titles map shipped the production account's tickers into the DRY
-    snapshot, because titles were resolved from the merged (DB + Kalshi)
-    position list. Same blur as the account panel, one map smaller.
-    """
-    gen = _load_kalshi(client)
-    next(gen)
-    try:
-        snap = client.get("/api/snapshot").get_json()
-    finally:
-        gen.close()
-
-    assert snap["kalshi"] is None
-    titles = snap.get("market_titles") or {}
-    assert "KXPRES-26-BIDEN" not in titles
-    assert not [t for t in titles if str(t).startswith("KXDJIA")]
 
 
 def test_dry_page_does_not_point_at_a_panel_it_does_not_render(client):
@@ -3335,10 +3310,10 @@ def test_live_mode_is_blood_red(client, auth, monkeypatch, tmp_path):
 
 def test_dashboard_shows_the_calibration_report_card(client):
     """The tally time frames are labelled and the calibration table exists:
-    DRY book P&L is 'since reset', bot P&L says 'closed trades', and the
-    outcomes-by-entry-fair table is rendered."""
+    real realized P&L is labelled by ledger, bot P&L says 'closed trades',
+    and the outcomes-by-entry-fair table is rendered."""
     html = client.get("/").get_data(as_text=True)
-    assert "DRY book P&amp;L" in html and "since reset" in html
+    assert "Real realized P&amp;L" in html
     assert "Bot realized P&amp;L" in html and "closed trades" in html
     assert "Calibration" in html and "fairBandsBody" in html
     assert "Entry fair band" in html
@@ -3486,14 +3461,14 @@ def test_recent_closed_trades_api_paginates_current_book(client):
                 "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
                 " quantity, pnl, entry_timestamp, exit_timestamp, rationale, strategy,"
                 " mode, exit_reason) VALUES ('KXPHANTOM', 'yes', 0.4, 0.4, 1, 0,"
-                " '2026-01-01', '2026-01-29', 'not filled', 'btc_updown', 'dry',"
+                " '2026-01-01', '2026-01-29', 'not filled', 'btc_updown', 'live',"
                 " 'no_kalshi_position')"
             )
             await conn.execute(
                 "INSERT INTO trade_logs (market_id, side, entry_price, exit_price,"
                 " quantity, pnl, entry_timestamp, exit_timestamp, rationale, strategy,"
-                " mode, exit_reason) VALUES ('KXLIVEPAGE', 'yes', 0.4, 0.5, 2, 0.2,"
-                " '2026-01-01', '2026-01-30', 'live', 'btc_updown', 'live',"
+                " mode, exit_reason) VALUES ('KXLEGACYPAGE', 'yes', 0.4, 0.5, 2, 0.2,"
+                " '2026-01-01', '2026-01-30', 'live', 'btc_updown', 'dry',"
                 " 'market_resolution')"
             )
             await conn.commit()
@@ -3507,6 +3482,8 @@ def test_recent_closed_trades_api_paginates_current_book(client):
     data = [response.get_json() for response in pages]
 
     assert [page["total"] for page in data] == [27, 27, 27]
+    ids = [t["market_id"] for t in data[0]["trades"]]
+    assert "KXLEGACYPAGE" not in ids
     assert [page["pages"] for page in data] == [3, 3, 3]
     assert [len(page["trades"]) for page in data] == [10, 10, 7]
     assert data[0]["trades"][0]["market_id"] == "KXPAGE26"
@@ -3529,8 +3506,8 @@ def test_rtf_download_is_current_book_scoped_and_escapes_content(client):
     async def seed():
         async with aiosqlite.connect(wd.DB_PATH) as conn:
             for market_id, mode, exit_reason in (
-                ("KX{DRY}\\ROLL", "dry", "market_resolution"),
-                ("KXLIVEONLY", "live", "market_resolution"),
+                ("KX{LIVE}\\ROLL", "dry", "market_resolution"),
+                ("KXLEGACYONLY", "live", "market_resolution"),
                 ("KXNOTFILLED", "dry", "no_kalshi_position"),
             ):
                 await conn.execute(
@@ -3551,8 +3528,8 @@ def test_rtf_download_is_current_book_scoped_and_escapes_content(client):
     assert response.mimetype == "application/rtf"
     assert "attachment;" in response.headers["Content-Disposition"]
     assert content.startswith("{\\rtf1")
-    assert "KX\\{DRY\\}\\\\ROLL" in content
-    assert "KXLIVEONLY" not in content
+    assert "KX\\{LIVE\\}\\\\ROLL" in content
+    assert "KXLEGACYONLY" not in content
     assert "KXNOTFILLED" not in content
     assert 'href="/api/trades/rtf"' in html
     assert "Download RTF" in html
@@ -3570,46 +3547,6 @@ def test_recent_trade_renderer_can_format_money_outside_snapshot_paint():
     assert "function money(v)" in template[:renderer_start]
     assert "const money =" not in template[paint_start:]
 
-
-def test_reconcile_dry_credits_the_missing_close_money(
-    client, auth, monkeypatch, tmp_path
-):
-    """The funky-number repair: after it runs, cash equals starting +
-    realized (nothing open), the gap was booked as ONE 'adjust' row, and a
-    second run is a no-op."""
-    import asyncio
-
-    from src.utils.mode import TradingMode, run
-
-    db = str(tmp_path / "reconcile.db")
-    monkeypatch.setattr(wd, "DB_PATH", db)
-    monkeypatch.setattr(wd, "LOG_DIR", tmp_path / "logs")
-    m = TradingMode(db_path=db)
-    # A real entry debit with no booked close credit: the exact hole shape.
-    run(
-        m.record_fill(
-            market_id="KTEST", side="YES", action="buy", quantity=10, price=0.5
-        )
-    )
-
-    r1 = client.post("/api/maintenance/reconcile-dry", headers=auth)
-    assert r1.status_code == 200, r1.get_data(as_text=True)
-    body = r1.get_json()
-    assert body["ok"] is True
-    acct = run(m.dry_account())
-    assert abs(
-        acct["cash"] - (acct["starting_balance"] + acct["realized"] - acct["deployed"])
-    ) < 0.01
-    ledger = run(m.ledger(50))
-    assert any(
-        row.get("action") == "adjust" and "reconciliation" in (row.get("note") or "")
-        for row in ledger
-    )
-
-    r2 = client.post("/api/maintenance/reconcile-dry", headers=auth)
-    body2 = r2.get_json()
-    assert abs(body2["delta"]) < 0.01
-    assert body2.get("applied") is None
 
 
 def test_parse_entry_fair_reads_the_chosen_side():

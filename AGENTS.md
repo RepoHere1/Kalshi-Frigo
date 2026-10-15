@@ -21,7 +21,6 @@ cp env.template .env           # add API keys
 # Run (from project root)
 python cli.py run --paper           # AI directional, paper mode
 python cli.py run --live            # AI directional, live (real money)
-python cli.py run --safe-compounder # Conservative edge-based, no LLM
 python cli.py run --beast           # Aggressive (NOT default)
 python cli.py health                # Verify API + DB connectivity
 python cli.py dashboard             # Streamlit dashboard
@@ -98,7 +97,7 @@ Key packages:
 - `src/clients/` — Kalshi REST+WS client, OpenRouter/xAI client
 - `src/agents/` — LLM agent definitions (bear/bull researchers, debate, ensemble)
 - `src/jobs/` — Core async jobs (decide, execute, ingest, track, evaluate, trade)
-- `src/strategies/` — Trading strategies (market_making, quick_flip_scalping, safe_compounder, etc.)
+- `src/strategies/` — Trading strategies (unified_trading_system, etc.)
 - `src/utils/` — Database, logging, position sizing, cash reserves, stop-loss, edge filter
 - `src/config/settings.py` — All trading knobs as dataclasses
 
@@ -112,7 +111,7 @@ Key packages:
 6. **Price sanity checks** in `execute.py` (issue #42): collection tickers return $1.00/$1.00 and are not tradeable — skip them. Prices ≤0¢ or ≥100¢ are invalid.
 7. **Fail-closed balance check**: if `get_balance()` errors before placing an order, the order is skipped rather than risking an unaffordable trade.
 8. **`settings.trading` defaults change between runs** — `cli.py run` mutates settings inline (confidence, position size, drawdown). The "disciplined" defaults are applied at runtime, not in the dataclass definition.
-9. **Safe Compounder mode** (`--safe-compounder`) does NOT use the LLM at all — pure math/edge-based.
+9. **Dashboard lane set (operator order)**: the up/down family (btc 15m, btc 1h, eth 15m, eth 1h, hyperliquid 15m, hyperliquid 1h, xrp 15m, xrp 1h) and `beast_mode`. `market_making` (the standalone lane; beast keeps its INTERNAL market-making leg), `safe_compounder`, `quick_flip`, and `ai_directional` (LLM Directional) have NO cards and are never spawned by the dashboard or keep-alive; `cli.py run` (manual) still runs the LLM directional strategy as the CLI default.
 10. **Database initialization must complete** before trading cycles start — `beast_mode_bot.py:110-113` has explicit await for this.
 
 ## Code Patterns

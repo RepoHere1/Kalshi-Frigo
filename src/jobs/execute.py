@@ -9,7 +9,8 @@ import uuid
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
-from src.clients.kalshi_client import KalshiAPIError, KalshiClient
+from typing import Any
+from src.clients.kilo_gateway import KiloGateway
 from src.config.settings import settings
 from src.jobs.broker import broker_for_mode, build_order_request, default_mode_manager
 from src.utils.database import DatabaseManager, Position
@@ -30,7 +31,7 @@ def _mode_manager():
 
 
 async def _confirm_maker_fill(
-    kalshi_client: KalshiClient,
+    kalshi_client: Any,
     request,
     position: Position,
     wait_seconds: float,
@@ -118,7 +119,7 @@ async def execute_position(
     position: Position,
     live_mode: bool,
     db_manager: DatabaseManager,
-    kalshi_client: KalshiClient,
+    gateway: KiloGateway,
     maker_wait_seconds: float = 0.0,
 ) -> bool:
     """
@@ -128,7 +129,7 @@ async def execute_position(
         position: The position to execute.
         live_mode: Whether to execute a live or simulated trade.
         db_manager: The database manager instance.
-        kalshi_client: The Kalshi client instance.
+        gateway: The Kilo Gateway instance (unified API interface).
 
     Returns:
         True if execution was successful, False otherwise.
@@ -187,14 +188,13 @@ async def execute_position(
                 return False
 
     try:
-        # Live market data drives validation in both modes - a DRY run must see
-        # the same prices the exchange would.
-        market_data = await kalshi_client.get_market(position.market_id)
+        # Get market data through gateway
+        market_data = await gateway.get_market(position.market_id)
         market = market_data.get("market", {})
 
         broker = broker_for_mode(
             mode,
-            kalshi_client=kalshi_client if live_mode else None,
+            kalshi_client=gateway._current_client if live_mode else None,
             mode_manager=mode_manager,
         )
 
@@ -224,7 +224,7 @@ async def execute_position(
             # the book actually crossed our price. A rehearsal that books
             # phantom maker fills would be worse than none.
             filled = await _simulate_dry_maker_fill(
-                kalshi_client, request, position, float(maker_wait_seconds), logger
+                gateway._current_client, request, position, float(maker_wait_seconds), logger
             )
             if not filled:
                 logger.warning(
@@ -235,7 +235,7 @@ async def execute_position(
             
             # Re-price position to actual book price when maker fill occurred
             # This ensures DRY ledger matches what would have happened LIVE
-            md = await kalshi_client.get_market(position.market_id)
+            md = await gateway.get_market(position.market_id)
             market = (md or {}).get("market") or {}
             from src.utils.market_prices import get_market_prices
             _yb, ya, _nb, na = get_market_prices(market)
@@ -573,8 +573,8 @@ async def place_sell_limit_order(
             f"(proceeds ${request.notional:.2f})"
         )
 
-        # The only difference between DRY and LIVE from here down is which broker
-        # owns the KalshiClient. DryBroker has no place_order at all.
+        # The broker owns the KalshiClient, and it is the only object that can
+        # reach the order endpoint.
         response = await broker.submit(request)
 
         if response.get("error"):
@@ -622,12 +622,10 @@ _UPDOWN_SERIES = (
     "KXBTC1H",
     "KXXRP15M",
     "KXXRP1H",
-    "KXGOLDD",
-    "KXGOLD15M",
-    "KXXAU15M",
     "KXETH15M",
     "KXETH1H",
     "KXHYPE15M",
+    "KXHYPED",
     "KXBTCD",
     "KXETHD",
     "KXXRPD",
@@ -718,7 +716,16 @@ async def _close_after_sell(
 
     from src.utils.database import TradeLog
 
-    pnl = (float(exit_price) - float(position.entry_price)) * int(position.quantity or 0)
+    entry_px = float(position.entry_price or 0.0)
+    exit_px = float(exit_price or 0.0)
+    qty = int(position.quantity or 0)
+
+# YES and NO are both long contracts: buying NO at entry_px and selling
+    # it at exit_px earns (exit_px - entry_px) per contract, exactly like
+    # YES. The sign is NOT inverted by the side - only the price that is
+    # quoted differs (the NO book instead of the YES book).
+    pnl = (exit_px - entry_px) * qty
+
     fee_paid = 0.0
     try:
         from src.jobs import live_fees as _lf
@@ -866,93 +873,93 @@ async def place_profit_taking_orders(
                         "winner sold early to free the clip for the next edge"
                     )
 
-                # Calculate current profit
+# Calculate current profit
                 if current_price > 0:
                     profit_pct = (current_price - position.entry_price) / position.entry_price
                     unrealized_pnl = (current_price - position.entry_price) * position.quantity
 
-                    logger.debug(
-                        f"Position {position.market_id}: Entry=${position.entry_price:.3f}, Current=${current_price:.3f}, Profit={profit_pct:.1%}, PnL=${unrealized_pnl:.2f}"
+                logger.debug(
+                    f"Position {position.market_id}: Entry=${position.entry_price:.3f}, Current=${current_price:.3f}, Profit={profit_pct:.1%}, PnL=${unrealized_pnl:.2f}"
+                )
+
+                # Check if we should place a profit-taking sell order
+                if profit_pct >= profit_threshold:
+                    # Exit price: same maker/taker logic for
+                    # BOTH books. When time is patient (>120s to
+                    # settlement) the exit rests at the quote
+                    # (maker fee, ~1/4 the cost); when urgent it
+                    # takes at 2% below mid. DRY and LIVE use
+                    # identical exit pricing.
+                    from src.jobs import live_fees as _live_fees
+
+                    _secs = None
+                    try:
+                        _close_ts = market_data.get("close_time")
+                        if _close_ts:
+                            from datetime import datetime, timezone
+
+                            _ct = datetime.fromisoformat(
+                                str(_close_ts).replace("Z", "+00:00")
+                            )
+                            if _ct.tzinfo is None:
+                                _ct = _ct.replace(tzinfo=timezone.utc)
+                            _secs = (_ct - datetime.now(timezone.utc)).total_seconds()
+                    except Exception:  # noqa: BLE001
+                        _secs = None
+                    # Item 4b: a winning position inside the
+                    # settlement window rides to the $1.00 print
+                    # instead of scalping out for a few cents and
+                    # paying a second fee. Losing positions keep
+                    # every exit they had.
+                    if (
+                        _secs is not None
+                        and 0 < _secs <= _live_fees.SETTLEMENT_WINDOW_SECONDS
+                        and current_price > float(position.entry_price or 0.0)
+                    ):
+                        logger.info(
+                            f"🎆 Riding {position.market_id} to settlement: "
+                            f"{_secs:.0f}s left, in profit at "
+                            f"{current_price:.3f} vs entry "
+                            f"{position.entry_price:.3f} - no scalp"
+                        )
+                        continue
+                    sell_price = _live_fees.live_exit_limit_price(
+                        position.side, current_price, _secs
                     )
 
-                    # Check if we should place a profit-taking sell order
-                    if profit_pct >= profit_threshold:
-                        # Exit price: same maker/taker logic for
-                        # BOTH books. When time is patient (>120s to
-                        # settlement) the exit rests at the quote
-                        # (maker fee, ~1/4 the cost); when urgent it
-                        # takes at 2% below mid. DRY and LIVE use
-                        # identical exit pricing.
-                        from src.jobs import live_fees as _live_fees
+                    logger.info(
+                        f"💰 PROFIT TARGET HIT: {position.market_id} - {profit_pct:.1%} profit (${unrealized_pnl:.2f})"
+                    )
 
-                        _secs = None
-                        try:
-                            _close_ts = market_data.get("close_time")
-                            if _close_ts:
-                                from datetime import datetime, timezone
+                    # Place sell limit order
+                    success = await place_sell_limit_order(
+                        position=position,
+                        limit_price=sell_price,
+                        live_mode=live_mode,
+                        db_manager=db_manager,
+                        kalshi_client=kalshi_client,
+                    )
 
-                                _ct = datetime.fromisoformat(
-                                    str(_close_ts).replace("Z", "+00:00")
-                                )
-                                if _ct.tzinfo is None:
-                                    _ct = _ct.replace(tzinfo=timezone.utc)
-                                _secs = (_ct - datetime.now(timezone.utc)).total_seconds()
-                        except Exception:  # noqa: BLE001
-                            _secs = None
-                        # Item 4b: a winning position inside the
-                        # settlement window rides to the $1.00 print
-                        # instead of scalping out for a few cents and
-                        # paying a second fee. Losing positions keep
-                        # every exit they had.
-                        if (
-                            _secs is not None
-                            and 0 < _secs <= _live_fees.SETTLEMENT_WINDOW_SECONDS
-                            and current_price > float(position.entry_price or 0.0)
-                        ):
-                            logger.info(
-                                f"🎆 Riding {position.market_id} to settlement: "
-                                f"{_secs:.0f}s left, in profit at "
-                                f"{current_price:.3f} vs entry "
-                                f"{position.entry_price:.3f} - no scalp"
-                            )
-                            continue
-                        sell_price = _live_fees.live_exit_limit_price(
-                            position.side, current_price, _secs
-                        )
-
-                        logger.info(
-                            f"💰 PROFIT TARGET HIT: {position.market_id} - {profit_pct:.1%} profit (${unrealized_pnl:.2f})"
-                        )
-
-                        # Place sell limit order
-                        success = await place_sell_limit_order(
-                            position=position,
-                            limit_price=sell_price,
+                    if success:
+                        booked = True
+                        results["orders_placed"] += 1
+                        await _close_after_sell(
+                            db_manager,
+                            position,
+                            exit_price=sell_price,
+                            exit_reason="take_profit",
+                            logger=logger,
                             live_mode=live_mode,
-                            db_manager=db_manager,
-                            kalshi_client=kalshi_client,
                         )
-
-                        if success:
-                            booked = True
-                            results["orders_placed"] += 1
-                            await _close_after_sell(
-                                db_manager,
-                                position,
-                                exit_price=sell_price,
-                                exit_reason="take_profit",
-                                logger=logger,
-                                live_mode=live_mode,
-                            )
-                            logger.info(f"✅ Profit-taking order placed for {position.market_id}")
-                        else:
-                            logger.error(
-                                f"❌ Failed to place profit-taking order for {position.market_id}"
-                            )
+                        logger.info(f"✅ Profit-taking order placed for {position.market_id}")
+                    else:
+                        logger.error(
+                            f"❌ Failed to place profit-taking order for {position.market_id}"
+                        )
 
             except Exception as e:
                 logger.error(
-                    f"Error processing position {position.market_id} for profit taking: {e}"
+                f"Error processing position {position.market_id} for profit taking: {e}"
                 )
                 continue
             finally:
@@ -1047,48 +1054,48 @@ async def place_stop_loss_orders(
                 else:
                     current_price = (no_bid + no_ask) / 2.0
 
-                # Calculate current loss
+# Calculate current loss
                 if current_price > 0:
                     loss_pct = (current_price - position.entry_price) / position.entry_price
                     unrealized_pnl = (current_price - position.entry_price) * position.quantity
 
-                    # Check if we need stop-loss protection
-                    if loss_pct <= stop_loss_threshold:  # Negative loss percentage
-                        # Calculate stop-loss sell price
-                        stop_price = position.entry_price * (
-                            1 + stop_loss_threshold * 1.1
-                        )  # Slightly more aggressive
-                        stop_price = max(0.01, stop_price)  # Ensure price is at least 1¢
+                # Check if we need stop-loss protection
+                if loss_pct <= stop_loss_threshold:  # Negative loss percentage
+                    # Calculate stop-loss sell price
+                    stop_price = position.entry_price * (
+                        1 + stop_loss_threshold * 1.1
+                    )  # Slightly more aggressive
+                    stop_price = max(0.01, stop_price)  # Ensure price is at least 1¢
 
-                        logger.info(
-                            f"🛡️ STOP LOSS TRIGGERED: {position.market_id} - {loss_pct:.1%} loss (${unrealized_pnl:.2f})"
-                        )
+                    logger.info(
+                        f"🛡️ STOP LOSS TRIGGERED: {position.market_id} - {loss_pct:.1%} loss (${unrealized_pnl:.2f})"
+                    )
 
-                        # Place stop-loss sell order
-                        success = await place_sell_limit_order(
-                            position=position,
-                            limit_price=stop_price,
+                    # Place stop-loss sell order
+                    success = await place_sell_limit_order(
+                        position=position,
+                        limit_price=stop_price,
+                        live_mode=live_mode,
+                        db_manager=db_manager,
+                        kalshi_client=kalshi_client,
+                    )
+
+                    if success:
+                        booked = True
+                        results["orders_placed"] += 1
+                        await _close_after_sell(
+                            db_manager,
+                            position,
+                            exit_price=stop_price,
+                            exit_reason="stop_loss",
+                            logger=logger,
                             live_mode=live_mode,
-                            db_manager=db_manager,
-                            kalshi_client=kalshi_client,
                         )
-
-                        if success:
-                            booked = True
-                            results["orders_placed"] += 1
-                            await _close_after_sell(
-                                db_manager,
-                                position,
-                                exit_price=stop_price,
-                                exit_reason="stop_loss",
-                                logger=logger,
-                                live_mode=live_mode,
-                            )
-                            logger.info(f"✅ Stop-loss order placed for {position.market_id}")
-                        else:
-                            logger.error(
-                                f"❌ Failed to place stop-loss order for {position.market_id}"
-                            )
+                        logger.info(f"✅ Stop-loss order placed for {position.market_id}")
+                    else:
+                        logger.error(
+                            f"❌ Failed to place stop-loss order for {position.market_id}"
+                        )
 
             except Exception as e:
                 logger.error(f"Error processing position {position.market_id} for stop loss: {e}")

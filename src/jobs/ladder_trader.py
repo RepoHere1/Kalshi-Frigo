@@ -83,16 +83,6 @@ ASSET_TUNING: Dict[str, Dict[str, float]] = {
         "sweet_band_low": 0.20,
         "sweet_band_high": 0.50,
     },
-    "XAU-USD": {
-        "noise_pct": 0.0003,          # ~0.03% of price (~$0.90): Gold moves steadily
-        "max_entry_price": 0.85,      # Gold markets quote 0.64-0.88 (verified live)
-        "max_entry_price_maker": 0.85,
-        # Sweet band widened: gold markets live in 0.60-0.80 (near-certain
-        # quote is dominant because gold's volatility is much smaller than
-        # BTC's); the 0.20-0.50 band refuses every real trade.
-        "sweet_band_low": 0.55,
-        "sweet_band_high": 0.80,
-    },
     "ETH-USD": {
         "noise_pct": 0.0002,          # ~0.02% of price (~$0.51): ETH/XAU are large
                                       # asset like BTC; 0.1% was far too wide
@@ -474,15 +464,10 @@ class UpDownConfig:
         """Apply per-asset deadband and entry-band overrides.
 
         Called once by the runner with the lane's Coinbase pair so a sub-dollar
-        asset (XRP) or Gold (XAU) is not graded against BTC's microstructure
-        defaults. Unknown products keep BTC defaults unchanged.
+        asset (XRP) is not graded against BTC's microstructure defaults.
+        Unknown products keep BTC defaults unchanged.
         """
         _prod = (spot_product or "").strip().upper()
-        # Gold proxy: Coinbase has no XAU-USD product, so the gold lane prices
-        # against PAXG-USD (1 troy oz of tokenised gold). Grade it with the
-        # XAU tuning rather than BTC's microstructure defaults.
-        if _prod == "PAXG-USD":
-            _prod = "XAU-USD"
         tuning = ASSET_TUNING.get(_prod)
         if not tuning:
             return
@@ -542,13 +527,6 @@ class UpDownBook:
     skipped_shadow: int = 0
     skipped_drawdown: int = 0
     skipped_quick_win: int = 0
-    # ROLL-FORWARD IQ counters (additive path).
-    roll_clips: int = 0
-    roll_wins: int = 0
-    roll_losses: int = 0
-    skipped_roll_cold: int = 0
-    skipped_roll_ask: int = 0
-    skipped_roll_edge: int = 0
     skipped_news_sentiment: int = 0
     last_error: str = ""
     blocked: str = ""
@@ -581,9 +559,6 @@ class UpDownBook:
             "skipped_momentum": self.skipped_momentum,
             "skipped_correlated": self.skipped_correlated,
             "skipped_news_sentiment": self.skipped_news_sentiment,
-            "roll_clips": self.roll_clips,
-            "roll_wins": self.roll_wins,
-            "roll_losses": self.roll_losses,
             "last_error": self.last_error,
             "dry": self.dry,
             "certain_wins": self.certain_wins,
@@ -834,14 +809,6 @@ class UpDownTrader:
         # A dislocation read only exists for the asset those feeds carry.
         if getattr(feed, "series", "KXBTC15M") != "KXBTC15M":
             self.config.venue_guard_enabled = False
-        if str(getattr(feed, "series", "")).upper() == "KXGOLDD":
-            # Gold uses scored entries; the pair-arb path has a separate
-            # budget and bypasses both edge scoring and volatility warm-up.
-            self.config.certain_win_enabled = False
-            # The Polymarket window/momentum filters track BTC 15-minute
-            # markets, not Gold's daily settlement window.
-            self.config.poly_guard_enabled = False
-            self.config.momentum_filter_enabled = False
         # Polymarket same-window scanner + Hyperliquid mark (both keyless).
         from src.jobs.cross_venue_poly import PolyScanner
         from src.jobs.vol_edge import HyperliquidMark
@@ -1166,40 +1133,13 @@ class UpDownTrader:
 
         seconds_left = market.seconds_left or 900.0
         # Realized $-vol for exactly the time that is left. Most lanes use the
-        # legacy logistic during cold start; daily Gold blocks until this exists.
+        # legacy logistic during cold start.
         if sigma_snapshot is _SIGMA_SNAPSHOT_UNSET:
             self._sigma_used = self.rv.sigma_dollars(
                 horizon_seconds=seconds_left, last_price=spot
             )
         else:
             self._sigma_used = sigma_snapshot
-        if (
-            str(getattr(self.feed, "series", "")).upper() == "KXGOLDD"
-            and self._sigma_used is None
-        ):
-            self.book.skipped_vol_warmup += 1
-            signal = UpDownSignal(
-                ticker=market.ticker,
-                bucket=market.bucket,
-                side="",
-                target=target,
-                spot=spot,
-                spot_vs_target=delta,
-                fair=0.5,
-                kalshi_price=market.up_price,
-                edge=0.0,
-                ask=None,
-                contracts=0,
-                notional=0.0,
-                seconds_left=round(seconds_left, 1),
-                reason=(
-                    "waiting for realized volatility warm-up; daily Gold "
-                    "entries are blocked until the estimate is available"
-                ),
-                truth=truth_kind,
-            )
-            self.book.signals = [signal]
-            return signal
         # IMPLIED sigma: Kalshi's own price inverted through the diffusion.
         # A RICH implied vs realized is usually momentum - the diffusion fair
         # value already prices the move, so penalizing it again would
@@ -1531,8 +1471,9 @@ class UpDownTrader:
                 if _signal_count >= 3:
                     _clip = round(_clip * (_mult / self.config.conviction_mult), 2)
                     reason += f" | multi-signal ({_signal_count}x/{_mult:.1f}x)"
-            # 3x more spent per clip (operator directive), same source of
-            # truth as the LLM Kelly path: active in DRY, 1x in LIVE for now.
+            # 2x more spent per clip (operator directive: DOUBLE the Kelly
+            # size), same source of truth as the LLM Kelly path: active in
+            # DRY, 1x in LIVE for now.
             try:
                 from src.utils.mode import buy_boost
 
@@ -2025,8 +1966,6 @@ class UpDownTrader:
         inserted and funded through the same canonical path as any clip, so
         DRY rehearses exactly what LIVE does.
         """
-        if str(getattr(self.feed, "series", "")).upper() == "KXGOLDD":
-            return False
         from src.jobs import certain_win as _cw
         from src.jobs.execute import execute_position
         from src.utils.database import DatabaseManager, Position
@@ -2179,7 +2118,8 @@ class UpDownTrader:
         mode = await TradingMode(db_path=self._db_path()).current()
         if not live:
             # The DRY book's own cash, for the Kelly sizer - same rule as
-            # LIVE, on its own money.
+            # LIVE, on its own money. Derived from the book's rows, so it can
+            # never disagree with them.
             try:
                 _acct = await TradingMode(db_path=self._db_path()).dry_account()
                 self._dry_cash_cache = float((_acct or {}).get("cash") or 0.0)
@@ -2268,23 +2208,6 @@ class UpDownTrader:
         market = self.feed.nearest(
             float(getattr(self.spot, "price", 0.0) or 0.0) or None
         )
-        _gold_daily = (
-            str(getattr(self.feed, "series", "")).upper() == "KXGOLDD"
-        )
-        _sigma_snapshot: Any = _SIGMA_SNAPSHOT_UNSET
-        if _gold_daily:
-            _gold_spot = float(getattr(self.spot, "price", 0.0) or 0.0)
-            if _gold_spot > 0.0 and self.spot.age <= self.config.max_spot_age:
-                self.rv.observe(_gold_spot)
-            _sigma_snapshot = None
-            if market is not None:
-                try:
-                    _sigma_snapshot = self.rv.sigma_dollars(
-                        horizon_seconds=market.seconds_left or 900.0,
-                        last_price=_gold_spot,
-                    )
-                except Exception:  # noqa: BLE001 - cold vol remains a hard gate
-                    _sigma_snapshot = None
         # LADDER STRIKE-BAND: an hourly/daily ladder expires a whole grid of
         # strikes at once. Score the strike whose modeled edge is widest -
         # nearest the money when the tape is quiet (win-rate play), a
@@ -2296,31 +2219,25 @@ class UpDownTrader:
                 _now_sp = float(getattr(self.spot, "price", 0.0) or 0.0)
                 if len(_grp) > 1 and _now_sp > 0:
                     _sl = market.seconds_left if market is not None else None
-                    _sig = None
-                    if _gold_daily:
-                        _sig = _sigma_snapshot
-                    else:
-                        try:
-                            _sig = self.rv.sigma_dollars(
-                                horizon_seconds=_sl or 900.0, last_price=_now_sp
-                            )
-                        except Exception:  # noqa: BLE001 - cold vol -> logistic fallback
-                            _sig = None
+                    try:
+                        _sig = self.rv.sigma_dollars(
+                            horizon_seconds=_sl or 900.0, last_price=_now_sp
+                        )
+                    except Exception:  # noqa: BLE001 - cold vol -> logistic fallback
+                        _sig = None
                     _grp.sort(key=lambda m: abs(float(m.target or 0.0) - _now_sp))
                     _band = _grp[: max(1, self.config.strike_band_n)]
-                    _gold_cold = _gold_daily and _sig is None
-                    if not _gold_cold:
-                        _pick = pick_ladder_strike(
-                            _band,
-                            _now_sp,
-                            _sl or 900.0,
-                            _sig,
-                            self.config.noise_pct,
-                            self.config.min_entry_price,
-                            self.config.max_entry_price,
-                        )
-                        if _pick is not None:
-                            market = _pick
+                    _pick = pick_ladder_strike(
+                        _band,
+                        _now_sp,
+                        _sl or 900.0,
+                        _sig,
+                        self.config.noise_pct,
+                        self.config.min_entry_price,
+                        self.config.max_entry_price,
+                    )
+                    if _pick is not None:
+                        market = _pick
             except Exception as exc:  # noqa: BLE001 - never block the cycle
                 self.book.last_error = f"strike-band: {type(exc).__name__}: {exc}"
 
@@ -2353,11 +2270,8 @@ class UpDownTrader:
                     round(cents / 100.0 * self.config.live_cash_fraction, 2),
                     _min_viable_notional(cents),
                 )
-                # Raw balance for the Kelly sizer in evaluate(). The LIVE
-                # book sizes off the real account. The DRY book sizes off its
-                # OWN simulated cash (set above from dry_account()) - never
-                # clobber it with the real (tiny) live balance: that flattened
-                # every DRY clip to one contract and made the tallies lie.
+                # Raw balance for the Kelly sizer in evaluate(): the real
+                # Kalshi balance, which is the only funding source there is.
                 self._live_balance = cents / 100.0
                 if live:
                     self._dry_cash_cache = cents / 100.0
@@ -2483,7 +2397,7 @@ class UpDownTrader:
             market,
             live=live,
             clip_usd=live_budget if live else None,
-            sigma_snapshot=_sigma_snapshot,
+            sigma_snapshot=self._sigma_used,
         )
         # Clear stale errors, but never wipe the explanation of a failed LIVE
         # balance read - that is the difference between "no edge" and "cannot

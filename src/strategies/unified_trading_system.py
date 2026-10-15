@@ -31,11 +31,6 @@ import numpy as np
 from src.clients.kalshi_client import KalshiClient
 from src.clients.xai_client import XAIClient
 from src.config.settings import settings
-from src.strategies.market_making import (
-    AdvancedMarketMaker,
-    MarketMakingOpportunity,
-    run_market_making_strategy,
-)
 from src.strategies.portfolio_optimization import (
     AdvancedPortfolioOptimizer,
     MarketOpportunity,
@@ -210,9 +205,9 @@ class UnifiedAdvancedTradingSystem:
         self.arbitrage_capital = self.total_capital * self.config.arbitrage_allocation
 
         # Initialize strategy modules with actual capital
-        self.market_maker = AdvancedMarketMaker(
-            self.db_manager, self.kalshi_client, self.xai_client
-        )
+        # AdvancedMarketMaker removed (market_making strategy deleted)
+        self.market_maker = None  # placeholder (market_making deleted)
+
         self.portfolio_optimizer = AdvancedPortfolioOptimizer(
             self.db_manager, self.kalshi_client, self.xai_client
         )
@@ -330,33 +325,9 @@ class UnifiedAdvancedTradingSystem:
         """
         Execute market making strategy for spread profits.
         """
-        try:
-            self.logger.info(f"🎯 Executing Market Making Strategy on {len(markets)} markets")
-
-            # Analyze market making opportunities
-            opportunities = await self.market_maker.analyze_market_making_opportunities(markets)
-
-            if not opportunities:
-                self.logger.warning("No market making opportunities found")
-                return {"orders_placed": 0, "expected_profit": 0.0}
-
-            # Filter to top opportunities within capital allocation
-            max_opportunities = int(self.market_making_capital / 100)  # $100 per opportunity
-            top_opportunities = opportunities[:max_opportunities]
-
-            # Execute market making
-            results = await self.market_maker.execute_market_making_strategy(top_opportunities)
-
-            self.logger.info(
-                f"✅ Market Making: {results['orders_placed']} orders, "
-                f"${results['expected_profit']:.2f} expected profit"
-            )
-
-            return results
-
-        except Exception as e:
-            self.logger.error(f"Error in market making strategy: {e}")
-            return {"orders_placed": 0, "expected_profit": 0.0}
+        # Market making strategy removed — skipping
+        self.logger.info('Market making strategy removed — skipping')
+        return {"orders_placed": 0, "expected_profit": 0.0}
 
     async def _execute_directional_trading_strategy(
         self, markets: List[Market]

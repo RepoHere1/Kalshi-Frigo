@@ -20,8 +20,8 @@ import src.utils.strategy_runtime as rt
 
 async def test_a_pid_from_a_previous_instance_is_not_a_live_strategy(tmp_path):
     store = rt.StrategyRuntime(db_path=str(tmp_path / "t.db"))
-    await store.record_start("ai_directional", os.getpid(), "paper", "cli.py run")
-    row = (await store.snapshot())[rt.key("ai_directional", "paper")]
+    await store.record_start("eth_updown", os.getpid(), "paper", "cli.py run")
+    row = (await store.snapshot())[rt.key("eth_updown", "paper")]
     assert rt.owns_process(row) is True
 
     stale = dict(row, instance="some-earlier-instance")
@@ -30,8 +30,8 @@ async def test_a_pid_from_a_previous_instance_is_not_a_live_strategy(tmp_path):
 
 async def test_a_recycled_pid_is_not_mistaken_for_the_strategy(tmp_path):
     store = rt.StrategyRuntime(db_path=str(tmp_path / "t.db"))
-    await store.record_start("quick_flip", os.getpid(), "paper", "cli.py run")
-    row = (await store.snapshot())[rt.key("quick_flip", "paper")]
+    await store.record_start("beast_mode", os.getpid(), "paper", "cli.py run")
+    row = (await store.snapshot())[rt.key("beast_mode", "paper")]
 
     real = rt.process_start_ticks(os.getpid())
     if real is None:
@@ -41,15 +41,15 @@ async def test_a_recycled_pid_is_not_mistaken_for_the_strategy(tmp_path):
 
 async def test_intent_to_run_outlives_the_process(tmp_path):
     store = rt.StrategyRuntime(db_path=str(tmp_path / "t.db"))
-    await store.record_start("market_making", os.getpid(), "paper", "cli.py run")
-    assert rt.key("market_making", "paper") in await store.desired()
+    await store.record_start("eth_updown", os.getpid(), "paper", "cli.py run")
+    assert rt.key("eth_updown", "paper") in await store.desired()
 
-    await store.record_stop("market_making", "exited on its own", "paper")
-    await store.set_desired("market_making", True, "paper")
-    assert rt.key("market_making", "paper") in await store.desired()
+    await store.record_stop("eth_updown", "exited on its own", "paper")
+    await store.set_desired("eth_updown", True, "paper")
+    assert rt.key("eth_updown", "paper") in await store.desired()
 
-    await store.set_desired("market_making", False, "paper")
-    assert rt.key("market_making", "paper") not in await store.desired()
+    await store.set_desired("eth_updown", False, "paper")
+    assert rt.key("eth_updown", "paper") not in await store.desired()
 
 
 async def test_stopping_one_book_never_touches_the_other(tmp_path):
@@ -116,9 +116,9 @@ async def test_columns_are_added_to_a_table_that_predates_them(tmp_path):
 
 async def test_a_stopped_strategy_is_not_live(tmp_path):
     store = rt.StrategyRuntime(db_path=str(tmp_path / "t.db"))
-    await store.record_start("safe_compounder", os.getpid(), "paper", "cli.py run")
-    await store.record_stop("safe_compounder", "stopped by operator", "paper")
-    row = (await store.snapshot())[rt.key("safe_compounder", "paper")]
+    await store.record_start("beast_mode", os.getpid(), "paper", "cli.py run")
+    await store.record_stop("beast_mode", "stopped by operator", "paper")
+    row = (await store.snapshot())[rt.key("beast_mode", "paper")]
     assert rt.owns_process(row) is False
     assert row["stop_reason"] == "stopped by operator"
 
@@ -138,7 +138,7 @@ async def test_the_old_name_keyed_table_is_rebuilt_composite(tmp_path):
             );
             INSERT INTO strategy_runtime (name, pid, mode, desired)
                 VALUES ('ai_directional', 1234, 'paper', 1),
-                       ('safe_compounder', NULL, 'dry', 0);
+                       ('beast_mode', NULL, 'dry', 0);
             """
         )
         await conn.commit()
@@ -147,5 +147,5 @@ async def test_the_old_name_keyed_table_is_rebuilt_composite(tmp_path):
     snap = await store.snapshot()
     assert rt.key("ai_directional", "paper") in snap
     # 'dry' normalises to 'paper', and a stopped lane stays stopped.
-    assert rt.key("safe_compounder", "paper") in snap
-    assert snap[rt.key("safe_compounder", "paper")]["desired"] == 0
+    assert rt.key("beast_mode", "paper") in snap
+    assert snap[rt.key("beast_mode", "paper")]["desired"] == 0

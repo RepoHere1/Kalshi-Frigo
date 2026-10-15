@@ -1,8 +1,8 @@
 """Canonical position-sizing math.
 
 This module is the single home for the Kelly criterion kernel. It used to be
-reimplemented (with subtle differences) in safe_compounder, and twice in
-portfolio_optimization — which is exactly how sizing bugs are born. Strategy
+reimplemented (with subtle differences) in the retired safe_compounder and twice
+in portfolio_optimization — which is exactly how sizing bugs are born. Strategy
 modules keep their own *policy* (fractional multipliers, regime/time-decay
 adjustments, caps), but the underlying bet math lives here.
 

@@ -124,21 +124,20 @@ def install_dependencies():
 
 
 def test_dashboard():
-    """Test if the dashboard can be imported and run."""
-    print("Testing dashboard import...")
+    """Test if the CLI can be imported."""
+    print("Testing CLI import...")
     
     try:
         # Test import
-        import beast_mode_dashboard
-        print("✅ Dashboard imports successfully.")
-        
-        # Test basic functionality
-        dashboard = beast_mode_dashboard.BeastModeDashboard()
-        print("✅ Dashboard can be instantiated.")
+        from cli import build_parser
+        print("✅ CLI imports successfully.")
         
         return True
     except ImportError as e:
-        print(f"❌ Dashboard import failed: {e}")
+        print(f"❌ CLI import failed: {e}")
+        return False
+    except Exception as e:
+        print(f"❌ Dashboard test failed: {e}")
         return False
     except Exception as e:
         print(f"❌ Dashboard test failed: {e}")
@@ -172,8 +171,8 @@ def main():
     print_header("Kalshi AI Trading Bot Setup")
     
     # Check if we're in the right directory
-    if not Path("beast_mode_dashboard.py").exists():
-        print("❌ beast_mode_dashboard.py not found.")
+    if not Path("cli.py").exists():
+        print("❌ cli.py not found.")
         print("   Make sure you're running this from the kalshi-ai-trading-bot directory.")
         return False
     
@@ -213,14 +212,14 @@ def main():
     
     print_header("Setup Complete!")
     print("✅ Your environment is ready!")
-    print("\n🚀 To run the dashboard:")
-    print("   python beast_mode_dashboard.py --summary")
-    print("   python beast_mode_dashboard.py  # for live dashboard")
-    
-    print("\n📚 Next steps:")
-    print("   1. Copy env.template to .env and fill in your API keys")
-    print("   2. Run the dashboard to verify everything works")
-    print("   3. Check the README.md for full configuration details")
+    print("\n🚀 To run the bot:")
+    print("   python cli.py run --paper")
+    print("   python cli.py run --live")
+    print("\n   For specific strategies:")
+    print("   python cli.py run --btc-updown")
+    print("   python cli.py run --btc-updown --series KXBTC1H --spot-product BTC-USD")
+    print("\n   To view strategy status:")
+    print("   python cli.py status")
     
     return True
 

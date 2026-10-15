@@ -177,6 +177,41 @@ class UpDownMarket:
         return self.yes_bid if side == "up" else self.no_bid
 
 
+async def fetch_recent_candles(
+    product: str, granularity: int = 60
+) -> List[float]:
+    """Coinbase 1-minute closes for `product`, oldest first, or [] on any failure.
+
+    Used to warm the realized-volatility window at lane start: after a
+    restart the RV is cold, and a slow-moving asset prints identical
+    prices for minutes at a time - the estimator excludes identical prints
+    by design, so the lane would hard-block for half an hour or
+    more on every restart. Real 1-minute bar closes warm it instantly with
+    the same honest tape the lane trades against.
+    """
+    url = f"https://api.exchange.coinbase.com/products/{product}/candles"
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                url, params={"granularity": str(int(granularity))}
+            ) as r:
+                r.raise_for_status()
+                payload = await r.json()
+    except Exception:  # noqa: BLE001 - best-effort; cold start stays cold
+        return []
+    closes: List[float] = []
+    for row in payload or []:
+        try:
+            # Coinbase shape: [time, low, high, open, close, volume].
+            closes.append(float(row[4]))
+        except (TypeError, ValueError, IndexError):
+            continue
+    # The API returns newest first; observe() wants chronological order.
+    closes.reverse()
+    return closes
+
+
 class SpotFeed:
     """Coinbase spot ticker over websocket, with a REST fallback.
 
@@ -299,7 +334,7 @@ class Btc15mFeed:
 
         Listing shapes include:
         - 15-minute up/down: the third segment is the horizon in minutes.
-        - strike ladders (KXBTCD/KXETHD/KXXRPD/KXGOLDD): the third segment is a
+        - strike ladders (KXBTCD/KXETHD/KXXRPD): the third segment is a
           strike (`-T82899.99` greater, `-B91750` between) and carries no
           horizon; those parse with horizon 0.
         """

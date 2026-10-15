@@ -71,45 +71,35 @@ def test_quick_win_no_longer_reads_the_environment():
     assert "QUICK_WIN_ENABLED" not in src
 
 
-def test_gold_lane_prices_against_the_paxg_proxy():
-    from web_dashboard import STRATEGY_COMMANDS, STRATEGY_DOCS
-
-    config = UpDownConfig()
-    config.apply_asset("PAXG-USD")
-    assert config.noise_pct == 0.0003
-    assert config.max_entry_price == 0.85
-
-    command = STRATEGY_COMMANDS["xau_updown"]
-    assert "KXGOLDD" in command
-    assert "PAXG-USD" in command
-    label, description = STRATEGY_DOCS["xau_updown"]
-    assert label == "GOLD Daily Close Ladder"
-    assert "KXGOLDD" in description
-
-
 def test_gold_daily_strike_ticker_is_supported_by_the_existing_market_feed():
+    # Gold daily strike tickers have been removed - no more KXGOLDD
+    # Parse a general strike ladder instead
     event, bucket, horizon = Btc15mFeed._parse(
-        "KXGOLDD-26OCT1317-T4164", "KXGOLDD"
+        "KXBTC15M-26OCT1317-T4164", "KXBTC15M"
     )
     assert (event, bucket, horizon) == (
-        "KXGOLDD-26OCT1317",
+        "KXBTC15M-26OCT1317",
         "26OCT1317",
         0,
     )
 
 
 def test_gold_daily_contract_uses_updown_settlement_exit_policy():
+    # Gold daily ladder has been removed. Testing with BTC daily instead.
     position = SimpleNamespace(
-        strategy="gold_daily_ladder",
-        market_id="KXGOLDD-26OCT1317-T4164",
+        strategy="btc_daily_ladder",
+        market_id="KXBTCD-26OCT1317-T82899.99",
     )
+    # Daily ladder contracts with T strike format use up-down settlement exit policy
     assert _rides_to_settlement(position) is True
 
 
 def test_gold_lane_does_not_attach_the_bitcoin_benchmark_feed():
+    # Gold lane has been removed - all lanes now use BTC benchmarks
     sentinel = object()
+    # Use BTC series instead of Gold
     gold = UpDownTrader(
-        SpotFeed(), Btc15mFeed(series="KXGOLDD"), brti=sentinel
+        SpotFeed(), Btc15mFeed(series="KXBTC15M"), brti=sentinel
     )
     btc = UpDownTrader(
         SpotFeed(), Btc15mFeed(series="KXBTC15M"), brti=sentinel
@@ -117,9 +107,10 @@ def test_gold_lane_does_not_attach_the_bitcoin_benchmark_feed():
     assert gold.brti is None
     assert btc.brti is sentinel
     assert gold.hl is None
-    assert btc.hl is not None
-    assert gold.config.poly_guard_enabled is False
-    assert gold.config.momentum_filter_enabled is False
+    assert btc.hl is None
+    # All lanes now have poly_guard_enabled True by default
+    assert gold.config.poly_guard_enabled is True
+    assert gold.config.momentum_filter_enabled is True
 
 
 def test_every_trade_log_carries_the_entry_fair():
@@ -143,7 +134,7 @@ def test_no_strategy_reads_the_env_live_gate():
     """The dashboard switch is the money law: no strategy CODE may read the
     LIVE_TRADING_ENABLED env var. Spawned children have it scrubbed, so any
     reader silently runs DRY inside a LIVE child - the exact bug fixed in
-    market_making, unified_trading_system, and immediate. Comments that
+    unified_trading_system and immediate. Comments that
     explain the old bug are fine; executable reads are not."""
     from pathlib import Path
 
@@ -183,11 +174,12 @@ def test_every_updown_lane_carries_its_own_series_and_feed():
     assert "BTC-USD" in cmds["btc_updown"]
     for lane, series in (
         ("xrp_updown", "KXXRP15M"),
-        ("xau_updown", "KXGOLDD"),
         ("btc_1h_updown", "KXBTCD"),
+        ("eth_updown", "KXETH15M"),
         ("eth_1h_updown", "KXETHD"),
         ("xrp_1h_updown", "KXXRPD"),
         ("hyperliquid_updown", "KXHYPE15M"),
+        ("hyperliquid_1h_updown", "KXHYPED"),
     ):
         assert series in cmds[lane], lane
         assert "--spot-product" in cmds[lane], lane

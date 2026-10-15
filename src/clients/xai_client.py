@@ -72,7 +72,11 @@ class XAIClient(TradingLoggerMixin):
         self.primary_model = settings.trading.primary_model
         self.fallback_model = settings.trading.fallback_model
         self.temperature = settings.trading.ai_temperature
-        self.max_tokens = settings.trading.ai_max_tokens
+        # Token budget honours OPENROUTER_MAX_TOKENS so requests can be fitted
+        # to a near-empty OpenRouter balance (a refused 402 skips the decision).
+        self.max_tokens = int(
+            os.environ.get("OPENROUTER_MAX_TOKENS") or settings.trading.ai_max_tokens
+        )
 
         # Cost tracking (aggregate across all delegated calls)
         self.total_cost = 0.0
@@ -196,7 +200,7 @@ class XAIClient(TradingLoggerMixin):
                     self._openrouter_client = OpenRouterClient(
                         api_key=settings.api.dry_openrouter_api_key or None,
                         default_model=settings.api.dry_openrouter_model,
-                        free_only=True,
+                        free_only=True,  
                         db_manager=self.db_manager,
                     )
                 self.logger.info("OpenRouter client initialised (via XAIClient shim)")
@@ -225,10 +229,14 @@ class XAIClient(TradingLoggerMixin):
         if client is None:
             return None
 
+        # DRY mode: use the client's default_model (free model); LIVE: use primary_model
+        is_live = should_trade_live()
+        model_to_use = self.primary_model if is_live else None
+
         try:
             result = await client.get_completion(
                 prompt=prompt,
-                model=self.primary_model,
+                model=model_to_use,
                 max_tokens=max_tokens or self.max_tokens,
                 temperature=temperature if temperature is not None else self.temperature,
                 strategy=strategy,
@@ -237,6 +245,7 @@ class XAIClient(TradingLoggerMixin):
             )
 
             # Mirror cost into our daily tracker
+            # OpenRouterClient sets _last_request_cost in get_completion
             if result is not None:
                 cost = getattr(client, "_last_request_cost", 0.0)
                 self.total_cost += cost
@@ -263,12 +272,16 @@ class XAIClient(TradingLoggerMixin):
         if client is None:
             return None
 
+        # DRY mode: use the client's default_model (free model); LIVE: use primary_model
+        is_live = should_trade_live()
+        model_to_use = self.primary_model if is_live else None
+
         try:
             decision = await client.get_trading_decision(
                 market_data=market_data,
                 portfolio_data=portfolio_data,
                 news_summary=news_summary,
-                model=self.primary_model,
+                model=model_to_use,
             )
 
             if decision is not None:

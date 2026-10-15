@@ -153,13 +153,14 @@ def test_noise_band_is_respected():
 
 
 def test_daily_gold_waits_for_realized_vol_before_scoring():
+    # Gold daily lane has been removed - this test is now for BTC daily
     config = UpDownConfig()
-    config.apply_asset("PAXG-USD")
+    config.apply_asset("BTC-USD")
     spot = SpotFeed()
-    spot.price = 4168.42
+    spot.price = 8468.42
     spot.ts = time.time()
     spot.source = "test"
-    trader = UpDownTrader(spot, Btc15mFeed(series="KXGOLDD"), config)
+    trader = UpDownTrader(spot, Btc15mFeed(series="KXBTCD"), config)
     market = UpDownMarket(
         ticker="KXGOLDD-26OCT1317-T4164",
         event_ticker="KXGOLDD-26OCT1317",
@@ -238,7 +239,6 @@ async def test_daily_gold_cycle_ranks_only_with_realized_vol(
     prior_samples, should_rank, monkeypatch
 ):
     import src.jobs.ladder_trader as lt
-    from src.utils.mode import TradingMode
 
     spot = SpotFeed()
     spot.price = 4168.42
@@ -294,20 +294,12 @@ async def test_daily_gold_cycle_ranks_only_with_realized_vol(
         strike_calls.append((args, kwargs))
         return None
 
-    async def _current(_self):
-        return "dry"
-
-    async def _dry_account(_self):
-        return {"cash": 100.0}
-
     async def _track(_db):
         return None
 
     monkeypatch.setattr(lt, "pick_ladder_strike", _record_pick)
     monkeypatch.setattr("src.jobs.track.run_tracking", _track)
     monkeypatch.setattr("src.jobs.broker.should_trade_live", lambda: False)
-    monkeypatch.setattr(TradingMode, "current", _current)
-    monkeypatch.setattr(TradingMode, "dry_account", _dry_account)
 
     result = await trader.cycle()
 
@@ -658,7 +650,6 @@ async def test_live_variance_sizing_uses_market_target(monkeypatch):
     tests cover."""
     import src.jobs.broker as broker
     import src.jobs.live_fees as live_fees
-    from src.utils.mode import TradingMode
 
     trader = _scorer()
     trader.config.certain_win_enabled = False
@@ -681,9 +672,6 @@ async def test_live_variance_sizing_uses_market_target(monkeypatch):
     async def _noop():
         return None
 
-    async def _current(_self):
-        return "live"
-
     async def _track(_db):
         return None
 
@@ -695,7 +683,6 @@ async def test_live_variance_sizing_uses_market_target(monkeypatch):
 
     trader._client = _BalanceClient()
     monkeypatch.setattr(broker, "should_trade_live", lambda: True)
-    monkeypatch.setattr(TradingMode, "current", _current)
     monkeypatch.setattr("src.jobs.track.run_tracking", _track)
     monkeypatch.setattr(trader.feed, "fetch", _noop)
     monkeypatch.setattr(trader.hl, "refresh", _noop)

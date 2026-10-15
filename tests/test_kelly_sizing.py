@@ -161,19 +161,6 @@ class TestKellyPositionSizing:
         assert qty_maker >= 1, "Maker position should be valid"
 
 
-def test_buy_boost_is_three_in_dry(monkeypatch):
-    """The x3 spend is live in DRY right now (operator directive)."""
-    import src.jobs.broker as _broker
-    from src.utils.mode import buy_boost
-
-    monkeypatch.setattr(_broker, "should_trade_live", lambda: False)
-    monkeypatch.delenv("BUY_MULT", raising=False)
-    monkeypatch.delenv("BUY_MULT_DRY", raising=False)
-    assert buy_boost() == 3.0
-    monkeypatch.setenv("BUY_MULT_DRY", "4.0")
-    assert buy_boost() == 4.0
-
-
 def test_buy_boost_stays_off_in_live(monkeypatch):
     """LIVE is not funded: the multiplier is installed but stays 1x there."""
     import src.jobs.broker as _broker

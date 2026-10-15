@@ -61,7 +61,7 @@ def main():
     print("\n📋 Next steps:")
     print("1. Make sure your .env file is configured with API keys")
     print("2. Activate your virtual environment")
-    print("3. Run the bot: python beast_mode_bot.py")
+    print("3. Run the bot: python cli.py run --paper")
 
 
 if __name__ == "__main__":

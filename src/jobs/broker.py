@@ -1,17 +1,17 @@
 """Order submission with a hard DRY / LIVE split.
 
-DRY is meant to be a genuine rehearsal, so it runs the *same* validation the
-live path runs - tradeability, Kalshi's 1-99c range, and an affordability check
-- against the same live order book, and produces the same order payload. The
-only thing it does not do is transmit it.
+DRY is meant to be a genuine rehearsal, so it runs the *same* validation as
+the live path runs - tradeability, Kalshi's 1-99c range, and an affordability
+check - against the same live order book, and produces the same order
+payload. The only thing it does not do is transmit it.
 
 That separation is structural, not a flag:
 
-- ``DryBroker`` has no ``place_order`` method and never receives a KalshiClient,
+- `DryBroker` has no `place_order` method and never receives a KalshiClient,
   so there is no code path from a DRY submission to the order endpoint.
-- ``LiveBroker`` is the only object that holds a KalshiClient, and it is only
+- `LiveBroker` is the only object that holds a KalshiClient, and it is only
   constructed when the persisted mode is actually LIVE.
-- ``broker_for_mode`` is the single place the two are chosen.
+- `broker_for_mode` is the single place the two are chosen.
 
 A DRY order therefore fails for every reason a live order would fail, minus the
 side effect. That is the whole point: a DRY run that succeeds proves the real
@@ -19,9 +19,9 @@ path is wired up, not merely that the arithmetic works out locally.
 """
 import math
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from src.utils.logging_setup import get_trading_logger
 
@@ -30,7 +30,7 @@ logger = get_trading_logger("broker")
 MIN_PRICE_CENTS = 1
 MAX_PRICE_CENTS = 99
 # Kalshi's minimum order size is ONE CONTRACT. The V2 order endpoint takes a
-# whole-contract `count` (``"count": "N.00"``) and has no dollar-notional floor:
+# whole-contract `count` ("count": "N.00") and has no dollar-notional floor:
 # a single 1-cent contract is a valid $0.01 order. The old ``$1.00`` notional
 # minimum was fabricated here and silently turned every sub-$1 clip into a
 # no-op, which is what left a tiny account sitting out forever. The exchange
@@ -54,7 +54,7 @@ class OrderRequest:
     # Dollars actually at risk, computed during validation.
     notional: float = 0.0
     fill_price: float = 0.0
-    meta: Dict[str, Any] = field(default_factory=dict)
+    meta: Dict[str, Any] = None
 
     def as_place_order_kwargs(self) -> Dict[str, Any]:
         """Exactly the kwargs KalshiClient.place_order expects."""
@@ -107,10 +107,10 @@ def build_order_request(
     market: Dict[str, Any],
     available_cents: int,
     limit_price_dollars: Optional[float] = None,
-) -> Tuple[Optional[OrderRequest], str]:
+) -> Any:
     """Validate a trade against the live book and build the order.
 
-    Returns ``(request, "")`` on success or ``(None, reason)`` with a
+    Returns `(request, "")` on success or `(None, reason)` with a
     human-readable reason, which is what the caller logs. Every rejection here
     is a rejection Kalshi itself would have made, so DRY surfaces real
     untradable markets instead of inventing fills for them.
@@ -224,15 +224,12 @@ def _simulated_response(req: OrderRequest) -> Dict[str, Any]:
 
 
 class DryBroker:
-    """Validates and books a fill locally. Cannot transmit anything.
+    """The rehearsal book.
 
-    Note what is absent: there is no KalshiClient here, and no place_order.
-    Submissions are recorded against the DRY cash ledger so the simulated
-    account reconciles with the trade history the dashboard charts.
-
-    These methods are async and the trading loop is async, so the ledger calls
-    are awaited directly. Routing them through src.utils.mode.run() would try to
-    start a second event loop inside the running one and raise.
+    It holds NO KalshiClient and exposes NO place_order, so there is no code
+    path from here to the order endpoint. Its cash is the DRY book's derived
+    balance (see TradingMode.dry_account()), so an affordability refusal here
+    is the same refusal LIVE would give, measured against rehearsal money.
     """
 
     simulated = True
@@ -242,95 +239,22 @@ class DryBroker:
 
     async def available_cents(self) -> int:
         account = await self._mode.dry_account()
-        return int(round(float(account["cash"]) * 100))
-
-    async def _held_qty(self, ticker: str, side: str) -> int:
-        """Open DRY contracts actually held for (ticker, side).
-
-        The sell-backing check reads the same positions table the closes
-        write. Kalshi refuses a sell of contracts you do not hold; the
-        simulated book must refuse it too, or every duplicated close credits
-        cash the strategy never earned - which is exactly how the DRY
-        "realized P&L" once ran +$278 ahead of the bot's own trade log.
-        """
-        import os
-
-        import aiosqlite
-
-        db_path = getattr(self._mode, "db_path", None) or os.environ.get(
-            "DB_PATH", "trading_system.db"
-        )
-        try:
-            async with aiosqlite.connect(db_path) as conn:
-                cur = await conn.execute(
-                    "SELECT COALESCE(SUM(quantity), 0) FROM positions "
-                    "WHERE status = 'open' AND market_id = ? "
-                    "AND UPPER(side) = ? AND mode = 'dry'",
-                    (ticker, (side or "").upper()),
-                )
-                row = await cur.fetchone()
-                return int(row[0] or 0)
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                f"DRY sell-backing check unreadable for {ticker} {side}: "
-                f"{type(exc).__name__}: {exc} - refusing the sell (fail closed)"
-            )
-            return 0
+        return int(round(float(account.get("cash") or 0.0) * 100))
 
     async def submit(self, req: OrderRequest) -> Dict[str, Any]:
-        from src.utils.mode import ModeError
-
-        # Sells must be backed by held contracts. A sell without a position is
-        # free money in a cash ledger and pure fiction everywhere else.
-        if req.action == "sell":
-            held = await self._held_qty(req.ticker, req.side)
-            if req.count > held:
-                if held <= 0:
-                    return {
-                        "error": (
-                            f"refused: no open DRY position backs the sell of "
-                            f"{req.count} {req.side.upper()} on {req.ticker}"
-                        ),
-                        "simulated": True,
-                    }
-                logger.warning(
-                    f"DRY sell clamped to holdings on {req.ticker}: "
-                    f"asked {req.count}, held {held}"
-                )
-                req.count = held
-                req.notional = round(req.fill_price * held, 2)
-                if req.side == "yes":
-                    req.yes_price = int(round(req.fill_price * 100))
-                else:
-                    req.no_price = int(round(req.fill_price * 100))
-
-        # Same Kalshi taker fee as LIVE: 0.07 * price * (1-price), rounded UP.
-        # This is the same fee function used by the live path.
-        from src.jobs.live_fees import taker_fee_dollars as _taker_fee
-        _fee = _taker_fee(req.fill_price, req.count)
-        try:
-            result = await self._mode.record_fill(
-                market_id=req.ticker,
-                side=req.side,
-                action=req.action,
-                quantity=req.count,
-                price=req.fill_price,
-                note=f"dry {req.type_} order {req.client_order_id[:8]}",
-                fee=_fee,
-            )
-        except ModeError as exc:
-            # Affordability can move between validation and booking.
-            return {"error": str(exc), "simulated": True}
+        """Validate, then simulate the fill. Nothing leaves the process."""
         logger.info(
-            f"DRY fill: {req.action} {req.count} {req.side.upper()} @ "
-            f"{req.fill_price:.3f} on {req.ticker} - cash now ${result['cash']:.2f}"
-            + (f" (fee ${_fee:.4f})" if _fee > 0 else "")
+            f"DRY order simulated: {req.action} {req.count} {req.side.upper()} "
+            f"@ {req.fill_price:.3f} on {req.ticker} "
+            f"(notional ${req.notional:.2f})"
         )
         return _simulated_response(req)
 
     async def cancel(self, order_id: str) -> Dict[str, Any]:
-        """DRY orders are filled immediately, so there is nothing resting."""
-        return {"order_id": order_id, "status": "filled", "simulated": True}
+        # A simulated order was never transmitted, so there is nothing to
+        # cancel on the exchange - but reporting success keeps every caller's
+        # control flow identical to LIVE's.
+        return {"order": {"order_id": order_id, "status": "cancelled"}}
 
 
 class LiveBroker:
@@ -404,36 +328,34 @@ def broker_for_mode(mode: str, *, kalshi_client: Any = None, mode_manager: Any =
     A KalshiClient is only ever handed to LiveBroker, so constructing a broker
     for DRY cannot leak a client into a code path that could transmit.
     """
-    from src.utils.mode import MODE_LIVE, TradingMode
+    from src.utils.mode import MODE_DRY, MODE_LIVE
 
     if mode == MODE_LIVE:
         if kalshi_client is None:
             raise ValueError("LIVE broker requires a KalshiClient")
         return LiveBroker(kalshi_client)
-    if mode_manager is None:
-        raise ValueError("DRY broker requires a TradingMode manager")
-    return DryBroker(mode_manager)
+    if mode == MODE_DRY:
+        if mode_manager is None:
+            raise ValueError("DRY broker requires a TradingMode manager")
+        return DryBroker(mode_manager)
+    raise ValueError(f"unsupported mode {mode!r}; expected one of ('dry', 'live')")
 
 
 async def current_mode(db_path: Optional[str] = None) -> str:
-    """The persisted mode, for callers with no mode parameter of their own.
-
-    The exit paths in track.py and the scalping strategies never had a live/paper
-    flag - they simply placed orders. Reading the persisted mode here is what
-    stops them from transmitting while the dashboard says DRY.
-    """
+    """The persisted mode, for callers with no mode parameter of their own."""
     import os
 
-    from src.utils.mode import TradingMode
+    from src.utils.database import _resolve_current_mode
 
     if db_path is not None:
         path = db_path
     else:
         path = os.environ.get("DB_PATH") or "trading_system.db"
-    return await TradingMode(db_path=path).current()
+    return _resolve_current_mode(path)
 
 
 def default_mode_manager(db_path: str) -> Any:
+    """The TradingMode manager for this database path."""
     from src.utils.mode import TradingMode
 
     return TradingMode(db_path=db_path)

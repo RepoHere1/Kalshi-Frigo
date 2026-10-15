@@ -59,9 +59,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     live = getattr(args, "live", False)
     paper = getattr(args, "paper", False)
-    beast = getattr(args, "beast", False)
     disciplined = getattr(args, "disciplined", False)
-    safe_compounder = getattr(args, "safe_compounder", False)
 
     if live and paper:
         print("Error: --live and --paper are mutually exclusive.")
@@ -72,37 +70,6 @@ def cmd_run(args: argparse.Namespace) -> None:
     if live_mode:
         print("⚠️  WARNING: LIVE TRADING MODE ENABLED")
         print("   This will use real money and place actual trades.")
-
-    # --safe-compounder mode: edge-based NO-side only
-    if safe_compounder:
-        _run_safe_compounder(
-            live_mode=live_mode,
-            loop=getattr(args, "loop", False),
-            interval=getattr(args, "interval", 300),
-        )
-        return
-
-    # --beast mode: original aggressive settings (NOT default)
-    if beast:
-        print("⚠️  BEAST MODE: Aggressive settings enabled.")
-        print("   WARNING: Aggressive settings with no guardrails. Use at your own risk.")
-        from beast_mode_bot import BeastModeBot
-
-        bot = BeastModeBot(live_mode=live_mode)
-        try:
-            asyncio.run(bot.run())
-        except KeyboardInterrupt:
-            print("\nTrading bot stopped by user.")
-        return
-
-    # --market-making mode: quote both sides of the book
-    if getattr(args, "market_making", False):
-        _run_market_making(
-            live_mode=live_mode,
-            loop=getattr(args, "loop", False),
-            interval=getattr(args, "interval", 300),
-        )
-        return
 
     # --btc-updown mode: live spot vs Kalshi's own up/down quotes
     if getattr(args, "btc_updown", False):
@@ -169,13 +136,70 @@ def cmd_run(args: argparse.Namespace) -> None:
                 _time.sleep(5)
         return
 
-    # --quick-flip mode: short-horizon momentum scalping
-    if getattr(args, "quick_flip", False):
-        _run_quick_flip(
-            live_mode=live_mode,
-            loop=getattr(args, "loop", True),
-            interval=getattr(args, "interval", 120),
-        )
+    # --all-no-markets mode: NO-side only maker entries with separate $250 book
+    # CRITICAL: DRY mode does NOT reflect ALL NO balances - they are separate books
+    if getattr(args, "all_no_markets", False):
+        from src.strategies.all_no import AllNoStrategy
+        # Determine mode: LIVE if --live flag set, otherwise DRY (default)
+        live_mode = bool(getattr(args, "live", False))
+        mode = "live" if live_mode else "dry"
+        print(f"📋 ALL NO MARKETS MODE ({mode.upper()})")
+        print("   NO-side only maker entries, separate $250 book.")
+        print("   Quarter-Kelly sizing with 20% max clip.")
+        print("   Only limit orders at bid prices (maker entries).")
+        print(f"   🔒 SEPARATION: ALL NO {mode.upper()} book is INDEPENDENT")
+        if mode == "dry":
+            print("   🔒 DRY balance does NOT include ALL NO balances")
+        db_path = os.environ.get("DB_PATH", "trading_system.db")
+
+        # Enable ALL NO book
+        os.environ["ALL_NO_ENABLED"] = "true"
+
+        async def _init_all_no():
+            from src.utils.database import DatabaseManager
+            await DatabaseManager(db_path=db_path).initialize()
+
+            # Initialize the ALL NO book
+            from src.strategies.all_no import AllNoKalshiBook
+            all_no_book = AllNoKalshiBook(db_path)
+            await all_no_book.ensure_schema()
+            await all_no_book.seed_book()
+
+            # Verify separation integrity
+            if mode == "dry":
+                is_separate = await all_no_book.is_separate_from_dry_book()
+                if not is_separate:
+                    raise RuntimeError("ALL NO DRY book separation from DRY book FAILED!")
+                print("   ✅ Separation verified: ALL NO DRY is independent of DRY book")
+
+        try:
+            asyncio.run(_init_all_no())
+        except Exception as exc:
+            print(f"ALL NO init failed: {type(exc).__name__}: {exc}")
+            sys.exit(1)
+
+        # Run the ALL NO strategy
+        import asyncio
+        import time as _time
+
+        async def _all_no_runner():
+            try:
+                strategy = AllNoStrategy()
+                loop = bool(getattr(args, "loop", True))
+                interval = int(getattr(args, "interval", 30) or 30)
+                await strategy.run(mode=mode, loop=loop, interval=interval)
+            except KeyboardInterrupt:
+                print(f"\nALL NO MARKETS ({mode.upper()}) strategy stopped by user.")
+                raise
+            except Exception as exc:
+                print(f"ALL NO MARKETS ({mode.upper()}) strategy crashed ({type(exc).__name__}: {exc}); restarting in 5s.", flush=True)
+                _time.sleep(5)
+                await _all_no_runner()
+
+        try:
+            asyncio.run(_all_no_runner())
+        except KeyboardInterrupt:
+            print(f"\nALL NO MARKETS ({mode.upper()}) strategy stopped by user.")
         return
 
     # DEFAULT: AI directional strategy with disciplined settings active.
@@ -184,10 +208,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     print("🤖  AI DIRECTIONAL MODE (default)")
     print("   Single-model OpenRouter call per decision (fallback chain on error).")
     print("   Category scoring + portfolio guardrails active.")
-    print("   Use --safe-compounder for conservative math-only mode.")
-    print("   Use --beast to run without guardrails (not recommended).")
 
-    from beast_mode_bot import BeastModeBot
+    from src.jobs.ladder_trader import run_updown_trader
 
     # Apply disciplined settings overrides
     from src.config import settings as cfg
@@ -200,148 +222,16 @@ def cmd_run(args: argparse.Namespace) -> None:
     cfg.max_drawdown = 0.15
     cfg.max_sector_exposure = 0.30
 
-    bot = BeastModeBot(live_mode=live_mode)
-    try:
-        asyncio.run(bot.run())
-    except KeyboardInterrupt:
-        print("\nTrading bot stopped by user.")
+    series = _normalize_updown_series(getattr(args, "series", "KXXRP15M"))
+    spot_product = getattr(args, "spot_product", "XRP-USD")
 
+    asyncio.run(run_updown_trader(
+        loop=getattr(args, "loop", True),
+        interval=float(getattr(args, "interval", 0) or 0),
+        series=series,
+        spot_product=spot_product,
+    ))
 
-def _run_safe_compounder(
-    live_mode: bool = False,
-    loop: bool = False,
-    interval: int = 300,
-) -> None:
-    """Run the Safe Compounder strategy.
-
-    When ``loop`` is True, run the strategy repeatedly with ``interval``
-    seconds between cycles until the user sends Ctrl-C.
-    """
-    from src.clients.kalshi_client import KalshiClient
-    from src.strategies.safe_compounder import SafeCompounder
-
-    print("🔒 SAFE COMPOUNDER MODE")
-    print("   NO-side only | Edge-based | Near-certain outcomes")
-    if not live_mode:
-        print("   DRY RUN — no real orders will be placed")
-    if loop:
-        print(f"   Continuous mode — re-running every {interval}s. Ctrl-C to stop.")
-
-    async def _run_once():
-        client = KalshiClient()
-        try:
-            compounder = SafeCompounder(
-                client=client,
-                dry_run=not live_mode,
-            )
-            return await compounder.run()
-        finally:
-            await client.close()
-
-    async def _run_forever():
-        cycle = 0
-        while True:
-            cycle += 1
-            print(f"\n──── Cycle {cycle} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ────")
-            try:
-                await _run_once()
-            except Exception as exc:
-                # One bad cycle shouldn't kill the loop. Log and keep going.
-                print(f"Cycle {cycle} failed: {exc}. Continuing after {interval}s.")
-            print(f"\n⏳ Sleeping {interval}s before next cycle...")
-            await asyncio.sleep(interval)
-
-    try:
-        if loop:
-            asyncio.run(_run_forever())
-        else:
-            asyncio.run(_run_once())
-    except KeyboardInterrupt:
-        print("\nSafe Compounder stopped by user.")
-
-
-def _run_single_pass_strategy(
-    label: str,
-    runner,
-    live_mode: bool = False,
-    loop: bool = False,
-    interval: int = 300,
-    capital: float = 500.0,
-) -> None:
-    """Run a one-shot strategy pass on a loop, with real clients.
-
-    `market_making` and `quick_flip` expose a `run_*_strategy()` coroutine but
-    had no CLI entry point, so the dashboard's toggle for them silently spawned
-    the AI directional loop instead - two buttons running the same bot. This
-    gives each one its own process and its own log.
-
-    Both strategies gate their order placement on `should_trade_live()`, which
-    requires the LIVE_TRADING_ENABLED env var *and* a persisted dashboard mode
-    of "live". `--live` alone therefore cannot put real orders on the wire.
-    """
-    from src.clients.kalshi_client import KalshiClient
-    from src.clients.xai_client import XAIClient
-    from src.jobs.broker import should_trade_live
-    from src.utils.database import DatabaseManager
-
-    print(f"🎯 {label.upper()} MODE")
-    if not should_trade_live():
-        print("   DRY RUN — no real orders will be placed")
-    else:
-        print("   LIVE — real orders will be sent")
-    if loop:
-        print(f"   Continuous mode — re-running every {interval}s. Ctrl-C to stop.")
-
-    async def _run_once():
-        db = DatabaseManager()
-        client = KalshiClient()
-        try:
-            return await runner(db, client, XAIClient(db_manager=db), capital)
-        finally:
-            await client.close()
-
-    async def _run_forever():
-        cycle = 0
-        while True:
-            cycle += 1
-            print(f"\n──── Cycle {cycle} — " f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ────")
-            try:
-                print(await _run_once())
-            except Exception as exc:
-                # One bad cycle must not kill the loop.
-                print(f"Cycle {cycle} failed: {exc}. Continuing after {interval}s.")
-            print(f"\n⏳ Sleeping {interval}s before next cycle...")
-            await asyncio.sleep(interval)
-
-    try:
-        if loop:
-            asyncio.run(_run_forever())
-        else:
-            asyncio.run(_run_once())
-    except KeyboardInterrupt:
-        print(f"\n{label} stopped by user.")
-
-
-def _run_market_making(live_mode: bool = False, loop: bool = False, interval: int = 300) -> None:
-    from src.strategies.market_making import run_market_making_strategy
-
-    async def _runner(db, client, xai, _capital):
-        return await run_market_making_strategy(db, client, xai)
-
-    _run_single_pass_strategy(
-        "market making", _runner, live_mode=live_mode, loop=loop, interval=interval
-    )
-
-
-def _run_quick_flip(live_mode: bool = False, loop: bool = False, interval: int = 120) -> None:
-    from src.strategies.quick_flip_scalping import run_quick_flip_strategy
-
-    async def _runner(db, client, xai, capital):
-        return await run_quick_flip_strategy(db, client, xai, capital)
-
-    _run_single_pass_strategy(
-        "quick flip scalping", _runner, live_mode=live_mode, loop=loop, interval=interval
-    )
 
 
 def cmd_dashboard(args: argparse.Namespace) -> None:
@@ -350,21 +240,9 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
 
     # Prefer the dedicated dashboard launch script if it exists.
     dashboard_script = Path(__file__).parent / "scripts" / "launch_dashboard.py"
-    beast_dashboard = Path(__file__).parent / "scripts" / "beast_mode_dashboard.py"
 
     if dashboard_script.exists():
         subprocess.run([sys.executable, str(dashboard_script)], check=False)
-    elif beast_dashboard.exists():
-        # Fall back to running the dashboard module directly.
-        from beast_mode_bot import BeastModeBot
-        from src.utils.logging_setup import setup_logging
-
-        setup_logging(log_level="INFO")
-        bot = BeastModeBot(live_mode=False, dashboard_mode=True)
-        try:
-            asyncio.run(bot.run())
-        except KeyboardInterrupt:
-            print("\nDashboard stopped by user.")
     else:
         print("Error: No dashboard script found.")
         sys.exit(1)
@@ -845,9 +723,6 @@ def build_parser() -> argparse.ArgumentParser:
             "examples:\n"
             "  python cli.py run                      Start AI Ensemble mode (default, paper)\n"
             "  python cli.py run --live               AI Ensemble with real capital\n"
-            "  python cli.py run --safe-compounder    Safe Compounder: conservative, math-only\n"
-            "  python cli.py run --safe-compounder --live  Safe Compounder live\n"
-            "  python cli.py run --beast              Beast mode (aggressive, not recommended)\n"
             "  python cli.py scores                   Show category scores\n"
             "  python cli.py history                  Show trade history + category breakdown\n"
             "  python cli.py status                   Check portfolio balance and positions\n"
@@ -864,10 +739,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Launch one of the example trading strategies. Default is the AI "
             "directional strategy: a single LLM call per market via OpenRouter "
             "(fallback chain on error), with category scoring and portfolio "
-            "guardrails layered on top. Use --safe-compounder for the "
-            "conservative math-only NO-side strategy. Use --beast to run "
-            "without guardrails (not recommended). All three are starting "
-            "points — fork them, tune them, replace them."
+            "guardrails layered on top."
         ),
     )
     live_group = p_run.add_mutually_exclusive_group()
@@ -889,46 +761,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disciplined mode: category scoring + portfolio enforcement (DEFAULT)",
     )
     strategy_group.add_argument(
-        "--beast",
-        action="store_true",
-        help="Beast mode: aggressive settings, no guardrails (not recommended)",
-    )
-    strategy_group.add_argument(
-        "--safe-compounder",
-        action="store_true",
-        dest="safe_compounder",
-        help="Safe Compounder: NO-side only, edge-based, near-certain outcomes",
-    )
-    strategy_group.add_argument(
-        "--market-making",
-        action="store_true",
-        dest="market_making",
-        help="Market making: quote both sides of the book and earn the spread",
-    )
-    strategy_group.add_argument(
-        "--quick-flip",
-        action="store_true",
-        dest="quick_flip",
-        help="Quick flip scalping: short-horizon momentum entries and exits",
-    )
-    strategy_group.add_argument(
         "--btc-updown",
         action="store_true",
         dest="btc_updown",
         help="Up/down market: trade when live spot and Kalshi's quote disagree. "
         "Use --series and --spot-product to select the market.",
     )
+    strategy_group.add_argument(
+        "--all-no-markets",
+        action="store_true",
+        dest="all_no_markets",
+        help="ALL NO MARKETS: NO-side only maker entries with separate $250 book",
+    )
     p_run.add_argument(
         "--series",
         type=str,
         default="KXXRP15M",
-        help="Kalshi series ticker (e.g. KXXRP15M, KXXRP1H, KXBTC15M, KXBTC1H, KXETH15M, KXETH1H, KXGOLDD) for --btc-updown",
+        help="Kalshi series ticker (e.g. KXXRP15M, KXBTC15M, KXETH15M) for --btc-updown",
     )
     p_run.add_argument(
         "--spot-product",
         type=str,
         default="XRP-USD",
-        help="Coinbase spot product (e.g. XRP-USD, BTC-USD, PAXG-USD) for --btc-updown",
+        help="Coinbase spot product (e.g. XRP-USD, BTC-USD, ETH-USD) for --btc-updown",
     )
     p_run.add_argument(
         "--loop",

@@ -185,7 +185,15 @@ class OpenRouterClient(TradingLoggerMixin):
 
         # Default generation parameters
         self.temperature = settings.trading.ai_temperature
-        self.max_tokens = settings.trading.ai_max_tokens
+        # Token budget. A near-empty OpenRouter balance refuses any request
+        # whose max_tokens exceeds what the remaining credit can pay for
+        # ("you can only afford N tokens"), and every refused call is a skipped
+        # decision - which is how a lane can sit at zero trades while its code
+        # is fine. OPENROUTER_MAX_TOKENS lets the operator fit requests to a
+        # small balance without a redeploy.
+        self.max_tokens = int(
+            os.environ.get("OPENROUTER_MAX_TOKENS") or settings.trading.ai_max_tokens
+        )
 
         # Per-model cost trackers
         self.model_costs: Dict[str, ModelCostTracker] = {
@@ -195,6 +203,7 @@ class OpenRouterClient(TradingLoggerMixin):
         # Aggregate cost tracking
         self.total_cost: float = 0.0
         self.request_count: int = 0
+        self._last_request_cost: float = 0.0
 
         # Daily usage tracker (same pattern as XAIClient).
         #
@@ -453,9 +462,13 @@ class OpenRouterClient(TradingLoggerMixin):
         """
         # PATCHED: never block paid models; only warn if DRY explicitly requires :free.
         if self.free_only and not str(model).endswith(":free"):
-            # YOLO / PI CLI override: allow paid anyway, just log it.
-            import warnings
-            warnings.warn(f"PI_CLI override: allowing paid model '{model}' despite free_only flag")
+            # free_only=True means DRY book - refuse paid models to avoid billing
+            self.logger.warning(
+                "free-only client refusing paid model",
+                model=model,
+                default_model=self.default_model,
+            )
+            raise ValueError(f"free_only client cannot use paid model: {model}")
         # Removed false veto: paid model always allowed when free_only=False.
         temperature = temperature if temperature is not None else self.temperature
         max_tokens = max_tokens or self.max_tokens
@@ -572,6 +585,7 @@ class OpenRouterClient(TradingLoggerMixin):
                 self.total_cost += cost
                 self.request_count += 1
                 self._update_daily_cost(cost)
+                self._last_request_cost = cost
 
                 # Log query if db_manager is available
                 await self._log_query(
@@ -638,6 +652,7 @@ class OpenRouterClient(TradingLoggerMixin):
                 self.total_cost += cost
                 self.request_count += 1
                 self._update_daily_cost(cost)
+                self._last_request_cost = cost
 
                 decision = self._parse_trading_decision(content)
 

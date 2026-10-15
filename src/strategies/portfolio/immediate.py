@@ -6,6 +6,8 @@ former 1,300-line portfolio_optimization.py.
 """
 
 import logging
+import os
+
 import numpy as np
 from datetime import datetime
 from typing import List, Optional, Tuple
@@ -446,10 +448,15 @@ async def _get_fast_ai_prediction(
         Focus on: probability estimate and your confidence level.
         """
         
-        # Use AI analysis for portfolio optimization - higher tokens for reasoning models  
+        # Token budget: the response is a couple of JSON fields, so a huge
+        # max_tokens only wastes the OpenRouter budget. At a near-empty balance
+        # a 3000-token request is refused outright ("you can only afford N"),
+        # which skipped EVERY market and left Beast with zero trades. Keep the
+        # default small and let OPENROUTER_MAX_TOKENS raise/lower it.
+        _max_tokens = int(os.environ.get("OPENROUTER_MAX_TOKENS", "700"))
         response_text = await xai_client.get_completion(
             prompt,
-            max_tokens=3000,  # Higher for reasoning models like grok-4
+            max_tokens=_max_tokens,
             temperature=0.1,   # Low temperature for consistency
             strategy="portfolio_optimizer"
         )

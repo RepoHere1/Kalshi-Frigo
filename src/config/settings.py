@@ -29,7 +29,7 @@ class APIConfig:
     dry_openrouter_api_key: str = field(default_factory=lambda: os.getenv("DRY_OPENROUTER_API_KEY", ""))
     # Free model for DRY mode AI features (veto/sentinel). Must be a real
     # `:free` OpenRouter listing — anything else burns the paid balance.
-    dry_openrouter_model: str = field(default_factory=lambda: os.getenv("DRY_OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free"))
+    dry_openrouter_model: str = field(default_factory=lambda: os.getenv("DRY_OPENROUTER_MODEL", "openrouter/free"))
 
     # xai_api_key removed — all models now route through OpenRouter
 
@@ -225,19 +225,10 @@ confidence_decay_threshold: float = 0.25  # INCREASED: Allow more confidence dec
 max_hold_time_hours: int = 240          # INCREASED: Hold longer (was 168, now 240 hours = 10 days)
 volatility_adjustment: bool = True      # Adjust exits based on volatility
 
-# === MARKET MAKING STRATEGY ===
-# Settings for limit order market making - MORE AGGRESSIVE
-enable_market_making: bool = True       # Enable market making strategy
-min_spread_for_making: float = 0.01     # DECREASED: Accept smaller spreads (was 0.02, now 1¢)
-max_inventory_risk: float = 0.15        # INCREASED: Allow higher inventory risk (was 0.10, now 15%)
-order_refresh_minutes: int = 15         # Refresh orders every 15 minutes
-max_orders_per_market: int = 4          # Maximum orders per market (2 each side)
-
 # === MARKET SELECTION (ENHANCED FOR MORE OPPORTUNITIES) ===
 # Removed time restrictions - trade ANY deadline with dynamic exits!
 # max_time_to_expiry_days: REMOVED      # No longer used - trade any timeline!
 min_volume_for_analysis: float = 100.0  # DECREASED: Very low volume threshold (was 200, now 100)
-min_volume_for_market_making: float = 200.0  # DECREASED: Lower volume for market making (was 500, now 200)
 min_price_movement: float = 0.02        # DECREASED: Lower minimum range (was 0.05, now 2¢)
 max_bid_ask_spread: float = 0.15        # INCREASED: Allow wider spreads (was 0.10, now 15¢)
 min_confidence_long_term: float = 0.45  # DECREASED: Lower confidence for distant expiries (was 0.65, now 45%)
@@ -266,6 +257,12 @@ sentiment_analysis: bool = True         # News sentiment analysis (ENABLED)
 websocket_streaming: bool = True        # WebSocket real-time data (ENABLED)
 options_strategies: bool = False        # Complex options strategies (future)
 algorithmic_execution: bool = False     # Smart order execution (future)
+
+# === ALL NO MARKETS CONFIGURATION ===
+all_no_enabled: bool = True             # Enable the ALL NO MARKETS strategy
+all_no_starting_balance: float = 250.0  # ALL NO starting balance (separate from DRY's $300)
+all_no_kelly_multiplier: float = 0.25  # Quarter-Kelly for ALL NO book
+all_no_max_clip_pct: float = 0.20       # Maximum clip size for ALL NO book (20% of book)
 
 
 @dataclass

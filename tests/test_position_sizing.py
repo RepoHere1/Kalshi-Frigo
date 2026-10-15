@@ -13,14 +13,13 @@ import numpy as np
 import pytest
 from unittest.mock import Mock
 
-from src.strategies.safe_compounder import kelly_fraction
 from src.strategies.portfolio_optimization import (
     AdvancedPortfolioOptimizer,
     MarketOpportunity,
     _calculate_simple_kelly,
 )
 from src.utils import position_sizing
-from src.utils.position_sizing import binary_market_payout_odds
+from src.utils.position_sizing import binary_market_payout_odds, kelly_fraction
 
 
 def make_opportunity(**overrides) -> MarketOpportunity:
@@ -49,7 +48,7 @@ def make_opportunity(**overrides) -> MarketOpportunity:
 
 
 # ---------------------------------------------------------------------------
-# Kernel: kelly_fraction(prob_win, payout_ratio)  [safe_compounder]
+# Kernel: kelly_fraction(prob_win, payout_ratio)  [shared canonical kernel]
 # ---------------------------------------------------------------------------
 
 class TestKellyKernel:
@@ -78,8 +77,9 @@ class TestKellyKernel:
     def test_certain_win_bets_everything(self):
         assert kelly_fraction(1.0, 2.0) == pytest.approx(1.0)
 
-    def test_safe_compounder_reexports_canonical_kernel(self):
-        # The strategy must use the shared kernel, not a private copy.
+    def test_kernel_is_the_shared_canonical_implementation(self):
+        # All consumers must import the kernel from position_sizing (safe_compounder,
+        # which re-exported it, was removed by operator order).
         assert kelly_fraction is position_sizing.kelly_fraction
 
 

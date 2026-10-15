@@ -29,7 +29,7 @@ class Signal:
     entry_price: float      # 0-1 scale (e.g. 0.85 = 85¢)
     confidence: float       # model confidence 0-1
     reasoning: str
-    strategy: str           # e.g. directional, market_making
+    strategy: str           # e.g. directional, beast_mode
     # Outcome fields (filled after settlement)
     outcome: Optional[str]  # win / loss / pending
     settlement_price: Optional[float]

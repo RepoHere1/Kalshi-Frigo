@@ -100,13 +100,13 @@ The dashboard automatically tracks and displays:
 
 ### Example Analysis
 ```
-🤖 Quick Flip Scalping | Movement Prediction | 14:23:15
+🤖 AI Directional | Movement Prediction | 14:23:15
 
-Strategy: quick_flip_scalping
+Strategy: ai_directional
 Type: movement_prediction  
 Market: KXELECTION-2024-TRUMP
 
-Prompt: "QUICK SCALP ANALYSIS for Will Trump win 2024..."
+Prompt: "DIRECTIONAL ANALYSIS for Will Trump win 2024..."
 
 Response: "TARGET_PRICE: 7
 CONFIDENCE: 0.75

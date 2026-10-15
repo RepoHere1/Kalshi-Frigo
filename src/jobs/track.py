@@ -97,9 +97,6 @@ def _infer_strategy(position: Position) -> str:
         return position.strategy
     rationale = (position.rationale or "").upper()
     for marker, name in (
-        ("QUICK FLIP", "quick_flip_scalping"),
-        ("SAFE COMPOUND", "safe_compounder"),
-        ("MARKET MAK", "market_making"),
         ("AI ", "ai_directional"),
     ):
         if marker in rationale:
@@ -516,9 +513,9 @@ async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
                 if _status == "closed":
                     try:
                         _res = str(_md.get("result", "") or "").lower()
-                        _side = str(position.side or "").lower()
+                        _side = str(position.side or "").upper()
                         if _res in ("yes", "no"):
-                            _exit = 1.0 if _res == _side else 0.0
+                            _exit = 1.0 if _res == _side.lower() else 0.0
                         else:
                             _exit = 0.0
                         _entry = float(position.entry_price or 0.0)
@@ -528,6 +525,11 @@ async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
                                 _entry, _exit, _qty, maker_exit=False
                             )
                         )
+                        # PnL depends on position side
+                        # Both sides are long contracts: the gross is the
+                        # exit-vs-entry move on the price actually quoted for
+                        # this side, with no sign inversion.
+                        _gross = (_exit - _entry) * _qty
                         _log = TradeLog(
                             entry_fair=getattr(position, "entry_fair", None),
                             market_id=position.market_id,
@@ -535,7 +537,7 @@ async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
                             entry_price=position.entry_price,
                             exit_price=_exit,
                             quantity=position.quantity,
-                            pnl=round((_exit - _entry) * _qty - _fee, 2),
+                            pnl=round(_gross - _fee, 2),
                             entry_timestamp=position.timestamp,
                             exit_timestamp=datetime.now(),
                             rationale=(
@@ -580,10 +582,15 @@ async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
                     if not _resolvable:
                         try:
                             _entry = float(position.entry_price or 0.0)
+                            _side = str(position.side or "").upper()
                             _qty = int(position.quantity or 0)
                             _fee = float(
                                 _live_fees.taker_fee_dollars(_entry, _qty)
                             )
+                            # PnL for expired-unresolved: exit at 0.0
+                            # Expired with no receipt: the contracts went to
+                            # zero, so the gross is the cost of entry lost.
+                            _gross = -_entry * _qty
                             _log = TradeLog(
                                 entry_fair=getattr(position, "entry_fair", None),
                                 market_id=position.market_id,
@@ -591,7 +598,7 @@ async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
                                 entry_price=position.entry_price,
                                 exit_price=0.0,
                                 quantity=position.quantity,
-                                pnl=round(-_entry * _qty - _fee, 2),
+                                pnl=round(_gross - _fee, 2),
                                 entry_timestamp=position.timestamp,
                                 exit_timestamp=datetime.now(),
                                 rationale=(
@@ -614,9 +621,9 @@ async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
                             result["reconciled"] += 1
                             logger.info(
                                 f"LIVE expired {position.market_id} closed at"
-                                f" 0.0 (no receipt, market gone;"
-                                f" net ${_log.pnl:.2f})"
                             )
+                        except Exception:  # noqa: BLE001 - gone from the API
+                            result["unreconciled"] += 1
                             continue
                         except Exception as exc:  # noqa: BLE001
                             logger.error(
@@ -633,8 +640,8 @@ async def _reconcile_live_settled(db_manager, kalshi_client, logger) -> dict:
                     pass
                 result["unreconciled"] += 1
                 continue
-            side = str(position.side or "").lower()
-            exit_price = 1.0 if receipt["result"] == side else 0.0
+            _side = str(position.side or "").upper()
+            exit_price = 1.0 if receipt["result"] == _side.lower() else 0.0
             gross = (exit_price - float(position.entry_price or 0.0)) * int(
                 position.quantity or 0
             )
@@ -1036,38 +1043,6 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                         continue
                     await db_manager.update_position_status(position.id, "closed")
 
-                    # DRY SETTLEMENT PAYOUT (new): LIVE's Kalshi account is
-                    # credited automatically at settlement; DRY has no
-                    # exchange behind it, so a resolution WIN used to pay
-                    # NOTHING into the simulated book - cash fell $80 while
-                    # realized said +$12 (every payout missing), and the
-                    # starved cash then shrank every future Kelly clip. Book
-                    # the payout locally (no fee at settlement) for the DRY
-                    # book only; LIVE already has it from Kalshi.
-                    if (
-                        is_resolution
-                        and not _pos_is_live
-                        and exit_price > 0.0
-                        and position.id is not None
-                    ):
-                        try:
-                            from src.utils.mode import TradingMode as _TM
-
-                            _mgr = _TM(db_path=db_manager.db_path)
-                            await _mgr.record_fill(
-                                market_id=position.market_id,
-                                side=position.side,
-                                action="sell",
-                                quantity=float(position.quantity or 0),
-                                price=float(exit_price),
-                                note="settlement payout (no fee)",
-                                fee=0.0,
-                            )
-                        except Exception as _exc:  # noqa: BLE001 - never block a close
-                            logger.warning(
-                                f"DRY settlement payout booking failed for "
-                                f"{position.market_id}: {_exc}"
-                            )
                     if is_resolution:
                         resolution_exits += 1
                     logger.info(

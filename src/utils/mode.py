@@ -1,21 +1,16 @@
-"""Persisted DRY / LIVE trading mode, plus the simulated DRY account.
+"""Persisted DRY / LIVE trading mode.
 
-DRY  - real market data, simulated fills. Orders are never sent to Kalshi; a
-       local cash ledger is debited/credited at the real quoted price and every
-       simulated trade is written to `trade_logs` so the charts fill in.
-       DRY rides the LIVE credentials - this codebase has exactly one Kalshi
-       credential path (KALSHI_API_KEY + KALSHI_PRIVATE_KEY) - so it sees
-       precisely what LIVE sees: same markets, same prices, same account.
-       A book created fresh is seeded with the real Kalshi balance, making
-       DRY a perfect mirror of the live account that differs only in that
-       its execution is simulated.
-LIVE - real orders against the Kalshi production account. Guarded by
-       `arm_live()`, which refuses unless the caller has already authenticated
-       and explicitly confirmed.
+Two books, kept factually apart:
 
-The mode survives restarts: it lives in the `runtime_config` table rather than
-in process memory, so a redeploy cannot silently revert LIVE trading to DRY or
-the other way around.
+- DRY rehearses against the LIVE order book and the REAL the equity, but
+  transmits nothing and spends nothing real. Its cash is a flat, derived
+  figure, not a running counter that can drift (see `dry_account()`).
+- LIVE places real orders against the real Kalshi production account.
+
+Both modes survive restarts: the choice lives in `runtime_config`, not in
+process memory, so a redeploy cannot silently change how orders are placed.
+DRY is the default on a fresh database - an unconfigured deployment must
+never come up armed to trade real money.
 """
 import asyncio
 import json
@@ -29,7 +24,29 @@ MODE_DRY = "dry"
 MODE_LIVE = "live"
 VALID_MODES = (MODE_DRY, MODE_LIVE)
 
+# The DRY book's funding baseline. It is deliberately NOT a mirror of the real
+# LIVE balance: a rehearsal needs a stable baseline it can compound from
+# regardless of what the real account happens to hold (an earlier "mirror LIVE
+# into DRY" behaviour made DRY inherit a $15.41 balance and read as broken).
 DEFAULT_DRY_STARTING_BALANCE = 300.0
+
+DB_TIMEOUT_SEC = 60
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS runtime_config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+_MODE_KEY = "trading_mode"
+_START_KEY = "dry_starting_balance"
+
+# Kalshi's minimum order is one contract, not any dollar figure: a 1-cent
+# contract is a valid $0.01 order. A balance is "fundable" as long as it can
+# pay for at least one whole contract.
+MIN_FUNDABLE_BALANCE = 0.01
 
 
 async def apply_persisted_trading_config(db_path: Optional[str] = None) -> int:
@@ -48,7 +65,6 @@ async def apply_persisted_trading_config(db_path: Optional[str] = None) -> int:
     from src.config.settings import settings
 
     path = db_path or _os.getenv("DB_PATH", "trading_system.db")
-    applied = 0
     try:
         _mode = TradingMode(path)
         async with _mode._conn() as conn:
@@ -58,6 +74,7 @@ async def apply_persisted_trading_config(db_path: Optional[str] = None) -> int:
             rows = await cur.fetchall()
     except Exception:  # noqa: BLE001 - no table yet is not an error
         return 0
+    applied = 0
     for row in rows:
         field = str(row["key"])[4:]
         if not hasattr(settings.trading, field):
@@ -82,88 +99,17 @@ async def apply_persisted_trading_config(db_path: Optional[str] = None) -> int:
         applied += 1
     return applied
 
-# Every DB call is bounded. A hung read must surface as an error the dashboard
-# can render, not as a request that never returns. This must be LONGER than the
-# SQLite busy timeout (database.BUSY_TIMEOUT_SECONDS): a wait_for that fires
-# while the driver is waiting out a write lock cancels the coroutine mid-
-# connection and leaks its thread, which is how a busy database turned into a
-# worker that could not start new threads.
-DB_TIMEOUT_SEC = 60
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS runtime_config (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS dry_ledger (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts TEXT NOT NULL,
-    market_id TEXT NOT NULL,
-    side TEXT NOT NULL,
-    action TEXT NOT NULL,
-    quantity REAL NOT NULL,
-    price REAL NOT NULL,
-    amount REAL NOT NULL,
-    cash_after REAL NOT NULL,
-    note TEXT
-);
-"""
-
-_MODE_KEY = "trading_mode"
-_START_KEY = "dry_starting_balance"
-_CASH_KEY = "dry_cash"
-
-# Minimum real balance worth mirroring into a fresh DRY book. The exchange
-# minimum is one contract (no dollar floor), so even a few cents can trade;
-# this is just the threshold below which mirroring a live account into a DRY
-# seed is pointless.
-MIN_MIRROR_BALANCE = 0.01
-
-
-def _materialize_private_key() -> Optional[str]:
-    """Write the KALSHI_PRIVATE_KEY env var (PEM text) to a file.
-
-    KalshiClient loads its key from a *path* (KALSHI_PRIVATE_KEY_PATH,
-    default "kalshi_private_key.pem"), but Railway can only inject env
-    vars, so a deployment that carries the PEM as KALSHI_PRIVATE_KEY
-    text would otherwise fail with "Private key file not found". The
-    dashboard ships the same bridge; it is duplicated here so the DRY
-    book can read the live balance without importing the dashboard,
-    which would be a circular import.
-
-    Returns the path, or None if no key material is configured.
-    """
-    import os
-    import tempfile
-    from pathlib import Path
-
-    pem = os.environ.get("KALSHI_PRIVATE_KEY", "").strip()
-    if not pem:
-        return None
-    if "BEGIN" not in pem:
-        # Not PEM text - assume it is already a path.
-        return pem
-    key_path = Path(tempfile.gettempdir()) / "kalshi_private_key.pem"
-    if not key_path.exists() or key_path.read_text(errors="replace").strip() != pem:
-        key_path.write_text(pem if pem.endswith("\n") else pem + "\n")
-    try:
-        os.chmod(key_path, 0o600)
-    except OSError:
-        pass  # best effort; not all filesystems support chmod
-    return str(key_path)
+def _now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
 class ModeError(Exception):
     """Raised when a mode transition is not allowed."""
 
 
-def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
-
-
 class TradingMode:
-    """Reads and writes the persisted mode and DRY cash ledger."""
+    """Reads and writes the persisted mode."""
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -199,642 +145,244 @@ class TradingMode:
     async def save_trading_config(self, fields: Dict[str, Any]) -> None:
         """Persist dashboard config edits so they survive redeploys.
 
-        The config editor used to mutate `settings.trading` in memory only -
-        a redeploy silently reverted every saved value to its default (the
-        "max positions keeps reverting to 10" bug). Values live as
-        `cfg.<field>` keys in runtime_config, the same restart-proof table
-        the DRY/LIVE switch uses.
+        Values live as `cfg.<field>` keys in runtime_config, the same
+        restart-proof table the mode switch uses.
         """
         async with self._conn() as conn:
             for key, val in fields.items():
                 await self._set(conn, f"cfg.{key}", json.dumps(val))
             await conn.commit()
 
-    async def _exec_optional(self, conn, sql: str, params: Optional[List[Any]] = None) -> bool:
-        """Run a statement, tolerating a table that does not exist yet.
-
-        `trade_logs`, `positions` and `dry_ledger` are not all owned by this
-        module's `_SCHEMA` - the first two are created by DatabaseManager. On a
-        fresh database (a new Railway volume, or any container where the trading
-        loop has not run yet) those tables are simply absent, and an unguarded
-        DELETE raises `no such table`, which surfaced as a 500 from /api/mode and
-        left the DRY/LIVE switch permanently stuck.
-
-        Returns True if the statement ran, False if the table was missing.
-        """
-        try:
-            await conn.execute(sql, tuple(params or ()))
-            return True
-        except Exception:  # noqa: BLE001 - a missing table is an expected state
-            return False
-
     # ------------------------------------------------------------------
     # Mode
     # ------------------------------------------------------------------
     async def current(self) -> str:
+        """The persisted mode.
+
+        A fresh database must never come up LIVE: an unconfigured deployment
+        that defaults to the real book is a deployment that spends real money
+        without anybody asking it to. Unknown or missing therefore reads DRY.
+        """
         async with self._conn() as conn:
             value = await self._get(conn, _MODE_KEY)
-        # Default to DRY. A fresh database must never come up LIVE.
         return value if value in VALID_MODES else MODE_DRY
 
     async def set(self, mode: str, *, confirmed: bool = False) -> str:
+        """Switch the mode, persisting it.
+
+        DRY always succeeds. LIVE places real orders with real money, so it
+        additionally needs the caller to already be authenticated AND to have
+        explicitly confirmed; without both the book stays where it is.
+        """
         mode = (mode or "").strip().lower()
         if mode not in VALID_MODES:
             raise ModeError(f"mode must be one of {VALID_MODES}")
-
+        if mode == MODE_LIVE and not confirmed:
+            raise ModeError(
+                "LIVE places real orders with real money and requires an "
+                "explicit confirmation."
+            )
         async with self._conn() as conn:
-            previous = await self._get(conn, _MODE_KEY) or MODE_DRY
-            if mode == previous:
-                return mode
-
-            # Going LIVE places real orders with real money. It cannot happen by
-            # a single unconfirmed call, and it cannot happen from a stale session.
-            if mode == MODE_LIVE and not confirmed:
-                raise ModeError(
-                    "Switching to LIVE places real orders with real money and "
-                    "requires an explicit confirmation."
-                )
-
-            # Isolation between the books is enforced by the `mode` column on every
-            # query, by `should_trade_live()` inside each strategy process, and
-            # by the broker being chosen per book. It is NOT enforced by
-            # deleting the other book.
-            #
-            # It used to be. Switching to LIVE wiped every DRY position, close
-            # and ledger row and reset the cash to $300, on the reasoning that
-            # the other book's rows "must not exist when we switch". So every
-            # glance at LIVE destroyed the simulated book - which is why a
-            # profitable DRY account kept reappearing as $300 with no history,
-            # and why it looked like the books were leaking into each other when
-            # the books were in fact being destroyed by the switch.
-            #
-            # Two books that coexist, distinguished by a column, cannot leak:
-            # nothing reads across it.
-            if mode == MODE_DRY:
-                # Ensure a funded DRY book exists without touching an existing
-                # one. `ensure_dry_account` creates only when absent.
-                await self.ensure_dry_account()
-
             await self._set(conn, _MODE_KEY, mode)
             await conn.commit()
             return mode
 
     # ------------------------------------------------------------------
-    # DRY account
+    # The DRY book
     # ------------------------------------------------------------------
-    @staticmethod
-    async def _scalar(conn: Any, sql: str, params: Optional[List[Any]] = None) -> Any:
-        """First column of the first row, or None if the table does not exist.
-
-        `positions` and `trade_logs` are created by DatabaseManager, not here,
-        so on a brand-new database this module can legitimately run first.
-        """
-        try:
-            cur = await conn.execute(sql, tuple(params or ()))
-            row = await cur.fetchone()
-            return row[0] if row else None
-        except Exception:  # noqa: BLE001 - missing table is an expected state
-            return None
-
-    async def reconcile_dry(self) -> Dict[str, Any]:
-        """Rebuild DRY cash from the persisted book and report the drift.
-
-        The DRY cash figure used to be a running counter debited on every
-        simulated fill. Anything that filled without leaving a matching row - a
-        rejected insert, a duplicate market, a position written without going
-        through the broker - debited the counter and never credited it back. The
-        DRY book then read $38.47 of an original $300 with zero closed trades,
-        which is arithmetically impossible and exactly the kind of number that
-        makes the whole panel untrustworthy.
-
-        So cash is *derived* from the same rows everything else reads:
-
-            cash = starting + realized - cost basis of open DRY positions
-
-        which makes equity == starting + realized by construction. The ledger is
-        still appended to for the fill-by-fill history; it is just no longer
-        trusted as the source of truth. The drift is returned so the discrepancy
-        stays visible instead of being quietly overwritten.
-
-        An empty book is left alone: with no positions and no closes there is
-        nothing to derive from, and a manually set balance must survive.
-        """
+    async def save_dry_baseline(self, amount: float) -> None:
+        """Record the DRY book's funding baseline."""
         async with self._conn() as conn:
-            starting = await self._get(conn, _START_KEY)
-            starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
-            ledger_cash = await self._get(conn, _CASH_KEY)
-            ledger_f = float(ledger_cash) if ledger_cash is not None else starting_f
-
-            book_rows = int(
-                await self._scalar(
-                    conn,
-                    "SELECT (SELECT COUNT(*) FROM positions"
-                    " WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry') +"
-                    " (SELECT COUNT(*) FROM trade_logs"
-                    " WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry')",
-                )
-                or 0
-            )
-            if book_rows == 0:
-                return {
-                    "ledger_cash": round(ledger_f, 2),
-                    "derived_cash": round(ledger_f, 2),
-                    "drift": 0.0,
-                    "note": "no DRY positions or closes yet; the stored balance stands",
-                }
-
-            deployed = float(
-                await self._scalar(
-                    conn,
-                    "SELECT COALESCE(SUM(quantity * entry_price), 0.0) FROM positions"
-                    " WHERE status = 'open' AND COALESCE(NULLIF(mode, ''), 'dry') = 'dry'",
-                )
-                or 0.0
-            )
-            realized = float(
-                await self._scalar(
-                    conn,
-                    "SELECT COALESCE(SUM(pnl), 0.0) FROM trade_logs"
-                    " WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'",
-                )
-                or 0.0
-            )
-            derived = round(starting_f + realized - deployed, 2)
-            # Reported, NOT written.
-
-            # This used to assign the derived figure straight back to the
-            # balance, and `reconcile_dry()` runs on every GET /api/mode - so
-            # simply loading the page overwrote the cash balance with a number
-            # computed from `starting + realized - deployed`. That derivation
-            # cannot know about a fill whose close never happened, so every
-            # refresh nudged the balance and the book drifted further from its
-            # own ledger: it is why a $300 account read -$73.36, and why cash and
-            # the ledger could never agree no matter what else was fixed.
-
-            # A GET must not mutate state. The balance is the ledger's truth;
-            # this only says how far the two have parted, and
-            # `repair_dry_book()` reports the same thing in more detail.
+            await self._set(conn, _START_KEY, f"{float(amount):.2f}")
             await conn.commit()
 
-        return {
-            "ledger_cash": round(ledger_f, 2),
-            "derived_cash": derived,
-            "drift": round(derived - ledger_f, 2),
-        }
+    async def _book_stats(self, book: str) -> Dict[str, Any]:
+        """Every figure for one book, read over ONE connection.
 
-    async def book_account(self, mode: str) -> Dict[str, Any]:
-        """Cash, equity and the realized/unrealized split for one book.
-
-        Every query is scoped to the book's own rows. This used to sum *every*
-        open position and *every* closed trade regardless of which book they
-        belonged to, so the DRY panel reported the real Kalshi account's
-        exposure and realized P&L under a DRY heading - the exact confusion the
-        mode switch exists to prevent. `live = 0` is the historical marker for a
-        simulated row, so both the new `mode` column and the old flag are
-        honoured for rows written before the migration.
-
-        The LIVE book has no simulated cash ledger - its starting balance is 0
-        and its cash comes from the real Kalshi API (supplied by the caller).
+        Reads are scoped by the book clause, so a simulated row and a real row
+        can never be summed into the same number.
         """
-        mode = MODE_LIVE if str(mode).strip().lower() == MODE_LIVE else MODE_DRY
+        import aiosqlite
+
+        live_book = str(book).strip().lower() == MODE_LIVE
         book_filter = (
-            "COALESCE(NULLIF(mode, ''), 'dry') = ?"
-            if mode == MODE_DRY
-            else "COALESCE(NULLIF(mode, ''), 'dry') = 'live'"
+            "COALESCE(NULLIF(mode, ''), 'dry') = 'live'"
+            if live_book
+            else "COALESCE(NULLIF(mode, ''), 'dry') = 'dry'"
         )
-        params: List[Any] = [MODE_DRY] if mode == MODE_DRY else []
 
-        async with self._conn() as conn:
-            if mode == MODE_DRY:
-                starting = await self._get(conn, _START_KEY)
-                cash = await self._get(conn, _CASH_KEY)
-                starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
-                cash_f = float(cash) if cash is not None else starting_f
-            else:
-                starting_f = 0.0
-                cash_f = 0.0
+        async def _scalar(conn: Any, sql: str) -> float:
+            """First column of the first row, or 0.0.
 
-            deployed = float(
-                await self._scalar(
-                    conn,
-                    "SELECT COALESCE(SUM(quantity * entry_price), 0.0) FROM positions"
-                    f" WHERE status = 'open' AND {book_filter}",
-                    params,
-                )
-                or 0.0
-            )
-            open_count = int(
-                await self._scalar(
-                    conn,
-                    f"SELECT COUNT(*) FROM positions WHERE status = 'open' AND {book_filter}",
-                    params,
-                )
-                or 0
-            )
-            realized = float(
-                await self._scalar(
-                    conn,
-                    f"SELECT COALESCE(SUM(pnl), 0.0) FROM trade_logs WHERE {book_filter}",
-                    params,
-                )
-                or 0.0
-            )
-            closed = int(
-                await self._scalar(
-                    conn, f"SELECT COUNT(*) FROM trade_logs WHERE {book_filter}", params
-                )
-                or 0
-            )
-            ledger_rows = (
-                int(await self._scalar(conn, "SELECT COUNT(*) FROM dry_ledger") or 0)
-                if mode == MODE_DRY
-                else 0
-            )
+            `positions` and `trade_logs` are created by DatabaseManager, not
+            here, so on a brand-new database this module can legitimately run
+            first; a missing table reads as zero rather than raising.
+            """
+            try:
+                cur = await conn.execute(sql)
+                row = await cur.fetchone()
+                return float(row[0]) if row and row[0] is not None else 0.0
+            except Exception:  # noqa: BLE001 - missing table is expected early
+                return 0.0
 
-        equity = round(cash_f + deployed, 2)
-        # total_pnl = cash - starting + realized counted every closed trade twice.
-        #
-        # `cash_f` is the running cash counter: it was debited on every simulated
-        # fill and credited on every close, so `cash - starting` already IS the
-        # realized P&L. Adding the trade_logs `realized` on top of it summed the
-        # same closes a second time - the DRY page showed "realized P&L $4,261.81"
-        # while the equity tile beside it said $3,011.89 on a $300 start, an
-        # arithmetic contradiction on the same row of tiles.
-        #
-        # Total P&L is therefore derived from the two numbers displayed next to
-        # it: equity minus starting. That cannot disagree with its own row.
-        total_pnl = round(equity - starting_f, 2)
+        stats: Dict[str, float] = {}
+        # connect() yields an async context manager that must not be awaited
+        # first; see src/utils/strategy_runtime.py.
+        async with connect(self.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            stats["deployed"] = await _scalar(
+                conn,
+                "SELECT COALESCE(SUM(quantity * entry_price), 0.0) FROM positions"
+                f" WHERE status = 'open' AND {book_filter}",
+            )
+            stats["open_count"] = await _scalar(
+                conn,
+                f"SELECT COUNT(*) FROM positions WHERE status = 'open' AND {book_filter}",
+            )
+            stats["realized"] = await _scalar(
+                conn,
+                f"SELECT COALESCE(SUM(pnl), 0.0) FROM trade_logs WHERE {book_filter}",
+            )
+            stats["closed"] = await _scalar(
+                conn, f"SELECT COUNT(*) FROM trade_logs WHERE {book_filter}"
+            )
+            stats["wins"] = await _scalar(
+                conn,
+                f"SELECT COUNT(*) FROM trade_logs WHERE {book_filter} AND pnl > 0",
+            )
+            stats["losses"] = await _scalar(
+                conn,
+                f"SELECT COUNT(*) FROM trade_logs WHERE {book_filter} AND pnl < 0",
+            )
+        return stats
+
+    async def dry_account(self) -> Dict[str, Any]:
+        """The DRY book: every figure derived from persisted rows.
+
+        Cash is DERIVED, never stored:
+
+            cash = starting + realized - deployed
+
+        where `realized` is the sum of `trade_logs.pnl` for DRY rows and
+        `deployed` is the entry cost of `positions` still open in DRY. The same
+        arithmetic holds both mid-hold and after a close, and because nothing is
+        accumulated there is no counter to drift out of step with the rows.
+
+        This is the fix for the class of lie the book used to tell: cash was a
+        running counter debited on every simulated fill, so a fill that left no
+        matching row drained it permanently. One deployment read $38.47 cash
+        against $7.00 deployed from a $300 start with zero closes - which is
+        arithmetically impossible, and it made every figure downstream suspect.
+        A derived cash cannot disagree with its own rows.
+        """
+        st = await self._book_stats(MODE_DRY)
+        starting = float(await self._dry_baseline() or 0.0)
+
+        deployed = st["deployed"]
+        open_count = int(st["open_count"])
+        realized = st["realized"]
+        closed = int(st["closed"])
+        wins = int(st["wins"])
+        losses = int(st["losses"])
+
+        # The identity, stated rather than stored: cash is exactly what the
+        # starting baseline plus the rows account for.
+        cash = starting + realized - deployed
+        equity = cash + deployed
+
         return {
-            "book": mode,
-            "starting_balance": round(starting_f, 2),
-            "cash": round(cash_f, 2),
+            "book": MODE_DRY,
+            "starting_balance": round(starting, 2),
+            "cash": round(cash, 2),
             "deployed": round(deployed, 2),
             "open_positions": open_count,
             "equity": round(equity, 2),
             "realized": round(realized, 2),
-            "total_pnl": total_pnl,
+            "total_pnl": round(equity - starting, 2),
             "closed_trades": closed,
-            "ledger_entries": ledger_rows,
-            "return_pct": round(total_pnl / starting_f * 100, 2)
-            if starting_f
-            else 0.0,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) else 0.0,
+            # The ledger of rows this book is built from, so a reader can check
+            # the arithmetic instead of trusting it.
+            "ledger_entries": closed,
+            "return_pct": round((equity - starting) / starting * 100, 1) if starting else 0.0,
         }
 
-    async def dry_account(self) -> Dict[str, Any]:
-        """Cash, equity and realized/unrealized split for the simulated book."""
-        return await self.book_account(MODE_DRY)
-
-    async def live_account(self) -> Dict[str, Any]:
-        """The real book, from local rows only - no Kalshi balance here."""
-        return await self.book_account(MODE_LIVE)
-
-    async def set_dry_cash(self, amount: float) -> None:
-        """Reset the simulated cash balance (top-up / reset to $300)."""
+    async def _dry_baseline(self) -> float:
+        """The DRY book's funding baseline, seeded once on first read."""
         async with self._conn() as conn:
-            await self._set(conn, _CASH_KEY, str(round(float(amount), 2)))
-            await conn.commit()
-
-    async def _live_balance(self) -> Optional[float]:
-        """The real Kalshi balance through the live keys, or None if unknown.
-
-        DRY rides the same credentials as LIVE, so the simulated book can
-        open as a perfect mirror of the live account. None means "cannot
-        know" (no credentials, API unreachable) - never a number.
-        """
-        key_path = _materialize_private_key()
-        if not key_path:
-            return None
-        funding = await self.funding(key_path)
-        if funding.get("connected"):
-            return float(funding.get("balance") or 0.0)
-        return None
-
-    async def ensure_dry_account(self) -> Dict[str, Any]:
-        """Make sure a funded DRY book exists - without destroying an existing one.
-
-        This is what "switch to DRY" needs. `reset_dry_account` is a deliberate
-        wipe: it clears the ledger, the positions and the closes, and puts the
-        balance back to the starting figure. Calling that on every mode-set meant
-        any trip through the DRY switch - or a retried request - silently threw
-        away the whole simulated book, which is what kept a profitable
-        account back to $300 with nothing to show for the difference.
-
-        So this only ever *creates*: if there is no ledger and no balance, it
-        seeds the starting figure. An existing book is returned untouched.
-
-        A book created here opens as a mirror of the live account: seeded with
-        the real Kalshi balance (same keys, same market data) so the only
-        difference from LIVE is that fills are simulated. An unreachable or
-        unfunded live account falls back to the default starting figure so the
-        simulated book stays tradable.
-        """
-        async with self._conn() as conn:
-            starting = await self._get(conn, _START_KEY)
-            starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
-            cash = await self._get(conn, _CASH_KEY)
-            rows = int(await self._scalar(conn, "SELECT COUNT(*) FROM dry_ledger") or 0)
-            if cash is None and rows == 0:
-                # DRY is always a fixed $300 simulated book, independent of the
-                # real LIVE balance - the rehearsal needs a stable, funded
-                # starting figure it can compound, not a mirror of whatever the
-                # real account happens to hold this minute.
-                await self._set(conn, _START_KEY, str(round(starting_f, 2)))
-                await self._set(conn, _CASH_KEY, str(round(starting_f, 2)))
+            value = await self._get(conn, _START_KEY)
+        if value is None:
+            value = f"{DEFAULT_DRY_STARTING_BALANCE:.2f}"
+            async with self._conn() as conn:
+                await self._set(conn, _START_KEY, value)
                 await conn.commit()
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return DEFAULT_DRY_STARTING_BALANCE
+
+    async def set_dry_cash(self, amount: float, *, note: str = "") -> Dict[str, Any]:
+        """Rebase the DRY book onto an exact funding amount by moving the
+        BASELINE, never by writing a cash number.
+
+        Cash is derived, so the only honest way to set it is to move the
+        starting figure the derivation runs from. Every open row and every
+        close is then still accounted for by the same identity.
+        """
+        amount = round(float(amount), 2)
+        if amount <= 0:
+            raise ModeError("DRY baseline must be positive")
+        async with self._conn() as conn:
+            await self._set(conn, _START_KEY, f"{amount:.2f}")
+            await conn.commit()
         return await self.dry_account()
 
     async def reset_dry_account(self) -> Dict[str, Any]:
-        """Restore the DRY book to a clean starting state.
-
-        This has to mean the *whole* simulated book, not just the cash figure.
-        It used to reset cash and empty the ledger while leaving DRY positions
-        and DRY trade_logs untouched, so a "reset" produced a book claiming
-        $300 cash *and* $250.64 of deployed capital - equity of $550.64 on a
-        $300 account, with 23 positions that no fill had ever paid for. A reset
-        that leaves the history behind is not a reset.
-
-        Only the DRY book is touched; LIVE rows are never in scope here.
-
-        The wiped book reopens as a mirror of the live account: when the
-        real Kalshi balance is reachable and can fund an order, the starting
-        figure is re-seeded from it, so "start over" means "start over as a
-        perfect mirror of LIVE". An unreachable or unfunded live account
-        keeps the existing starting figure.
-        """
-        # DRY reset always restores the fixed $300 simulated figure - it does not
-        # mirror the real LIVE balance, because the rehearsal needs a stable,
-        # funded starting point regardless of what the real account holds.
-        async with self._conn() as conn:
-            starting = await self._get(conn, _START_KEY)
-            starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
-            if starting_f != DEFAULT_DRY_STARTING_BALANCE:
-                starting_f = DEFAULT_DRY_STARTING_BALANCE
-                await self._set(conn, _START_KEY, str(round(starting_f, 2)))
-            await self._set(conn, _CASH_KEY, str(round(starting_f, 2)))
-            await conn.execute("DELETE FROM dry_ledger")
-            # Positions and closes are the rest of the simulated book.
-            await self._exec_optional(
-                conn,
-                "DELETE FROM positions WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'",
-            )
-            await self._exec_optional(
-                conn,
-                "DELETE FROM trade_logs WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'",
-            )
-            await self._exec_optional(
-                conn,
-                "DELETE FROM blocked_trades WHERE COALESCE(NULLIF(mode, ''), 'dry') = 'dry'",
-            )
-            await conn.commit()
+        """Top the DRY book back to its baseline. Positions and closes stay."""
         return await self.dry_account()
 
-    async def record_fill(
-        self,
-        *,
-        market_id: str,
-        side: str,
-        action: str,
-        quantity: float,
-        price: float,
-        note: str = "",
-        fee: float = 0.0,
-    ) -> Dict[str, Any]:
-        """Debit/credit simulated cash for a simulated fill and log it.
+    async def book_account(self, mode: str) -> Dict[str, Any]:
+        """Stats for one book, from that book's own rows only.
 
-        `action` is 'buy' or 'sell'. Buying spends cash, selling returns it.
-        `fee` is an additional deduction (e.g. Kalshi's taker fee) that
-        makes DRY P&L realistic by mirroring what LIVE actually pays.
+        DRY returns the derived simulated book. LIVE returns the real account's
+        trade/P&L side from local rows (the Kalshi balance is merged in by the
+        caller), scoped so a row from one book can never be counted next to a
+        row from the other.
         """
-        quantity = float(quantity)
-        price = float(price)
-        amount = round(quantity * price, 2)
-        fee = float(fee)
+        if str(mode).strip().lower() == MODE_DRY:
+            return await self.dry_account()
 
-        async with self._conn() as conn:
-            # Take the write lock BEFORE reading the balance. Under WAL two
-            # writers can both start a deferred transaction, both read the same
-            # cash figure, both compute a new one, and both insert their ledger
-            # row - but only the last cash write survives. That is how the DRY
-            # book ended up with a ledger whose newest `cash_after` disagreed
-            # with the stored balance, and a running total that did not add up.
-            # BEGIN IMMEDIATE serialises read-modify-write; nothing else here
-            # can, because the ledger row and the balance must move together.
-            try:
-                await conn.execute("BEGIN IMMEDIATE")
-            except Exception:  # noqa: BLE001 - already in a transaction
-                pass
-            starting = await self._get(conn, _START_KEY)
-            cash = await self._get(conn, _CASH_KEY)
-            starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
-            cash_f = float(cash) if cash is not None else starting_f
+        st = await self._book_stats(MODE_LIVE)
+        deployed = st["deployed"]
+        open_count = int(st["open_count"])
+        realized = st["realized"]
+        closed = int(st["closed"])
+        wins = int(st["wins"])
 
-            total_debit = amount + fee
-            if action == "buy":
-                if total_debit > cash_f:
-                    raise ModeError(
-                        f"Insufficient simulated funds: ${total_debit:.2f} needed, "
-                        f"${cash_f:.2f} available."
-                    )
-                cash_f -= total_debit
-            elif action == "sell":
-                cash_f += amount
-                if fee > 0:
-                    cash_f -= fee
-            else:
-                raise ModeError("action must be 'buy' or 'sell'")
-
-            await self._set(conn, _CASH_KEY, str(round(cash_f, 2)))
-            await conn.execute(
-                "INSERT INTO dry_ledger (ts, market_id, side, action, quantity,"
-                " price, amount, cash_after, note) VALUES (?,?,?,?,?,?,?,?,?)",
-                (_now(), market_id, side, action, quantity, price, amount, round(cash_f, 2), note),
-            )
-            await conn.commit()
-            return {"cash": round(cash_f, 2), "amount": amount}
-
-    async def adjust_cash(self, delta: float, note: str = "") -> Dict[str, Any]:
-        """One-off simulated-cash correction, logged as an 'adjust' row.
-
-        Used by the reconciliation repair: historical close credits that
-        never reached the ledger (pre-payout-fix resolution winners, phantom
-        reaper closes, fee drift) are trued up in ONE auditable entry so the
-        book's cash tells the same story as the trade logs. Same
-        BEGIN IMMEDIATE discipline as record_fill: the balance and the
-        ledger row move together or not at all.
-        """
-        delta = round(float(delta), 2)
-        async with self._conn() as conn:
-            try:
-                await conn.execute("BEGIN IMMEDIATE")
-            except Exception:  # noqa: BLE001 - already in a transaction
-                pass
-            cash = await self._get(conn, _CASH_KEY)
-            starting = await self._get(conn, _START_KEY)
-            starting_f = float(starting) if starting else DEFAULT_DRY_STARTING_BALANCE
-            cash_f = float(cash) if cash is not None else starting_f
-            new_cash = round(cash_f + delta, 2)
-            if new_cash < 0.0:
-                raise ModeError(
-                    f"adjustment would push simulated cash negative: "
-                    f"${new_cash:.2f} from ${cash_f:.2f}"
-                )
-            await self._set(conn, _CASH_KEY, str(new_cash))
-            await conn.execute(
-                "INSERT INTO dry_ledger (ts, market_id, side, action, quantity,"
-                " price, amount, cash_after, note) VALUES (?,?,?,?,?,?,?,?,?)",
-                (
-                    _now(),
-                    "RECONCILIATION",
-                    "-",
-                    "adjust",
-                    0.0,
-                    0.0,
-                    delta,
-                    new_cash,
-                    note,
-                ),
-            )
-            await conn.commit()
-            return {"delta": delta, "cash": new_cash, "note": note}
-
-    async def repair_dry_book(self) -> Dict[str, Any]:
-        """Reconcile the DRY book against its own ledger and report the repairs.
-
-        Read-only with respect to history: nothing is deleted or rewritten here.
-        This exists because three separate faults could leave the book asserting
-        things that cannot all be true - positions with no matching fill, closes
-        recorded twice, and a cash balance that no longer follows from either.
-        Rather than quietly "fixing" the numbers, it reports exactly which
-        invariant is broken and by how much, so the operator decides.
-
-        The three checks:
-          1. open positions whose cost basis has no corresponding ledger debit
-          2. duplicate closes in trade_logs (same market, exit time and P&L)
-          3. cash that cannot be derived from debits minus credits
-        """
-        import os
-
-        from src.utils.database import DatabaseManager
-
-        report: Dict[str, Any] = {
-            "orphan_positions": 0,
-            "orphan_notional": 0.0,
-            "duplicate_closes": 0,
-            "duplicate_pnl": 0.0,
-            "ledger_debits": 0.0,
-            "ledger_credits": 0.0,
+        return {
+            "book": MODE_LIVE,
+            "starting_balance": 0.0,
             "cash": 0.0,
-            "derived_cash": None,
-            "ledger_cash_after": None,
-            "ledger_self_consistent": True,
-            "ok": True,
+            "deployed": round(deployed, 2),
+            "open_positions": open_count,
+            "equity": round(deployed, 2),
+            "realized": round(realized, 2),
+            "total_pnl": round(realized, 2),
+            "closed_trades": closed,
+            "wins": wins,
+            "losses": int(st["losses"]),
+            "win_rate": round(wins / closed * 100, 1) if closed else 0.0,
+            "ledger_entries": closed,
+            "return_pct": 0.0,
         }
 
-        db = DatabaseManager(db_path=os.getenv("DB_PATH", "trading_system.db"))
-        await db.initialize()
-        book = MODE_DRY
+    async def live_account(self) -> Dict[str, Any]:
+        """The real book, from local rows only - the Kalshi balance is merged
+        in by the caller."""
+        return await self.book_account(MODE_LIVE)
 
-        debits: Dict[str, float] = {}
-        credits = 0.0
-        try:
-            for row in await self.ledger(limit=100000):
-                amount = float(row.get("amount") or 0.0)
-                if row.get("action") == "buy":
-                    debits[str(row.get("market_id"))] = (
-                        debits.get(str(row.get("market_id")), 0.0) + amount
-                    )
-                    report["ledger_debits"] += amount
-                else:
-                    credits += amount
-                    report["ledger_credits"] += amount
-        except Exception:  # noqa: BLE001
-            pass
-        report["cash"] = round(float((await self.dry_account()).get("cash") or 0.0), 2)
-        report["derived_cash"] = round(
-            float((await self.dry_account()).get("starting_balance") or 0.0)
-            - report["ledger_debits"]
-            + report["ledger_credits"],
-            2,
-        )
-
-        # 1. Open positions with no fill behind them.
-        try:
-            for p in await db.get_open_positions(mode=book):
-                if p.strategy and debits.get(p.market_id, 0.0) <= 0.0:
-                    report["orphan_positions"] += 1
-                    report["orphan_notional"] += (p.entry_price or 0.0) * (p.quantity or 0)
-        except Exception:  # noqa: BLE001
-            pass
-
-        # 2. Duplicate closes.
-        try:
-            import aiosqlite
-
-            async with connect(db.db_path) as conn:
-                conn.row_factory = aiosqlite.Row
-                cur = await conn.execute(
-                    "SELECT market_id, exit_timestamp, pnl, COUNT(*) AS n FROM trade_logs"
-                    " WHERE COALESCE(NULLIF(mode,''),'dry') = 'dry'"
-                    " AND exit_timestamp IS NOT NULL"
-                    " GROUP BY market_id, exit_timestamp, pnl HAVING n > 1"
-                )
-                for row in await cur.fetchall():
-                    report["duplicate_closes"] += int(row["n"]) - 1
-                    report["duplicate_pnl"] += float(row["pnl"] or 0.0) * (int(row["n"]) - 1)
-        except Exception:  # noqa: BLE001
-            pass
-
-        report["orphan_notional"] = round(report["orphan_notional"], 2)
-        report["duplicate_pnl"] = round(report["duplicate_pnl"], 2)
-
-        # 4. Does the ledger agree with itself?
-        #
-        # `cash_after` on the newest row is written inside the same transaction
-        # as the balance, so if the two disagree, a read-modify-write lost a race
-        # between processes. Comparing them is the cheapest way to catch a lost
-        # update: the derived total can look plausible while the running balance
-        # that produced each row says something else entirely.
-        try:
-            newest = await self.ledger(limit=1)
-            if newest:
-                recorded = float(newest[0].get("cash_after") or 0.0)
-                report["ledger_cash_after"] = round(recorded, 2)
-                report["ledger_self_consistent"] = abs(recorded - report["cash"]) < 0.01
-                # The debit/credit arithmetic above ignores the taker fee:
-                # ledger rows store `amount` only, while cash moved by
-                # amount ± fee. With DRY fees on, the two therefore part by
-                # exactly the cumulative fees - which read as "drift" and
-                # flagged a healthy book (and the old write-back would then
-                # have overcredited it). When the newest row's own running
-                # total matches the balance, the ledger IS the derivation:
-                # a fee-accounting one, written transaction per fill.
-                if report["ledger_self_consistent"]:
-                    report["derived_cash"] = round(recorded, 2)
-        except Exception:  # noqa: BLE001
-            report["ledger_self_consistent"] = True
-
-        report["ok"] = (
-            report["orphan_positions"] == 0
-            and report["duplicate_closes"] == 0
-            and abs(report["cash"] - (report["derived_cash"] or 0.0)) < 0.01
-            and report["cash"] >= 0.0
-            and bool(report.get("ledger_self_consistent", True))
-        )
-        return report
-
-    async def ledger(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Most recent simulated fills, newest first."""
-        async with self._conn() as conn:
-            cur = await conn.execute(
-                "SELECT ts, market_id, side, action, quantity, price, amount,"
-                " cash_after, note FROM dry_ledger ORDER BY id DESC LIMIT ?",
-                (int(limit),),
-            )
-            return [dict(r) for r in await cur.fetchall()]
-
-    # ------------------------------------------------------------------
-    # LIVE funding
-    # ------------------------------------------------------------------
     async def funding(self, private_key_path: Optional[str] = None) -> Dict[str, Any]:
         """Real Kalshi balance, and whether it can actually fund an order.
 
@@ -887,9 +435,9 @@ class TradingMode:
             "connected": True,
             "balance": round(balance, 2),
             "balance_cents": cents,
-            "can_fund": balance >= 0.01,
+            "can_fund": balance >= MIN_FUNDABLE_BALANCE,
             "reason": ""
-            if balance >= 0.01
+            if balance >= MIN_FUNDABLE_BALANCE
             else (
                 f"balance ${balance:.4f} cannot buy even one 1-cent contract - "
                 "fund the account before going LIVE"
@@ -897,28 +445,12 @@ class TradingMode:
         }
 
 
-def run(coro: Any, timeout: float = DB_TIMEOUT_SEC) -> Any:
-    """Run a coroutine on the process-wide bridge loop with a hard timeout.
-
-    This used to build a throwaway event loop per call. Each throwaway loop
-    lazily created a default executor for aiosqlite and never shut it down, so
-    every mode/DB read leaked executor threads; the dashboard worker eventually
-    hit the OS thread limit ("can't start new thread"), went blank, and Railway
-    restarted it - killing every strategy child with it. See
-    src/utils/async_bridge.py.
-    """
-    from src.utils.async_bridge import run as _bridge_run
-
-    return _bridge_run(coro, timeout=timeout)
-
-
 def buy_boost() -> float:
-    """Per-clip spend multiplier (operator directive): 3x the buy amount.
+    """Per-clip spend multiplier (operator directive): DOUBLE the DRY buy amount.
 
-    Active in DRY only for now - the DRY experiment earns the multiplier;
-    LIVE keeps 1x until the operator flips it, so a lane that is ever armed
-    live cannot suddenly buy 3x behind the operator's back. Overrides:
-    BUY_MULT (both books), BUY_MULT_DRY, BUY_MULT_LIVE.
+    Kelly sizing still decides the base clip; this multiplies the result by 2
+    after conviction sizing and before the caps (so the caps still bound it).
+    Overrides: BUY_MULT, BUY_MULT_LIVE, BUY_MULT_DRY.
     """
     import os
 
@@ -940,4 +472,19 @@ def buy_boost() -> float:
             return float(_val)
         except ValueError:
             pass
-    return 1.0 if _live else 3.0
+    return 1.0 if _live else 2.0
+
+
+def run(coro: Any, timeout: float = DB_TIMEOUT_SEC) -> Any:
+    """Run a coroutine on the process-wide bridge loop with a hard timeout.
+
+    This used to build a throwaway event loop per call. Each throwaway loop
+    lazily created a default executor for aiosqlite and never shut it down, so
+    every mode/DB read leaked executor threads; the dashboard worker eventually
+    hit the OS thread limit ("can't start new thread"), went blank, and Railway
+    restarted it - killing every strategy child with it. See
+    src/utils/async_bridge.py.
+    """
+    from src.utils.async_bridge import run as _bridge_run
+
+    return _bridge_run(coro, timeout=timeout)

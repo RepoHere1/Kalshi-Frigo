@@ -68,6 +68,11 @@ class RealizedVol:
         while self._samples and self._samples[0][0] < cutoff:
             self._samples.popleft()
 
+    @property
+    def warmed(self) -> bool:
+        """True once at least one sample is in the window (a cold start has none)."""
+        return bool(self._samples)
+
     def _per_sqrt_second_sigma(self) -> Optional[float]:
         """Std of per-pair log returns scaled to $ per sqrt-second, or None.
 
