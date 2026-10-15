@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kalshi-Frigo — ALL NO MARKETS</title>
+  <style>
+    /* ---------- palette ----------
+       White page, black cards. The page reads as a ledger, not a terminal:
+       every tally and every row sits in its own black card on white paper so
+       the numbers carry the contrast instead of a dark theme. */
+    :root{
+      --paper:#ffffff;
+      --card:#0a0a0a;
+      --card2:#161616;
+      --cardline:#2a2a2a;
+      --fg:#f5f5f5;
+      --dim:#a3a3a3;
+      --faint:#737373;
+      --up:#34d399;
+      --down:#f87171;
+      --amber:#fbbf24;
+      --blue:#60a5fa;
+      --r:12px;
+    }
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{
+      font:13px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;
+      background:var(--paper);
+      color:#0a0a0a;
+      min-height:100vh;
+      padding:22px 24px 48px;
+      -webkit-font-smoothing:antialiased;
+    }
+    .wrap{max-width:1500px;margin:0 auto}
+
+    /* ---------- header ---------- */
+    header{
+      display:flex;flex-wrap:wrap;align-items:center;gap:14px;
+      margin-bottom:20px;min-width:0;
+    }
+    .brand{display:flex;align-items:center;gap:12px;min-width:0;flex:0 1 auto}
+    .logo{
+      width:40px;height:40px;border-radius:11px;display:grid;place-items:center;flex:none;
+      background:#0a0a0a;border:1px solid #d4d4d4;
+    }
+    h1{font-size:20px;font-weight:700;letter-spacing:-.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#0a0a0a}
+    h1 span{color:#737373;font-weight:400}
+    .sub{color:#737373;font-size:11px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .stamp{margin-left:auto;flex:none;font-size:11px;color:#737373;white-space:nowrap}
+    .back{
+      background:#0a0a0a;color:#fff;border:1px solid #0a0a0a;
+      padding:7px 15px;border-radius:9px;cursor:pointer;font-size:11px;font-weight:700;
+      letter-spacing:.06em;text-decoration:none;white-space:nowrap;
+    }
+    .back:hover{background:#262626}
+
+    /* ---------- rule bar: what this page is ---------- */
+    .rule{
+      background:#0a0a0a;color:#f5f5f5;border-radius:var(--r);
+      padding:13px 17px;margin-bottom:18px;font-size:12px;line-height:1.7;
+      box-shadow:0 6px 20px rgba(0,0,0,.18);
+    }
+    .rule b{color:var(--amber)}
+    .rule .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+
+    /* ---------- black cards ---------- */
+    .card{
+      background:var(--card);color:var(--fg);
+      border:1px solid var(--cardline);border-radius:var(--r);
+      box-shadow:0 6px 20px rgba(0,0,0,.16);
+      overflow:hidden;
+    }
+    .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:18px}
+    .tile{padding:15px 16px}
+    .tile .k{font-size:9.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--amber);margin-bottom:7px}
+    .tile .v{font-size:27px;font-weight:700;letter-spacing:-.6px;font-variant-numeric:tabular-nums;line-height:1.05}
+    .tile .s{font-size:11px;color:var(--dim);margin-top:5px;font-variant-numeric:tabular-nums}
+    .up{color:var(--up)} .down{color:var(--down)} .flat{color:var(--fg)}
+
+    /* ---------- panels ---------- */
+    .panel{margin-bottom:18px}
+    .ph{
+      display:flex;align-items:center;justify-content:space-between;gap:12px;
+      padding:12px 16px;border-bottom:1px solid var(--cardline);background:var(--card2);
+    }
+    .ph h2{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase}
+    .ph .note{font-size:10.5px;color:var(--amber);font-weight:400;text-transform:none;letter-spacing:0}
+    .pb{padding:12px 16px}
+    .tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .tools input{
+      background:#0a0a0a;color:var(--fg);border:1px solid var(--cardline);border-radius:8px;
+      padding:6px 10px;font-size:11.5px;width:190px;font-family:inherit;
+    }
+    .tools input:focus{outline:none;border-color:var(--blue)}
+    .tools button{
+      background:#1f1f1f;color:var(--fg);border:1px solid var(--cardline);
+      padding:6px 12px;border-radius:8px;cursor:pointer;font-size:11px;font-weight:600;font-family:inherit;
+    }
+    .tools button:hover{background:#2a2a2a}
+
+    /* ---------- tables ---------- */
+    .scroll{max-height:620px;overflow:auto}
+    .scroll::-webkit-scrollbar{width:9px;height:9px}
+    .scroll::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px}
+    .scroll::-webkit-scrollbar-track{background:#0a0a0a}
+    table{width:100%;border-collapse:collapse;font-size:11.5px}
+    th{
+      position:sticky;top:0;z-index:2;
+      text-align:left;padding:9px 10px;color:#0a0a0a;background:#e5e5e5;
+      font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;
+      border-bottom:2px solid #a3a3a3;white-space:nowrap;
+    }
+    td{padding:8px 10px;border-bottom:1px solid #1f1f1f;vertical-align:middle;white-space:nowrap}
+    tbody tr:hover{background:#1f1f1f}
+    .num{text-align:right;font-variant-numeric:tabular-nums}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:var(--dim)}
+    .empty{padding:30px 14px;text-align:center;color:var(--faint);font-size:12px}
+    .badge{
+      display:inline-block;padding:2px 7px;border-radius:5px;font-size:9.5px;font-weight:700;
+      letter-spacing:.03em;text-transform:uppercase;
+    }
+    .badge.no{background:rgba(52,211,153,.16);color:var(--up)}
+    .badge.closing{background:rgba(251,191,36,.16);color:var(--amber)}
+    .badge.open{background:rgba(96,165,250,.16);color:var(--blue)}
+    .badge.dry{background:#262626;color:var(--dim)}
+    .badge.live{background:rgba(248,113,113,.18);color:var(--down)}
+    .band{background:rgba(251,191,36,.10)}
+    /* NO LANES toggle - black by default, YELLOW when ON */
+    .nolanes-btn{
+      background:#0a0a0a;color:#f5f5f5;border:1px solid #d4d4d4;
+      padding:6px 14px;border-radius:8px;cursor:pointer;
+      font-size:11px;font-weight:700;font-family:inherit;
+      display:inline-flex;align-items:center;gap:6px;
+    }
+    .nolanes-btn:hover{background:#1a1a1a}
+    .nolanes-btn.on{background:#FFD700;color:#0a0a0a;border-color:#FFD700}
+    .nolanes-btn.on:hover{background:#FFED4E}
+    footer{margin-top:22px;text-align:center;color:#737373;font-size:10.5px}
+
+    @media (max-width:700px){
+      body{padding:14px 10px 40px}
+      .tiles{grid-template-columns:1fr;gap:8px}
+      .tile .v{font-size:22px}
+      .tools input{width:100%}
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="brand">
+    <div class="logo" aria-hidden="true">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32"><rect width="32" height="32" rx="8" fill="#ffffff" stroke="#d4d4d4"/><text x="16" y="23" font-size="17" font-weight="bold" text-anchor="middle" fill="#0a0a0a">N</text></svg>
+    </div>
+    <div class="brandtext">
+      <h1>ALL NO MARKETS <span>&middot; limit-order NO side only</span></h1>
+      <div class="sub">Kalshi NO contracts &middot; maker (limit) entries &middot; open &amp; closed ledger</div>
+    </div>
+  </div>
+  <a class="back" href="/">&larr; DASHBOARD</a>
+  <button class="nolanes-btn {{ 'on' if no_lanes_enabled else '' }}" id="noLanesBtn" onclick="toggleNoLanes()">NO LANES {{ 'ON' if no_lanes_enabled else 'OFF' }}</button>
+  <div class="stamp">Rendered {{ now }}</div>
+</header>
+
+<!-- What the page is, and what it is not. Read-only: no order is placed,
+     cancelled or modified from here. -->
+<div class="rule">
+  <b>NO side only, in its own book.</b> Every row below is a <b>NO</b> contract
+  entered with a <b>resting limit order</b> at the side's bid &mdash; not by
+  crossing the spread, which is what the backtested strategy requires (Kalshi
+  taker fees are <span class="mono">7%</span> against
+  <span class="mono">1.75%</span> for makers, and the
+  <span class="mono">84&ndash;92&cent;</span> NO band carries the
+  favorite-longshot edge). Prices are the <b>limit actually rested</b>, not the
+  ask a taker would have paid.<br>
+  <b>Separated from the lanes.</b> This book's money, positions and closed
+  trades are its own: a fake <span class="mono">${{ '%.0f'|format(book.starting) }}</span>
+  seeded once and never re-funded, and every row tagged
+  <span class="mono">strategy&nbsp;=&nbsp;all_no</span>. The BTC / ETH / XRP /
+  HYPE up-down lanes keep their own clips, tallies and balances and never
+  appear here.<br>
+  <b>Sizing: quarter-Kelly.</b> Clip size is
+  <span class="mono">f*&nbsp;=&nbsp;(fair&nbsp;&times;&nbsp;b&nbsp;&minus;&nbsp;(1&minus;fair))&nbsp;/&nbsp;b</span>
+  with <span class="mono">b&nbsp;=&nbsp;(1&minus;price)&nbsp;/&nbsp;price</span>
+  for a NO contract, multiplied by <span class="mono">{{ '%.2f'|format(kelly.multiplier) }}</span>
+  and capped at <span class="mono">{{ '%.0f'|format(kelly.max_clip_pct * 100) }}%</span>
+  of the book per clip, rounded to whole contracts with a floor of one.
+  <span class="mono">f*</span> is the share of the book at risk, so a
+  <span class="mono">${{ '%.2f'|format(kelly.example.stake * 250 if kelly.example.stake else 0) }}</span>
+  clip at fair <span class="mono">0.90</span> against a
+  <span class="mono">88&cent;</span> limit is the worked example.
+  <b>Read-only</b> &mdash; nothing here places, cancels or edits an order.
+</div>
+
+<!-- ============ TALLIES ============ -->
+<!-- The book tiles come FIRST because this page is its own book, not a view of
+     the lanes'. $250 of fake money, seeded once, never re-funded. -->
+<div class="tiles">
+
+  <div class="card tile">
+    <div class="k">Book balance</div>
+    <div class="v">{{ '%.2f'|format(book.balance) }}</div>
+    <div class="s">fake &middot; seeded at {{ '%.0f'|format(book.starting) }} once</div>
+  </div>
+
+  <div class="card tile">
+    <div class="k">Deployed</div>
+    <div class="v">{{ '%.2f'|format(open_tally.cost) }}</div>
+    <div class="s">resting limit &times; qty</div>
+  </div>
+
+  <div class="card tile">
+    <div class="k">Equity</div>
+    <div class="v">{{ '%.2f'|format(book.balance + open_tally.cost) }}</div>
+    <div class="s">balance + deployed</div>
+  </div>
+
+  <div class="card tile">
+    <div class="k">Book P&amp;L</div>
+    <div class="v {{ 'up' if book.pnl > 0 else ('down' if book.pnl < 0 else 'flat') }}">
+      {{ '%s%.2f'|format('+' if book.pnl > 0 else '', book.pnl) }}
+    </div>
+    <div class="s">since the book opened &middot; {{ book.entries }} entries</div>
+  </div>
+
+</div>
+
+<!-- ============ TRADE TALLIES ============ -->
+<div class="tiles">
+
+  <div class="card tile">
+    <div class="k">Closed NO trades</div>
+    <div class="v">{{ tally.closed }}</div>
+    <div class="s">lifetime &middot; trade log is never pruned</div>
+  </div>
+
+  <div class="card tile">
+    <div class="k">NO win rate</div>
+    <div class="v {{ 'up' if tally.win_rate >= 50 else 'down' }}">{{ '%.1f'|format(tally.win_rate) }}%</div>
+    <div class="s">{{ tally.wins }}W / {{ tally.losses }}L</div>
+  </div>
+
+  <div class="card tile">
+    <div class="k">Realized P&amp;L</div>
+    <div class="v {{ 'up' if tally.pnl > 0 else ('down' if tally.pnl < 0 else 'flat') }}">
+      {{ '%s%.2f'|format('+' if tally.pnl > 0 else '', tally.pnl) }}
+    </div>
+    <div class="s">net of {{ '%.2f'|format(tally.fees) }} fees</div>
+  </div>
+
+  <div class="card tile">
+    <div class="k">Open NO positions</div>
+    <div class="v">{{ open_tally.positions }}</div>
+    <div class="s">{{ open_tally.contracts }} contracts on the book</div>
+  </div>
+
+  <div class="card tile">
+    <div class="k">Capital at risk</div>
+    <div class="v">{{ '%.2f'|format(open_tally.cost) }}</div>
+    <div class="s">sum of resting limit &times; qty</div>
+  </div>
+
+  <div class="card tile">
+    <div class="k">84&ndash;92&cent; band</div>
+    <div class="v {{ 'up' if open_tally.sweet > 0 else 'flat' }}">{{ open_tally.sweet }}</div>
+    <div class="s">open clips in the edge zone</div>
+  </div>
+
+  <div class="card tile">
+    <div class="k">Avg limit entry</div>
+    <div class="v">{{ '%.1f'|format(tally.avg_entry * 100) }}&cent;</div>
+    <div class="s">across every closed NO trade</div>
+  </div>
+
+  <div class="card tile">
+    <div class="k">Fees paid</div>
+    <div class="v down">{{ '%.2f'|format(tally.fees) }}</div>
+    <div class="s">maker fees on closed trades</div>
+  </div>
+
+</div>
+
+<!-- ============ OPEN NO POSITIONS ============ -->
+<div class="card panel">
+  <div class="ph">
+    <h2>Open NO positions</h2>
+    <span class="note">this book only &middot; {{ open_rows|length }} resting</span>
+    <div class="tools">
+      <input id="openFilter" type="text" placeholder="filter market / strategy" onkeyup="filterRows('openFilter','openBody')">
+      <button onclick="clearFilter('openFilter','openBody')">clear</button>
+    </div>
+  </div>
+  <div class="pb">
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Market</th>
+            <th>Strategy</th>
+            <th>Side</th>
+            <th class="num">Limit entry</th>
+            <th class="num">Qty</th>
+            <th class="num">Cost</th>
+            <th class="num">Model fair</th>
+            <th class="num">Edge</th>
+            <th class="num">Kelly f*</th>
+            <th class="num">Stop</th>
+            <th class="num">Take profit</th>
+            <th class="num">Conf</th>
+            <th>Status</th>
+            <th>Book</th>
+            <th>Opened (UTC)</th>
+          </tr>
+        </thead>
+        <tbody id="openBody">
+          {% for r in open_rows %}
+          <tr class="{{ 'band' if 0.84 <= r.entry_price <= 0.92 }}">
+            <td class="mono">{{ r.id }}</td>
+            <td class="mono">{{ r.market_id }}</td>
+            <td>{{ r.strategy }}</td>
+            <td><span class="badge no">NO</span></td>
+            <td class="num">{{ '%.1f'|format(r.entry_price * 100) }}&cent;</td>
+            <td class="num">{{ r.quantity }}</td>
+            <td class="num">{{ '%.2f'|format(r.cost) }}</td>
+            <td class="num">{{ '%.1f'|format(r.entry_fair * 100) }}&cent;</td>
+            <td class="num {{ 'up' if r.edge > 0 else ('down' if r.edge < 0 else 'flat') }}">{{ '%+.1f'|format(r.edge * 100) }}pp</td>
+            <td class="num {{ 'up' if r.kelly > 0 else 'flat' }}">{{ '%.2f'|format(r.kelly) }}%</td>
+            <td class="num">{{ ('%.1f'|format(r.stop_loss * 100) ~ '¢') if r.stop_loss > 0 else '—' }}</td>
+            <td class="num">{{ ('%.1f'|format(r.take_profit * 100) ~ '¢') if r.take_profit > 0 else '—' }}</td>
+            <td class="num">{{ '%.2f'|format(r.confidence) }}</td>
+            <td><span class="badge {{ 'closing' if r.status == 'closing' else 'open' }}">{{ r.status }}</span></td>
+            <td><span class="badge {{ 'live' if r.mode == 'live' else 'dry' }}">{{ r.mode|upper }}</span></td>
+            <td class="mono">{{ r.timestamp[:19].replace('T', ' ') }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="16" class="empty">No open NO positions in this book &mdash; the up/down lanes keep their own clips, and this book has not placed one yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ============ CLOSED NO TRADES ============ -->
+<div class="card panel">
+  <div class="ph">
+    <h2>Closed NO trades</h2>
+    <span class="note">this book only &middot; newest first &middot; {{ closed_rows|length }} of {{ tally.closed }}</span>
+    <div class="tools">
+      <input id="closedFilter" type="text" placeholder="filter market / strategy / reason" onkeyup="filterRows('closedFilter','closedBody')">
+      <button onclick="clearFilter('closedFilter','closedBody')">clear</button>
+    </div>
+  </div>
+  <div class="pb">
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Market</th>
+            <th>Strategy</th>
+            <th>Side</th>
+            <th class="num">Entry</th>
+            <th class="num">Exit</th>
+            <th class="num">Qty</th>
+            <th class="num">Cost</th>
+            <th class="num">Proceeds</th>
+            <th class="num">P&amp;L</th>
+            <th class="num">ROI</th>
+            <th class="num">Model fair</th>
+            <th class="num">Kelly f*</th>
+            <th class="num">Fee</th>
+            <th>Exit reason</th>
+            <th>Book</th>
+            <th>Opened (UTC)</th>
+            <th>Closed (UTC)</th>
+          </tr>
+        </thead>
+        <tbody id="closedBody">
+          {% for r in closed_rows %}
+          <tr>
+            <td class="mono">{{ r.id }}</td>
+            <td class="mono">{{ r.market_id }}</td>
+            <td>{{ r.strategy }}</td>
+            <td><span class="badge no">NO</span></td>
+            <td class="num">{{ '%.1f'|format(r.entry_price * 100) }}&cent;</td>
+            <td class="num">{{ '%.1f'|format(r.exit_price * 100) }}&cent;</td>
+            <td class="num">{{ r.quantity }}</td>
+            <td class="num">{{ '%.2f'|format(r.cost) }}</td>
+            <td class="num">{{ '%.2f'|format(r.proceeds) }}</td>
+            <td class="num {{ 'up' if r.pnl > 0 else ('down' if r.pnl < 0 else 'flat') }}">
+              {{ '%s%.2f'|format('+' if r.pnl > 0 else '', r.pnl) }}
+            </td>
+            <td class="num {{ 'up' if r.roi > 0 else ('down' if r.roi < 0 else 'flat') }}">{{ '%+.1f'|format(r.roi) }}%</td>
+            <td class="num">{{ '%.1f'|format(r.entry_fair * 100) }}&cent;</td>
+            <td class="num {{ 'up' if r.kelly > 0 else 'flat' }}">{{ '%.2f'|format(r.kelly) }}%</td>
+            <td class="num">{{ '%.3f'|format(r.fee_paid) }}</td>
+            <td>{{ r.exit_reason or '—' }}</td>
+            <td><span class="badge {{ 'live' if r.mode == 'live' else 'dry' }}">{{ r.mode|upper }}</span></td>
+            <td class="mono">{{ r.entry_timestamp[:19].replace('T', ' ') }}</td>
+            <td class="mono">{{ r.exit_timestamp[:19].replace('T', ' ') }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="18" class="empty">No closed NO trades in this book yet &mdash; the up/down lanes keep their own history; this book has not closed one.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<footer>
+  NO side only &middot; maker (limit) entries &middot; read-only &middot;
+  prices in &cent; are the limit rested &middot; model fair is the lane's
+  fair-value estimate at entry
+</footer>
+
+</div>
+
+<script>
+  // Text filter over either table. Pure client-side: no Jinja is evaluated
+  // inside this script, so there is no server-side interpolation to escape.
+  function filterRows(inputId, bodyId) {
+    var q = document.getElementById(inputId).value.toLowerCase();
+    var rows = document.getElementById(bodyId).getElementsByTagName('tr');
+    for (var i = 0; i < rows.length; i++) {
+      var text = rows[i].textContent || rows[i].innerText;
+      rows[i].style.display = text.toLowerCase().indexOf(q) > -1 ? '' : 'none';
+    }
+  }
+  function clearFilter(inputId, bodyId) {
+    document.getElementById(inputId).value = '';
+    filterRows(inputId, bodyId);
+  }
+
+  // Toggle NO LANES ON/OFF - persisted to runtime_config so both this page
+  // and the DRY/LIVE dashboard see the same state.
+  async function toggleNoLanes() {
+    var btn = document.getElementById('noLanesBtn');
+    var currentlyOn = btn.classList.contains('on');
+    var next = !currentlyOn;
+    try {
+      var r = await fetch('/api/no-lanes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next, token: '{{ token | tojson }}' }),
+      });
+      var d = await r.json().catch(() => ({}));
+      if (d.error) {
+        console.error('NO LANES toggle failed:', d.error);
+        return;
+      }
+      btn.classList.toggle('on', next);
+      btn.textContent = 'NO LANES ' + (next ? 'ON' : 'OFF');
+    } catch (e) {
+      console.error('NO LANES toggle failed:', e.message);
+    }
+  }
+</script>
+</body>
+</html>

@@ -3038,6 +3038,55 @@ def _mode_manager():
     return TradingMode(db_path=DB_PATH)
 
 
+async def _get_no_lanes_enabled_async(mgr) -> bool:
+    """Read the persisted NO LANES ON/OFF state from runtime_config."""
+    import aiosqlite
+
+    async with mgr._conn() as conn:
+        cur = await conn.execute(
+            "SELECT value FROM runtime_config WHERE key = ?",
+            ("cfg.no_lanes_enabled",),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return False
+    try:
+        import json
+
+        return bool(json.loads(row["value"]))
+    except Exception:
+        return str(row["value"]).strip().lower() in ("1", "true", "yes", "on")
+
+
+async def _set_no_lanes_enabled_async(mgr, enabled: bool) -> None:
+    """Persist the NO LANES ON/OFF state to runtime_config."""
+    import json
+
+    import aiosqlite
+
+    async with mgr._conn() as conn:
+        await conn.execute(
+            "INSERT INTO runtime_config (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            ("cfg.no_lanes_enabled", json.dumps(bool(enabled)), _now()),
+        )
+        await conn.commit()
+
+
+def _get_no_lanes_enabled(mgr) -> bool:
+    """Synchronous wrapper for _get_no_lanes_enabled_async."""
+    from src.utils.mode import run
+
+    return run(_get_no_lanes_enabled_async(mgr))
+
+
+def _set_no_lanes_enabled(mgr, enabled: bool) -> None:
+    """Synchronous wrapper for _set_no_lanes_enabled_async."""
+    from src.utils.mode import run
+
+    run(_set_no_lanes_enabled_async(mgr, enabled))
+
+
 def _mode_payload() -> Dict[str, Any]:
     from src.utils.mode import MODE_DRY, MODE_LIVE, run
 
@@ -3046,9 +3095,13 @@ def _mode_payload() -> Dict[str, Any]:
     # Reconcile before reporting, so the DRY headline is derived from the
     # persisted rows rather than from a counter that can drift from them.
     dry = run(mgr.dry_account())
+    # Read the persisted NO LANES ON/OFF state from runtime_config
+    # (stored as cfg.no_lanes_enabled). Defaults to OFF.
+    _no_lanes = _get_no_lanes_enabled(mgr)
     payload: Dict[str, Any] = {
         "mode": mode,
         "token_set": token_required(),
+        "no_lanes_enabled": bool(_no_lanes),
         # Both books are reported, always scoped to themselves. The page renders
         # the one it is in, but a DRY view that merely *hid* the real account
         # would still be one refactor away from showing it again.
@@ -3198,6 +3251,45 @@ def api_mode_set():
         run(mgr.dry_account())
     _audit(f"trading mode set to {mode.upper()}")
     return jsonify({"ok": True, **_mode_payload()})
+
+
+@app.route("/api/no-lanes", methods=["GET"])
+def api_no_lanes_get():
+    """Read the persisted NO LANES ON/OFF state."""
+    try:
+        mgr = _mode_manager()
+        enabled = _get_no_lanes_enabled(mgr)
+        return jsonify({"no_lanes_enabled": bool(enabled)})
+    except Exception as e:
+        _push_error(f"NO LANES read: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/no-lanes", methods=["POST"])
+def api_no_lanes_set():
+    """Toggle the NO LANES ON/OFF state.
+
+    Denied without a valid write token. Persists to runtime_config so the
+    state is visible on both the DRY/LIVE dashboard and the ALL NO MARKETS page.
+    """
+    denied = require_token()
+    if denied is not None:
+        return denied
+
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled", False))
+
+    try:
+        mgr = _mode_manager()
+        _set_no_lanes_enabled(mgr, enabled)
+        _SNAPSHOT_CACHE["payload"] = None
+        _SNAPSHOT_CACHE["at"] = 0.0
+        _broadcast("no_lanes", {"no_lanes_enabled": enabled})
+        _audit(f"NO LANES {'ON' if enabled else 'OFF'}")
+        return jsonify({"ok": True, "no_lanes_enabled": enabled})
+    except Exception as e:
+        _push_error(f"NO LANES toggle: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/dry/cash", methods=["POST"])
@@ -3772,6 +3864,14 @@ def all_no_markets():
     84-92c NO band carries the favorite-longshot edge). The page is read-only -
     no order is placed, cancelled or modified from here.
     """
+    # Read the NO LANES ON/OFF state so the button reflects the same setting
+    # as the DRY/LIVE dashboard.
+    try:
+        _mgr = _mode_manager()
+        _no_lanes_all_no = _get_no_lanes_enabled(_mgr)
+    except Exception:
+        _no_lanes_all_no = False
+
     open_rows, closed_rows, tally, open_tally = [], [], {}, {}
     book = _all_no_book()
     try:
@@ -3809,6 +3909,8 @@ def all_no_markets():
         tally=tally,
         open_tally=open_tally,
         book=book,
+        no_lanes_enabled=bool(_no_lanes_all_no),
+        token=_configured_token(),
         kelly={
             "multiplier": ALL_NO_KELLY_MULTIPLIER,
             "max_clip_pct": ALL_NO_MAX_CLIP_PCT,
@@ -5514,6 +5616,11 @@ h1 span{color:var(--dim);font-weight:400}
 a.modebtn{display:inline-flex;align-items:center;text-decoration:none;line-height:normal}
 .modebtn.allno{color:var(--blue);font-weight:800}
 .modebtn.allno:hover{background:rgba(56,132,255,.14)}
+/* NO LANES toggle - black by default, turns YELLOW when ON. Same box as the
+   mode buttons so it reads as part of the control group. */
+.modebtn.nolanes{color:var(--fg)}
+.modebtn.nolanes.on{background:rgba(255,215,0,.22);color:#FFD700;box-shadow:inset 0 -2px 0 #FFD700}
+.modebtn.nolanes:hover{background:rgba(255,255,255,.07)}
 
 /* ---------- Mode is a whole-page state, not a badge you have to find ----------
    LIVE and DRY now share the same clean green palette (DRY was the visually
@@ -5781,6 +5888,7 @@ button.loading.yellow::after {
     <div class="modeswitch">
       <button id="modeDry"  class="modebtn {{ 'on' if s.mode.mode != 'live' else '' }}" onclick="setMode('dry')">DRY</button>
       <button id="modeLive" class="modebtn live {{ 'on' if s.mode.mode == 'live' else '' }}" onclick="setMode('live')">LIVE</button>
+      <button id="noLanesBtn" class="modebtn nolanes {{ 'on' if s.mode.no_lanes_enabled else '' }}" onclick="toggleNoLanes()">NO LANES {{ 'ON' if s.mode.no_lanes_enabled else 'OFF' }}</button>
       <a href="/all-no-markets" class="modebtn allno" id="allNoBtn" title="ALL NO MARKETS — NO-side only, maker entries, $250 of its own simulated money">ALL NO</a>
     </div>
   </div>
@@ -6855,6 +6963,54 @@ async function postMode(mode, confirmLive) {
   }
 }
 
+// Toggle the NO LANES ON/OFF switch. Persisted to runtime_config so both the
+// DRY/LIVE dashboard and the ALL NO MARKETS page see the same state. The button
+// is black by default and turns YELLOW when ON.
+async function toggleNoLanes() {
+  try {
+    // Read current state from the button class
+    const btn = $('noLanesBtn');
+    const currentlyOn = btn.classList.contains('on');
+    const next = !currentlyOn;
+    const r = await fetch('/api/no-lanes', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ enabled: next }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (d.error) {
+      note('NO LANES toggle failed: ' + d.error);
+      return;
+    }
+    note('NO LANES is now ' + (next ? 'ON' : 'OFF'));
+    paintNoLanes(next);
+    flashBanner('NO LANES ' + (next ? 'ON' : 'OFF'), false);
+  } catch (e) {
+    note('NO LANES toggle failed: ' + e.message);
+  }
+}
+
+// Paint the NO LANES button state. Called after a toggle and after a mode
+// switch reload. The button reads its state from SNAPSHOT (which carries
+// no_lanes_enabled from _mode_payload).
+function paintNoLanes(enabled) {
+  const btn = $('noLanesBtn');
+  if (!btn) return;
+  btn.classList.toggle('on', !!enabled);
+  btn.textContent = 'NO LANES ' + (enabled ? 'ON' : 'OFF');
+}
+
+// Re-read the authoritative NO LANES state after any ambiguous toggle attempt.
+async function syncNoLanesFromServer(why) {
+  try {
+    const d = await fetch('/api/no-lanes').then(r => r.json());
+    paintNoLanes(d.no_lanes_enabled === true);
+    if (why) note('NO LANES resynced from server' + (why ? ' - ' + why : ''));
+  } catch (_) {
+    paintNoLanes(SNAPSHOT.no_lanes_enabled === true);
+  }
+}
+
 // Re-read the authoritative mode after any ambiguous switch attempt. SNAPSHOT is
 // a rendering of the page as it was served; it cannot describe a mode change that
 // happened after that.
@@ -6948,6 +7104,9 @@ function paintMode(d) {
   // The bulk-start button must say - and do - what the switch says.
   const sab = $('startAllBtn');
   if (sab) sab.textContent = d.mode === 'live' ? 'Start all in LIVE' : 'Start all in DRY';
+  // Keep the NO LANES toggle in sync with the server state (it is mode-independent,
+  // so it can be flipped from either book without reloading).
+  paintNoLanes(d.no_lanes_enabled === true);
 }
 
 // --- DRY book controls ---
