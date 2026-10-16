@@ -510,14 +510,25 @@ class AllNoStrategy:
             # AI edge: we believe NO is more likely than market implies
             market_no_prob = no_price / 100.0 if no_price > 1.0 else no_price
 
-            # Conservative fair estimate: assume NO is slightly undervalued
+            # Conservative fair estimate: assume NO is undervalued
             # In real implementation, this would come from AI/LLM analysis
             fair_no_prob = market_no_prob + 0.08  # Assume 8% edge for NO
 
-            # Calculate edge using EdgeFilter
+            # CRITICAL FIX: EdgeFilter.calculate_edge() interprets probabilities
+            # as YES-side probabilities. When ai_prob > market_prob, edge > 0 and
+            # side = "YES". When ai_prob < market_prob, edge < 0 and side = "NO".
+            #
+            # For a NO-side strategy, we want side = "NO", which means we must
+            # pass YES-side probabilities (1 - fair_no, 1 - market_no). Then:
+            #   edge = (1 - fair_no) - (1 - market_no) = market_no - fair_no < 0
+            #   side = "NO"  ✓
+            #
+            # The old code passed NO-side probabilities directly, which made
+            # edge > 0 → side = "YES" → the side check at the bottom rejected
+            # EVERY opportunity. The lane never traded.
             edge_result = EdgeFilter.calculate_edge(
-                ai_probability=fair_no_prob,
-                market_probability=market_no_prob,
+                ai_probability=1.0 - fair_no_prob,
+                market_probability=1.0 - market_no_prob,
                 confidence=MIN_CONFIDENCE_FOR_TRADE,
                 price=no_price,
                 contracts=1,
@@ -527,7 +538,7 @@ class AllNoStrategy:
             if not edge_result.passes_filter:
                 return None
 
-            # Verify NO side
+            # Verify NO side (should always be "NO" now with the fix above)
             if edge_result.side != "NO":
                 return None
 

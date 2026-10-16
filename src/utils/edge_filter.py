@@ -50,11 +50,12 @@ class EdgeFilter:
     UPDATED: More aggressive thresholds to allow more trading opportunities.
     """
     
-    # Lowered to capture more trades with smaller edges (Kalshi fees are 7% taker)
-    MIN_EDGE_REQUIREMENT = 0.06        # 6% minimum edge (lowered from 10% to allow more trades)
-    HIGH_CONFIDENCE_EDGE = 0.06        # 6% edge for high confidence (>=80%)
-    MEDIUM_CONFIDENCE_EDGE = 0.08      # 8% edge for medium confidence (>=60%)
-    LOW_CONFIDENCE_EDGE = 0.10         # 10% edge for low confidence (<60%)
+    # Lowered to capture more trades - the old 6% floor rejected the 8% NO
+    # opportunities because maker fees ate into the edge after fee adjustment.
+    MIN_EDGE_REQUIREMENT = 0.04        # 4% minimum edge (lowered from 6%)
+    HIGH_CONFIDENCE_EDGE = 0.04        # 4% edge for high confidence (>=80%)
+    MEDIUM_CONFIDENCE_EDGE = 0.05      # 5% edge for medium confidence (>=60%)
+    LOW_CONFIDENCE_EDGE = 0.06         # 6% edge for low confidence (<60%)
     
     # Lowered confidence to capture more opportunities
     MIN_CONFIDENCE_FOR_TRADE = 0.40    # 40% minimum confidence (lowered from 55%)
