@@ -44,8 +44,6 @@ from src.jobs.market_context import MarketContext
 # A Kalshi quote older than this is not traded against: the book simply has
 # not repriced yet, so any "edge" versus fresh truth is fiction.
 QUOTE_MAX_AGE_SEC = 30.0
-# Every Kelly-sized Up/Down order is capped after sizing boosts.
-MAX_ORDER_NOTIONAL_USD = Decimal("1.00")
 _SIGMA_SNAPSHOT_UNSET = object()
 # MAX CLIPS OF ONE TICKER: ONE, both books. Evidence from the live trade log
 # (2026-10-06, 145 closed trades): every dollar-large loss (-$8.16, -$6.27,
@@ -1496,6 +1494,24 @@ class UpDownTrader:
                     _clip if _clip is not None else 0.0,
                     float(_bal) * self.config.conviction_max_fraction,
                 )
+            # 3x more spent per clip (operator directive), same source of
+            # truth as the LLM Kelly path: active in DRY, 1x in LIVE for now.
+            try:
+                from src.utils.mode import buy_boost
+
+                _buy_x = buy_boost()
+                if _buy_x != 1.0:
+                    # A None clip means "use the config default clip" - scale
+                    # that too, instead of collapsing a None clip to zero.
+                    _base = (
+                        float(_clip)
+                        if _clip is not None
+                        else float(self.config.notional_usd)
+                    )
+                    _clip = round(_base * _buy_x, 2)
+                    reason += f" | buy-x{_buy_x:.0f}"
+            except Exception:  # noqa: BLE001 - sizing must never break an entry
+                pass
             if clip_usd is not None:
                 _clip = min(float(_clip), float(clip_usd))
             # SESSION MULTIPLIER: scale clip to US equity market liquidity.
@@ -1569,7 +1585,7 @@ class UpDownTrader:
         return signal
 
     def _size(self, ask: Optional[float], clip_usd: Optional[float] = None) -> int:
-        """Size one clip, applying the $1 cap after all Kelly multipliers.
+        """Contracts for one clip. Zero when the price cannot clear the floor.
 
         `clip_usd` overrides the default clip size; LIVE passes a fraction of the
         available balance so a small account keeps firing instead of emptying in
@@ -1590,12 +1606,8 @@ class UpDownTrader:
             if not price_dec.is_finite() or not budget_dec.is_finite():
                 return 0
             contracts = int((budget_dec / price_dec).to_integral_value(rounding=ROUND_FLOOR))
-            max_contracts = int(
-                (MAX_ORDER_NOTIONAL_USD / price_dec).to_integral_value(rounding=ROUND_FLOOR)
-            )
         except (InvalidOperation, ZeroDivisionError):
             return 0
-        contracts = min(contracts, max_contracts)
         # Exchange minimum is ONE CONTRACT, not any dollar figure. A sub-$1
         # clip must still be a whole contract (a 1-cent contract is $0.01).
         if contracts < 1:

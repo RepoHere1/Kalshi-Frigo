@@ -122,9 +122,9 @@ class TradingConfig:
     position_size_multiplier: float = 1.0  # Multiplier for AI confidence
     
     # Kelly Criterion settings (PRIMARY position sizing method) — DISCIPLINED
-    use_kelly_criterion: bool = False        # Use fixed default_position_size (reverted from Kelly)
-    kelly_fraction: float = 0.25            # quarter-Kelly (spec entry 22)
-    max_single_position: float = 0.03       # SANE: 3% max position cap (was 0.05 beast mode)
+    use_kelly_criterion: bool = True        # Use Kelly Criterion for position sizing (PRIMARY METHOD)
+    kelly_fraction: float = 0.50            # INCREASED: Half-Kelly for bigger position sizes (was 0.25)
+    max_single_position: float = 0.05       # 5% max position cap (SANE: was 0.03)
     
     # Live trading mode control
     live_trading_enabled: bool = field(default_factory=lambda: os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true")
@@ -261,8 +261,8 @@ algorithmic_execution: bool = False     # Smart order execution (future)
 # === ALL NO MARKETS CONFIGURATION ===
 all_no_enabled: bool = True             # Enable the ALL NO MARKETS strategy
 all_no_starting_balance: float = 250.0  # ALL NO starting balance (separate from DRY's $300)
-all_no_kelly_multiplier: float = 0.25  # Quarter-Kelly for ALL NO book
-all_no_max_clip_pct: float = 0.20       # Maximum clip size for ALL NO book (20% of book)
+all_no_kelly_multiplier: float = 1.0    # FULL Kelly for ALL NO book (was 0.25)
+all_no_max_clip_pct: float = 0.80       # Maximum clip size for ALL NO book (80% of book)
 
 
 @dataclass
