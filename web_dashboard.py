@@ -5953,6 +5953,11 @@ button.loading.yellow::after {
     <div class="s">of {{ '$%.2f'|format(s.mode.dry.starting_balance) }} simulated baseline &middot; derived from the book's own rows</div>
   </div>
   <div class="tile">
+    <div class="k">Win rate</div>
+    <div class="v" id="dWinRate">{{ s.mode.dry.win_rate if s.mode.dry.win_rate is not none else 0 }}%</div>
+    <div class="s" id="dWinRateNote">{{ s.mode.dry.closed_trades if s.mode.dry.closed_trades is not none else 0 }} closed trades</div>
+  </div>
+  <div class="tile">
     <div class="k">DRY positions</div>
     <div class="v" id="dPosTile">{{ s.open_dry.positions }}</div>
     <div class="s" id="dDepTile">{{ '$%.2f'|format(s.open_dry.capital) }} deployed</div>
@@ -5963,12 +5968,7 @@ button.loading.yellow::after {
         P&L figure with no stated baseline is unreadable: the same number means
         different things against $300 versus $250. -#}
     <div class="v" id="dRealTile">{{ '$%.2f'|format(s.mode.dry.total_pnl) }}</div>
-    <div class="s">since reset &middot; realized {{ '$%.2f'|format(s.mode.dry.realized) }} &middot; {{ s.mode.dry.closed_trades }} closed &middot; {{ s.mode.dry.win_rate }}% win rate</div>
-  </div>
-  <div class="tile">
-    <div class="k">DRY cash available</div>
-    <div class="v" id="dAvailTile">{% if s.mode.dry_funding.get('can_fund') %}<span class="pill ok">funded</span>{% else %}<span class="pill no">empty</span>{% endif %}</div>
-    <div class="s">{{ s.mode.dry_funding.get('reason') or 'can fund at least one 1-cent contract' }}</div>
+    <div class="s">since reset &middot; realized {{ '$%.2f'|format(s.mode.dry.realized) }} &middot; {{ s.mode.dry.win_rate }}% win rate</div>
   </div>
   {% endif %}
   {% if live %}
@@ -5992,11 +5992,6 @@ button.loading.yellow::after {
     <div class="s" id="tLivePosNote">{% if s.kalshi %}{{ s.kalshi.held_count }} held &middot; {{ s.kalshi.ghost_count }} flat rows on Kalshi's side (no shares, cannot be deleted){% else %}&mdash;{% endif %}</div>
   </div>
   <div class="tile">
-    <div class="k">Real exposure</div>
-    <div class="v" id="tExposure">{{ '$%.2f'|format(s.kalshi.exposure) if s.kalshi else '$0.00' }}</div>
-    <div class="s" id="tExposureNote">{% if s.kalshi and s.kalshi.realized_known and s.kalshi.cost_basis_known %}mark-to-market &middot; cost {{ '$%.2f'|format(s.kalshi.cost_basis) }}{% elif s.kalshi and s.kalshi.realized_known %}mark-to-market &middot; cost unknown ({{ s.kalshi.cost_basis_missing }} holding{{ '' if s.kalshi.cost_basis_missing == 1 else 's' }} predate fill history){% else %}mark-to-market &middot; cost n/a{% endif %}</div>
-  </div>
-  <div class="tile">
     <div class="k">Real realized P&amp;L</div>
     {#- An unavailable total reads "n/a", never "$0.00". A zero here is
         indistinguishable from a break-even account, which is the one thing a
@@ -6007,8 +6002,8 @@ button.loading.yellow::after {
         wrong; showing that it is +$162.71 of sales against -$492.29 of
         settlements over Aug 1 - Oct 4 is what makes it checkable. -#}
      <div class="s" id="tKalshiPnlNote">{% if s.kalshi and s.kalshi.realized_known %}sales {{ '$%.2f'|format(s.kalshi.ledger.get('sales_realized', 0.0)) }} &middot; settled {{ '$%.2f'|format(s.kalshi.ledger.get('settlement_realized', 0.0)) }} &middot; fees {{ '$%.2f'|format(s.kalshi.fees) }}{% if s.kalshi.ledger.get('window_start') %} &middot; since {{ _format_date(s.kalshi.ledger.get('window_start')[:10]) }}{% endif %}{% else %}fill history unavailable{% endif %}</div>
-   </div>
-{% endif %}
+    </div>
+  {% endif %}
   <div class="tile">
     <div class="k">Strategies live</div>
     <div class="v" id="tRunning">{{ s.running_count if s.running_count is defined else 0 }}</div>
