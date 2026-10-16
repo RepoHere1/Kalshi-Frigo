@@ -326,6 +326,60 @@ class AllNoKalshiBook:
         live_balance = await self.get_balance(MODE_LIVE)
         return live_balance.get("separate_from_live_account", False)
 
+    async def reset_to_starting_balance(self, mode: str = MODE_DRY) -> Dict[str, Any]:
+        """Reset ALL NO book to $250 starting balance.
+
+        Clears all positions, trade logs, and book entries for the given mode,
+        then re-seeds at ALL_NO_STARTING_BALANCE. Useful when the balance
+        goes negative due to double-counting bugs.
+        """
+        import aiosqlite
+
+        mode = mode.strip().lower()
+        await self.ensure_schema()
+
+        async with aiosqlite.connect(self.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            # Clear positions for this mode
+            await conn.execute(
+                "DELETE FROM all_no_positions WHERE mode = ?", (mode,)
+            )
+            # Clear trade logs for this mode
+            await conn.execute(
+                "DELETE FROM all_no_trade_logs WHERE mode = ?", (mode,)
+            )
+            # Clear all non-seed book entries for this mode
+            await conn.execute(
+                "DELETE FROM all_no_book WHERE note != 'seed'"
+            )
+
+            # Re-insert seed if not present
+            cursor = await conn.execute(
+                "SELECT COUNT(*) AS n FROM all_no_book WHERE note = 'seed'"
+            )
+            seeded = await cursor.fetchone()
+            seeded = int(seeded["n"] or 0)
+            if not seeded:
+                stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                await conn.execute(
+                    "INSERT INTO all_no_book (kind, amount, balance_after, note, timestamp) "
+                    "VALUES ('deposit', ?, ?, 'seed', ?)",
+                    (ALL_NO_STARTING_BALANCE, ALL_NO_STARTING_BALANCE, stamp),
+                )
+            else:
+                # Reset seed to full amount
+                await conn.execute(
+                    "UPDATE all_no_book SET amount = ?, balance_after = ? WHERE note = 'seed'",
+                    (ALL_NO_STARTING_BALANCE, ALL_NO_STARTING_BALANCE),
+                )
+
+            await conn.commit()
+            self.logger.info(
+                f"ALL NO {mode.upper()} book reset to ${ALL_NO_STARTING_BALANCE:.2f}"
+            )
+
+        return await self.get_balance(mode)
+
 
 class AllNoStrategy:
     """ALL NO MARKETS trading strategy with COMPLETE SEPARATION guarantee.
@@ -640,8 +694,12 @@ class AllNoStrategy:
             # Insert into ALL NO positions table
             await self._insert_position(db_manager, position)
 
-            # Record balance movement in ALL NO book
-            await self._record_balance_change(cost, mode, "position_open")
+            # DO NOT call _record_balance_change here. The get_balance()
+            # method already computes the correct balance from
+            # seed + realized_pnl - deployed_cost. Calling
+            # _record_balance_change on top of that double-counts
+            # every trade and drove the book to -$248.
+            # The balance is derived, not ledger-tracked.
 
             return position
 
@@ -734,6 +792,17 @@ class AllNoStrategy:
         # Ensure schema and seed
         await self.all_no_book.ensure_schema()
         await self.all_no_book.seed_book()
+
+        # Check balance and reset if negative (due to previous bugs)
+        dry_balance = await self.all_no_book.get_balance(MODE_DRY)
+        live_balance = await self.all_no_book.get_balance(MODE_LIVE)
+        if dry_balance["cash"] < 0 or live_balance["cash"] < 0:
+            self.logger.warning(
+                f"ALL NO book balance negative (DRY: ${dry_balance['cash']:.2f}, "
+                f"LIVE: ${live_balance['cash']:.2f}). Resetting to starting balance."
+            )
+            await self.all_no_book.reset_to_starting_balance(MODE_DRY)
+            await self.all_no_book.reset_to_starting_balance(MODE_LIVE)
 
         # Verify separation
         if not await self.all_no_book.is_separate_from_dry_book():
