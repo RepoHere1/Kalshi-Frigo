@@ -6008,17 +6008,7 @@ button.loading.yellow::after {
         settlements over Aug 1 - Oct 4 is what makes it checkable. -#}
      <div class="s" id="tKalshiPnlNote">{% if s.kalshi and s.kalshi.realized_known %}sales {{ '$%.2f'|format(s.kalshi.ledger.get('sales_realized', 0.0)) }} &middot; settled {{ '$%.2f'|format(s.kalshi.ledger.get('settlement_realized', 0.0)) }} &middot; fees {{ '$%.2f'|format(s.kalshi.fees) }}{% if s.kalshi.ledger.get('window_start') %} &middot; since {{ _format_date(s.kalshi.ledger.get('window_start')[:10]) }}{% endif %}{% else %}fill history unavailable{% endif %}</div>
    </div>
-  {% endif %}
-  <div class="tile">
-    <div class="k">Bot realized P&amp;L</div>
-    {#- The bot's own ledger, next to Kalshi's. When these two disagree, the
-        disagreement IS the finding: the local book is missing a close, a
-        settlement, or a fee. A single number with nothing to compare it to
-        hides that, so this tile exists to be read against the tile above. -#}
-    <div class="v {{ 'up' if s.trades and s.trades.realized_pnl > 0 else ('down' if s.trades and s.trades.realized_pnl < 0 else 'flat') }}" id="tBotPnl">{{ '$%.2f'|format(s.trades.realized_pnl) if s.trades else '$0.00' }}</div>
-    <div class="s" id="tBotPnlNote">{{ s.trades.trades if s.trades else 0 }} closed trades &middot; {{ s.trades.win_rate if s.trades else 0 }}% win rate</div>
-  </div>
-
+{% endif %}
   <div class="tile">
     <div class="k">Strategies live</div>
     <div class="v" id="tRunning">{{ s.running_count if s.running_count is defined else 0 }}</div>
