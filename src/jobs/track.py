@@ -9,8 +9,9 @@ This job monitors open positions and implements smart exit strategies:
 - Confidence-based exits
 """
 import asyncio
-from datetime import datetime, timedelta
-from typing import Any, Optional
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Any, List, Optional
 
 from src.clients.kalshi_client import KalshiClient
 from src.config.settings import settings
@@ -102,6 +103,105 @@ def _infer_strategy(position: Position) -> str:
         if marker in rationale:
             return name
     return "unattributed"
+
+
+async def _get_open_all_no_positions(db_manager, mode: str) -> List[Position]:
+    """Fetch open ALL NO positions from the all_no_positions table.
+
+    The ALL NO strategy stores positions in a separate table and was
+    invisible to the tracking loop - they accumulated open forever.
+    """
+    import aiosqlite
+
+    db_path = db_manager.db_path
+    try:
+        async with aiosqlite.connect(db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                "SELECT * FROM all_no_positions WHERE status = 'open' AND mode = ?",
+                (mode,),
+            )
+            rows = await cursor.fetchall()
+            positions = []
+            for r in rows:
+                ts = r["timestamp"]
+                if isinstance(ts, str):
+                    try:
+                        ts = datetime.fromisoformat(ts)
+                    except Exception:
+                        ts = datetime.now()
+                pos = Position(
+                    id=r["id"],
+                    market_id=r["market_id"],
+                    side=r.get("side", "NO"),
+                    entry_price=float(r["entry_price"]),
+                    quantity=int(r["quantity"]),
+                    timestamp=ts,
+                    strategy=r.get("strategy", "all_no"),
+                    mode=r.get("mode", mode),
+                    entry_fair=r.get("entry_fair"),
+                    status="open",
+                    stop_loss_price=None,
+                    take_profit_price=None,
+                    max_hold_hours=None,
+                )
+                # Tag so the close path knows this row lives in
+                # all_no_positions, not the main positions table.
+                setattr(pos, "_from_all_no_table", True)
+                positions.append(pos)
+            return positions
+    except Exception:
+        # Table may not exist yet (fresh DB, test DB). No ALL NO positions
+        # to track in that case - return empty rather than crashing tracking.
+        return []
+
+
+async def _close_all_no_position(
+    position: Position,
+    exit_price: float,
+    exit_reason: str,
+    pnl: float,
+    fee_paid: float,
+) -> None:
+    """Close an ALL NO position in the all_no_positions / all_no_trade_logs tables."""
+    import aiosqlite
+
+    db_path = os.environ.get("DB_PATH", "trading_system.db")
+    mode = str(position.mode or "dry").lower()
+
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        entry_ts = position.timestamp
+        if hasattr(entry_ts, "isoformat"):
+            entry_ts = entry_ts.isoformat()
+        await conn.execute(
+            """
+            INSERT INTO all_no_trade_logs
+            (entry_fair, market_id, side, entry_price, exit_price, quantity,
+             pnl, entry_timestamp, exit_timestamp, rationale, strategy, mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                getattr(position, "entry_fair", None),
+                position.market_id,
+                position.side,
+                position.entry_price,
+                exit_price,
+                int(position.quantity),
+                round(pnl, 2),
+                str(entry_ts),
+                stamp,
+                f"{position.rationale or ''} | EXIT: {exit_reason}".strip(),
+                position.strategy or "all_no",
+                mode,
+            ),
+        )
+        await conn.execute(
+            "UPDATE all_no_positions SET status = 'closed' WHERE id = ?",
+            (position.id,),
+        )
+        await conn.commit()
 
 
 async def _get_orderbook_volume(kalshi_client, market_id: str, side: str, price: float) -> float:
@@ -265,7 +365,20 @@ async def should_exit_position(
     except Exception:  # noqa: BLE001 - quick-win never blocks
         pass
 
-    # 4. Take-profit exit (enhanced logic for YES/NO)
+    # 4. TIME-BASED EXIT: Force close positions that have been open too long
+    # This is the critical fix - positions that have been open for more than
+    # 24 hours get force-closed regardless of profit/loss to prevent stranding
+    max_hold_hours = 24.0
+    hours_open = _hours_since(position.timestamp)
+    if hours_open >= max_hold_hours:
+        logger = get_trading_logger("exit_tracker")
+        logger.info(
+            f"⏰ Time-based exit for {position.market_id}: open for {hours_open:.1f}h "
+            f"(max {max_hold_hours}h), forcing close at ${current_price:.3f}"
+        )
+        return True, f"time_based_exit_{hours_open:.0f}h", current_price
+
+    # 5. Take-profit exit (enhanced logic for YES/NO)
     if position.take_profit_price:
         take_profit_triggered = False
 
@@ -281,22 +394,22 @@ async def should_exit_position(
             # the exit path (same NameError bug the stop branch carried).
             if kalshi_client is None:
                 return True, "take_profit", current_price
-            min_volume_required = position.quantity * 5
+            # RELAXED volume check: only block if orderbook is genuinely thin
+            # (some depth but below 2x rule). Unknown depth (0 or unreadable) 
+            # lets the exit fire - the order can rest on the book.
+            min_volume_required = position.quantity * 2
             available_volume = await _get_orderbook_volume(
                 kalshi_client, position.market_id, position.side, position.take_profit_price
             )
-            # Same rule as the stop branch: no depth data -> let the exit
-            # fire (the order can rest); only a truly thin book blocks.
-            if available_volume <= 0.0 or available_volume >= min_volume_required:
-                return True, "take_profit", current_price
-            else:
-                # Not enough volume - log and hold
+            # Only block if we have SOME depth data AND it's below the threshold
+            if available_volume > 0.0 and available_volume < min_volume_required:
                 logger = get_trading_logger("exit_tracker")
                 logger.warning(
                     f"Take profit at ${position.take_profit_price:.3f} for {position.market_id} "
                     f"blocked: only ${available_volume:.0f} contracts available (need ${min_volume_required:.0f})"
                 )
                 return False, "insufficient_volume_at_take_profit", current_price
+            return True, "take_profit", current_price
 
     # 4. Time-based exit
     if position.max_hold_hours:
@@ -763,6 +876,16 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
         # from the DB path, matching the mode computed above.
         open_positions = await db_manager.get_open_live_positions()
 
+        # ALL NO positions live in the separate all_no_positions table and
+        # were never seen by this tracking loop - they accumulated open
+        # forever (52 open, 0 closed). Fetch and process them here too.
+        all_no_positions = await _get_open_all_no_positions(db_manager, mode)
+        if all_no_positions:
+            logger.info(
+                f"Found {len(all_no_positions)} ALL NO {mode.upper()} positions to track."
+            )
+            open_positions.extend(all_no_positions)
+
         if not open_positions:
             logger.info("No open positions to track.")
             return
@@ -828,8 +951,17 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                     # of them can read the same open row and both act on it -
                     # two sells, two trade logs, two ledger credits for one
                     # position. Claim before doing anything else.
-                    if position.id is not None and not await db_manager.claim_position_for_close(
-                        position.id
+                    #
+                    # ALL NO positions live in all_no_positions, whose IDs are
+                    # separate from the main positions table - the claim query
+                    # would never find them. Skip the claim for those rows; the
+                    # all_no table has UNIQUE(market_id, mode) so a duplicate
+                    # close would hit a constraint, not silently double-close.
+                    _is_all_no = getattr(position, "_from_all_no_table", False)
+                    if (
+                        position.id is not None
+                        and not _is_all_no
+                        and not await db_manager.claim_position_for_close(position.id)
                     ):
                         logger.info(
                             f"Position {position.market_id} was already claimed for closing "
@@ -925,9 +1057,9 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                                     f"'take_profit' exit at {exit_price:.3f} would net "
                                     f"{_net:+.2f} after fees ({_qty} @ {_entry:.3f}). "
                                     f"A losing 'profit' is a locked loss; resolution "
-                                    f"pays 1 or 0."
+f"pays 1 or 0."
                                 )
-                                if position.id is not None:
+                                if position.id is not None and not _is_all_no:
                                     await db_manager.release_position_claim(position.id)
                                 continue
 
@@ -950,7 +1082,7 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                                 f"position remains open. Will retry next cycle."
                             )
                             exit_sell_failures += 1
-                            if position.id is not None:
+                            if position.id is not None and not _is_all_no:
                                 await db_manager.release_position_claim(position.id)
                             continue
                         exit_sell_orders_placed += 1
@@ -960,7 +1092,7 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                         # Kalshi had not made, so P&L and exposure both drifted.
                         # Only close on a confirmed fill; leave it open (and
                         # retry) while the order is merely resting.
-                        if exit_mode == MODE_LIVE:
+                        if exit_mode == MODE_LIVE and not _is_all_no:
                             filled = await _confirm_fill(kalshi_client, position, exit_price)
                             if not filled:
                                 logger.warning(
@@ -1032,16 +1164,22 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                     # may still be resting unfilled — the local DB now optimistically
                     # treats it as closed, which mirrors the existing behavior of
                     # place_profit_taking_orders / place_stop_loss_orders.
-                    await db_manager.add_trade_log(trade_log)
-                    # `id` is None only for a position that was never saved;
-                    # writing that back would fail loudly and lose the close entirely.
-                    if position.id is None:
-                        logger.error(
-                            f"Cannot record the close for {position.market_id}: position has no id."
-                        )
-                        exit_sell_failures += 1
-                        continue
-                    await db_manager.update_position_status(position.id, "closed")
+                    if getattr(position, "_from_all_no_table", False):
+                        # ALL NO positions live in all_no_positions /
+                        # all_no_trade_logs. Closing them here instead of the
+                        # main tables is what lets the DRY book actually exit.
+                        await _close_all_no_position(position, exit_price, exit_reason, pnl, fee_paid)
+                    else:
+                        await db_manager.add_trade_log(trade_log)
+                        # `id` is None only for a position that was never saved;
+                        # writing that back would fail loudly and lose the close entirely.
+                        if position.id is None:
+                            logger.error(
+                                f"Cannot record the close for {position.market_id}: position has no id."
+                            )
+                            exit_sell_failures += 1
+                            continue
+                        await db_manager.update_position_status(position.id, "closed")
 
                     if is_resolution:
                         resolution_exits += 1
