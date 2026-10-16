@@ -39,7 +39,7 @@ def _normalize_updown_series(series: str) -> str:
     return s
 
 
-def cmd_run(args: argparse.Namespace) -> None:
+async def cmd_run(args: argparse.Namespace) -> None:
     """Start the trading bot (disciplined mode by default)."""
     from src.utils.logging_setup import setup_logging
 
@@ -53,7 +53,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     try:
         from src.utils.mode import apply_persisted_trading_config
 
-        asyncio.run(apply_persisted_trading_config())
+        await apply_persisted_trading_config()
     except Exception as exc:  # noqa: BLE001 - boot never fails on config
         print(f"config apply failed: {type(exc).__name__}: {exc}")
 
@@ -101,17 +101,21 @@ def cmd_run(args: argparse.Namespace) -> None:
         # read "exited on its own" in BOTH books.
         db_path = os.environ.get("DB_PATH", "trading_system.db")
 
-        async def _init_mode():
-            await DatabaseManager(db_path=db_path).initialize()
-            book = os.environ.get("STRATEGY_BOOK_MODE", "").strip().lower()
-            if book in ("dry", "live", "paper"):
-                return
-            live = os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
-            await TradingMode(db_path=db_path).set(
-                "live" if live else "dry", confirmed=True
-            )
+        # Apply persisted trading config
+        from src.utils.mode import apply_persisted_trading_config
+        try:
+            await apply_persisted_trading_config()
+        except Exception as exc:
+            print(f"config apply failed: {type(exc).__name__}: {exc}")
 
-        asyncio.run(_init_mode())
+        # Initialize the database and set up trading mode
+        await DatabaseManager(db_path=db_path).initialize()
+        book = os.environ.get("STRATEGY_BOOK_MODE", "").strip().lower()
+        if book not in ("dry", "live", "paper"):
+            live_mode = os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
+            await TradingMode(db_path=db_path).set(
+                "live" if live_mode else "dry", confirmed=True
+            )
         # The inner loop is already immortal; this outer loop is belt-and-braces
         # so even an unexpected asyncio.run failure cannot end the process. Only
         # SIGTERM/SIGKILL (operator Stop / container kill) takes it down.
@@ -119,14 +123,12 @@ def cmd_run(args: argparse.Namespace) -> None:
 
         while True:
             try:
-                asyncio.run(
-                    run_updown_trader(
-                        UpDownConfig(),
-                        loop=getattr(args, "loop", True),
-                        interval=float(getattr(args, "interval", 0) or 0),
-                        series=series,
-                        spot_product=spot_product,
-                    )
+                await run_updown_trader(
+                    UpDownConfig(),
+                    loop=getattr(args, "loop", True),
+                    interval=float(getattr(args, "interval", 0) or 0),
+                    series=series,
+                    spot_product=spot_product,
                 )
             except KeyboardInterrupt:
                 print(f"\n{series} up/down trader stopped by user.")
@@ -173,7 +175,27 @@ def cmd_run(args: argparse.Namespace) -> None:
                 print("   ✅ Separation verified: ALL NO DRY is independent of DRY book")
 
         try:
-            asyncio.run(_init_all_no())
+            # Synchronous wrapper for ALL NO initialization
+            def _init_all_no_sync():
+                async def _init_all_no():
+                    from src.utils.database import DatabaseManager
+                    await DatabaseManager(db_path=db_path).initialize()
+
+                    # Initialize the ALL NO book
+                    from src.strategies.all_no import AllNoKalshiBook
+                    all_no_book = AllNoKalshiBook(db_path)
+                    await all_no_book.ensure_schema()
+                    await all_no_book.seed_book()
+
+                    # Verify separation integrity
+                    if mode == "dry":
+                        is_separate = await all_no_book.is_separate_from_dry_book()
+                        if not is_separate:
+                            raise RuntimeError("ALL NO DRY book separation from DRY book FAILED!")
+                        print("   ✅ Separation verified: ALL NO DRY is independent of DRY book")
+                return asyncio.run(_init_all_no())
+            
+            _init_all_no_sync()
         except Exception as exc:
             print(f"ALL NO init failed: {type(exc).__name__}: {exc}")
             sys.exit(1)
@@ -182,24 +204,24 @@ def cmd_run(args: argparse.Namespace) -> None:
         import asyncio
         import time as _time
 
-        async def _all_no_runner():
-            try:
-                strategy = AllNoStrategy()
-                loop = bool(getattr(args, "loop", True))
-                interval = int(getattr(args, "interval", 30) or 30)
-                await strategy.run(mode=mode, loop=loop, interval=interval)
-            except KeyboardInterrupt:
-                print(f"\nALL NO MARKETS ({mode.upper()}) strategy stopped by user.")
-                raise
-            except Exception as exc:
-                print(f"ALL NO MARKETS ({mode.upper()}) strategy crashed ({type(exc).__name__}: {exc}); restarting in 5s.", flush=True)
-                _time.sleep(5)
-                await _all_no_runner()
+        # Synchronous wrapper for ALL NO runner
+        def _all_no_runner_sync():
+            async def _all_no_runner():
+                try:
+                    strategy = AllNoStrategy()
+                    loop = bool(getattr(args, "loop", True))
+                    interval = int(getattr(args, "interval", 30) or 30)
+                    await strategy.run(mode=mode, loop=loop, interval=interval)
+                except KeyboardInterrupt:
+                    print(f"\nALL NO MARKETS ({mode.upper()}) strategy stopped by user.")
+                    raise
+                except Exception as exc:
+                    print(f"ALL NO MARKETS ({mode.upper()}) strategy crashed ({type(exc).__name__}: {exc}); restarting in 5s.", flush=True)
+                    _time.sleep(5)
+                    await _all_no_runner()
+            return asyncio.run(_all_no_runner())
 
-        try:
-            asyncio.run(_all_no_runner())
-        except KeyboardInterrupt:
-            print(f"\nALL NO MARKETS ({mode.upper()}) strategy stopped by user.")
+        _all_no_runner_sync()
         return
 
     # DEFAULT: AI directional strategy with disciplined settings active.
@@ -308,15 +330,26 @@ def cmd_status(args: argparse.Namespace) -> None:
                 print(f"  Total Realized P&L: ${total_realized_pnl:>10,.2f}")
                 print(f"  Total Fees Paid:    ${total_fees:>10,.2f}")
 
-            print("=" * 56)
+            print()
+            print("  Current Positions Summary")
+            print("  =======================")
+            print(f"  | {'Exposure':>10} | {'Unrealized P&L':>15} |")
+            print(f"  | {'-'*10} | {'-'*15} |")
+            total_unrealized_pnl = 0.0
+            if active_positions:
+                for pos in active_positions:
+                    exposure = float(pos.get("event_exposure_dollars", "0"))
+                    unrealized_pnl = float(pos.get("unrealized_pnl_dollars", "0"))
+                    total_unrealized_pnl += unrealized_pnl
+                    print(f"  | ${exposure:>8.2f} | ${unrealized_pnl:>13.2f} |")
+            print(f"  | {'-'*10} | {'-'*15} |")
+            print(f"  | ${total_exposure:>8.2f} | ${total_unrealized_pnl:>13.2f} |")
+
         finally:
             await client.close()
 
-    try:
-        asyncio.run(_status())
-    except Exception as exc:
-        print(f"Error fetching status: {exc}")
-        sys.exit(1)
+    import asyncio
+    asyncio.run(_status())
 
 
 def cmd_scores(args: argparse.Namespace) -> None:
@@ -333,11 +366,8 @@ def cmd_scores(args: argparse.Namespace) -> None:
         print("  Key: Score < 30 = BLOCKED | Alloc = max portfolio % allowed")
         print()
 
-    try:
-        asyncio.run(_scores())
-    except Exception as exc:
-        print(f"Error fetching scores: {exc}")
-        sys.exit(1)
+    import asyncio
+    asyncio.run(_scores())
 
 
 def cmd_history(args: argparse.Namespace) -> None:
@@ -889,11 +919,12 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+async def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    await args.func(args)
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
