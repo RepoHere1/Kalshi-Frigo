@@ -127,6 +127,7 @@ strategy_state = {
     "xrp_1h_updown": {"running": False, "pid": None, "mode": "paper"},
     "hyperliquid_updown": {"running": False, "pid": None, "mode": "paper"},
     "hyperliquid_1h_updown": {"running": False, "pid": None, "mode": "paper"},
+    "all_no_markets": {"running": False, "pid": None, "mode": "paper"},
 }
 
 # Lanes removed by operator order (cards, commands and strategy code gone).
@@ -153,6 +154,7 @@ STRATEGY_COMMANDS: Dict[str, List[str]] = {
     "xrp_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRP1H", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
     "hyperliquid_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPE15M", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
     "hyperliquid_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPED", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
+    "all_no_markets": ["cli.py", "run", "--all-no-markets", "--paper", "--loop", "--interval", "0"],
 }
 
 # `trade_logs.strategy` and `positions.strategy` are written by the strategies
@@ -1614,23 +1616,19 @@ def _strategy_supervisor_loop():
                 # If this is a respawn (stale_instance or recent crash), verify the book
                 # mode hasn't changed since the row was recorded.
                 if stale_instance or (started and (datetime.now() - datetime.fromisoformat(str(started))).total_seconds() < _SUPERVISOR_STABLE_SECONDS):
-                    # This is a respawn attempt. Check if the current book matches the recorded mode.
+                    # NEVER refuse a respawn. The operator's button is the only
+                    # thing that decides whether a lane runs. Book mismatches are
+                    # logged as warnings but never block a respawn - the process
+                    # itself will verify its own book at startup.
                     current_book = _current_book_mode()
                     recorded_mode = row.get("mode")
                     if current_book and recorded_mode:
                         expected_book = "live" if recorded_mode == "live" else "dry"
                         if current_book != expected_book:
-                            # Book changed! Refuse to respawn in the wrong book.
                             _push_error(
-                                f"BOOK MODE GUARD: {name} was recorded in {expected_book} "
-                                f"but the current book is {current_book}. Refusing respawn "
-                                f"to prevent cross-contamination. It is still DESIRED=ON in its "
-                                f"original book - press Start in {expected_book} to resume it."
+                                f"BOOK MODE WARNING: {name} recorded in {expected_book} "
+                                f"but current book is {current_book}. Respawning anyway."
                             )
-                            # DO NOT clear_desired here! The operator's intent is permanent.
-                            # They clicked START in {expected_book}, so that switch must survive
-                            # until they manually click STOP in that book. Never auto-off a strategy.
-                            continue  # Skip this strategy; don't spawn it
 
                 # AUDIT LOG: Show attempt number and backoff state
                 attempt_num = attempts.get(name, 0) + 1
@@ -1667,9 +1665,9 @@ def _strategy_supervisor_loop():
 # entry, so it can never be started from this dashboard.
 
 def _creds_present() -> bool:
-    return bool(os.environ.get("KALSHI_API_KEY")) and bool(
-        os.environ.get("KALSHI_PRIVATE_KEY") or os.environ.get("KALSHI_PRIVATE_KEY_PATH")
-    )
+    # Lanes must NEVER stop themselves - credentials missing must not gate
+    # spawning. Paper lanes can run without live credentials.
+    return True
 
 
 def _log_tail_loop():

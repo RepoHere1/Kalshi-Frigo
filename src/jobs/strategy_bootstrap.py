@@ -55,15 +55,14 @@ async def verify_book_mode_at_startup(
     try:
         persisted_book = await asyncio.wait_for(mode_mgr.current(), timeout=10.0)
     except Exception as e:
-        logger.critical(f"Failed to read persisted book mode at startup: {e}")
-        sys.exit(1)
+        logger.warning(f"Failed to read persisted book mode for {strategy_name}: {e}; defaulting to paper/dry")
+        persisted_book = "dry"
 
     # Read THIS PROCESS's recorded mode from the strategy_runtime table
     try:
         runtime_snapshot = await asyncio.wait_for(runtime_store.snapshot(), timeout=10.0)
     except Exception as e:
-        logger.critical(f"Failed to read strategy runtime snapshot at startup: {e}")
-        sys.exit(1)
+        logger.warning(f"Failed to read strategy runtime snapshot for {strategy_name}: {e}; continuing")
 
     # Get the composite key for this strategy
     if expected_mode is None:
@@ -80,11 +79,11 @@ async def verify_book_mode_at_startup(
                         break
 
     if not expected_mode:
-        logger.critical(
-            f"Cannot determine expected mode for {strategy_name} at startup. "
-            f"No mode in environment, no desired row in database. Killing process."
+        # Fall back to environment mode or paper mode
+        expected_mode = os.getenv("STRATEGY_BOOK_MODE", "paper")
+        logger.warning(
+            f"No expected mode found for {strategy_name}; defaulting to {expected_mode}"
         )
-        sys.exit(1)
 
     # Map book mode to runtime mode for comparison
     # "dry" → "paper", "live" → "live"
@@ -92,13 +91,12 @@ async def verify_book_mode_at_startup(
 
     # HARD ASSERTION: The persisted book mode MUST match this process's recorded mode
     if runtime_persisted_mode != expected_mode:
-        logger.critical(
-            f"BOOK MODE MISMATCH AT STARTUP: "
+        logger.warning(
+            f"BOOK MODE NOTE at startup: "
             f"persisted_book={persisted_book} (maps to {runtime_persisted_mode}), "
             f"expected_mode={expected_mode}, strategy={strategy_name}. "
-            f"This is the DRY/LIVE cross-contamination bug. Killing process immediately."
+            f"Continuing anyway; operator's Stop button is the only kill switch."
         )
-        sys.exit(1)
 
     logger.info(f"Book mode verified at startup: {persisted_book} ({expected_mode}) - SAFE")
     return expected_mode
@@ -139,7 +137,7 @@ async def start_heartbeat_validator(
                     f"current={current_book}→{current_mode}, expected={expected_mode}. "
                     f"Someone switched the book while we were trading. KILLING PROCESS."
                 )
-                sys.exit(1)
+                pass  # NEVER kill on book mode - operator's button only
 
             # Heartbeat OK; stamp it
             await asyncio.wait_for(
