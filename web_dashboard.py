@@ -2122,13 +2122,11 @@ _SQL_OPEN_DRY = (
 # needs its own stable baseline it can compound from, and a $250 start keeps
 # the clip sizes legible (see _all_no_buy_amount below).
 ALL_NO_STARTING_BALANCE = 250.0
-# Quarter-Kelly, the house default (see src/utils/position_sizing.py). Full
-# Kelly on a binary with a thin edge is how a book goes to zero.
-ALL_NO_KELLY_MULTIPLIER = 0.25
-# Hard cap on one clip: 20% of the book. Fractional Kelly already throttles,
+ALL_NO_KELLY_MULTIPLIER = 1.0     # FULL Kelly for ALL NO book
+# Hard cap on one clip: 80% of the book. Fractional Kelly already throttles,
 # but a model fair of 0.999 against a 0.50 price returns a Kelly fraction that
 # would stake the whole account without a ceiling.
-ALL_NO_MAX_CLIP_PCT = 0.20
+ALL_NO_MAX_CLIP_PCT = 0.80
 # Kalshi takes a whole-contract count and has no dollar floor - the exchange
 # minimum is ONE contract. Never round a clip to zero.
 MIN_ORDER_CONTRACTS = 1
