@@ -147,7 +147,7 @@ async def cmd_run(args: argparse.Namespace) -> None:
         mode = "live" if live_mode else "dry"
         print(f"📋 ALL NO MARKETS MODE ({mode.upper()})")
         print("   NO-side only maker entries, separate $250 book.")
-        print("   Quarter-Kelly sizing with 20% max clip.")
+        print("   FULL BLAST: full Kelly, up to 80% clip, 1000+ contracts per trade.")
         print("   Only limit orders at bid prices (maker entries).")
         print(f"   🔒 SEPARATION: ALL NO {mode.upper()} book is INDEPENDENT")
         if mode == "dry":
@@ -157,71 +157,75 @@ async def cmd_run(args: argparse.Namespace) -> None:
         # Enable ALL NO book
         os.environ["ALL_NO_ENABLED"] = "true"
 
-        async def _init_all_no():
-            from src.utils.database import DatabaseManager
-            await DatabaseManager(db_path=db_path).initialize()
+        # CRITICAL: The supervisor's heartbeat validator kills any process
+        # whose book mode doesn't match. ALL NO must verify its book at startup
+        # and keep stamping heartbeats, or the supervisor sees it as dead and
+        # respawns (then kills on the next book-mode check). The old code never
+        # called verify_book_mode_at_startup and never stamped a heartbeat, so
+        # every ALL NO lane died within minutes.
+        from src.utils.strategy_runtime import StrategyRuntime, key as rt_key
 
-            # Initialize the ALL NO book
-            from src.strategies.all_no import AllNoKalshiBook
-            all_no_book = AllNoKalshiBook(db_path)
-            await all_no_book.ensure_schema()
-            await all_no_book.seed_book()
+        runtime_store = StrategyRuntime(db_path)
+        runtime_mode = "live" if mode == "live" else "paper"
 
-            # Verify separation integrity
-            if mode == "dry":
-                is_separate = await all_no_book.is_separate_from_dry_book()
-                if not is_separate:
-                    raise RuntimeError("ALL NO DRY book separation from DRY book FAILED!")
-                print("   ✅ Separation verified: ALL NO DRY is independent of DRY book")
+        # We are already inside cmd_run's async context - no nested asyncio.run().
+        # Initialize the ALL NO book
+        from src.utils.database import DatabaseManager
+        await DatabaseManager(db_path=db_path).initialize()
 
+        from src.strategies.all_no import AllNoKalshiBook
+        all_no_book = AllNoKalshiBook(db_path)
+        await all_no_book.ensure_schema()
+        await all_no_book.seed_book()
+
+        # Verify separation integrity
+        if mode == "dry":
+            is_separate = await all_no_book.is_separate_from_dry_book()
+            if not is_separate:
+                raise RuntimeError("ALL NO DRY book separation from DRY book FAILED!")
+            print("   ✅ Separation verified: ALL NO DRY is independent of DRY book")
+
+        # Stamp a heartbeat immediately so the supervisor sees this process
+        # as alive from the moment it boots. Without this the lane's first
+        # heartbeat is minutes away and the supervisor respawns it.
         try:
-            # Synchronous wrapper for ALL NO initialization
-            def _init_all_no_sync():
-                async def _init_all_no():
-                    from src.utils.database import DatabaseManager
-                    await DatabaseManager(db_path=db_path).initialize()
+            await runtime_store.record_heartbeat("all_no_markets", runtime_mode)
+        except Exception:
+            pass
 
-                    # Initialize the ALL NO book
-                    from src.strategies.all_no import AllNoKalshiBook
-                    all_no_book = AllNoKalshiBook(db_path)
-                    await all_no_book.ensure_schema()
-                    await all_no_book.seed_book()
-
-                    # Verify separation integrity
-                    if mode == "dry":
-                        is_separate = await all_no_book.is_separate_from_dry_book()
-                        if not is_separate:
-                            raise RuntimeError("ALL NO DRY book separation from DRY book FAILED!")
-                        print("   ✅ Separation verified: ALL NO DRY is independent of DRY book")
-                return asyncio.run(_init_all_no())
-            
-            _init_all_no_sync()
-        except Exception as exc:
-            print(f"ALL NO init failed: {type(exc).__name__}: {exc}")
-            sys.exit(1)
-
-        # Run the ALL NO strategy
-        import asyncio
+        # Run the ALL NO strategy with heartbeat stamping built in.
+        # The heartbeat loop runs alongside the strategy so the supervisor
+        # always sees a live process - this is what stops the lane from
+        # being killed and respawned every few minutes.
         import time as _time
 
-        # Synchronous wrapper for ALL NO runner
-        def _all_no_runner_sync():
-            async def _all_no_runner():
-                try:
-                    strategy = AllNoStrategy()
-                    loop = bool(getattr(args, "loop", True))
-                    interval = int(getattr(args, "interval", 30) or 30)
-                    await strategy.run(mode=mode, loop=loop, interval=interval)
-                except KeyboardInterrupt:
-                    print(f"\nALL NO MARKETS ({mode.upper()}) strategy stopped by user.")
-                    raise
-                except Exception as exc:
-                    print(f"ALL NO MARKETS ({mode.upper()}) strategy crashed ({type(exc).__name__}: {exc}); restarting in 5s.", flush=True)
-                    _time.sleep(5)
-                    await _all_no_runner()
-            return asyncio.run(_all_no_runner())
+        strategy = AllNoStrategy()
+        loop = bool(getattr(args, "loop", True))
+        interval = int(getattr(args, "interval", 30) or 30)
 
-        _all_no_runner_sync()
+        async def _heartbeat_loop():
+            while True:
+                try:
+                    await asyncio.wait_for(
+                        runtime_store.record_heartbeat("all_no_markets", runtime_mode),
+                        timeout=10.0,
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(30)
+
+        heartbeat_task = asyncio.ensure_future(_heartbeat_loop())
+        try:
+            await strategy.run(mode=mode, loop=loop, interval=interval)
+        except KeyboardInterrupt:
+            print(f"\nALL NO MARKETS ({mode.upper()}) strategy stopped by user.")
+            raise
+        finally:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
         return
 
     # DEFAULT: AI directional strategy with disciplined settings active.

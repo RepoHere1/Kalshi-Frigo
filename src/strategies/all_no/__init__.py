@@ -41,28 +41,30 @@ logger = get_trading_logger("all_no_strategy")
 
 # Configuration from web_dashboard.py
 ALL_NO_STARTING_BALANCE = 250.0
-ALL_NO_KELLY_MULTIPLIER = 0.25
-ALL_NO_MAX_CLIP_PCT = 0.20
+ALL_NO_KELLY_MULTIPLIER = 1.0     # Full Kelly (not quarter) for full blast
+ALL_NO_MAX_CLIP_PCT = 0.80        # Up to 80% of book on one trade
 MIN_ORDER_CONTRACTS = 1
 
 # Mode-specific books
 ALL_NO_DRY_BOOK = "all_no_dry"
 ALL_NO_LIVE_BOOK = "all_no_live"
 
-# TRADING PARAMETERS FOR MAXIMUM WIN RATE
-MIN_EDGE_REQUIREMENT = 0.06          # 6% minimum edge (after fees)
-MIN_CONFIDENCE_FOR_TRADE = 0.75      # 75% minimum confidence
-NO_PRICE_MIN = 0.80                  # NO price minimum (80c)
-NO_PRICE_MAX = 0.95                  # NO price maximum (95c) - favorite-longshot sweet spot
-MAX_CONCURRENT_POSITIONS = 50        # Max open positions
-PROFIT_TARGET_PRICE = 0.95           # Sell NO when price reaches 95c
-STOP_LOSS_THRESHOLD = -0.10          # 10% drawdown stop loss
-MIN_TIME_TO_EXPIRY_HOURS = 6         # Don't trade markets expiring in < 6 hours
-MIN_VOLUME_FOR_TRADE = 1000          # Minimum volume for liquidity
+# TRADING PARAMETERS FOR MAXIMUM WIN RATE - FULL BLAST
+MIN_EDGE_REQUIREMENT = 0.02          # 2% minimum edge (after fees) - wide net
+MIN_CONFIDENCE_FOR_TRADE = 0.55      # 55% minimum confidence - more opportunities
+NO_PRICE_MIN = 0.70                  # NO price minimum (70c) - wider range
+NO_PRICE_MAX = 0.98                  # NO price maximum (98c) - catch every tradeable NO
+MAX_CONCURRENT_POSITIONS = 500       # Max open positions - full blast
+PROFIT_TARGET_PRICE = 0.97           # Sell NO when price reaches 97c
+STOP_LOSS_THRESHOLD = -0.20          # 20% drawdown stop loss - wide stops
+MIN_TIME_TO_EXPIRY_HOURS = 2         # Don't trade markets expiring in < 2 hours
+MIN_VOLUME_FOR_TRADE = 100           # Minimum volume for liquidity - tiny threshold
+MAX_CONTRACTS_PER_MARKET = 5000      # Buy up to 5000 contracts per market
+TARGET_CONTRACTS_PER_TRADE = 1000    # Aim for 1000+ contracts per trade
 
 
 class AllNoKalshiKellySizer:
-    """Kelly sizing implementation for ALL NO MARKETS book."""
+    """Kelly sizing implementation for ALL NO MARKETS book - FULL BLAST."""
 
     @staticmethod
     def calculate_kelly_fraction(fair: float, price: float) -> float:
@@ -71,6 +73,8 @@ class AllNoKalshiKellySizer:
         For a NO contract bought at price P with a model fair of F:
         - stake P to win (1 - P) -> net odds b = (1 - P) / P
         - f* = (F*b - (1 - F)) / b [kelly_fraction(F, b)]
+
+        FULL BLAST: uses full Kelly (not quarter) and allows up to 80% clip.
         """
         if price <= 0.0 or price >= 1.0 or fair <= 0.0:
             return 0.0
@@ -81,12 +85,13 @@ class AllNoKalshiKellySizer:
         return max(0.0, min(f, ALL_NO_MAX_CLIP_PCT))
 
     @staticmethod
-    def calculate_buy_amount(fair: float, price: float) -> Dict[str, Any]:
-        """Calculate the clip a Kelly fraction actually buys.
+    def calculate_buy_amount(fair: float, price: float, balance: float = 250.0) -> Dict[str, Any]:
+        """Calculate the clip a Kelly fraction actually buys - FULL BLAST.
 
-        The contract count is the whole number of contracts the stake actually
-        buys, floored at one: Kalshi takes a whole-contract count with no dollar
-        minimum, so rounding a clip to zero would silently drop a paper bet.
+        Buys THOUSANDS of contracts. The contract count targets
+        TARGET_CONTRACTS_PER_TRADE or more, capped by MAX_CONTRACTS_PER_MARKET
+        and available balance. Kalshi takes a whole-contract count with no
+        dollar minimum, so rounding a clip to zero would silently drop a bet.
         """
         if price <= 0.0 or price >= 1.0:
             return {"fraction": 0.0, "stake": 0.0, "contracts": 0}
@@ -97,7 +102,15 @@ class AllNoKalshiKellySizer:
 
         stake = fraction  # a fraction of the book; the caller multiplies by balance
         # One contract's cost, so the count is the whole contracts the stake buys.
-        contracts = max(MIN_ORDER_CONTRACTS, int(fraction / price))
+        kelly_contracts = max(MIN_ORDER_CONTRACTS, int(fraction / price))
+
+        # FULL BLAST: target at least TARGET_CONTRACTS_PER_TRADE contracts,
+        # using available balance as the hard ceiling.
+        target = TARGET_CONTRACTS_PER_TRADE
+        balance_ceiling = int(balance / price) if price > 0 else 0
+        contracts = min(max(kelly_contracts, target), MAX_CONTRACTS_PER_MARKET, balance_ceiling)
+        contracts = max(MIN_ORDER_CONTRACTS, contracts)
+
         return {"fraction": fraction, "stake": stake, "contracts": contracts}
 
 
@@ -505,7 +518,7 @@ class AllNoStrategy:
             edge_result = EdgeFilter.calculate_edge(
                 ai_probability=fair_no_prob,
                 market_probability=market_no_prob,
-                confidence=0.75,  # Conservative confidence
+                confidence=MIN_CONFIDENCE_FOR_TRADE,
                 price=no_price,
                 contracts=1,
                 is_maker=True  # Maker entries
@@ -539,7 +552,7 @@ class AllNoStrategy:
                 "fair_probability": fair_no_prob,
                 "edge": edge_result.edge_magnitude,
                 "edge_percentage": edge_result.edge_percentage,
-                "confidence": 0.75,
+                "confidence": MIN_CONFIDENCE_FOR_TRADE,
                 "volume": market.volume,
                 "hours_to_expiry": hours_to_expiry if close_time_str else 24,
                 "is_maker": True,
@@ -565,8 +578,10 @@ class AllNoStrategy:
             fair_prob = opportunity["fair_probability"]
             confidence = opportunity["confidence"]
 
-            # Calculate Kelly sizing
-            buy_amount = AllNoKalshiKellySizer.calculate_buy_amount(fair_prob, entry_price)
+            # Calculate Kelly sizing - FULL BLAST with balance passed in
+            buy_amount = AllNoKalshiKellySizer.calculate_buy_amount(
+                fair_prob, entry_price, balance=available_cash
+            )
 
             if buy_amount["contracts"] <= 0:
                 return None
@@ -683,13 +698,27 @@ class AllNoStrategy:
         if mode not in (MODE_DRY, MODE_LIVE):
             raise ValueError(f"Invalid mode: {mode}")
 
+        # CRITICAL: verify book mode at startup. The strategy_bootstrap
+        # validator kills any process whose book mode doesn't match the
+        # persisted mode. Without this call the ALL NO lane dies on boot.
+        try:
+            from src.jobs.strategy_bootstrap import verify_book_mode_at_startup
+
+            expected = "live" if mode == MODE_LIVE else "paper"
+            await verify_book_mode_at_startup("all_no_markets", expected_mode=expected)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            self.logger.error(f"❌ Book mode verification failed: {exc}")
+            raise
+
         self.logger.info(f"🚀 ALL NO MARKETS strategy starting ({mode.upper()} mode)")
         self.logger.info(f"   Book balance: $250.00 (SEPARATE from DRY $300)")
         self.logger.info(f"   Mode: {mode.upper()}")
         self.logger.info(f"   Separation: COMPLETE - no crossover with main books")
-        self.logger.info(f"   Strategy: NO-side maker entries, quarter-Kelly, 20% max clip")
-        self.logger.info(f"   Entry criteria: Edge > 6%, confidence > 40%, NO price 80-95c")
-        self.logger.info(f"   Exit strategy: Profit at 95c+, stop at -10%, time-based")
+        self.logger.info(f"   Strategy: NO-side maker entries, FULL KELLY, 80% max clip")
+        self.logger.info(f"   Entry criteria: Edge > 2%, confidence > 55%, NO price 70-98c")
+        self.logger.info(f"   Exit strategy: Profit at 97c+, stop at -20%, 24h time-based")
 
         # Ensure schema and seed
         await self.all_no_book.ensure_schema()
@@ -701,6 +730,18 @@ class AllNoStrategy:
             raise RuntimeError("ALL NO book separation from DRY book not verified!")
 
         self.logger.info("✅ Separation guarantee verified")
+
+        # Stamp heartbeat so the supervisor sees this process as alive.
+        # Without this the lane's first heartbeat is minutes away and the
+        # supervisor respawns it (then kills it on the next book-mode check).
+        try:
+            from src.utils.strategy_runtime import StrategyRuntime
+
+            runtime_store = StrategyRuntime(self.db_path)
+            runtime_mode = "live" if mode == MODE_LIVE else "paper"
+            await runtime_store.record_heartbeat("all_no_markets", runtime_mode)
+        except Exception:
+            pass
 
         try:
             cycle = 0
@@ -716,6 +757,18 @@ class AllNoStrategy:
                     )
                 else:
                     self.logger.debug(f"📭 No ALL NO {mode.upper()} positions this cycle")
+
+                # Stamp heartbeat every cycle so the supervisor always sees
+                # this process as alive - this is what stops the lane from
+                # being killed and respawned every few minutes.
+                try:
+                    from src.utils.strategy_runtime import StrategyRuntime
+
+                    runtime_store = StrategyRuntime(self.db_path)
+                    runtime_mode = "live" if mode == MODE_LIVE else "paper"
+                    await runtime_store.record_heartbeat("all_no_markets", runtime_mode)
+                except Exception:
+                    pass
 
                 if not loop:
                     break
