@@ -2154,12 +2154,10 @@ _SQL_NO_OPEN = (
     " ROUND(quantity * entry_price, 4) AS cost,"
     " COALESCE(entry_fair, 0) AS entry_fair,"
     " COALESCE(NULLIF(strategy, ''), 'unattributed') AS strategy,"
-    " COALESCE(stop_loss_price, 0) AS stop_loss_price,"
-    " COALESCE(take_profit_price, 0) AS take_profit_price,"
+    " 0 AS stop_loss_price, 0 AS take_profit_price,"
     " COALESCE(confidence, 0) AS confidence,"
     " status, COALESCE(NULLIF(mode, ''), 'dry') AS mode, timestamp"
-    " FROM positions WHERE side = 'NO' AND status != 'closed'"
-    " AND COALESCE(NULLIF(strategy, ''), '') = 'all_no'"
+    " FROM all_no_positions WHERE side = 'NO' AND status != 'closed'"
     " ORDER BY timestamp DESC LIMIT 300"
 )
 _SQL_NO_CLOSED = (
@@ -2171,10 +2169,8 @@ _SQL_NO_CLOSED = (
     " COALESCE(NULLIF(strategy, ''), 'unattributed') AS strategy,"
     " COALESCE(exit_reason, '') AS exit_reason,"
     " COALESCE(NULLIF(mode, ''), 'dry') AS mode,"
-    " entry_timestamp, exit_timestamp FROM trade_logs"
+    " entry_timestamp, exit_timestamp FROM all_no_trade_logs"
     " WHERE side = 'NO'"
-    " AND COALESCE(exit_reason, '') != 'no_kalshi_position'"
-    " AND COALESCE(NULLIF(strategy, ''), '') = 'all_no'"
     " ORDER BY COALESCE(exit_timestamp, entry_timestamp) DESC LIMIT 300"
 )
 _SQL_NO_TALLY = (
@@ -2185,9 +2181,7 @@ _SQL_NO_TALLY = (
     " COALESCE(SUM(fee_paid), 0.0) AS fees,"
     " COALESCE(AVG(entry_price), 0.0) AS avg_entry,"
     " COALESCE(SUM(quantity * entry_price), 0.0) AS cost"
-    " FROM trade_logs WHERE side = 'NO'"
-    " AND COALESCE(exit_reason, '') != 'no_kalshi_position'"
-    " AND COALESCE(NULLIF(strategy, ''), '') = 'all_no'"
+    " FROM all_no_trade_logs WHERE side = 'NO'"
 )
 _SQL_NO_OPEN_TALLY = (
     "SELECT COUNT(*) AS positions,"
@@ -2197,8 +2191,7 @@ _SQL_NO_OPEN_TALLY = (
     # underpriced by ~4pp, the clearest statistical edge on the board.
     " COALESCE(SUM(CASE WHEN entry_price >= 0.84 AND entry_price <= 0.92"
     " THEN 1 ELSE 0 END), 0) AS sweet"
-    " FROM positions WHERE side = 'NO' AND status != 'closed'"
-    " AND COALESCE(NULLIF(strategy, ''), '') = 'all_no'"
+    " FROM all_no_positions WHERE side = 'NO' AND status != 'closed'"
 )
 
 
