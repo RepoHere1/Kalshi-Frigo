@@ -15,6 +15,11 @@ config.json
 trading_system.db
 e2e_test_trading_system.db
 
+# Core dumps
+core
+core.*
+*.core
+
 # Logs
 logs/
 *.log
