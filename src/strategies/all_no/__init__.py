@@ -92,6 +92,10 @@ class AllNoKalshiKellySizer:
         TARGET_CONTRACTS_PER_TRADE or more, capped by MAX_CONTRACTS_PER_MARKET
         and available balance. Kalshi takes a whole-contract count with no
         dollar minimum, so rounding a clip to zero would silently drop a bet.
+
+        The clip is a FRACTION of the book, so it must be multiplied by the
+        balance before dividing by the contract price. A raw fraction/price
+        division silently ignores the balance and can deploy the whole book.
         """
         if price <= 0.0 or price >= 1.0:
             return {"fraction": 0.0, "stake": 0.0, "contracts": 0}
@@ -100,18 +104,29 @@ class AllNoKalshiKellySizer:
         if fraction <= 0.0:
             return {"fraction": 0.0, "stake": 0.0, "contracts": 0}
 
-        stake = fraction  # a fraction of the book; the caller multiplies by balance
-        # One contract's cost, so the count is the whole contracts the stake buys.
-        kelly_contracts = max(MIN_ORDER_CONTRACTS, int(fraction / price))
+        # The Kelly fraction is a share of the BOOK, so the dollar stake is
+        # fraction * balance. One contract costs `price`, so the count is
+        # stake_dollars / price. This is what makes the clip balance-aware.
+        stake_dollars = fraction * balance
+        kelly_contracts = max(MIN_ORDER_CONTRACTS, int(stake_dollars / price))
 
         # FULL BLAST: target at least TARGET_CONTRACTS_PER_TRADE contracts,
         # using available balance as the hard ceiling.
         target = TARGET_CONTRACTS_PER_TRADE
         balance_ceiling = int(balance / price) if price > 0 else 0
-        contracts = min(max(kelly_contracts, target), MAX_CONTRACTS_PER_MARKET, balance_ceiling)
+        # The max-clip cap is ALSO a dollar cap: ALL_NO_MAX_CLIP_PCT of the
+        # book. Without it the target can override the Kelly fraction and
+        # deploy 100% of the book in one trade.
+        clip_ceiling = int(ALL_NO_MAX_CLIP_PCT * balance / price) if price > 0 else 0
+        contracts = min(
+            max(kelly_contracts, target),
+            MAX_CONTRACTS_PER_MARKET,
+            balance_ceiling,
+            clip_ceiling,
+        )
         contracts = max(MIN_ORDER_CONTRACTS, contracts)
 
-        return {"fraction": fraction, "stake": stake, "contracts": contracts}
+        return {"fraction": fraction, "stake": stake_dollars, "contracts": contracts}
 
 
 class AllNoKalshiBook:
