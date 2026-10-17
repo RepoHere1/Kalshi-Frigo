@@ -793,12 +793,16 @@ class AllNoStrategy:
         await self.all_no_book.ensure_schema()
         await self.all_no_book.seed_book()
 
-        # Check balance and reset if negative (due to previous bugs)
+        # Check balance and reset if too low (due to previous bugs that
+        # deployed too much of the book). Reset when the balance is below
+        # 50% of starting - the book is meant to compound from $250, not
+        # sit at a cent.
         dry_balance = await self.all_no_book.get_balance(MODE_DRY)
         live_balance = await self.all_no_book.get_balance(MODE_LIVE)
-        if dry_balance["cash"] < 0 or live_balance["cash"] < 0:
+        _min_cash = ALL_NO_STARTING_BALANCE * 0.5
+        if dry_balance["cash"] < _min_cash or live_balance["cash"] < _min_cash:
             self.logger.warning(
-                f"ALL NO book balance negative (DRY: ${dry_balance['cash']:.2f}, "
+                f"ALL NO book balance too low (DRY: ${dry_balance['cash']:.2f}, "
                 f"LIVE: ${live_balance['cash']:.2f}). Resetting to starting balance."
             )
             await self.all_no_book.reset_to_starting_balance(MODE_DRY)
