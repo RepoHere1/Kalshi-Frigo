@@ -2155,7 +2155,7 @@ _SQL_NO_OPEN = (
     " COALESCE(entry_fair, 0) AS entry_fair,"
     " COALESCE(NULLIF(strategy, ''), 'unattributed') AS strategy,"
     " 0 AS stop_loss_price, 0 AS take_profit_price,"
-    " COALESCE(confidence, 0) AS confidence,"
+    " 0 AS confidence,"
     " status, COALESCE(NULLIF(mode, ''), 'dry') AS mode, timestamp"
     " FROM all_no_positions WHERE side = 'NO' AND status != 'closed'"
     " ORDER BY timestamp DESC LIMIT 300"
