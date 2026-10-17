@@ -2286,7 +2286,7 @@ def _row_no_open_tally(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 #
 # The kernel lives in src/utils/position_sizing.py (the one home, pinned by
 # tests/test_position_sizing.py). This is POLICY, which is where a strategy is
-# allowed its own multiplier and caps: quarter-Kelly, and never more than a
+# allowed its own multiplier and caps: full-Kelly, and never more than a
 # fifth of the book on one clip.
 #
 # For a NO contract bought at price P with a model fair of F:
@@ -6474,7 +6474,7 @@ button.loading.yellow::after {
     <ol class="steps">
       <li><b>Ingest</b> &mdash; pulls open markets from the Kalshi API and upserts prices into <code>markets</code>.</li>
       <li><b>Decide</b> &mdash; scores each eligible market with an LLM pass via OpenRouter, under a daily cost budget.</li>
-      <li><b>Execute</b> &mdash; sizes with quarter-Kelly and places orders, with price-sanity and fail-closed balance checks.</li>
+      <li><b>Execute</b> — sizes with full-Kelly and places orders, with price-sanity and fail-closed balance checks.</li>
       <li><b>Track</b> &mdash; monitors open positions and closes them on stop-loss, take-profit, time or resolution, writing each close to <code>trade_logs</code>.</li>
       <li><b>Evaluate</b> &mdash; aggregates realized P&amp;L, win rate and per-strategy attribution.</li>
     </ol>

@@ -452,11 +452,16 @@ class AllNoStrategy:
 
             db_manager = DatabaseManager(self.db_path)
 
-            # Get eligible markets with volume and expiry filters
+            # Get eligible markets with volume and expiry filters.
+            # ALL NO has its own separate position book, so it must NOT
+            # be filtered out by has_position=0 — that flag tracks the
+            # main book's positions and would silently exclude every
+            # market the main book already holds, leaving only 2 markets.
             try:
                 markets = await db_manager.get_eligible_markets(
                     volume_min=MIN_VOLUME_FOR_TRADE,
-                    max_days_to_expiry=30
+                    max_days_to_expiry=30,
+                    ignore_has_position=True,
                 )
             except Exception:
                 self.logger.warning("⚠️  Could not fetch eligible markets from DB")
@@ -709,6 +714,33 @@ class AllNoStrategy:
             # Insert into ALL NO positions table
             await self._insert_position(db_manager, position)
 
+            # CRITICAL: Actually submit the order through the broker.
+            # Without this call, every position logged is a phantom —
+            # no order ever reaches Kalshi. The position row exists but
+            # nothing was transmitted. execute_position() runs the same
+            # validation as LIVE (tradeability, price range, affordability)
+            # and submits through broker_for_mode(), so DRY rehearses
+            # what LIVE would do.
+            from src.jobs.execute import execute_position
+            from src.clients.kilo_gateway import KiloGateway
+
+            gateway = KiloGateway()
+            live_mode = (mode == MODE_LIVE)
+            success = await execute_position(
+                position=position,
+                live_mode=live_mode,
+                db_manager=db_manager,
+                gateway=gateway,
+                maker_wait_seconds=0.0,  # taker entry for ALL NO
+            )
+            if not success:
+                self.logger.error(
+                    f"❌ ALL NO order execution failed for {position.market_id}, "
+                    f"removing phantom position row"
+                )
+                await self._remove_position(db_manager, position.market_id, mode)
+                return None
+
             # DO NOT call _record_balance_change here. The get_balance()
             # method already computes the correct balance from
             # seed + realized_pnl - deployed_cost. Calling
@@ -745,6 +777,18 @@ class AllNoStrategy:
                     position.mode or "dry",
                     getattr(position, "entry_fair", None),
                 ),
+            )
+            await conn.commit()
+
+    async def _remove_position(self, db_manager: DatabaseManager, market_id: str, mode: str) -> None:
+        """Remove a phantom position row when execution fails."""
+        import aiosqlite
+
+        async with aiosqlite.connect(self.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute(
+                "DELETE FROM all_no_positions WHERE market_id = ? AND mode = ?",
+                (market_id, mode),
             )
             await conn.commit()
 

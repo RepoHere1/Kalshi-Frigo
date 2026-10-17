@@ -26,14 +26,14 @@ def client(monkeypatch, tmp_path):
 # Kelly sizing
 # ---------------------------------------------------------------------------
 class TestAllNoKelly:
-    """Quarter-Kelly for a NO contract bought at price P with model fair F."""
+    """Full-Kelly for a NO contract bought at price P with model fair F, capped at 80%."""
 
     def test_positive_edge_sizes_a_clip(self):
         # fair 0.90 against a 88c limit: b = 0.12/0.88 = 0.1364
         # f* = (0.9 * 0.1364 - 0.1) / 0.1364 = 0.16667 full Kelly
-        # quarter-Kelly = 0.041667 -> 4.17% of the book
+        # full-Kelly = 0.16667 -> 16.67% of the book
         f = wd._all_no_kelly(0.90, 0.88)
-        assert f == pytest.approx(0.0416666666666667, abs=1e-9)
+        assert f == pytest.approx(0.16666666666666666, abs=1e-9)
 
     def test_no_edge_stakes_nothing(self):
         # fair == price is a coin flip at the market's own number: no edge, no bet
@@ -48,7 +48,7 @@ class TestAllNoKelly:
             for price in (0.0, 0.05, 0.5, 0.95, 1.0):
                 assert wd._all_no_kelly(fair, price) >= 0.0
 
-    def test_the_20_percent_cap_binds_before_full_kelly(self):
+    def test_the_80_percent_cap_binds_before_full_kelly(self):
         # A near-certain fair against a mid price returns a huge full-Kelly
         # fraction. The cap is what keeps the book alive.
         f = wd._all_no_kelly(0.999, 0.50)
@@ -151,8 +151,19 @@ class TestNoBookSeparation:
         import sqlite3
 
         conn = sqlite3.connect(str(tmp_path / "sep.db"))
+        # Ensure the all_no_positions table exists (it is created by
+        # AllNoKalshiBook.ensure_schema(), not by DatabaseManager).
         conn.execute(
-            "INSERT INTO positions (market_id, side, entry_price, quantity,"
+            "CREATE TABLE IF NOT EXISTS all_no_positions ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " market_id TEXT NOT NULL, side TEXT NOT NULL DEFAULT 'NO',"
+            " entry_price REAL NOT NULL, quantity INTEGER NOT NULL,"
+            " timestamp TEXT NOT NULL, status TEXT DEFAULT 'open',"
+            " strategy TEXT DEFAULT 'all_no', mode TEXT NOT NULL DEFAULT 'dry',"
+            " entry_fair REAL)"
+        )
+        conn.execute(
+            "INSERT INTO all_no_positions (market_id, side, entry_price, quantity,"
             " timestamp, status, strategy, mode, entry_fair)"
             " VALUES ('KXHYPED-26OCT1519-T80.9999', 'NO', 0.88, 1,"
             " '2026-10-15T00:01:00', 'open', 'all_no', 'dry', 0.90)"
@@ -196,7 +207,7 @@ class TestAllNoMarketsPage:
         assert "250.00" in html
         assert "seeded at 250 once" in html
         # Kelly is on the page, in the policy and in both tables.
-        assert "quarter-Kelly" in html
+        assert "full-Kelly" in html
         assert html.count("Kelly f*") >= 2
         # Separation from the lanes is stated, not implied.
         assert "Separated from the lanes" in html

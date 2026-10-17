@@ -29,7 +29,7 @@ class APIConfig:
     dry_openrouter_api_key: str = field(default_factory=lambda: os.getenv("DRY_OPENROUTER_API_KEY", ""))
     # Free model for DRY mode AI features (veto/sentinel). Must be a real
     # `:free` OpenRouter listing — anything else burns the paid balance.
-    dry_openrouter_model: str = field(default_factory=lambda: os.getenv("DRY_OPENROUTER_MODEL", "openrouter/free"))
+    dry_openrouter_model: str = field(default_factory=lambda: os.getenv("DRY_OPENROUTER_MODEL", "openrouter/auto:free"))
 
     # xai_api_key removed — all models now route through OpenRouter
 

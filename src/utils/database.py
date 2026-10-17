@@ -659,42 +659,58 @@ class DatabaseManager(TradingLoggerMixin):
             await db.commit()
             self.logger.info(f"Upserted {len(markets)} markets.")
 
-    async def get_eligible_markets(self, volume_min: int, max_days_to_expiry: int) -> List[Market]:
-        """
-        Get markets that are eligible for trading.
+    async def get_eligible_markets(self, volume_min: int, max_days_to_expiry: int, ignore_has_position: bool = False) -> List[Market]:
+            """
+            Get markets that are eligible for trading.
 
-        Args:
-            volume_min: Minimum trading volume.
-            max_days_to_expiry: Maximum days to expiration.
+            Args:
+                volume_min: Minimum trading volume.
+                max_days_to_expiry: Maximum days to expiration.
+                ignore_has_position: If True, bypass the has_position filter so
+                    strategies with their own separate position books (like
+                    ALL NO) can scan markets the main book already holds.
 
-        Returns:
-            A list of eligible markets.
-        """
-        now_ts = int(datetime.now().timestamp())
-        max_expiry_ts = now_ts + (max_days_to_expiry * 24 * 60 * 60)
+            Returns:
+                A list of eligible markets.
+            """
+            now_ts = int(datetime.now().timestamp())
+            max_expiry_ts = now_ts + (max_days_to_expiry * 24 * 60 * 60)
 
-        async with connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                """
-                SELECT * FROM markets
-                WHERE
-                    volume >= ? AND
-                    expiration_ts > ? AND
-                    expiration_ts <= ? AND
-                    status = 'active' AND
-                    has_position = 0
-            """,
-                (volume_min, now_ts, max_expiry_ts),
-            )
-            rows = await cursor.fetchall()
+            async with connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                if ignore_has_position:
+                    cursor = await db.execute(
+                        """
+                        SELECT * FROM markets
+                        WHERE
+                            volume >= ? AND
+                            expiration_ts > ? AND
+                            expiration_ts <= ? AND
+                            status = 'active'
+                        """,
+                        (volume_min, now_ts, max_expiry_ts),
+                    )
+                else:
+                    cursor = await db.execute(
+                        """
+                        SELECT * FROM markets
+                        WHERE
+                            volume >= ? AND
+                            expiration_ts > ? AND
+                            expiration_ts <= ? AND
+                            status = 'active' AND
+                            has_position = 0
+                        """,
+                        (volume_min, now_ts, max_expiry_ts),
+                    )
+                rows = await cursor.fetchall()
 
-            markets = []
-            for row in rows:
-                market_dict = dict(row)
-                market_dict["last_updated"] = datetime.fromisoformat(market_dict["last_updated"])
-                markets.append(Market(**market_dict))
-            return markets
+                markets = []
+                for row in rows:
+                    market_dict = dict(row)
+                    market_dict["last_updated"] = datetime.fromisoformat(market_dict["last_updated"])
+                    markets.append(Market(**market_dict))
+                return markets
 
     async def get_markets_with_positions(self) -> set[str]:
         """

@@ -1,0 +1,9 @@
+# Exclude local files from Railway deployment
+trading_system.db
+trading_system.db-wal
+trading_system.db-shm
+logs/
+.kilo/
+core
+cur_fail.txt
+*.log
