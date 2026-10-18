@@ -3331,6 +3331,109 @@ def api_dry_reset():
     return jsonify({"ok": True, "dry": account})
 
 
+@app.route("/api/dry/wipe", methods=["POST"])
+def api_dry_wipe():
+    """Wipe the buggy DRY book rows from a cutoff onward.
+
+    The 64x-leverage era left 2,238 open positions and $446,935 deployed on
+    the DRY book. The cap now blocks new entries, but the book stays
+    over-exposed until those rows are gone, and the derived cash reads
+    $-446,504.25 against a $300 baseline. This is the surgical fix: it deletes
+    DRY rows (positions and trade_logs, plus the DRY-only all_no tables) whose
+    timestamp is at or after the cutoff, and rebases the DRY baseline to the
+    amount given. Every row before the cutoff - the legitimate history - is
+    untouched, so the curve still tells the truth.
+
+    Pass `?confirm=1` to actually delete. Without it the endpoint returns what
+    it WOULD do, read-only, so a mistyped cutoff is visible before it costs.
+    """
+    denied = require_token()
+    if denied is not None:
+        return denied
+    from src.utils.mode import run
+
+    data = request.get_json(silent=True) or {}
+    try:
+        cutoff = (data.get("cutoff") or "2026-10-17T23:43:00").strip()
+        baseline = round(float(data.get("baseline", 300.0)), 2)
+    except (TypeError, ValueError):
+        return jsonify({"error": "cutoff/baseline must be valid"}), 400
+    confirm = request.args.get("confirm") == "1" or data.get("confirm") is True
+
+    mgr = _mode_manager()
+    dry_filter = "COALESCE(NULLIF(mode, ''), 'dry') = 'dry'"
+
+    async def _count() -> Dict[str, int]:
+        import aiosqlite
+
+        async with aiosqlite.connect(DB_PATH) as conn:
+            conn.row_factory = aiosqlite.Row
+            out: Dict[str, int] = {}
+            # `positions` timestamps the entry, `trade_logs` timestamps the
+            # close - they are not the same column, so each is queried by its
+            # own name and a missing table reads as -1 rather than crashing.
+            for table, col in (("positions", "timestamp"), ("trade_logs", "entry_timestamp")):
+                try:
+                    cur = await conn.execute(
+                        f"SELECT COUNT(*) AS n FROM {table} WHERE {dry_filter}"
+                        f" AND {col} >= ?",
+                        (cutoff,),
+                    )
+                    out[table] = (await cur.fetchone())["n"]
+                except Exception:  # noqa: BLE001
+                    out[table] = -1
+            for table in ("all_no_positions", "all_no_trade_logs"):
+                try:
+                    cur = await conn.execute(
+                        f"SELECT COUNT(*) AS n FROM {table} WHERE ts >= ?", (cutoff,)
+                    )
+                    out[table] = (await cur.fetchone())["n"]
+                except Exception:  # noqa: BLE001
+                    out[table] = -1
+            return out
+
+    async def _wipe() -> Dict[str, int]:
+        import aiosqlite
+
+        async with aiosqlite.connect(DB_PATH) as conn:
+            deleted: Dict[str, int] = {}
+            for table, col in (("positions", "timestamp"), ("trade_logs", "entry_timestamp")):
+                cur = await conn.execute(
+                    f"DELETE FROM {table} WHERE {dry_filter} AND {col} >= ?",
+                    (cutoff,),
+                )
+                deleted[table] = cur.rowcount
+            for table in ("all_no_positions", "all_no_trade_logs"):
+                try:
+                    cur = await conn.execute(
+                        f"DELETE FROM {table} WHERE ts >= ?", (cutoff,)
+                    )
+                    deleted[table] = cur.rowcount
+                except Exception:  # noqa: BLE001
+                    deleted[table] = -1
+            await conn.commit()
+            return deleted
+
+    try:
+        would = run(_count())
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+
+    if not confirm:
+        return jsonify({"ok": False, "would_delete": would, "cutoff": cutoff})
+
+    try:
+        deleted = run(_wipe())
+        run(mgr.set_dry_cash(baseline))
+    except Exception as e:  # noqa: BLE001
+        _push_error(f"DRY wipe: {e}")
+        return jsonify({"error": str(e)}), 500
+
+    account = run(mgr.dry_account())
+    _broadcast("mode", {"mode": run(mgr.current()), "action": "dry_wipe"})
+    return jsonify({"ok": True, "deleted": deleted, "dry": account})
+
+
 @app.route("/api/strategies/reset-state", methods=["POST"])
 def api_strategies_reset_state():
     """THE LATCH RESET (operator order): kill the one part of the volume that
@@ -5170,8 +5273,13 @@ def _account_payload(mode: str) -> Dict[str, Any]:
         cash = float(account.get("cash") or 0.0)
         equity = float(account.get("equity") or 0.0)
         exposure = float(account.get("deployed") or 0.0)
-        realized = today_pnl
+        # The card's headline stats are the BOOK's, not today's: realized is the
+        # sum of every close in the book and closed_trades is every close. Using
+        # today's figures instead made the card report 0 realized / 0 closes
+        # with a $180.76 total_pnl next to it - the two could not both be true.
+        realized = float(account.get("realized") or 0.0)
         total_pnl = float(account.get("total_pnl") or 0.0)
+        closed_trades = int(account.get("closed_trades") or 0)
         label = "DRY account — simulated money"
     else:
         account = _kalshi_account()
@@ -5184,6 +5292,14 @@ def _account_payload(mode: str) -> Dict[str, Any]:
         label = "LIVE Kalshi account"
 
     open_positions = int(account.get("open_positions") or 0)
+    # closed_trades is the book's total closes (DRY) or today's (LIVE, where the
+    # real ledger is the fill history and has no "total closes" column).
+    if dry_book:
+        closed_trades = int(account.get("closed_trades") or 0)
+        losses = max(closed_trades - wins_today, 0)
+    else:
+        closed_trades = trades_today
+        losses = max(trades_today - wins_today, 0)
 
     return {
         "book": "dry" if dry_book else "live",
@@ -5192,12 +5308,12 @@ def _account_payload(mode: str) -> Dict[str, Any]:
         "equity": round(equity, 2),
         "exposure": exposure,
         "starting_balance": round(starting, 2),
-        "realized": realized,
-        "total_pnl": total_pnl,
+        "realized": round(realized, 2),
+        "total_pnl": round(total_pnl, 2),
         "open_positions": open_positions,
-        "closed_trades": trades_today,
+        "closed_trades": closed_trades,
         "wins": wins_today,
-        "losses": max(trades_today - wins_today, 0),
+        "losses": losses,
         "today": {
             "pnl": today_pnl,
             "trades": trades_today,
