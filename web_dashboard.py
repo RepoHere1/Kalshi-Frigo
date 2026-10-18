@@ -3946,72 +3946,8 @@ def api_live_flatten():
 # ---------------------------------------------------------------------------
 # Routes — HTML
 # ---------------------------------------------------------------------------
-@app.route("/all-no-markets")
-def all_no_markets():
-    """Serve the ALL NO MARKETS page — white background, black cards, NO-side only.
-
-    Every row on this page is a NO (limit/maker) order: the lanes rest buys at
-    the side's bid rather than crossing the spread, which is what the backtested
-    NO-side strategy requires (Kalshi taker fees are 7% vs 1.75% maker, and the
-    84-92c NO band carries the favorite-longshot edge). The page is read-only -
-    no order is placed, cancelled or modified from here.
-    """
-    # Read the NO LANES ON/OFF state so the button reflects the same setting
-    # as the DRY/LIVE dashboard.
-    try:
-        _mgr = _mode_manager()
-        _no_lanes_all_no = _get_no_lanes_enabled(_mgr)
-    except Exception:
-        _no_lanes_all_no = False
-
-    open_rows, closed_rows, tally, open_tally = [], [], {}, {}
-    book = _all_no_book()
-    try:
-        res = _db_many(
-            [
-                (_SQL_NO_OPEN, ()),
-                (_SQL_NO_CLOSED, ()),
-                (_SQL_NO_TALLY, ()),
-                (_SQL_NO_OPEN_TALLY, ()),
-            ]
-        )
-        open_rows = _row_no_open(res[0])
-        closed_rows = _row_no_closed(res[1])
-        tally = _row_no_tally(res[2])
-        open_tally = _row_no_open_tally(res[3])
-    except Exception as e:
-        _push_error(f"DB query for all-no-markets: {e}")
-
-    # The page lives in its own HTML file (static/all_no_markets.html) so the
-    # markup can be edited without touching this module. It is read from disk
-    # and rendered as a Jinja source rather than served raw, because every
-    # tally and every row is real database output interpolated server-side.
-    # A missing file renders the empty state rather than a 500: the numbers are
-    # the point, and an unreadable page hides them worse than an empty one.
-    try:
-        source = (BASE_DIR / "static" / "all_no_markets.html").read_text(errors="replace")
-    except OSError as e:
-        _push_error(f"all_no_markets.html unreadable: {e}")
-        source = "<p class='empty'>all_no_markets.html could not be read.</p>"
-
-    return render_template_string(
-        source,
-        open_rows=open_rows,
-        closed_rows=closed_rows,
-        tally=tally,
-        open_tally=open_tally,
-        book=book,
-        no_lanes_enabled=bool(_no_lanes_all_no),
-        token=_configured_token(),
-        kelly={
-            "multiplier": ALL_NO_KELLY_MULTIPLIER,
-            "max_clip_pct": ALL_NO_MAX_CLIP_PCT,
-            # What a fixture edge at the middle of the sweet spot would size to,
-            # so the rule on the page is a worked example, not a claim.
-            "example": _all_no_buy_amount(0.90, 0.88),
-        },
-        now=_now(),
-    )
+# ALL NO MARKETS section is now integrated into the main dashboard template at the bottom
+# The ALL NO functionality is accessible via the dashboard interface
 
 
 @app.route("/")
@@ -7964,15 +7900,78 @@ safeRun(loadLogs, 'loadLogs');
 safeRun(() => paintMode({ mode: SNAPSHOT.mode.mode }), 'paintMode');
 safeRun(refresh, 'refresh');
 safeRun(refreshFeeds, 'refreshFeeds');
-</script>
+  <!-- ALL NO MARKETS section is now integrated into the main dashboard -->
+  <div class="panel all-no-panel">
+    <div class="ph">
+      <h2>ALL NO MARKETS</h2>
+      <span class="note">NO side only, maker entries, read-only &middot; every row below is a *NO* LANE contract entered with a resting limit order at the side's bid</span>
+      <div class="tools">
+        <input id="noFilter" type="text" placeholder="filter market / strategy" onkeyup="filterRows('noFilter','noBody')">
+        <button onclick="clearFilter('noFilter','noBody')">clear</button>
+      </div>
+    </div>
+    <div class="pb">
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Market</th>
+              <th>Strategy</th>
+              <th>Side</th>
+              <th class="num">Limit entry</th>
+              <th class="num">Qty</th>
+              <th class="num">Cost</th>
+              <th class="num">Model fair</th>
+              <th class="num">Edge</th>
+              <th class="num">Kelly f*</th>
+              <th class="num">Stop</th>
+              <th class="num">Take profit</th>
+              <th class="num">Conf</th>
+              <th>Expiration</th>
+              <th>Status</th>
+              <th>Book</th>
+              <th>Opened (UTC)</th>
+            </tr>
+          </thead>
+          <tbody id="noBody">
+            {% for r in open_rows %}
+            <tr class="{{ 'band' if 0.84 <= r.entry_price <= 0.92 }}">
+              <td class="mono">{{ r.id }}</td>
+              <td class="mono">{{ r.market_id }}</td>
+              <td>{{ r.strategy }}</td>
+              <td><span class="badge no">*NO* LANE</span></td>
+              <td class="num">{{ '%.1f'|format(r.entry_price * 100) }}&cent;</td>
+              <td class="num">{{ r.quantity }}</td>
+              <td class="num">{{ '%.2f'|format(r.cost) }}</td>
+              <td class="num">{{ '%.1f'|format(r.entry_fair * 100) }}&cent;</td>
+              <td class="num {{ 'up' if r.edge > 0 else ('down' if r.edge < 0 else 'flat') }}">{{ '%+.1f'|format(r.edge * 100) }}pp</td>
+              <td class="num {{ 'up' if r.kelly > 0 else 'flat' }}">{{ '%.2f'|format(r.kelly) }}%</td>
+              <td class="num">{{ ('%.1f'|format(r.stop_loss * 100) ~ '¢') if r.stop_loss > 0 else '—' }}</td>
+              <td class="num">{{ ('%.1f'|format(r.take_profit * 100) ~ '¢') if r.take_profit > 0 else '—' }}</td>
+              <td class="num">{{ '%.2f'|format(r.confidence) }}</td>
+              <td class="{{ 'band' if r.expiration else '' }}">{{ r.expiration or '—' }}</td>
+              <td><span class="badge {{ 'closing' if r.status == 'closing' else 'open' }}">{{ r.status }}</span></td>
+              <td><span class="badge {{ 'live' if r.mode == 'live' else 'dry' }}">{{ r.mode|upper }}</span></td>
+              <td class="mono">{{ r.timestamp[:19].replace('T', ' ') }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="17" class="empty">No open *NO* LANE positions in this book &mdash; the up/down lanes keep their own clips, and this book has not placed one yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <footer>
+    <p>Kalshi-Frigo Trading Dashboard &middot; ALL NO MARKETS are integrated into the main dashboard at the bottom</p>
+  </footer>
+</div>
 </body>
 </html>
 """
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 _workers_started = False
 
 
