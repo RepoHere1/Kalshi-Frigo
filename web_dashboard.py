@@ -5296,9 +5296,11 @@ def _account_payload(mode: str) -> Dict[str, Any]:
     # real ledger is the fill history and has no "total closes" column).
     if dry_book:
         closed_trades = int(account.get("closed_trades") or 0)
-        losses = max(closed_trades - wins_today, 0)
+        wins = int(account.get("wins") or 0)
+        losses = int(account.get("losses") or 0)
     else:
         closed_trades = trades_today
+        wins = wins_today
         losses = max(trades_today - wins_today, 0)
 
     return {
@@ -5312,8 +5314,9 @@ def _account_payload(mode: str) -> Dict[str, Any]:
         "total_pnl": round(total_pnl, 2),
         "open_positions": open_positions,
         "closed_trades": closed_trades,
-        "wins": wins_today,
+        "wins": wins,
         "losses": losses,
+        "win_rate": round(wins / closed_trades * 100, 1) if closed_trades else 0.0,
         "today": {
             "pnl": today_pnl,
             "trades": trades_today,
