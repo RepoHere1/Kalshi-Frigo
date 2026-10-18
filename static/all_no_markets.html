@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Kalshi-Frigo — ALL NO MARKETS</title>
+  <title>Kalshi-Frigo — *NO* LANE MARKETS</title>
   <style>
     /* ---------- palette ----------
        White page, black cards. The page reads as a ledger, not a terminal:
@@ -126,7 +126,7 @@
     .badge.dry{background:#262626;color:var(--dim)}
     .badge.live{background:rgba(248,113,113,.18);color:var(--down)}
     .band{background:rgba(251,191,36,.10)}
-    /* NO LANES toggle - black by default, YELLOW when ON */
+    /* *NO* LANES toggle - black by default, YELLOW when ON */
     .nolanes-btn{
       background:#0a0a0a;color:#f5f5f5;border:1px solid #d4d4d4;
       padding:6px 14px;border-radius:8px;cursor:pointer;
@@ -152,46 +152,43 @@
 <header>
   <div class="brand">
     <div class="logo" aria-hidden="true">
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32"><rect width="32" height="32" rx="8" fill="#ffffff" stroke="#d4d4d4"/><text x="16" y="23" font-size="17" font-weight="bold" text-anchor="middle" fill="#0a0a0a">N</text></svg>
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32"><rect width="32" height="32" rx="8" fill="#ffffff" stroke="#d4d4d4"/><text x="16" y="23" font-size="17" font-weight="bold" text-anchor="middle" fill="#0a0a0a">*N*</text></svg>
     </div>
     <div class="brandtext">
-      <h1>ALL NO MARKETS <span>&middot; limit-order NO side only</span></h1>
-      <div class="sub">Kalshi NO contracts &middot; maker (limit) entries &middot; open &amp; closed ledger</div>
+      <h1>*NO* LANE MARKETS <span>&middot; limit-order *NO* LANE side only</span></h1>
+      <div class="sub">Kalshi *NO* LANE contracts &middot; maker (limit) entries &middot; open &amp; closed ledger</div>
     </div>
   </div>
   <a class="back" href="/">&larr; DASHBOARD</a>
-  <button class="nolanes-btn {{ 'on' if no_lanes_enabled else '' }}" id="noLanesBtn" onclick="toggleNoLanes()">NO LANES {{ 'ON' if no_lanes_enabled else 'OFF' }}</button>
+  <button class="nolanes-btn {{ 'on' if no_lanes_enabled else '' }}" id="noLanesBtn" onclick="toggleNoLanes()">*NO* LANES {{ 'ON' if no_lanes_enabled else 'OFF' }}</button>
   <div class="stamp">Rendered {{ now }}</div>
 </header>
 
-<!-- What the page is, and what it is not. Read-only: no order is placed,
-     cancelled or modified from here. -->
-<div class="rule">
-  <b>NO side only, in its own book.</b> Every row below is a <b>NO</b> contract
-  entered with a <b>resting limit order</b> at the side's bid &mdash; not by
-  crossing the spread, which is what the backtested strategy requires (Kalshi
-  taker fees are <span class="mono">7%</span> against
-  <span class="mono">1.75%</span> for makers, and the
-  <span class="mono">84&ndash;92&cent;</span> NO band carries the
-  favorite-longshot edge). Prices are the <b>limit actually rested</b>, not the
-  ask a taker would have paid.<br>
-  <b>Separated from the lanes.</b> This book's money, positions and closed
-  trades are its own: a fake <span class="mono">${{ '%.0f'|format(book.starting) }}</span>
-  seeded once and never re-funded, and every row tagged
-  <span class="mono">strategy&nbsp;=&nbsp;all_no</span>. The BTC / ETH / XRP /
-  HYPE up-down lanes keep their own clips, tallies and balances and never
-  appear here.<br>
-  <b>Sizing: full-Kelly.</b> Clip size is
-  <span class="mono">f*&nbsp;=&nbsp;(fair&nbsp;&times;&nbsp;b&nbsp;&minus;&nbsp;(1&minus;fair))&nbsp;/&nbsp;b</span>
-  with <span class="mono">b&nbsp;=&nbsp;(1&minus;price)&nbsp;/&nbsp;price</span>
-  for a NO contract, multiplied by <span class="mono">{{ '%.2f'|format(kelly.multiplier) }}</span>
-  and capped at <span class="mono">{{ '%.0f'|format(kelly.max_clip_pct * 100) }}%</span>
-  of the book per clip, rounded to whole contracts with a floor of one.
-  <span class="mono">f*</span> is the share of the book at risk, so a
-  <span class="mono">${{ '%.2f'|format(kelly.example.stake * 250 if kelly.example.stake else 0) }}</span>
-  clip at fair <span class="mono">0.90</span> against a
-  <span class="mono">88&cent;</span> limit is the worked example.
-  <b>Read-only</b> &mdash; nothing here places, cancels or edits an order.
+Every row below is a *NO* LANE contract
+   entered with a <b>resting limit order</b> at the side's bid &mdash; not by
+   crossing the spread, which is what the backtested strategy requires (Kalshi
+   taker fees are <span class="mono">7%</span> against
+   <span class="mono">1.75%</span> for makers, and the
+   <span class="mono">84&ndash;92&cent;</span> NO band carries the
+   favorite-longshot edge). Prices are the <b>limit actually rested</b>, not the
+   ask a taker would have paid.<br>
+   <b>Separated from the lanes.</b> This book's money, positions and closed
+   trades are its own: a fake <span class="mono">${{ '%.0f'|format(book.starting) }}</span>
+   seeded once and never re-funded, and every row tagged
+   <span class="mono">strategy&nbsp;=&nbsp;all_no</span>. The BTC / ETH / XRP /
+   HYPE up-down lanes keep their own clips, tallies and balances and never
+   appear here.<br>
+   <b>Sizing: full-Kelly.</b> Clip size is
+   <span class="mono">f*&nbsp;=&nbsp;(fair&nbsp;&times;&nbsp;b&nbsp;&minus;&nbsp;(1&minus;fair))&nbsp;/&nbsp;b</span>
+   with <span class="mono">b&nbsp;=&nbsp;(1&minus;price)&nbsp;/&nbsp;price</span>
+   for a *NO* LANE contract, multiplied by <span class="mono">{{ '%.2f'|format(kelly.multiplier) }}</span>
+   and capped at <span class="mono">{{ '%.0f'|format(kelly.max_clip_pct * 100) }}%</span>
+   of the book per clip, rounded to whole contracts with a floor of one.
+   <span class="mono">f*</span> is the share of the book at risk, so a
+   <span class="mono">${{ '%.2f'|format(kelly.example.stake * 250 if kelly.example.stake else 0) }}</span>
+   clip at fair <span class="mono">0.90</span> against a
+   <span class="mono">88&cent;</span> limit is the worked example.
+   <b>Read-only</b> &mdash; nothing here places, cancels or modifies an order.
 </div>
 
 <!-- ============ TALLIES ============ -->
@@ -310,6 +307,7 @@
             <th class="num">Stop</th>
             <th class="num">Take profit</th>
             <th class="num">Conf</th>
+            <th>Expiration</th>
             <th>Status</th>
             <th>Book</th>
             <th>Opened (UTC)</th>
@@ -321,7 +319,7 @@
             <td class="mono">{{ r.id }}</td>
             <td class="mono">{{ r.market_id }}</td>
             <td>{{ r.strategy }}</td>
-            <td><span class="badge no">NO</span></td>
+            <td><span class="badge no">*NO* LANE</span></td>
             <td class="num">{{ '%.1f'|format(r.entry_price * 100) }}&cent;</td>
             <td class="num">{{ r.quantity }}</td>
             <td class="num">{{ '%.2f'|format(r.cost) }}</td>
@@ -331,12 +329,13 @@
             <td class="num">{{ ('%.1f'|format(r.stop_loss * 100) ~ '¢') if r.stop_loss > 0 else '—' }}</td>
             <td class="num">{{ ('%.1f'|format(r.take_profit * 100) ~ '¢') if r.take_profit > 0 else '—' }}</td>
             <td class="num">{{ '%.2f'|format(r.confidence) }}</td>
+            <td class="{{ 'band' if r.expiration else '' }}">{{ r.expiration or '—' }}</td>
             <td><span class="badge {{ 'closing' if r.status == 'closing' else 'open' }}">{{ r.status }}</span></td>
             <td><span class="badge {{ 'live' if r.mode == 'live' else 'dry' }}">{{ r.mode|upper }}</span></td>
             <td class="mono">{{ r.timestamp[:19].replace('T', ' ') }}</td>
           </tr>
           {% else %}
-          <tr><td colspan="16" class="empty">No open NO positions in this book &mdash; the up/down lanes keep their own clips, and this book has not placed one yet.</td></tr>
+          <tr><td colspan="17" class="empty">No open *NO* LANE positions in this book &mdash; the up/down lanes keep their own clips, and this book has not placed one yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -344,10 +343,10 @@
   </div>
 </div>
 
-<!-- ============ CLOSED NO TRADES ============ -->
+<!-- ============ CLOSED *NO* LANE TRADES ============ -->
 <div class="card panel">
   <div class="ph">
-    <h2>Closed NO trades</h2>
+    <h2>Closed *NO* LANE trades</h2>
     <span class="note">this book only &middot; newest first &middot; {{ closed_rows|length }} of {{ tally.closed }}</span>
     <div class="tools">
       <input id="closedFilter" type="text" placeholder="filter market / strategy / reason" onkeyup="filterRows('closedFilter','closedBody')">
@@ -385,9 +384,9 @@
             <td class="mono">{{ r.id }}</td>
             <td class="mono">{{ r.market_id }}</td>
             <td>{{ r.strategy }}</td>
-            <td><span class="badge no">NO</span></td>
+            <td><span class="badge no">*NO* LANE</span></td>
             <td class="num">{{ '%.1f'|format(r.entry_price * 100) }}&cent;</td>
-            <td class="num">{{ '%.1f'|format(r.exit_price * 100) }}&cent;</td>
+            <td class="num">{{ r.exit_price * 100 }}&cent;</td>
             <td class="num">{{ r.quantity }}</td>
             <td class="num">{{ '%.2f'|format(r.cost) }}</td>
             <td class="num">{{ '%.2f'|format(r.proceeds) }}</td>
@@ -413,7 +412,7 @@
 </div>
 
 <footer>
-  NO side only &middot; maker (limit) entries &middot; read-only &middot;
+  *NO* LANE side only &middot; maker (limit) entries &middot; read-only &middot;
   prices in &cent; are the limit rested &middot; model fair is the lane's
   fair-value estimate at entry
 </footer>
@@ -436,7 +435,7 @@
     filterRows(inputId, bodyId);
   }
 
-  // Toggle NO LANES ON/OFF - persisted to runtime_config so both this page
+  // Toggle *NO* LANES ON/OFF - persisted to runtime_config so both this page
   // and the DRY/LIVE dashboard see the same state.
   async function toggleNoLanes() {
     var btn = document.getElementById('noLanesBtn');
@@ -450,11 +449,11 @@
       });
       var d = await r.json().catch(() => ({}));
       if (d.error) {
-        console.error('NO LANES toggle failed:', d.error);
+        console.error('*NO* LANES toggle failed:', d.error);
         return;
       }
       btn.classList.toggle('on', next);
-      btn.textContent = 'NO LANES ' + (next ? 'ON' : 'OFF');
+      btn.textContent = '*NO* LANES ' + (next ? 'ON' : 'OFF');
     } catch (e) {
       console.error('NO LANES toggle failed:', e.message);
     }
