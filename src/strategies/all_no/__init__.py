@@ -711,8 +711,9 @@ class AllNoStrategy:
                 entry_fair=fair_prob,
             )
 
-            # Insert into ALL NO positions table
-            await self._insert_position(db_manager, position)
+            # Insert into ALL NO positions table, and stamp the row id onto the
+            # position so execute_position can record the fill against it.
+            position.id = await self._insert_position(db_manager, position)
 
             # CRITICAL: Actually submit the order through the broker.
             # Without this call, every position logged is a phantom —
@@ -754,13 +755,21 @@ class AllNoStrategy:
             self.logger.error(f"❌ Error placing NO order: {e}")
             return None
 
-    async def _insert_position(self, db_manager: DatabaseManager, position: Position) -> None:
-        """Insert position into ALL NO positions table."""
+    async def _insert_position(self, db_manager: DatabaseManager, position: Position) -> int:
+        """Insert position into ALL NO positions table and return its row id.
+
+        execute_position() refuses to submit anything whose position has no id,
+        because the fill could not be recorded against a row. This used to insert
+        the row and return nothing, so every ALL NO entry died at that check -
+        the strategy found opportunities, wrote a phantom row, then deleted it,
+        and the book never traded a single contract. Capturing lastrowid and
+        stamping it onto the position object is what makes the submission legal.
+        """
         import aiosqlite
 
         async with aiosqlite.connect(self.db_path) as conn:
             conn.row_factory = aiosqlite.Row
-            await conn.execute(
+            cursor = await conn.execute(
                 """
                 INSERT OR REPLACE INTO all_no_positions
                 (market_id, side, entry_price, quantity, timestamp, status, strategy, mode, entry_fair)
@@ -779,6 +788,7 @@ class AllNoStrategy:
                 ),
             )
             await conn.commit()
+            return cursor.lastrowid
 
     async def _remove_position(self, db_manager: DatabaseManager, market_id: str, mode: str) -> None:
         """Remove a phantom position row when execution fails."""
