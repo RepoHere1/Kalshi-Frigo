@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Dict, Optional, Tuple
 
 from typing import Any
-from src.clients.kalshi_client import KalshiClient
+from src.clients.kalshi_client import KalshiAPIError, KalshiClient
 from src.clients.kilo_gateway import KiloGateway
 from src.config.settings import settings
 from src.jobs.broker import broker_for_mode, build_order_request, default_mode_manager
