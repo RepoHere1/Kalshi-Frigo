@@ -13,6 +13,8 @@ config.json
 *.sqlite
 *.sqlite3
 trading_system.db
+trading_system.db-shm
+trading_system.db-wal
 e2e_test_trading_system.db
 
 # Core dumps
