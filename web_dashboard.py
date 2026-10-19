@@ -4099,7 +4099,7 @@ def build_snapshot_cached() -> Dict[str, Any]:
 @app.route("/all-no-markets")
 def all_no_markets():
     """Redirect to main dashboard with ALL NO MARKETS content visible.
-    
+
     The ALL NO MARKETS functionality is now integrated into the main dashboard
     at the bottom, so this route redirects users to the main dashboard where
     the ALL NO MARKETS content can be accessed.
@@ -4107,6 +4107,40 @@ def all_no_markets():
     # Redirect to main dashboard with hash anchor to ALL NO section
     # The main dashboard template now includes ALL NO MARKETS content
     return redirect("/#all-no-panel")
+
+
+@app.route("/api/all-no/reset", methods=["POST"])
+def api_all_no_reset():
+    """Reset the ALL NO MARKETS book back to its $250 starting balance.
+
+    The ALL NO book is its own entity (separate from the DRY $300), and it
+    had no reset route of its own. When the lane was dead and every entry
+    failed, phantom rows accumulated and the derived balance drifted negative;
+    the only way to recover was to delete the rows by hand. This is the
+    operator-gated equivalent of /api/dry/reset for the ALL NO book:
+    positions, trade logs and every non-seed ledger row for the mode go, and
+    the seed is re-anchored at ALL_NO_STARTING_BALANCE.
+    """
+    denied = require_token()
+    if denied is not None:
+        return denied
+    from src.utils.mode import run
+    from src.strategies.all_no import AllNoKalshiBook
+
+    data = request.get_json(silent=True) or {}
+    mode = (data.get("mode") or "dry").strip().lower()
+    if mode not in ("dry", "live"):
+        return jsonify({"error": "mode must be 'dry' or 'live'"}), 400
+
+    try:
+        book = AllNoKalshiBook(str(DB_PATH))
+        await book.ensure_schema()
+        balance = await book.reset_to_starting_balance(mode)
+    except Exception as e:  # noqa: BLE001 - surfaced to the dashboard
+        _push_error(f"ALL NO reset: {e}")
+        return jsonify({"error": str(e)}), 500
+    _broadcast("mode", {"mode": mode, "action": "all_no_reset"})
+    return jsonify({"ok": True, "mode": mode, "all_no": balance})
 
 
 @app.route("/api/snapshot")
