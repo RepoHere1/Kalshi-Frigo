@@ -251,12 +251,12 @@ async def cmd_run(args: argparse.Namespace) -> None:
     series = _normalize_updown_series(getattr(args, "series", "KXXRP15M"))
     spot_product = getattr(args, "spot_product", "XRP-USD")
 
-    asyncio.run(run_updown_trader(
+    await run_updown_trader(
         loop=getattr(args, "loop", True),
         interval=float(getattr(args, "interval", 0) or 0),
         series=series,
         spot_product=spot_product,
-    ))
+    )
 
 
 
@@ -274,7 +274,7 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
-def cmd_status(args: argparse.Namespace) -> None:
+async def cmd_status(args: argparse.Namespace) -> None:
     """Show current portfolio status: balance, positions, and P&L."""
 
     async def _status() -> None:
@@ -352,11 +352,10 @@ def cmd_status(args: argparse.Namespace) -> None:
         finally:
             await client.close()
 
-    import asyncio
-    asyncio.run(_status())
+    await _status()
 
 
-def cmd_scores(args: argparse.Namespace) -> None:
+async def cmd_scores(args: argparse.Namespace) -> None:
     """Show current category scores from the scoring system."""
 
     async def _scores():
@@ -370,8 +369,7 @@ def cmd_scores(args: argparse.Namespace) -> None:
         print("  Key: Score < 30 = BLOCKED | Alloc = max portfolio % allowed")
         print()
 
-    import asyncio
-    asyncio.run(_scores())
+    await _scores()
 
 
 def cmd_history(args: argparse.Namespace) -> None:
@@ -490,7 +488,7 @@ def cmd_history(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
-def cmd_close_all(args: argparse.Namespace) -> None:
+async def cmd_close_all(args: argparse.Namespace) -> None:
     """Place sell orders to close every open position on Kalshi.
 
     Use this AFTER stopping the bot (Ctrl-C). It queries Kalshi directly
@@ -604,11 +602,7 @@ def cmd_close_all(args: argparse.Namespace) -> None:
         finally:
             await client.close()
 
-    try:
-        asyncio.run(_close())
-    except Exception as exc:
-        print(f"  Error: {exc}")
-        sys.exit(1)
+    await _close()
 
 
 def cmd_backtest(args: argparse.Namespace) -> None:
@@ -628,7 +622,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     print("=" * 56)
 
 
-def cmd_health(args: argparse.Namespace) -> None:
+async def cmd_health(args: argparse.Namespace) -> None:
     """Run health checks on configuration, API, and database."""
 
     checks_passed = 0
@@ -682,7 +676,7 @@ def cmd_health(args: argparse.Namespace) -> None:
             balance_resp = await client.get_balance()
             balance_usd = balance_resp.get("balance", 0) / 100.0
             ok("Kalshi API connection", f"balance=${balance_usd:,.2f}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             msg = str(exc)
             fail("Kalshi API connection", msg)
             if "401" in msg or "authentication" in msg.lower():
@@ -700,7 +694,7 @@ def cmd_health(args: argparse.Namespace) -> None:
             await client.close()
 
     try:
-        asyncio.run(_check_api())
+        await _check_api()
     except Exception as exc:
         fail("Kalshi API connection", str(exc))
 
@@ -716,7 +710,7 @@ def cmd_health(args: argparse.Namespace) -> None:
             await db_manager.initialize()
             ok("Database initialization", str(db_path))
 
-        asyncio.run(_check_db())
+        await _check_db()
     except Exception as exc:
         fail("Database initialization", str(exc))
 
