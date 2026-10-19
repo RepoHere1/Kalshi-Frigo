@@ -4134,8 +4134,12 @@ def api_all_no_reset():
 
     try:
         book = AllNoKalshiBook(str(DB_PATH))
-        await book.ensure_schema()
-        balance = await book.reset_to_starting_balance(mode)
+
+        async def _reset():
+            await book.ensure_schema()
+            return await book.reset_to_starting_balance(mode)
+
+        balance = run(_reset())
     except Exception as e:  # noqa: BLE001 - surfaced to the dashboard
         _push_error(f"ALL NO reset: {e}")
         return jsonify({"error": str(e)}), 500
