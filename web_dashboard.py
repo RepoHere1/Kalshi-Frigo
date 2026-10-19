@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple, cast
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, redirect
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
@@ -4094,6 +4094,19 @@ def build_snapshot_cached() -> Dict[str, Any]:
     _SNAPSHOT_CACHE["at"] = now
     _SNAPSHOT_CACHE["payload"] = payload
     return payload
+
+
+@app.route("/all-no-markets")
+def all_no_markets():
+    """Redirect to main dashboard with ALL NO MARKETS content visible.
+    
+    The ALL NO MARKETS functionality is now integrated into the main dashboard
+    at the bottom, so this route redirects users to the main dashboard where
+    the ALL NO MARKETS content can be accessed.
+    """
+    # Redirect to main dashboard with hash anchor to ALL NO section
+    # The main dashboard template now includes ALL NO MARKETS content
+    return redirect("/#all-no-panel")
 
 
 @app.route("/api/snapshot")
