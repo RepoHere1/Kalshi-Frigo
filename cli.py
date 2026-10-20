@@ -138,6 +138,52 @@ async def cmd_run(args: argparse.Namespace) -> None:
                 _time.sleep(5)
         return
 
+    # --btc-ladder mode: hourly strike ladder (KXBTCD), the same engine as
+    # --btc-updown but walking the near-money strike band for the widest edge.
+    if getattr(args, "btc_ladder", False):
+        from src.jobs.ladder_trader import UpDownConfig, run_updown_trader
+        from src.utils.mode import TradingMode
+        from src.utils.database import DatabaseManager
+
+        series = _normalize_updown_series(getattr(args, "series", "KXBTCD"))
+        spot_product = getattr(args, "spot_product", "BTC-USD")
+        print(f"📈 BTC HOURLY LADDER MODE")
+        print(f"   {series} | live spot ({spot_product}) vs Kalshi's own strike quotes")
+        print("   Walks the near-money band for the widest modeled edge | fee-aware in LIVE")
+        db_path = os.environ.get("DB_PATH", "trading_system.db")
+
+        from src.utils.mode import apply_persisted_trading_config
+        try:
+            await apply_persisted_trading_config()
+        except Exception as exc:
+            print(f"config apply failed: {type(exc).__name__}: {exc}")
+
+        await DatabaseManager(db_path=db_path).initialize()
+        book = os.environ.get("STRATEGY_BOOK_MODE", "").strip().lower()
+        if book not in ("dry", "live", "paper"):
+            live_mode = os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower() == "true"
+            await TradingMode(db_path=db_path).set(
+                "live" if live_mode else "dry", confirmed=True
+            )
+        import time as _time
+
+        while True:
+            try:
+                await run_updown_trader(
+                    UpDownConfig(),
+                    loop=getattr(args, "loop", True),
+                    interval=float(getattr(args, "interval", 0) or 0),
+                    series=series,
+                    spot_product=spot_product,
+                )
+            except KeyboardInterrupt:
+                print(f"\n{series} ladder trader stopped by user.")
+                raise
+            except Exception as exc:  # noqa: BLE001 - restart, never exit
+                print(f"{series} ladder trader crashed ({type(exc).__name__}: {exc}); restarting in 5s.", flush=True)
+                _time.sleep(5)
+        return
+
     # --all-no-markets mode: NO-side only maker entries with separate $250 book
     # CRITICAL: DRY mode does NOT reflect ALL NO balances - they are separate books
     if getattr(args, "all_no_markets", False):
@@ -780,7 +826,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--paper",
         action="store_true",
         help="Run in paper-trading mode (no real orders)",
-    )
+)
     strategy_group = p_run.add_mutually_exclusive_group()
     strategy_group.add_argument(
         "--disciplined",
@@ -792,8 +838,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--btc-updown",
         action="store_true",
         dest="btc_updown",
-        help="Up/down market: trade when live spot and Kalshi's quote disagree. "
-        "Use --series and --spot-product to select the market.",
+        help="Up/down market: trade when live spot and Kalshi's own quote disagree",
+    )
+    strategy_group.add_argument(
+        "--btc-ladder",
+        action="store_true",
+        dest="btc_ladder",
+        help="BTC hourly strike ladder (KXBTCD): walk the near-money band for the widest edge",
     )
     strategy_group.add_argument(
         "--all-no-markets",

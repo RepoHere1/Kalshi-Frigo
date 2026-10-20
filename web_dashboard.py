@@ -128,6 +128,7 @@ strategy_state = {
     "hyperliquid_updown": {"running": False, "pid": None, "mode": "paper"},
     "hyperliquid_1h_updown": {"running": False, "pid": None, "mode": "paper"},
     "all_no_markets": {"running": False, "pid": None, "mode": "paper"},
+    "btc_ladder": {"running": False, "pid": None, "mode": "paper"},
 }
 
 # Lanes removed by operator order (cards, commands and strategy code gone).
@@ -155,6 +156,7 @@ STRATEGY_COMMANDS: Dict[str, List[str]] = {
     "hyperliquid_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPE15M", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
     "hyperliquid_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPED", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
     "all_no_markets": ["cli.py", "run", "--all-no-markets", "--paper", "--loop", "--interval", "0"],
+    "btc_ladder": ["cli.py", "run", "--btc-ladder", "--series", "KXBTCD", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
 }
 
 # `trade_logs.strategy` and `positions.strategy` are written by the strategies
@@ -971,7 +973,14 @@ STRATEGY_DOCS = {
         "policy as the other 1-hour lanes. Enabled by operator order; toggled by "
         "hand like every other lane.",
     ),
-}
+    "btc_ladder": (
+        "BTC Hourly Strike Ladder",
+        "Reads Kalshi's hourly BTC above/below ladder (KXBTCD) - a whole grid of "
+        "strike contracts expiring together - and walks the near-money band for "
+        "the strike with the widest modeled edge. Same engine as the 15-minute "
+        "lane, on an hourly clock. Manual control: starts only when you press "
+        "Start in this book, keeps running until you press Stop."
+    )}
 
 
 def _refresh_kalshi():
@@ -5368,6 +5377,25 @@ def api_marketdata():
     return jsonify(data)
 
 
+@app.route("/api/accounts", methods=["GET"])
+def api_accounts():
+    """Both account cards. Always both books, each scoped to itself.
+
+    The page's account card reads this on every 5s feed poll. It is NOT part of
+    the snapshot: the snapshot is rebuilt from the DB on a 15s memo, and the
+    account curve is rebuilt from trade_logs by day on every call, so folding it
+    into the snapshot would have made the card 15s stale and doubled the work.
+    """
+    mode = _current_book_mode()
+    other = "live" if mode == "dry" else "dry"
+    return jsonify(
+        {
+            "current": mode,
+            "accounts": {mode: _account_payload(mode), other: _account_payload(other)},
+        }
+    )
+
+
 @app.route("/api/chart/pnl")
 def api_chart_pnl():
     """Return P&L data for Chart.js, scoped to the current book.
@@ -6934,6 +6962,12 @@ async function refresh() {
   } catch (e) {
     note('snapshot refresh failed: ' + e.message);
   }
+  // The market feed and the account card are NOT in the snapshot - they live on
+  // their own background threads and their own endpoints. A 30s snapshot poll
+  // that never called them left both frozen at the server-rendered first byte:
+  // "connecting..." and "no tick yet" forever, with the Kalshi contract card
+  // showing "--" for every field even though /api/marketdata was answering.
+  try { refreshFeeds(); } catch (_) {}
   try { refreshLlmUsage(); } catch (_) {}
 }
 
