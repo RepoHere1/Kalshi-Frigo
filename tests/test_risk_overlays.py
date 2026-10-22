@@ -126,20 +126,19 @@ class TestCorrelationCap:
 
 class TestFlowVerdict:
     def test_wide_spread_vetoes(self):
-        passes, mult = flow_verdict(
-            yes_ask=0.70, yes_bid=0.30, no_ask=0.70, no_bid=0.30
-        )
+        passes, mult = flow_verdict(yes_ask=0.70, yes_bid=0.30, no_ask=0.70, no_bid=0.30)
         assert passes is False
         assert mult is None
 
     def test_adverse_flow_halves(self):
-        passes, mult = flow_verdict(
-            yes_ask=0.62, yes_bid=0.58, no_ask=0.42, no_bid=0.38
-        )
+        passes, mult = flow_verdict(yes_ask=0.62, yes_bid=0.58, no_ask=0.42, no_bid=0.38)
         # Normal spread, 4bps / 0.60 * 10000 = 66bps > 300bps... let's use tighter
         # Actually let's increase the max_spread_bps in the test
         passes, mult = flow_verdict(
-            yes_ask=0.61, yes_bid=0.59, no_ask=0.41, no_bid=0.39,
+            yes_ask=0.61,
+            yes_bid=0.59,
+            no_ask=0.41,
+            no_bid=0.39,
             max_spread_bps=500.0,
         )
         assert passes is True
@@ -147,7 +146,10 @@ class TestFlowVerdict:
 
     def test_normal_flow_full_size(self):
         passes, mult = flow_verdict(
-            yes_ask=0.61, yes_bid=0.59, no_ask=0.41, no_bid=0.39,
+            yes_ask=0.61,
+            yes_bid=0.59,
+            no_ask=0.41,
+            no_bid=0.39,
             max_spread_bps=400.0,
         )
         assert passes is True
@@ -180,9 +182,7 @@ class TestScenarioVerdict:
         assert reason is None
 
     def test_negative_score_vetoes(self):
-        passes, reason = scenario_verdict(
-            "BTC up", {"black_swan": -0.8, "normal": 0.2}
-        )
+        passes, reason = scenario_verdict("BTC up", {"black_swan": -0.8, "normal": 0.2})
         assert passes is False
         assert reason is not None
 
@@ -245,6 +245,7 @@ class TestOverlaysMaster:
     def test_kill_switch_env(self):
         # Simulate kill switch
         import os
+
         os.environ["OVERLAYS_ENABLED"] = "0"
         # Check that functions still work but may short-circuit
         assert kelly_scale_for_drawdown(0.25, DrawdownFraction(100, 100)) == 0.25
@@ -254,6 +255,7 @@ class TestFusionMode:
     def test_default_enabled(self):
         # Check default state
         import os
+
         if "OVERLAYS_ENABLED" in os.environ:
             del os.environ["OVERLAYS_ENABLED"]
         # Default should be enabled

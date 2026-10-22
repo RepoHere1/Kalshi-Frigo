@@ -14,6 +14,7 @@ Features:
 
 Railway-ready: listens on $PORT, healthcheck on /health.
 """
+
 import asyncio
 import base64
 import json
@@ -92,14 +93,29 @@ dashboard_state = {
     "balance": None,
     "positions": [],
     "trades": [],
-        "strategies": {
-            "btc_1h_updown": {"desired": 0, "running": False, "mode": "paper", "pid": None,
-                              "command": "cli.py run --btc-updown --series KXBTC1H --spot-product BTC-USD --paper --loop --interval 0"},
-            "eth_1h_updown": {"desired": 0, "running": False, "mode": "paper", "pid": None,
-                              "command": "cli.py run --btc-updown --series KXETH1H --spot-product ETH-USD --paper --loop --interval 0"},
-            "xrp_1h_updown": {"desired": 0, "running": False, "mode": "paper", "pid": None,
-                              "command": "cli.py run --btc-updown --series KXXRP1H --spot-product XRP-USD --paper --loop --interval 0"},
+    "strategies": {
+        "btc_1h_updown": {
+            "desired": 0,
+            "running": False,
+            "mode": "paper",
+            "pid": None,
+            "command": "cli.py run --btc-updown --series KXBTC1H --spot-product BTC-USD --paper --loop --interval 0",
         },
+        "eth_1h_updown": {
+            "desired": 0,
+            "running": False,
+            "mode": "paper",
+            "pid": None,
+            "command": "cli.py run --btc-updown --series KXETH1H --spot-product ETH-USD --paper --loop --interval 0",
+        },
+        "xrp_1h_updown": {
+            "desired": 0,
+            "running": False,
+            "mode": "paper",
+            "pid": None,
+            "command": "cli.py run --btc-updown --series KXXRP1H --spot-product XRP-USD --paper --loop --interval 0",
+        },
+    },
     "last_update": None,
     "errors": [],
     "sse_listeners": [],
@@ -129,6 +145,16 @@ strategy_state = {
     "hyperliquid_1h_updown": {"running": False, "pid": None, "mode": "paper"},
     "all_no_markets": {"running": False, "pid": None, "mode": "paper"},
     "btc_ladder": {"running": False, "pid": None, "mode": "paper"},
+    # Retired lanes still appear in state so toggle/detail/bots endpoints can
+    # inspect or refuse them. They have NO cards and are never auto-spawned by
+    # the dashboard or keep-alive; only the operator's explicit Start/Stop can
+    # touch them, and heavy API abusers are locked OFF at the toggle latch.
+    "ai_directional": {"running": False, "pid": None, "mode": "paper"},
+    "market_making": {"running": False, "pid": None, "mode": "paper"},
+    "safe_compounder": {"running": False, "pid": None, "mode": "paper"},
+    "quick_flip": {"running": False, "pid": None, "mode": "paper"},
+    "xau_updown": {"running": False, "pid": None, "mode": "paper"},
+    "beast_mode": {"running": False, "pid": None, "mode": "paper"},
 }
 
 # Lanes removed by operator order (cards, commands and strategy code gone).
@@ -143,21 +169,6 @@ RETIRED_LANES: Tuple[str, ...] = (
     "quick_flip",
     "xau_updown",
 )
-
-# The command each strategy is actually run with. Every one is a distinct
-# process and writes its own log.
-STRATEGY_COMMANDS: Dict[str, List[str]] = {
-    "btc_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTC15M", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
-    "xrp_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRP15M", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
-    "eth_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETH15M", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
-"btc_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXBTC1H", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
-    "eth_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXETH1H", "--spot-product", "ETH-USD", "--paper", "--loop", "--interval", "0"],
-    "xrp_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXXRP1H", "--spot-product", "XRP-USD", "--paper", "--loop", "--interval", "0"],
-    "hyperliquid_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPE15M", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
-    "hyperliquid_1h_updown": ["cli.py", "run", "--btc-updown", "--series", "KXHYPED", "--spot-product", "HYPE-USD", "--paper", "--loop", "--interval", "0"],
-    "all_no_markets": ["cli.py", "run", "--all-no-markets", "--paper", "--loop", "--interval", "0"],
-    "btc_ladder": ["cli.py", "run", "--btc-ladder", "--series", "KXBTCD", "--spot-product", "BTC-USD", "--paper", "--loop", "--interval", "0"],
-}
 
 # `trade_logs.strategy` and `positions.strategy` are written by the strategies
 # themselves and are not consistent with the dashboard's button names. Without
@@ -176,9 +187,167 @@ STRATEGY_ALIASES = {
     "hype": "hyperliquid_updown",
     "xrp": "xrp_updown",
     "xrp_15m": "xrp_updown",
+    # Retired lanes still written by strategy code under these names.
+    "directional_trading": "ai_directional",
+    "quick_flip_scalping": "quick_flip",
 }
 
-# Alert webhooks
+# Lanes that are not operator-spawnable on the dashboard at all: the lockout
+# is enforced in api_strategy_toggle (START side), they still render as cards
+# so the operator can see they exist, but Start is refused with 403 and Stop is
+# always honoured if one is already running.
+HEAVY_API_ABUSERS = ("safe_compounder",)
+
+# The command each strategy is actually run with. Every one is a distinct
+# process and writes its own log.
+STRATEGY_COMMANDS: Dict[str, List[str]] = {
+    "btc_updown": [
+        "cli.py",
+        "run",
+        "--btc-updown",
+        "--series",
+        "KXBTC15M",
+        "--spot-product",
+        "BTC-USD",
+        "--paper",
+        "--loop",
+        "--interval",
+        "0",
+    ],
+    "xrp_updown": [
+        "cli.py",
+        "run",
+        "--btc-updown",
+        "--series",
+        "KXXRP15M",
+        "--spot-product",
+        "XRP-USD",
+        "--paper",
+        "--loop",
+        "--interval",
+        "0",
+    ],
+    "eth_updown": [
+        "cli.py",
+        "run",
+        "--btc-updown",
+        "--series",
+        "KXETH15M",
+        "--spot-product",
+        "ETH-USD",
+        "--paper",
+        "--loop",
+        "--interval",
+        "0",
+    ],
+    "btc_1h_updown": [
+        "cli.py",
+        "run",
+        "--btc-updown",
+        "--series",
+        "KXBTCD",
+        "--spot-product",
+        "BTC-USD",
+        "--paper",
+        "--loop",
+        "--interval",
+        "0",
+    ],
+    "eth_1h_updown": [
+        "cli.py",
+        "run",
+        "--btc-updown",
+        "--series",
+        "KXETHD",
+        "--spot-product",
+        "ETH-USD",
+        "--paper",
+        "--loop",
+        "--interval",
+        "0",
+    ],
+    "xrp_1h_updown": [
+        "cli.py",
+        "run",
+        "--btc-updown",
+        "--series",
+        "KXXRPD",
+        "--spot-product",
+        "XRP-USD",
+        "--paper",
+        "--loop",
+        "--interval",
+        "0",
+    ],
+    "hyperliquid_updown": [
+        "cli.py",
+        "run",
+        "--btc-updown",
+        "--series",
+        "KXHYPE15M",
+        "--spot-product",
+        "HYPE-USD",
+        "--paper",
+        "--loop",
+        "--interval",
+        "0",
+    ],
+    "hyperliquid_1h_updown": [
+        "cli.py",
+        "run",
+        "--btc-updown",
+        "--series",
+        "KXHYPED",
+        "--spot-product",
+        "HYPE-USD",
+        "--paper",
+        "--loop",
+        "--interval",
+        "0",
+    ],
+    "all_no_markets": ["cli.py", "run", "--all-no-markets", "--paper", "--loop", "--interval", "0"],
+    "btc_ladder": [
+        "cli.py",
+        "run",
+        "--btc-ladder",
+        "--series",
+        "KXBTCD",
+        "--spot-product",
+        "BTC-USD",
+        "--paper",
+        "--loop",
+        "--interval",
+        "0",
+    ],
+    # Retired lanes: each carries its own command and its own log. They are
+    # spawned by manual operator request only.
+    "ai_directional": ["cli.py", "run", "--directional", "--paper", "--loop", "--interval", "0"],
+    "market_making": ["cli.py", "run", "--market-making", "--paper", "--loop", "--interval", "0"],
+    "safe_compounder": [
+        "cli.py",
+        "run",
+        "--safe-compounder",
+        "--paper",
+        "--loop",
+        "--interval",
+        "0",
+    ],
+    "quick_flip": ["cli.py", "run", "--quick-flip", "--paper", "--loop", "--interval", "0"],
+    "xau_updown": [
+        "cli.py",
+        "run",
+        "--btc-updown",
+        "--series",
+        "KXXAU15M",
+        "--spot-product",
+        "XAU-USD",
+        "--paper",
+        "--loop",
+        "--interval",
+        "0",
+    ],
+    "beast_mode": ["cli.py", "run", "--beast", "--paper", "--loop", "--interval", "0"],
+}
 alert_state = {
     "telegram_url": os.environ.get("TELEGRAM_WEBHOOK", ""),
     "discord_url": os.environ.get("DISCORD_WEBHOOK", ""),
@@ -302,7 +471,7 @@ def _log_files():
 BACKUP_DIR_NAME = "backups"
 BACKUP_INTERVAL_SEC = 24 * 60 * 60  # daily (was 6h)
 BACKUP_KEEP = 12  # ~12 days (was 48) - the DB grows with LLM transcripts, so
-                  # fewer retained backups keeps the volume off the ceiling
+# fewer retained backups keeps the volume off the ceiling
 
 
 def backup_database() -> Optional[str]:
@@ -829,11 +998,62 @@ def _run_async(coro):
 
 def _db():
     """Build an initialized DatabaseManager (schema created if missing)."""
+    import aiosqlite
+
     from src.utils.database import DatabaseManager
 
-    mgr = DatabaseManager(db_path=DB_PATH)
-    _run_async(mgr.initialize())
-    return mgr
+    async def _init():
+        mgr = DatabaseManager(db_path=DB_PATH)
+        await mgr.initialize()
+        # ALL NO book needs its own tables: the dashboard's SQL reads
+        # all_no_positions directly, so the schema must exist before any query.
+        async with aiosqlite.connect(DB_PATH) as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS all_no_positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    market_id TEXT NOT NULL,
+                    side TEXT NOT NULL DEFAULT 'NO',
+                    entry_price REAL NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    status TEXT DEFAULT 'open',
+                    strategy TEXT DEFAULT 'all_no',
+                    mode TEXT NOT NULL DEFAULT 'dry',
+                    entry_fair REAL,
+                    UNIQUE(market_id, mode)
+                )
+                """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS all_no_book (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    starting REAL NOT NULL,
+                    balance REAL NOT NULL,
+                    entries INTEGER DEFAULT 0,
+                    pnl REAL DEFAULT 0.0,
+                    seed_ts TEXT NOT NULL
+                )
+                """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS all_no_trade_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    market_id TEXT NOT NULL,
+                    side TEXT NOT NULL DEFAULT 'NO',
+                    entry_price REAL NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    exit_price REAL,
+                    entry_fair REAL,
+                    realized_pnl REAL,
+                    timestamp TEXT NOT NULL,
+                    close_ts TEXT,
+                    exit_reason TEXT,
+                    mode TEXT NOT NULL DEFAULT 'dry',
+                    strategy TEXT DEFAULT 'all_no'
+                )
+                """)
+            await conn.commit()
+        return mgr
+
+    return _run_async(_init())
 
 
 async def _fetch_db_data():
@@ -924,7 +1144,7 @@ STRATEGY_DOCS = {
     ),
     "xrp_updown": (
         "XRP 15-Min Up/Down",
-        'Reads Kalshi\'s XRP 15-min up/down contract and compares its Up/Down price '
+        "Reads Kalshi's XRP 15-min up/down contract and compares its Up/Down price "
         "against live Coinbase XRP-USD spot. Takes one $5 clip only when the two disagree "
         "by more than the configured edge. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "
@@ -932,14 +1152,14 @@ STRATEGY_DOCS = {
     ),
     "btc_1h_updown": (
         "BTC 1-Hour Up/Down",
-        'Reads Kalshi\'s BTC 1-hour above/below ladder (KXBTC1H) and compares its '
-                "strike nearest the money against live Coinbase BTC-USD spot. Manual control. "
+        "Reads Kalshi's BTC 1-hour above/below ladder (KXBTC1H) and compares its "
+        "strike nearest the money against live Coinbase BTC-USD spot. Manual control. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "
         "keeps running until you press Stop - nothing re-arms it for you.",
     ),
     "eth_updown": (
         "ETH 15-Min Up/Down",
-        'Reads Kalshi\'s ETH 15-min up/down contract (KXETH15M) and compares its '
+        "Reads Kalshi's ETH 15-min up/down contract (KXETH15M) and compares its "
         "Up/Down price against live Coinbase ETH-USD spot. Takes one clip only when "
         "the two disagree by more than the configured edge. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "
@@ -947,28 +1167,28 @@ STRATEGY_DOCS = {
     ),
     "eth_1h_updown": (
         "ETH 1-Hour Up/Down",
-        'Reads Kalshi\'s ETH 1-hour above/below ladder (KXETH1H) and compares its '
-                "strike nearest the money against live Coinbase ETH-USD spot. Manual control. "
+        "Reads Kalshi's ETH 1-hour above/below ladder (KXETH1H) and compares its "
+        "strike nearest the money against live Coinbase ETH-USD spot. Manual control. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "
         "keeps running until you press Stop - nothing re-arms it for you.",
     ),
     "xrp_1h_updown": (
         "XRP 1-Hour Up/Down",
-        'Reads Kalshi\'s XRP 1-hour above/below ladder (KXXRP1H) and compares '
-                "its strike nearest the money against live Coinbase XRP-USD spot. Manual control. "
+        "Reads Kalshi's XRP 1-hour above/below ladder (KXXRP1H) and compares "
+        "its strike nearest the money against live Coinbase XRP-USD spot. Manual control. "
         "MANUAL CONTROL: starts only when you press Start in this book, and "
         "keeps running until you press Stop - nothing re-arms it for you.",
     ),
     "hyperliquid_updown": (
         "Hyperliquid (HYPE) 15-Min Up/Down",
-        'Reads Kalshi\'s HYPE 15-min up/down contract (KXHYPE15M) and compares '
+        "Reads Kalshi's HYPE 15-min up/down contract (KXHYPE15M) and compares "
         "its Up/Down price against HYPE-USD spot. Takes one clip only when the "
         "two disagree by more than the configured edge. Enabled by operator "
         "order; toggled by hand like every other lane.",
     ),
     "hyperliquid_1h_updown": (
         "Hyperliquid (HYPE) 1-Hour Up/Down",
-        'Reads Kalshi\'s HYPE hourly above/below ladder (KXHYPED) and compares its '
+        "Reads Kalshi's HYPE hourly above/below ladder (KXHYPED) and compares its "
         "strike nearest the money against live HYPE-USD spot. Same trader and exit "
         "policy as the other 1-hour lanes. Enabled by operator order; toggled by "
         "hand like every other lane.",
@@ -979,8 +1199,9 @@ STRATEGY_DOCS = {
         "strike contracts expiring together - and walks the near-money band for "
         "the strike with the widest modeled edge. Same engine as the 15-minute "
         "lane, on an hourly clock. Manual control: starts only when you press "
-        "Start in this book, keeps running until you press Stop."
-    )}
+        "Start in this book, keeps running until you press Stop.",
+    ),
+}
 
 
 def _refresh_kalshi():
@@ -1602,7 +1823,7 @@ def _strategy_supervisor_loop():
 
                 mode = row.get("mode", book_mode)
                 backoff = failures.get(name, 0.0)
-                
+
                 # IRONCLAD PERMANENT FIX: NEVER GIVE UP ON desired=True
                 # This is the EXACT bug that has been destroying button persistence for a week.
                 # The old code had:
@@ -1617,14 +1838,18 @@ def _strategy_supervisor_loop():
                 # - Every attempt is logged so the operator can see it's trying
                 #
                 # This makes it MATHEMATICALLY IMPOSSIBLE for the button to break again.
-                
+
                 if backoff > 0:
                     time.sleep(min(backoff, _SUPERVISOR_MAX_BACKOFF))
 
                 # SUPERVISOR RESPAWN GUARD: Never respawn a strategy in the wrong book.
                 # If this is a respawn (stale_instance or recent crash), verify the book
                 # mode hasn't changed since the row was recorded.
-                if stale_instance or (started and (datetime.now() - datetime.fromisoformat(str(started))).total_seconds() < _SUPERVISOR_STABLE_SECONDS):
+                if stale_instance or (
+                    started
+                    and (datetime.now() - datetime.fromisoformat(str(started))).total_seconds()
+                    < _SUPERVISOR_STABLE_SECONDS
+                ):
                     # NEVER refuse a respawn. The operator's button is the only
                     # thing that decides whether a lane runs. Book mismatches are
                     # logged as warnings but never block a respawn - the process
@@ -1650,7 +1875,9 @@ def _strategy_supervisor_loop():
                         if stale_instance
                         else "restarted after it died"
                     )
-                    _push_error(f"Supervisor {why}: {name} (pid {started['pid']}, {mode}, attempt #{attempt_num}).")
+                    _push_error(
+                        f"Supervisor {why}: {name} (pid {started['pid']}, {mode}, attempt #{attempt_num})."
+                    )
                     _broadcast("strategy", {"name": name, "action": "restarted"})
                 except Exception as exc:  # noqa: BLE001
                     attempts[name] = attempt_num
@@ -1672,6 +1899,7 @@ def _strategy_supervisor_loop():
 # the "lanes do not obey my buttons" bug. A lane starts only from a Start
 # press and stops only from a Stop press. DOGE has no card and no command
 # entry, so it can never be started from this dashboard.
+
 
 def _creds_present() -> bool:
     # Lanes must NEVER stop themselves - credentials missing must not gate
@@ -1869,6 +2097,9 @@ def _strategy_cards(
             "worst": 0.0,
             "open_positions": 0,
             "deployed": 0.0,
+            "roll_clips": 0,
+            "roll_open": 0,
+            "roll_wins": 0,
             "first_trade": None,
             "last_trade": None,
             "equity": {"labels": [], "pnl": []},
@@ -1891,6 +2122,18 @@ def _strategy_cards(
         running[name] = running.get(name, 0.0) + pnl
         card["trades"] += 1
         card["wins"] += 1 if pnl > 0 else 0
+        # Roll clip tracking: a trade with "ROLL-IQ successor" rationale counts
+        # as a roll clip, unless it's a phantom row.
+        if (
+            row.get("rationale", "").strip()
+            and "ROLL-IQ successor" in row.get("rationale", "").strip()
+        ):
+            if (row.get("exit_reason") or "") != "no_kalshi_position":
+                card["roll_clips"] += 1
+                card["roll_wins"] += 1 if pnl > 0 else 0
+            else:
+                # Phantom roll: counts as open clip, not a closed clip
+                card["roll_open"] += 1
         card["losses"] += 0 if pnl > 0 else 1
         card["realized"] = round(running[name], 2)
         card["best"] = max(card["best"], round(pnl, 2))
@@ -1913,10 +2156,16 @@ def _strategy_cards(
             card["deployed"] + float(row.get("quantity") or 0) * float(row.get("entry_price") or 0),
             2,
         )
+        rationale = str(row.get("rationale") or "")
+        if "ROLL-IQ successor" in rationale:
+            card["roll_open"] += 1
 
     for card in cards.values():
         card["win_rate"] = (
             round(100.0 * card["wins"] / card["trades"], 1) if card["trades"] else 0.0
+        )
+        card["roll_rate"] = (
+            round(100.0 * card["roll_wins"] / card["roll_clips"], 1) if card["roll_clips"] else 0.0
         )
     # Horizon grouping: ALL 15-minute cards lead, ALL 1-hour cards follow,
     # then everything else — one sort (shared with _mode_payload) so DRY and
@@ -1968,6 +2217,8 @@ _SQL_TRADES = (
     " SUM(CASE WHEN COALESCE(exit_reason,'') = 'no_kalshi_position' THEN 1 ELSE 0 END) AS phantom"
     " FROM trade_logs WHERE {book}"
 )
+
+
 def _parse_entry_fair(rationale: Any) -> Optional[float]:
     """Recover the chosen side's entry fair from a lane rationale string.
 
@@ -2047,8 +2298,14 @@ _SQL_STRATEGY = (
     " COUNT(*) AS trades,"
     " COALESCE(SUM(pnl), 0.0) AS pnl,"
     " COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,"
+    " COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0) AS losses,"
     " COALESCE(MAX(pnl), 0.0) AS best,"
-    " COALESCE(MIN(pnl), 0.0) AS worst"
+    " COALESCE(MIN(pnl), 0.0) AS worst,"
+    " COALESCE(SUM(CASE WHEN COALESCE(rationale, '') LIKE '%ROLL-IQ successor%'"
+    " AND COALESCE(exit_reason, '') != 'no_kalshi_position' THEN 1 ELSE 0 END), 0) AS roll_clips,"
+    " COALESCE(SUM(CASE WHEN COALESCE(rationale, '') LIKE '%ROLL-IQ successor%'"
+    " AND COALESCE(exit_reason, '') != 'no_kalshi_position' AND pnl > 0"
+    " THEN 1 ELSE 0 END), 0) AS roll_wins"
     " FROM trade_logs WHERE {book} GROUP BY strategy ORDER BY pnl DESC"
 )
 _SQL_RECENT = (
@@ -2094,12 +2351,28 @@ _SQL_LLM_USAGE = (
 _SQL_STRATEGY_CURVE = (
     "SELECT COALESCE(NULLIF(strategy, ''), 'unattributed') AS strategy,"
     " COALESCE(NULLIF(mode, ''), 'dry') AS mode,"
-    " exit_timestamp, exit_reason, pnl, market_id FROM trade_logs"
+    " exit_timestamp, exit_reason, pnl, market_id, rationale FROM trade_logs"
     " ORDER BY COALESCE(exit_timestamp, entry_timestamp) ASC LIMIT 2000"
+)
+_SQL_ROLL_CARD = (
+    "SELECT COALESCE(SUM(CASE WHEN COALESCE(exit_reason, '') != 'no_kalshi_position'"
+    " THEN 1 ELSE 0 END), 0) AS closed_clips,"
+    " COALESCE(SUM(CASE WHEN pnl > 0 AND COALESCE(exit_reason, '') != 'no_kalshi_position'"
+    " THEN 1 ELSE 0 END), 0) AS wins,"
+    " COALESCE(SUM(CASE WHEN pnl <= 0 AND COALESCE(exit_reason, '') != 'no_kalshi_position'"
+    " THEN 1 ELSE 0 END), 0) AS losses,"
+    " COALESCE(SUM(pnl), 0.0) AS realized_pnl"
+    " FROM trade_logs WHERE {book} AND COALESCE(NULLIF(rationale, ''), '') LIKE '%ROLL-IQ successor%'"
+)
+_SQL_ROLL_OPEN = (
+    "SELECT COALESCE(SUM(quantity * entry_price), 0.0) AS open_deployed,"
+    " COUNT(*) AS open_clips"
+    " FROM positions WHERE status = 'open' AND {book}"
+    " AND COALESCE(NULLIF(rationale, ''), '') LIKE '%ROLL-IQ successor%'"
 )
 _SQL_POSITIONS = (
     "SELECT market_id, side, entry_price, quantity, strategy, stop_loss_price,"
-    " take_profit_price, status, timestamp, mode FROM positions"
+    " take_profit_price, status, timestamp, mode, rationale FROM positions"
     " WHERE status = 'open' AND {book} ORDER BY timestamp DESC"
 )
 # The simulated book's own open positions, so its headline tiles describe
@@ -2131,11 +2404,11 @@ _SQL_OPEN_DRY = (
 # needs its own stable baseline it can compound from, and a $250 start keeps
 # the clip sizes legible (see _all_no_buy_amount below).
 ALL_NO_STARTING_BALANCE = 250.0
-ALL_NO_KELLY_MULTIPLIER = 1.0     # FULL Kelly for ALL NO book
+ALL_NO_KELLY_MULTIPLIER = 0.25  # quarter-Kelly for ALL NO book
 # Hard cap on one clip: 80% of the book. Fractional Kelly already throttles,
 # but a model fair of 0.999 against a 0.50 price returns a Kelly fraction that
 # would stake the whole account without a ceiling.
-ALL_NO_MAX_CLIP_PCT = 0.80
+ALL_NO_MAX_CLIP_PCT = 0.20  # 20% cap on any single ALL NO clip
 # Kalshi takes a whole-contract count and has no dollar floor - the exchange
 # minimum is ONE contract. Never round a clip to zero.
 MIN_ORDER_CONTRACTS = 1
@@ -2353,9 +2626,7 @@ def _all_no_book() -> Dict[str, Any]:
             await conn.execute(_SQL_ALL_NO_BOOK_CREATE)
             # Seed once. `note` is the latch: a second boot sees the row and
             # leaves the balance whatever trading made it.
-            cur = await conn.execute(
-                "SELECT COUNT(*) AS n FROM all_no_book WHERE note = 'seed'"
-            )
+            cur = await conn.execute("SELECT COUNT(*) AS n FROM all_no_book WHERE note = 'seed'")
             seeded = int((await cur.fetchone())["n"] or 0)
             if not seeded:
                 stamp = _now()
@@ -2367,13 +2638,10 @@ def _all_no_book() -> Dict[str, Any]:
                 )
                 await conn.commit()
             cur = await conn.execute(
-                "SELECT amount, balance_after, kind FROM all_no_book"
-                " ORDER BY id DESC LIMIT 1"
+                "SELECT amount, balance_after, kind FROM all_no_book" " ORDER BY id DESC LIMIT 1"
             )
             row = await cur.fetchone()
-            cur = await conn.execute(
-                "SELECT COUNT(*) AS n FROM all_no_book WHERE note != 'seed'"
-            )
+            cur = await conn.execute("SELECT COUNT(*) AS n FROM all_no_book WHERE note != 'seed'")
             entries = int((await cur.fetchone())["n"] or 0)
             cur = await conn.execute(
                 "SELECT COALESCE(SUM(amount), 0.0) AS moved FROM all_no_book"
@@ -2470,7 +2738,13 @@ def _row_no_closed(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "exit_timestamp": str(r.get("exit_timestamp") or ""),
                 # The Kelly fraction this clip was sized at, recomputed from the
                 # recorded fair and entry so the closed history is checkable.
-                "kelly": round(_all_no_kelly(float(r.get("entry_fair") or 0.0), float(r.get("entry_price") or 0.0)) * 100, 2),
+                "kelly": round(
+                    _all_no_kelly(
+                        float(r.get("entry_fair") or 0.0), float(r.get("entry_price") or 0.0)
+                    )
+                    * 100,
+                    2,
+                ),
             }
         )
     return out
@@ -2497,6 +2771,8 @@ def _row_breakdown(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for r in rows:
         trades = int(r.get("trades") or 0)
         wins = int(r.get("wins") or 0)
+        roll_clips = int(r.get("roll_clips") or 0)
+        roll_wins = int(r.get("roll_wins") or 0)
         out.append(
             {
                 "strategy": r.get("strategy") or "unattributed",
@@ -2507,6 +2783,8 @@ def _row_breakdown(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "best": round(float(r.get("best") or 0.0), 2),
                 "worst": round(float(r.get("worst") or 0.0), 2),
                 "win_rate": round(wins / trades * 100, 1) if trades else 0.0,
+                "roll_clips": roll_clips,
+                "roll_rate": round(roll_wins / roll_clips * 100, 1) if roll_clips else 0.0,
             }
         )
     return out
@@ -2518,6 +2796,34 @@ def _row_open_dry(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "positions": int(row.get("positions") or 0),
         "capital": round(float(row.get("capital") or 0.0), 2),
+    }
+
+
+def _roll_card_summary(
+    roll_rows: List[Dict[str, Any]], roll_open_rows: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Aggregate roll card stats from closed and open roll trades."""
+    roll = roll_rows[0] if roll_rows else {}
+    roll_open = roll_open_rows[0] if roll_open_rows else {}
+
+    closed_clips = int(roll.get("closed_clips") or 0)
+    wins = int(roll.get("wins") or 0)
+    losses = int(roll.get("losses") or 0)
+    realized_pnl = float(roll.get("realized_pnl") or 0.0)
+    open_clips = int(roll_open.get("open_clips") or 0)
+    open_deployed = float(roll_open.get("open_deployed") or 0.0)
+    total_clips = closed_clips + open_clips
+    win_rate = round(wins / closed_clips * 100, 1) if closed_clips else 0.0
+
+    return {
+        "closed_clips": closed_clips,
+        "open_clips": open_clips,
+        "total_clips": total_clips,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "realized_pnl": round(realized_pnl, 2),
+        "open_deployed": round(open_deployed, 2),
     }
 
 
@@ -2770,6 +3076,8 @@ def build_snapshot() -> Dict[str, Any]:
             (_SQL_OPEN_DRY, ()),
             (_SQL_STRATEGY_CURVE, ()),
             (_SQL_FAIR_BANDS.format(book=where), ()),
+            (_SQL_ROLL_CARD.format(book=where), ()),
+            (_SQL_ROLL_OPEN.format(book=where), ()),
         ]
         + [(f"SELECT COUNT(*) AS n FROM {t}", ()) for t in DATA_TABLES]
     )
@@ -2785,12 +3093,14 @@ def build_snapshot() -> Dict[str, Any]:
         dry_open_r,
         curve_r,
         fairs_r,
-    ) = batch[:11]
-    # The per-table counts follow the eleven book queries. Anything that reorders
+        roll_r,
+        roll_open_r,
+    ) = batch[:13]
+    # The per-table counts follow the book queries. Anything that reorders
     # this batch must renumber the slice with it: an off-by-one here made
     # "never_run" read the wrong table's count and report a database with markets
     # as never having run.
-    counts = batch[11:]
+    counts = batch[13:]
 
     # Equity curve is fetched newest-first; flip it so the chart reads left to right.
     equity_rows = list(reversed(equity_r))
@@ -2860,6 +3170,7 @@ def build_snapshot() -> Dict[str, Any]:
         "db_exists": Path(DB_PATH).exists(),
         "db_persistent": not _is_ephemeral_db(),
         "public_domain": os.environ.get("RAILWAY_PUBLIC_DOMAIN", ""),
+        "roll_card": _roll_card_summary(roll_r, roll_open_r),
         # Nothing has run if we have never ingested a market or recorded a
         # decision. Shown as an explicit banner instead of a page of zeros.
         "never_run": never_run,
@@ -3113,11 +3424,13 @@ def _mode_payload() -> Dict[str, Any]:
             "connected": True,
             "balance": dry["cash"],
             "can_fund": dry["cash"] >= 0.01,
-            "reason": ""
-            if dry["cash"] >= 0.01
-            else (
-                f"DRY cash ${dry['cash']:.2f} cannot fund even one 1-cent contract - "
-                "add DRY cash to keep rehearsing"
+            "reason": (
+                ""
+                if dry["cash"] >= 0.01
+                else (
+                    f"DRY cash ${dry['cash']:.2f} cannot fund even one 1-cent contract - "
+                    "add DRY cash to keep rehearsing"
+                )
             ),
         },
     }
@@ -3487,9 +3800,7 @@ def api_strategies_reset_state():
             _run_async(store.disarm(lane, book, "stopped by operator"))
             cleared += 1
     _recorded_state()
-    _broadcast(
-        "strategy", {"action": "latch_reset", "killed": killed, "cleared": cleared}
-    )
+    _broadcast("strategy", {"action": "latch_reset", "killed": killed, "cleared": cleared})
     return jsonify({"ok": True, "killed": killed, "lanes_cleared": cleared})
 
 
@@ -3595,9 +3906,7 @@ def api_maintenance_backfill_fair():
                     if val is None:
                         unparseable += 1
                         continue
-                    await conn.execute(
-                        f"UPDATE {table} SET entry_fair=? WHERE id=?", (val, rid)
-                    )
+                    await conn.execute(f"UPDATE {table} SET entry_fair=? WHERE id=?", (val, rid))
                     if tag == "log":
                         updated_logs += 1
                     else:
@@ -3619,9 +3928,7 @@ def api_maintenance_backfill_fair():
         async def _diag() -> None:
             nonlocal still_null
             async with _a.connect(DB_PATH) as conn:
-                conn.row_factory = lambda c, r: dict(
-                    zip([d[0] for d in c.description], r)
-                )
+                conn.row_factory = lambda c, r: dict(zip([d[0] for d in c.description], r))
                 cur = await conn.execute(
                     "SELECT COUNT(*) AS n FROM trade_logs WHERE entry_fair IS NULL"
                 )
@@ -3657,15 +3964,16 @@ def api_trades():
     Pass ?mode=dry or ?mode=live to filter to one book; omit for all.
     """
     try:
-        import aiosqlite
         import asyncio
-        
+
+        import aiosqlite
+
         mode_filter = request.args.get("mode", "").strip().lower()
         if mode_filter in ("dry", "live"):
             where = f"COALESCE(NULLIF(mode, ''), 'dry') = '{mode_filter}'"
         else:
             where = "1=1"
-        
+
         async def _fetch():
             async with aiosqlite.connect(DB_PATH) as db:
                 async with db.execute(
@@ -3678,27 +3986,38 @@ def api_trades():
                 ) as cur:
                     rows = await cur.fetchall()
             trades = []
-            for (market_id, side, entry_price, pnl, quantity, exit_ts,
-                 mode, strategy, rationale, exit_reason, entry_fair,
-                 cost_basis) in rows:
-                trades.append({
-                    "market_id": market_id,
-                    "side": side,
-                    "entry_price": entry_price,
-                    "pnl": pnl,
-                    "quantity": quantity,
-                    "cost_basis": round(float(cost_basis or 0.0), 2),
-                    "exit_timestamp": exit_ts,
-                    "mode": mode or "dry",
-                    "strategy": strategy or "",
-                    "rationale": rationale or "",
-                    "exit_reason": exit_reason or "",
-                    "entry_fair": (
-                        float(entry_fair) if entry_fair is not None else None
-                    ),
-                })
+            for (
+                market_id,
+                side,
+                entry_price,
+                pnl,
+                quantity,
+                exit_ts,
+                mode,
+                strategy,
+                rationale,
+                exit_reason,
+                entry_fair,
+                cost_basis,
+            ) in rows:
+                trades.append(
+                    {
+                        "market_id": market_id,
+                        "side": side,
+                        "entry_price": entry_price,
+                        "pnl": pnl,
+                        "quantity": quantity,
+                        "cost_basis": round(float(cost_basis or 0.0), 2),
+                        "exit_timestamp": exit_ts,
+                        "mode": mode or "dry",
+                        "strategy": strategy or "",
+                        "rationale": rationale or "",
+                        "exit_reason": exit_reason or "",
+                        "entry_fair": (float(entry_fair) if entry_fair is not None else None),
+                    }
+                )
             return {"trades": trades, "mode_filter": mode_filter or "all"}
-        
+
         return jsonify(asyncio.run(_fetch()))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -3714,10 +4033,12 @@ def api_recent_trades():
             return jsonify({"error": "page must be positive and per_page must be 1..100"}), 400
 
         book = _current_book_mode()
+
         where = _book_filter(book)
         eligible = (
             f"{where} AND exit_timestamp IS NOT NULL"
             " AND COALESCE(exit_reason, '') != 'no_kalshi_position'"
+            " AND COALESCE(rationale, '') != 'live'"
         )
         count_rows, trade_rows = _db_many(
             [
@@ -3831,7 +4152,9 @@ def api_trades_rtf():
         return Response(
             body,
             content_type="application/rtf; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="kalshi-{book}-closed-trades.rtf"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="kalshi-{book}-closed-trades.rtf"'
+            },
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -4526,9 +4849,7 @@ def _recorded_state() -> Dict[str, Dict[str, Any]]:
             # written. Skip this pass rather than guess.
             _book = _runtime_mode()
             if _book is not None:
-                _run_async(
-                    _runtime_store().record_stop(name, reason, _book, clear_desired=False)
-                )
+                _run_async(_runtime_store().record_stop(name, reason, _book, clear_desired=False))
             st["pid"] = None
             st["running"] = False
             st["stuck"] = False
@@ -4642,24 +4963,26 @@ def api_strategy_analysis(name):
 @app.route("/api/equity-report", methods=["GET"])
 def api_equity_report():
     """DRY vs LIVE equity curves and divergence alerts.
-    
+
     Recommendation #10: Real-time equity tracking across both books with
     divergence detection. Returns equity history, current balances, and alerts.
     """
     try:
         from src.jobs.equity_tracker import EquityTracker
-        
+
         tracker = EquityTracker(_db_conn())
         dry_equity = tracker.get_equity_curve("DRY")
         live_equity = tracker.get_equity_curve("LIVE")
         alerts = tracker.get_divergence_alerts()
-        
-        return jsonify({
-            "dry_curve": dry_equity,
-            "live_curve": live_equity,
-            "alerts": alerts,
-            "timestamp": datetime.utcnow().isoformat()
-        })
+
+        return jsonify(
+            {
+                "dry_curve": dry_equity,
+                "live_curve": live_equity,
+                "alerts": alerts,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        )
     except Exception as e:
         return jsonify({"error": str(e), "alert": "Equity tracker not yet initialized"}), 200
 
@@ -4857,7 +5180,7 @@ def api_strategy_toggle(name):
     recorded_row = recorded.get(this_runtime_key) or {}
     recorded_mode = recorded_row.get("mode")
     db_pid = recorded_row.get("pid")
-    
+
     # CRITICAL FIX: Only reject mode mismatch if strategy is CURRENTLY RUNNING
     # This allows switching a strategy from DRY to LIVE or vice versa without
     # being blocked by old database records. But never allow starting in wrong
@@ -4866,15 +5189,17 @@ def api_strategy_toggle(name):
         # Strategy IS running - verify it's in the right book
         if recorded_mode and recorded_mode != ("live" if book_mode == "live" else "paper"):
             return (
-                jsonify({
-                    "error": (
-                        f"RUNNING IN WRONG BOOK: {name} is alive in {recorded_mode} "
-                        f"but you clicked the button in {book_mode}. Refusing to prevent contamination."
-                    )
-                }),
+                jsonify(
+                    {
+                        "error": (
+                            f"RUNNING IN WRONG BOOK: {name} is alive in {recorded_mode} "
+                            f"but you clicked the button in {book_mode}. Refusing to prevent contamination."
+                        )
+                    }
+                ),
                 409,
             )
-    
+
     # NOT running - allow mode change without complaint. Old records don't matter.
 
     # Check the DATABASE for the current state — not just the in-memory dict.
@@ -4913,6 +5238,25 @@ def api_strategy_toggle(name):
             }
         )
 
+    # HEAVY API ABUSER LOCKOUT: the operator has locked OFF the #1 OpenRouter
+    # spender. Its Start button is refused with 403 and no process is spawned.
+    # Stop is never blocked - an already-running process can still be stopped.
+    # The lock lives HERE, in the START section; the card still renders so the
+    # operator can see the lane exists, but it cannot be armed.
+    if name in HEAVY_API_ABUSERS:
+        print(
+            f"[api_strategy_toggle] {name} is a heavy API abuser - refusing START with 403",
+            flush=True,
+        )
+        return (
+            jsonify(
+                {
+                    "error": f"{name} is locked OFF by the operator as a heavy API abuser. Start refused with 403."
+                }
+            ),
+            403,
+        )
+
     # LAW: the operator's last button push is permanent truth. This point is
     # reached only when the DB says the lane is NOT running, so this is a
     # START request. Never clear intent here: a Start that fails validation
@@ -4920,8 +5264,11 @@ def api_strategy_toggle(name):
     # intent exactly as it was, not flip a lane the operator turned ON into
     # OFF-forever. The Start path arms the lane before spawning (the latch);
     # the Stop path above (db_running) is the only place desired=False is written.
-    
-    print(f"[api_strategy_toggle] {name} is NOT RUNNING, executing START in {book_mode} book", flush=True)
+
+    print(
+        f"[api_strategy_toggle] {name} is NOT RUNNING, executing START in {book_mode} book",
+        flush=True,
+    )
 
     if requested_mode is not None and requested_mode != runtime_mode:
         # Starting is gated on the book: the page controls the book it shows.
@@ -4962,7 +5309,10 @@ def api_strategy_toggle(name):
         # and the supervisor retries - a Start stays a Start, forever.
         _run_async(store.arm(name, mode))
         result = _spawn_strategy(name, mode)
-        print(f"[api_strategy_toggle] {name} spawned successfully in {mode} mode (PID {result['pid']})", flush=True)
+        print(
+            f"[api_strategy_toggle] {name} spawned successfully in {mode} mode (PID {result['pid']})",
+            flush=True,
+        )
         # PERMANENT ASSERTION: The book we read must match the mode we spawned.
         # If they differ, it means a guessed/stale book mode snuck through and the
         # wrong strategy is now running. This is THE BUG the operator complained about.
@@ -5005,8 +5355,9 @@ def api_diagnostics():
     """Return detailed diagnostic information about the environment and strategy health."""
     import os
     import sys
+
     from src.utils.database import DatabaseManager
-    
+
     diagnostics = {
         "environment": {
             "python_version": sys.version,
@@ -5015,25 +5366,42 @@ def api_diagnostics():
             "project": os.environ.get("RAILWAY_PROJECT_ID", "not set"),
             "service": os.environ.get("RAILWAY_SERVICE_ID", "not set"),
             "kalshi_api_key": "present" if os.environ.get("KALSHI_API_KEY") else "MISSING",
-            "kalshi_private_key": "present" if os.environ.get("KALSHI_PRIVATE_KEY") or os.environ.get("KALSHI_PRIVATE_KEY_PATH") else "MISSING",
+            "kalshi_private_key": (
+                "present"
+                if os.environ.get("KALSHI_PRIVATE_KEY") or os.environ.get("KALSHI_PRIVATE_KEY_PATH")
+                else "MISSING"
+            ),
             "db_path": os.environ.get("DB_PATH", "not set"),
             "live_trading_enabled": os.environ.get("LIVE_TRADING_ENABLED", "false").strip().lower(),
-            "openrouter_api_key": os.environ.get("OPENROUTER_API_KEY", "not set")[:10] + "..." if os.environ.get("OPENROUTER_API_KEY") else None,
-            "kalshi_api_key_id": os.environ.get("KALSHI_API_KEY_ID", "not set")[:10] + "..." if os.environ.get("KALSHI_API_KEY_ID") else None,
-            "kalshi_demo_api_key_id": os.environ.get("KALSHI_DEMO_API_KEY_ID", "not set")[:10] + "..." if os.environ.get("KALSHI_DEMO_API_KEY_ID") else None,
+            "openrouter_api_key": (
+                os.environ.get("OPENROUTER_API_KEY", "not set")[:10] + "..."
+                if os.environ.get("OPENROUTER_API_KEY")
+                else None
+            ),
+            "kalshi_api_key_id": (
+                os.environ.get("KALSHI_API_KEY_ID", "not set")[:10] + "..."
+                if os.environ.get("KALSHI_API_KEY_ID")
+                else None
+            ),
+            "kalshi_demo_api_key_id": (
+                os.environ.get("KALSHI_DEMO_API_KEY_ID", "not set")[:10] + "..."
+                if os.environ.get("KALSHI_DEMO_API_KEY_ID")
+                else None
+            ),
         },
         "strategy_state": {},
         "database": {},
         "process": {
             "pid": os.getpid(),
-            "parent_pid": os.getppid() if hasattr(os, 'getppid') else None,
+            "parent_pid": os.getppid() if hasattr(os, "getppid") else None,
         },
         "missing_requirements": [
-            var for var in ["KALSHI_API_KEY", "KALSHI_PRIVATE_KEY", "KALSHI_PRIVATE_KEY_PATH"] 
+            var
+            for var in ["KALSHI_API_KEY", "KALSHI_PRIVATE_KEY", "KALSHI_PRIVATE_KEY_PATH"]
             if not os.environ.get(var)
-        ]
+        ],
     }
-    
+
     # Add strategy state details
     for name, st in strategy_state.items():
         diagnostics["strategy_state"][name] = {
@@ -5042,7 +5410,7 @@ def api_diagnostics():
             "mode": st.get("mode"),
             "stop_reason": st.get("stop_reason"),
         }
-    
+
     # Check database connectivity
     try:
         db = DatabaseManager(db_path=DB_PATH)
@@ -5059,8 +5427,7 @@ def api_diagnostics():
     try:
         rows = _run_async(_runtime_store().snapshot())
         diagnostics["strategy_runtime"] = {
-            k: {kk: vv for kk, vv in v.items() if kk != "start_ticks"}
-            for k, v in rows.items()
+            k: {kk: vv for kk, vv in v.items() if kk != "start_ticks"} for k, v in rows.items()
         }
     except Exception as e:  # noqa: BLE001 - diagnostics must never 500
         diagnostics["strategy_runtime"] = {"error": str(e)}
@@ -5075,7 +5442,7 @@ def api_diagnostics():
             "mode": st.get("mode"),
             "stop_reason": st.get("stop_reason"),
         }
-    
+
     # Check database connectivity
     try:
         db = DatabaseManager(db_path=DB_PATH)
@@ -5085,8 +5452,9 @@ def api_diagnostics():
     except Exception as e:
         diagnostics["database"]["connected"] = False
         diagnostics["database"]["error"] = str(e)
-    
+
     return jsonify(diagnostics)
+
 
 def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
     """Launch one strategy process and record it. Raises on failure.
@@ -5131,7 +5499,7 @@ def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
         child_env["KALSHI_PRIVATE_KEY_PATH"] = key_path
     # Children must share the volume-mounted database, not a fresh container one.
     child_env["DB_PATH"] = str(DB_PATH)
-    
+
     # CRITICAL: Isolate book mode environment variables to prevent cross-contamination.
     # Remove any stale TRADING_MODE or LIVE_TRADING_ENABLED from parent process.
     # This ensures child inherits only the mode we explicitly set.
@@ -5187,13 +5555,19 @@ def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
         try:
             _run_async(store.record_start(name, proc.pid, mode, " ".join(cmd[1:]), desired=True))
             last_error = None
-            print(f"[strategy_spawn] {name} (PID {proc.pid}) recorded successfully on attempt {attempt + 1}", flush=True)
+            print(
+                f"[strategy_spawn] {name} (PID {proc.pid}) recorded successfully on attempt {attempt + 1}",
+                flush=True,
+            )
             break
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             # Increased backoff: 0.2s, 0.5s, 1.2s, 2.8s, 6.4s, 14.6s, 33.2s, 75.2s
-            backoff = 0.2 * (2.4 ** attempt)
-            print(f"[strategy_spawn] {name} (PID {proc.pid}) record_start attempt {attempt + 1} failed ({exc}), retrying in {backoff:.1f}s", flush=True)
+            backoff = 0.2 * (2.4**attempt)
+            print(
+                f"[strategy_spawn] {name} (PID {proc.pid}) record_start attempt {attempt + 1} failed ({exc}), retrying in {backoff:.1f}s",
+                flush=True,
+            )
             time.sleep(backoff)
     if last_error is not None:
         _child_procs.pop(proc.pid, None)
@@ -5205,7 +5579,9 @@ def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
                 proc.kill()
             except Exception:  # noqa: BLE001
                 pass
-        print(f"[strategy_spawn] {name} failed to record after 8 attempts: {last_error}", flush=True)
+        print(
+            f"[strategy_spawn] {name} failed to record after 8 attempts: {last_error}", flush=True
+        )
         raise RuntimeError(
             f"started {name} but could not record it ({last_error}); "
             f"the process was stopped rather than left untracked"
@@ -5909,7 +6285,7 @@ pre{
 }
 .note-box b{color:var(--amber)}
 /* strategy cards: one per strategy, each with its own persistent curve */
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(430px,100%),1fr));gap:12px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:12px}
 .row.three{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}
 .card{
   background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:11px 12px;
@@ -6115,6 +6491,14 @@ button.loading.yellow::after {
     <div class="s" id="tLivePosNote">{% if s.kalshi %}{{ s.kalshi.held_count }} held &middot; {{ s.kalshi.ghost_count }} flat rows on Kalshi's side (no shares, cannot be deleted){% else %}&mdash;{% endif %}</div>
   </div>
   <div class="tile">
+    <div class="k">Real exposure</div>
+    {#- Exposure is what the account can lose, not the notional the positions
+        would fetch at the last trade. Mark-to-model of a 98¢ yes on a coin
+        contract is $0.98 of exposure; the same contract at 2¢ is $0.02. -#}
+    <div class="v" id="tLiveExposure">{{ '$%.2f'|format(s.kalshi.exposure) if s.kalshi and s.kalshi.exposure_known else '-' }}</div>
+    <div class="s" id="tLiveExposureNote">{% if s.kalshi and s.kalshi.exposure_known %}mark-to-model across {{ s.kalshi.held_count }} held contracts{% else %}unavailable{% endif %}</div>
+  </div>
+  <div class="tile">
     <div class="k">Real realized P&amp;L</div>
     {#- An unavailable total reads "n/a", never "$0.00". A zero here is
         indistinguishable from a break-even account, which is the one thing a
@@ -6141,6 +6525,10 @@ button.loading.yellow::after {
     <span class="note"><span id="calibToggle" style="cursor:pointer;font-weight:600">show</span> &middot; the model's own report card &middot; closed trades, current book</span>
   </div>
   <div class="pb" id="calibBodyWrap" style="display:none"><div class="scroll">
+  <div class="cstats" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));margin:8px 0">
+    <div><b id="caliRealPnl">Real realized P&amp;L</b></div>
+    <div><b id="caliBotPnl">Bot realized P&amp;L</b><span class="note">closed trades</span></div>
+  </div>
   <table><thead><tr><th>Entry fair band</th><th class="num">Trades</th><th class="num">Wins</th><th class="num">Win %</th><th class="num">Net $</th></tr></thead>
   <tbody id="fairBandsBody">
     {%- for b in (s.trades.by_fair_band if s.trades else []) %}
@@ -8080,24 +8468,23 @@ def start_background_workers():
     except Exception as exc:  # noqa: BLE001 - boot never fails on config
         _push_error(f"config apply failed: {type(exc).__name__}: {exc}")
     for target in (
-         _monitor_loop,
-         _log_tail_loop,
-         _log_trim_loop,
-         _backup_loop,
-         _market_data_loop,
-         # Button-only control, with restart persistence. This loop NEVER
-         # starts an unpushed lane and
-         # NEVER kills anything (a stale heartbeat only alerts). What
-         # it does is honour the operator's own pushes across a
-         # redeploy: a lane with desired=1 whose process died with the
-         # container is resumed. With the loop disabled, every deploy
-         # silently stopped the whole book - the "strategies turn
-         # themselves off" the operator reported. The operator's Stop
-          # stays welded: desired=0 lanes are not touched.
-          _strategy_supervisor_loop,
+        _monitor_loop,
+        _log_tail_loop,
+        _log_trim_loop,
+        _backup_loop,
+        _market_data_loop,
+        # Button-only control, with restart persistence. This loop NEVER
+        # starts an unpushed lane and
+        # NEVER kills anything (a stale heartbeat only alerts). What
+        # it does is honour the operator's own pushes across a
+        # redeploy: a lane with desired=1 whose process died with the
+        # container is resumed. With the loop disabled, every deploy
+        # silently stopped the whole book - the "strategies turn
+        # themselves off" the operator reported. The operator's Stop
+        # stays welded: desired=0 lanes are not touched.
+        _strategy_supervisor_loop,
     ):
         threading.Thread(target=target, daemon=True).start()
-
 
 
 def main():

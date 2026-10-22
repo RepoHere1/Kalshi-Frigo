@@ -42,10 +42,10 @@ class TestOpenRouterClient:
         client = OpenRouterClient.__new__(OpenRouterClient)
         client._logger = MagicMock()
 
-        response = '''Here is my analysis:
+        response = """Here is my analysis:
 ```json
 {"action": "BUY", "side": "YES", "limit_price": 45, "confidence": 0.78, "reasoning": "Good edge"}
-```'''
+```"""
         decision = client._parse_trading_decision(response)
         assert decision is not None
         assert decision.action == "BUY"
@@ -96,5 +96,3 @@ class TestOpenRouterClient:
         summary = client.get_cost_summary()
         assert summary["total_cost"] == 0.05
         assert summary["total_requests"] == 10
-
-

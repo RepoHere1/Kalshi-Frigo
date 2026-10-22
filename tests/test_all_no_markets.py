@@ -129,6 +129,8 @@ class TestNoBookSeparation:
         # A lane NO clip: the strategy is one of the up/down lanes.
         wd._db_rows("DELETE FROM positions")
         wd._db_rows("DELETE FROM trade_logs")
+        wd._db_rows("DELETE FROM all_no_positions")
+        wd._db_rows("DELETE FROM all_no_book")
         import sqlite3
 
         conn = sqlite3.connect(str(tmp_path / "sep.db"))

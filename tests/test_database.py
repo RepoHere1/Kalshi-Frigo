@@ -16,7 +16,7 @@ FIXTURE_PATH = "tests/fixtures/markets.json"
 
 def load_and_prepare_markets(fixture_path: str) -> List[Market]:
     """Loads markets from a fixture and processes dynamic timestamps."""
-    with open(fixture_path, 'r') as f:
+    with open(fixture_path, "r") as f:
         raw_markets = json.load(f)
 
     processed_markets = []
@@ -24,9 +24,9 @@ def load_and_prepare_markets(fixture_path: str) -> List[Market]:
     for m in raw_markets:
         # Handle dynamic expiration timestamps like "NOW+5D"
         if isinstance(m["expiration_ts"], str) and "NOW+" in m["expiration_ts"]:
-            days_to_add = int(m["expiration_ts"].split('+')[1].replace('D', ''))
+            days_to_add = int(m["expiration_ts"].split("+")[1].replace("D", ""))
             m["expiration_ts"] = int((now + timedelta(days=days_to_add)).timestamp())
-        
+
         m["last_updated"] = datetime.now()
         processed_markets.append(Market(**m))
     return processed_markets
@@ -39,10 +39,10 @@ async def test_get_eligible_markets():
     db_path = TEST_DB
     if os.path.exists(db_path):
         os.remove(db_path)
-    
+
     manager = DatabaseManager(db_path=db_path)
     await manager.initialize()
-    
+
     markets = load_and_prepare_markets(FIXTURE_PATH)
     await manager.upsert_markets(markets)
 
@@ -53,17 +53,16 @@ async def test_get_eligible_markets():
 
         # Fetch eligible markets
         eligible_markets = await manager.get_eligible_markets(
-            volume_min=volume_min,
-            max_days_to_expiry=max_days_to_expiry
+            volume_min=volume_min, max_days_to_expiry=max_days_to_expiry
         )
 
         # Assertions
         assert len(eligible_markets) == 2, "Should find exactly two eligible markets"
-        
+
         eligible_ids = {market.market_id for market in eligible_markets}
         assert "ELIGIBLE-1" in eligible_ids
         assert "ELIGIBLE-2-EDGE-CASE" in eligible_ids
-        
+
         # Check that ineligible markets are not present
         assert "INELIGIBLE-LOW-VOLUME" not in eligible_ids
         assert "INELIGIBLE-LONG-EXPIRY" not in eligible_ids
@@ -72,4 +71,4 @@ async def test_get_eligible_markets():
     finally:
         # Manual teardown
         if os.path.exists(db_path):
-            os.remove(db_path) 
+            os.remove(db_path)

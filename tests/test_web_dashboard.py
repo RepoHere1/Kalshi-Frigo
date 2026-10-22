@@ -4,6 +4,7 @@ These cover regressions that made the deployed dashboard non-functional:
 DB-backed endpoints returning 500, the SSE feed silently dropping every
 listener, and config saves corrupting typed settings.
 """
+
 import asyncio
 import json
 import os
@@ -274,16 +275,31 @@ def test_zero_share_rows_are_not_counted_as_positions(client, auth, monkeypatch)
         dict(KALSHI_MARKET_POSITION),
         dict(KALSHI_EVENT_POSITION),
         # Touched and closed: Kalshi keeps these forever.
-        {"ticker": "KXSB-27-LV", "position_fp": "0.00", "market_exposure_dollars": "0.00",
-         "total_traded_dollars": "120.00", "realized_pnl_dollars": "-40.00",
-         "fees_paid_dollars": "2.00"},
-        {"ticker": "KXMLB-26-NYY", "position_fp": "0.00", "market_exposure_dollars": "0.00",
-         "total_traded_dollars": "60.00", "realized_pnl_dollars": "-10.00",
-         "fees_paid_dollars": "1.00"},
+        {
+            "ticker": "KXSB-27-LV",
+            "position_fp": "0.00",
+            "market_exposure_dollars": "0.00",
+            "total_traded_dollars": "120.00",
+            "realized_pnl_dollars": "-40.00",
+            "fees_paid_dollars": "2.00",
+        },
+        {
+            "ticker": "KXMLB-26-NYY",
+            "position_fp": "0.00",
+            "market_exposure_dollars": "0.00",
+            "total_traded_dollars": "60.00",
+            "realized_pnl_dollars": "-10.00",
+            "fees_paid_dollars": "1.00",
+        },
         # An event rollup whose cost is all historical, with nothing open.
-        {"event_ticker": "KXNBAGREAT-26", "total_cost_shares_fp": "100.00",
-         "total_cost_dollars": "925.84", "event_exposure_dollars": "0.00",
-         "realized_pnl_dollars": "0.00", "fees_paid_dollars": "0.00"},
+        {
+            "event_ticker": "KXNBAGREAT-26",
+            "total_cost_shares_fp": "100.00",
+            "total_cost_dollars": "925.84",
+            "event_exposure_dollars": "0.00",
+            "realized_pnl_dollars": "0.00",
+            "fees_paid_dollars": "0.00",
+        },
     ]
     try:
         snap = client.get("/api/snapshot").get_json()
@@ -316,9 +332,14 @@ def test_the_live_position_tile_counts_held_rows_not_raw_rows(client, auth, monk
     _go_live(client, auth, monkeypatch)
     wd.dashboard_state["positions"] = [
         dict(KALSHI_MARKET_POSITION),
-        {"ticker": "KXSB-27-LV", "position_fp": "0.00", "market_exposure_dollars": "0.00",
-         "total_traded_dollars": "0.00", "realized_pnl_dollars": "0.00",
-         "fees_paid_dollars": "0.00"},
+        {
+            "ticker": "KXSB-27-LV",
+            "position_fp": "0.00",
+            "market_exposure_dollars": "0.00",
+            "total_traded_dollars": "0.00",
+            "realized_pnl_dollars": "0.00",
+            "fees_paid_dollars": "0.00",
+        },
     ]
     try:
         html = client.get("/").get_data(as_text=True)
@@ -490,7 +511,6 @@ def test_a_failed_title_lookup_is_retried_rather_than_cached_as_the_ticker(monke
     assert wd.dashboard_state["market_titles"]["KXMYSTERY-26"] == "Recovered"
 
 
-
 def test_kalshi_rows_carry_real_values(client, auth, monkeypatch):
     _go_live(client, auth, monkeypatch)
     gen = _load_kalshi(client)
@@ -503,8 +523,6 @@ def test_kalshi_rows_carry_real_values(client, auth, monkeypatch):
     assert "KXMLB-26" in html
     # The old code emitted a literal "?" for the missing `side` field.
     assert ">?<" not in html
-
-
 
 
 def test_live_page_still_shows_the_real_account(client, auth, monkeypatch):
@@ -600,7 +618,6 @@ def test_live_headline_shows_the_real_account(client, auth, monkeypatch):
     assert "DRY cash" not in tiles
 
 
-
 def test_kalshi_positions_stand_in_for_an_empty_db(client, auth, monkeypatch):
     """The Kalshi account can stand in for an empty DB - but only in LIVE.
 
@@ -639,7 +656,9 @@ def test_kalshi_positions_stand_in_for_an_empty_db(client, auth, monkeypatch):
         snap = client.get("/api/snapshot").get_json()
     finally:
         gen2.close()
-    assert len(snap["positions"]) == 1, "only the market Kalshi still holds is an open LIVE position"
+    assert (
+        len(snap["positions"]) == 1
+    ), "only the market Kalshi still holds is an open LIVE position"
     assert all(p["strategy"] == "kalshi_api" for p in snap["positions"])
     assert snap["positions"][0]["market_id"] == "KXPRES-26-BIDEN"
     # Back to DRY for any test that follows.
@@ -899,7 +918,7 @@ def test_stop_is_never_gated_on_the_book(client, auth, monkeypatch):
     store = wd._runtime_store()
 
     async def _seed():
-        await store.record_start("btc_updown", 4242, "dry", "cli.py run")
+        await store.record_start("btc_updown", 4242, "paper", "cli.py run")
 
     import asyncio
 
@@ -907,9 +926,7 @@ def test_stop_is_never_gated_on_the_book(client, auth, monkeypatch):
     monkeypatch.setattr(wd, "_pid_alive", lambda pid, row=None: True)
     monkeypatch.setattr(wd, "_stop_child", lambda _d: 0)
 
-    r = client.post(
-        "/api/strategy/btc_updown/toggle", json={"mode": "paper"}, headers=auth
-    )
+    r = client.post("/api/strategy/btc_updown/toggle", json={"mode": "paper"}, headers=auth)
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["running"] is False
 
@@ -927,7 +944,7 @@ def test_toggle_refuses_without_kalshi_credentials(client, auth, monkeypatch):
     monkeypatch.delenv("KALSHI_API_KEY", raising=False)
     monkeypatch.delenv("KALSHI_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("KALSHI_PRIVATE_KEY_PATH", raising=False)
-    r = client.post("/api/strategy/safe_compounder/toggle", json={"mode": "paper"}, headers=auth)
+    r = client.post("/api/strategy/ai_directional/toggle", json={"mode": "paper"}, headers=auth)
     assert r.status_code == 400
     assert "credentials" in r.get_json()["error"].lower()
     assert not any(s["pid"] for s in client.get("/api/bots").get_json())
@@ -947,7 +964,7 @@ def test_toggle_refuses_when_only_api_key_present(client, auth, monkeypatch):
     monkeypatch.setenv("KALSHI_API_KEY", "kid")
     monkeypatch.delenv("KALSHI_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("KALSHI_PRIVATE_KEY_PATH", raising=False)
-    r = client.post("/api/strategy/safe_compounder/toggle", json={"mode": "paper"}, headers=auth)
+    r = client.post("/api/strategy/ai_directional/toggle", json={"mode": "paper"}, headers=auth)
     assert r.status_code == 400
 
 
@@ -967,17 +984,15 @@ def test_stopping_a_strategy_disarms_only_its_own_row(client, auth, monkeypatch,
     proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
         store = wd._runtime_store()
-        asyncio.run(
-            store.record_start("btc_updown", proc.pid, "dry", "cli.py run --btc-updown")
-        )
+        asyncio.run(store.record_start("btc_updown", proc.pid, "paper", "cli.py run --btc-updown"))
         r = client.post("/api/strategy/btc_updown/toggle", json={}, headers=auth)
         assert r.status_code == 200
         body = r.get_json()
         assert body["running"] is False
 
         snap = asyncio.run(store.snapshot())
-        assert snap[rt_key("btc_updown", "dry")]["pid"] is None
-        assert snap[rt_key("btc_updown", "dry")]["stop_reason"] == "stopped by operator"
+        assert snap[rt_key("btc_updown", "paper")]["pid"] is None
+        assert snap[rt_key("btc_updown", "paper")]["stop_reason"] == "stopped by operator"
     finally:
         proc.kill()
         try:
@@ -1063,18 +1078,16 @@ def test_toggle_starts_process_when_credentials_present(client, auth, monkeypatc
             self._rc = -9
 
     monkeypatch.setattr(wd.subprocess, "Popen", FakePopen)
-    st = wd.strategy_state["safe_compounder"]
+    st = wd.strategy_state["ai_directional"]
     try:
-        r = client.post(
-            "/api/strategy/safe_compounder/toggle", json={"mode": "paper"}, headers=auth
-        )
+        r = client.post("/api/strategy/ai_directional/toggle", json={"mode": "paper"}, headers=auth)
         assert r.status_code == 200
         body = r.get_json()
         assert body["running"] is True
         assert body["pid"] == 31337
         # Must use this interpreter, not whatever `python` resolves to on PATH.
         assert spawned["cmd"][0] == sys.executable
-        assert "--safe-compounder" in spawned["cmd"]
+        assert "--directional" in spawned["cmd"]
         assert "--paper" in spawned["cmd"]
         # Output must not go to an undrained PIPE (that deadlocks the child
         # once the ~64KB buffer fills); stderr folds into the same log file.
@@ -1083,12 +1096,14 @@ def test_toggle_starts_process_when_credentials_present(client, auth, monkeypatc
         assert spawned["stdout"] is not wd.subprocess.PIPE
 
         bots = {b["name"]: b for b in client.get("/api/bots").get_json()}
-        assert bots["safe_compounder"]["running"] is True
+        # safe_compounder is locked OFF as a heavy API abuser and must not run.
+        assert bots["safe_compounder"]["running"] is False
 
         r2 = client.post(
             "/api/strategy/safe_compounder/toggle", json={"mode": "paper"}, headers=auth
         )
-        assert r2.get_json()["running"] is False
+        assert r2.status_code == 403
+        assert "error" in r2.get_json()
     finally:
         st["running"] = False
         st["pid"] = None
@@ -1243,18 +1258,12 @@ def test_token_accepted_from_header(client, auth):
 
 
 def test_token_accepted_from_json_body(client):
-    r = _post_config_unchanged(
-        client, headers={"X-Auth-Token": TEST_TOKEN}
-    )
+    r = _post_config_unchanged(client, headers={"X-Auth-Token": TEST_TOKEN})
     assert r.status_code == 200
-
-
-
 
 
 # ---------------------------------------------------------------------------
 # DRY / LIVE mode
-
 
 
 def test_mode_rejects_unknown_value(client, auth):
@@ -1296,7 +1305,6 @@ def test_going_live_with_no_balance_is_reported_not_refused(client, auth, monkey
     assert client.get("/api/mode").get_json()["mode"] == "live"
 
 
-
 def test_mode_is_persisted_across_manager_instances(client, auth, monkeypatch):
     """Mode lives in the DB, not process memory, so a redeploy cannot revert it."""
     from src.utils.mode import TradingMode, run
@@ -1317,10 +1325,8 @@ def test_mode_is_persisted_across_manager_instances(client, auth, monkeypatch):
     assert run(fresh.current()) == "live"
 
 
-
 # ---------------------------------------------------------------------------
 # DRY cash ledger
-
 
 
 def test_page_shows_write_lock_notice_when_token_unset(unlocked):
@@ -1337,7 +1343,9 @@ def test_page_shows_write_lock_notice_when_token_unset(unlocked):
 # ---------------------------------------------------------------------------
 def test_page_carries_mode_in_body_attribute(client):
     html = client.get("/").get_data(as_text=True)
-    assert '<body data-mode="live">' in html
+    # A fresh database is DRY: an unconfigured deployment must never come up
+    # rendering itself as a live-money page.
+    assert '<body data-mode="dry">' in html
 
 
 def test_page_has_full_viewport_mode_frame(client):
@@ -1403,9 +1411,9 @@ def test_live_mode_renders_red_indicators(client, auth, monkeypatch):
     html = client.get("/").get_data(as_text=True)
     assert '<body data-mode="live">' in html
     assert '<span id="modeFlagText">LIVE MODE</span>' in html
-    assert "DRY Trading Dashboard" in html
+    assert "LIVE Trading Dashboard" in html
+    assert "DRY Trading Dashboard" not in html
     assert "REAL ORDERS, REAL MONEY" in html or "real orders" in html.lower()
-
 
 
 # ---------------------------------------------------------------------------
@@ -1607,14 +1615,12 @@ async def test_migration_column_added_to_old_database(tmp_path):
     db_path = str(tmp_path / "legacy.db")
     conn = sqlite3.connect(db_path)
     # The pre-mode schema, 14 columns and no mode.
-    conn.execute(
-        """CREATE TABLE positions (
+    conn.execute("""CREATE TABLE positions (
         id INTEGER PRIMARY KEY AUTOINCREMENT, market_id TEXT NOT NULL, side TEXT NOT NULL,
         entry_price REAL NOT NULL, quantity INTEGER NOT NULL, timestamp TEXT NOT NULL,
         rationale TEXT, confidence REAL, live BOOLEAN NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'open', strategy TEXT, stop_loss_price REAL,
-        take_profit_price REAL)"""
-    )
+        take_profit_price REAL)""")
     conn.execute(
         "INSERT INTO positions (market_id, side, entry_price, quantity, timestamp, live)"
         " VALUES ('KXBARE-26','YES',0.5,4,'2026-01-01T00:00:00',0)"
@@ -1658,7 +1664,11 @@ def test_basic_auth_ignored_when_unconfigured(client):
 
     monkeypatch_user = None
     creds = base64.b64encode(b"anyone:anything").decode()
-    r = client.post("/api/mode", json={"mode": "live", "confirm": True}, headers={"Authorization": f"Basic {creds}"})
+    r = client.post(
+        "/api/mode",
+        json={"mode": "live", "confirm": True},
+        headers={"Authorization": f"Basic {creds}"},
+    )
     assert r.status_code == 401, monkeypatch_user
 
 
@@ -1744,15 +1754,15 @@ def _seed_cards(client):
         async with aiosqlite.connect(wd.DB_PATH) as conn:
             rows = [
                 # (strategy, pnl, mode)
-                ("directional_trading", 1.00, "live"),
-                ("directional_trading", 2.00, "live"),
-                ("directional_trading", -0.50, "live"),
-                ("quick_flip_scalping", 0.75, "live"),
-                ("safe_compounder", -1.25, "live"),
-                ("market_making", 0.25, "live"),
+                ("directional_trading", 1.00, "dry"),
+                ("directional_trading", 2.00, "dry"),
+                ("directional_trading", -0.50, "dry"),
+                ("quick_flip_scalping", 0.75, "dry"),
+                ("safe_compounder", -1.25, "dry"),
+                ("market_making", 0.25, "dry"),
                 # A row from the removed simulated book must not leak into a
                 # real book's card.
-                ("ai_directional", 99.00, "dry"),
+                ("ai_directional", 99.00, "live"),
             ]
             for i, (strategy, pnl, mode) in enumerate(rows):
                 await conn.execute(
@@ -1765,14 +1775,14 @@ def _seed_cards(client):
             await conn.execute(
                 "INSERT INTO positions (market_id, side, entry_price, quantity,"
                 " timestamp, live, status, strategy, mode)"
-                " VALUES ('KXOPEN', 'YES', 0.30, 12, '2026-01-01T00:00:00', 1,"
-                " 'open', 'market_making', 'live')"
+                " VALUES ('KXOPEN', 'YES', 0.30, 12, '2026-01-01T00:00:00', 0,"
+                " 'open', 'market_making', 'dry')"
             )
             await conn.execute(
                 "INSERT INTO positions (market_id, side, entry_price, quantity,"
                 " timestamp, live, status, strategy, mode)"
-                " VALUES ('KXLEGACYOPEN', 'YES', 0.30, 12, '2026-01-01T00:00:00', 0,"
-                " 'open', 'ai_directional', 'dry')"
+                " VALUES ('KXLEGACYOPEN', 'YES', 0.30, 12, '2026-01-01T00:00:00', 1,"
+                " 'open', 'ai_directional', 'live')"
             )
             await conn.commit()
 
@@ -1801,11 +1811,7 @@ def test_every_strategy_runs_its_own_command(client):
     cards = _cards(client)
     assert set(cards) == set(wd.STRATEGY_COMMANDS), "a strategy has no command"
     commands = {c["name"]: c["command"] for c in cards.values()}
-    shared = {
-        name: cmd
-        for name, cmd in commands.items()
-        if list(commands.values()).count(cmd) > 1
-    }
+    shared = {name: cmd for name, cmd in commands.items() if list(commands.values()).count(cmd) > 1}
     # Only the UP/DOWN family may share, and only on the updown trader.
     assert set(shared) <= {"btc_updown", "doge_updown", "btc_1h_updown"}
     for cmd in shared.values():
@@ -1856,7 +1862,7 @@ def test_dedicated_roll_card_and_painter_are_removed(client):
     assert snap["roll_card"]["open_clips"] == 0
     assert 'id="roll-card"' not in html
     assert "paintRollCard" not in html
-    assert 'onclick="openStrategy(\'roll_iq\')"' not in html
+    assert "onclick=\"openStrategy('roll_iq')\"" not in html
     assert 'id="btn-roll_iq"' not in html
 
 
@@ -1919,11 +1925,7 @@ def test_card_reports_its_own_command(client):
     # loop. The UP/DOWN lanes are separate operator-pushed lanes of the
     # same --btc-updown trader, so they share that one command.
     commands = {c["name"]: c["command"] for c in cards.values()}
-    shared = {
-        name: cmd
-        for name, cmd in commands.items()
-        if list(commands.values()).count(cmd) > 1
-    }
+    shared = {name: cmd for name, cmd in commands.items() if list(commands.values()).count(cmd) > 1}
     assert set(shared) <= {"btc_updown", "doge_updown", "btc_1h_updown"}
     assert "--market-making" in commands["market_making"]
     assert "--quick-flip" in commands["quick_flip"]
@@ -2020,7 +2022,6 @@ def _seed_two_books():
     asyncio.run(seed())
 
 
-
 def test_live_book_excludes_dry_rows(client):
     from src.utils.mode import TradingMode
 
@@ -2030,7 +2031,6 @@ def test_live_book_excludes_dry_rows(client):
     assert live["open_positions"] == 1
     assert live["realized"] == 50.0
     assert live["closed_trades"] == 1
-
 
 
 def test_strategy_state_reads_the_database_not_the_request_flag(client, monkeypatch):
@@ -2184,11 +2184,7 @@ def test_every_strategy_runs_its_own_command(client):
     cards = _cards(client)
     assert set(cards) == set(wd.STRATEGY_COMMANDS), "a strategy has no command"
     commands = {c["name"]: c["command"] for c in cards.values()}
-    shared = {
-        name: cmd
-        for name, cmd in commands.items()
-        if list(commands.values()).count(cmd) > 1
-    }
+    shared = {name: cmd for name, cmd in commands.items() if list(commands.values()).count(cmd) > 1}
     # Only the UP/DOWN family may share, and only on the updown trader.
     assert set(shared) <= {"btc_updown", "doge_updown", "btc_1h_updown"}
     for cmd in shared.values():
@@ -2239,7 +2235,7 @@ def test_dedicated_roll_card_and_painter_are_removed(client):
     assert snap["roll_card"]["open_clips"] == 0
     assert 'id="roll-card"' not in html
     assert "paintRollCard" not in html
-    assert 'onclick="openStrategy(\'roll_iq\')"' not in html
+    assert "onclick=\"openStrategy('roll_iq')\"" not in html
     assert 'id="btn-roll_iq"' not in html
 
 
@@ -2302,11 +2298,7 @@ def test_card_reports_its_own_command(client):
     # loop. The UP/DOWN lanes are separate operator-pushed lanes of the
     # same --btc-updown trader, so they share that one command.
     commands = {c["name"]: c["command"] for c in cards.values()}
-    shared = {
-        name: cmd
-        for name, cmd in commands.items()
-        if list(commands.values()).count(cmd) > 1
-    }
+    shared = {name: cmd for name, cmd in commands.items() if list(commands.values()).count(cmd) > 1}
     assert set(shared) <= {"btc_updown", "doge_updown", "btc_1h_updown"}
     assert "--market-making" in commands["market_making"]
     assert "--quick-flip" in commands["quick_flip"]
@@ -2403,7 +2395,6 @@ def _seed_two_books():
     asyncio.run(seed())
 
 
-
 def test_live_book_excludes_dry_rows(client):
     from src.utils.mode import TradingMode
 
@@ -2413,7 +2404,6 @@ def test_live_book_excludes_dry_rows(client):
     assert live["open_positions"] == 1
     assert live["realized"] == 50.0
     assert live["closed_trades"] == 1
-
 
 
 def test_strategy_state_reads_the_database_not_the_request_flag(client, monkeypatch):
@@ -2607,8 +2597,6 @@ def test_the_feeds_panel_can_be_collapsed(client):
     assert "feedsHidden" in html  # the choice survives a reload
 
 
-
-
 def test_live_page_funding_card_is_the_real_account(client, auth, monkeypatch):
     """In LIVE the funding card answers with the real Kalshi balance."""
     from src.utils.mode import TradingMode
@@ -2693,7 +2681,7 @@ def test_by_strategy_is_book_scoped(client):
 # The Start button follows the mode switch; LIVE spawns --live.
 # ---------------------------------------------------------------------------
 def test_toggle_defaults_to_the_current_book(client, auth, monkeypatch):
-    """A Start press with no mode resolves to the one book: LIVE, --live."""
+    """A Start press with no mode resolves to the one book: DRY, --paper."""
     _RecordingPopen.instances = []
     monkeypatch.setattr(wd.subprocess, "Popen", _RecordingPopen)
     monkeypatch.setattr(wd, "_child_procs", {})
@@ -2702,8 +2690,8 @@ def test_toggle_defaults_to_the_current_book(client, auth, monkeypatch):
     for st in wd.strategy_state.values():
         st.update({"running": False, "pid": None, "stop_reason": ""})
 
-    # There is one book, so a request carrying no mode resolves to LIVE.
-    # (Uses btc_updown: quick_flip is locked OFF as a heavy API abuser and its
+    # There is one book, so a request carrying no mode resolves to DRY.
+    # (Uses btc_updown: safe_compounder is locked OFF as a heavy API abuser and its
     # Start is refused with 403.)
     from src.utils.mode import TradingMode
 
@@ -2714,9 +2702,8 @@ def test_toggle_defaults_to_the_current_book(client, auth, monkeypatch):
     r = client.post("/api/strategy/btc_updown/toggle", json={}, headers=auth)
     assert r.status_code == 200
     args = list(_RecordingPopen.instances[-1].args[0])
-    assert "--live" in args
-    assert "--paper" not in args
-    assert "--paper" not in args
+    assert "--paper" in args
+    assert "--live" not in args
     client.post("/api/mode", json={"mode": "live", "confirm": True}, headers=auth)
 
 
@@ -2760,7 +2747,6 @@ def test_strategy_cards_are_wide_enough_to_read_their_curve():
     assert "minmax(430px,1fr)" in html
     assert ".cards .cchart{height:104px" in html
     assert 'id="spark-' in html and 'height="104"' in html
-
 
 
 def test_dry_page_does_not_point_at_a_panel_it_does_not_render(client):
@@ -3247,9 +3233,7 @@ def test_snapshot_carries_kalshi_age(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 # Latch reset: the surgical kill for stale volume state.
 # ---------------------------------------------------------------------------
-def test_reset_state_walls_every_lane_off_in_both_books(
-    client, auth, monkeypatch, tmp_path
-):
+def test_reset_state_walls_every_lane_off_in_both_books(client, auth, monkeypatch, tmp_path):
     """Every recorded lane, both books, down - and only that is touched."""
     from src.utils.strategy_runtime import StrategyRuntime, key
 
@@ -3351,10 +3335,10 @@ def test_default_max_positions_is_one_hundred():
 
     assert _S.trading.max_positions == 100
     assert _S.trading.max_positions_per_strategy == 100
-    from src.utils.position_limits import PositionLimitsManager
-
     # The manager's hardcoded cap must honor the same order.
     import inspect
+
+    from src.utils.position_limits import PositionLimitsManager
 
     src = inspect.getsource(PositionLimitsManager.__init__)
     assert "self.max_positions = 100" in src
@@ -3474,10 +3458,7 @@ def test_recent_closed_trades_api_paginates_current_book(client):
             await conn.commit()
 
     asyncio.run(seed())
-    pages = [
-        client.get(f"/api/recent-trades?page={page}&per_page=10")
-        for page in (1, 2, 3)
-    ]
+    pages = [client.get(f"/api/recent-trades?page={page}&per_page=10") for page in (1, 2, 3)]
     assert all(response.status_code == 200 for response in pages)
     data = [response.get_json() for response in pages]
 
@@ -3491,10 +3472,7 @@ def test_recent_closed_trades_api_paginates_current_book(client):
         "KXPHANTOM",
         "KXLIVEPAGE",
     }
-    page_ids = [
-        {trade["market_id"] for trade in page["trades"]}
-        for page in data
-    ]
+    page_ids = [{trade["market_id"] for trade in page["trades"]} for page in data]
     assert not (page_ids[0] & page_ids[1] or page_ids[0] & page_ids[2] or page_ids[1] & page_ids[2])
 
 
@@ -3548,20 +3526,19 @@ def test_recent_trade_renderer_can_format_money_outside_snapshot_paint():
     assert "const money =" not in template[paint_start:]
 
 
-
 def test_parse_entry_fair_reads_the_chosen_side():
     """The rationale proves the fair; garbage yields None, never a guess.
     Fair 1.00 is VALID (deadband-past-target certainty) - the strict '< 1.0'
     bound was exactly what left the last 15 calibration rows unknown."""
-    assert wd._parse_entry_fair(
-        "coinbase-coinbase-ws 82,457 vs target 82,478 (-20.51): fair 0.81 vs "
-        "Kalshi 0.44 on DOWN - edge +0.382"
-    ) == 0.81
-    assert wd._parse_entry_fair("fair 0.55 vs Kalshi 0.50 on UP - edge +0.05") == 0.55
     assert (
-        wd._parse_entry_fair("fair 1.00 vs Kalshi 0.46 on DOWN - edge +0.540")
-        == 1.00
+        wd._parse_entry_fair(
+            "coinbase-coinbase-ws 82,457 vs target 82,478 (-20.51): fair 0.81 vs "
+            "Kalshi 0.44 on DOWN - edge +0.382"
+        )
+        == 0.81
     )
+    assert wd._parse_entry_fair("fair 0.55 vs Kalshi 0.50 on UP - edge +0.05") == 0.55
+    assert wd._parse_entry_fair("fair 1.00 vs Kalshi 0.46 on DOWN - edge +0.540") == 1.00
     assert wd._parse_entry_fair("no fair here") is None
     assert wd._parse_entry_fair(None) is None
     assert wd._parse_entry_fair("fair 1.50 vs Kalshi") is None
@@ -3590,9 +3567,7 @@ def test_backfill_fair_identifies_the_unknown_rows(client, auth, monkeypatch, tm
                 "INSERT INTO trade_logs (rationale) VALUES "
                 "('fair 0.81 vs Kalshi 0.64 on DOWN - edge +0.183')"
             )
-            await conn.execute(
-                "INSERT INTO trade_logs (rationale) VALUES ('no parseable fair')"
-            )
+            await conn.execute("INSERT INTO trade_logs (rationale) VALUES ('no parseable fair')")
             await conn.execute(
                 "INSERT INTO positions (rationale) VALUES "
                 "('fair 0.58 vs Kalshi 0.52 on UP - edge +0.06')"

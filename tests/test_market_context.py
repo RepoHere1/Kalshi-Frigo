@@ -365,8 +365,11 @@ def test_sentiment_failure_adds_no_headline_risk():
         raise RuntimeError("model down")
 
     ctx = mc.MarketContext(
-        "PAXG-USD", enabled=True, clock=lambda: NOW,
-        http_get=fake_get, classify=broken,
+        "PAXG-USD",
+        enabled=True,
+        clock=lambda: NOW,
+        http_get=fake_get,
+        classify=broken,
         feeds=("https://www.coindesk.com/arc/outboundfeeds/rss/",),
     )
     ctx._first_due = 0.0
@@ -404,8 +407,12 @@ def test_calendar_that_parses_to_nothing_is_unavailable_not_fresh():
         return "<html>maintenance</html>"
 
     ctx = mc.MarketContext(
-        "PAXG-USD", enabled=True, clock=lambda: NOW,
-        http_get=fake_get, classify=None, feeds=(),
+        "PAXG-USD",
+        enabled=True,
+        clock=lambda: NOW,
+        http_get=fake_get,
+        classify=None,
+        feeds=(),
     )
     ctx._first_due = 0.0
     asyncio.run(ctx.refresh_now())
@@ -431,10 +438,13 @@ def test_state_faults_degrade_to_base_scoring(monkeypatch):
 def test_conflicting_headlines_raise_the_bar_without_moving_price():
     ctx = mc.MarketContext("PAXG-USD", enabled=True, clock=lambda: NOW, classify=None)
     ctx._articles = {
-        "feed": (NOW, [
-            mc.Headline("https://x/a", "Gold surges", NOW - 60, 1.0, "feed"),
-            mc.Headline("https://x/b", "Gold slumps", NOW - 60, 1.0, "feed"),
-        ]),
+        "feed": (
+            NOW,
+            [
+                mc.Headline("https://x/a", "Gold surges", NOW - 60, 1.0, "feed"),
+                mc.Headline("https://x/b", "Gold slumps", NOW - 60, 1.0, "feed"),
+            ],
+        ),
     }
     ctx._sentiment = {"https://x/a": (0.9, 0.9), "https://x/b": (-0.9, 0.9)}
     ctx._events = {

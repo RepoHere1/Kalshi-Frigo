@@ -4,6 +4,7 @@ Everything here is pure math or cache-level logic: no network on the test
 path. The law holds across both books - these are shared code paths; only
 real-money ORDERING on Hyperliquid stays behind an operator-armed gate.
 """
+
 import math
 import time
 from datetime import datetime, timezone
@@ -95,8 +96,7 @@ def test_strike_question_is_parsed():
             "markets": [
                 {
                     "question": (
-                        f"Bitcoin above 87,400 on {today.strftime('%B')} {today.day},"
-                        " 4AM ET?"
+                        f"Bitcoin above 87,400 on {today.strftime('%B')} {today.day}," " 4AM ET?"
                     ),
                     "outcomePrices": ["0.5", "0.5"],
                 }
@@ -240,9 +240,7 @@ def test_reason_names_implied_sigma_when_both_curves_exist():
     t0 = time.monotonic()
     for i in range(60):
         trader.rv.observe(84000.0 + 0.1 * i + (1.0 if i % 2 else -1.0), now=t0 - 300.0 + i * 5.0)
-    market = _dollars(
-        seconds_left=300, yes_bid=0.40, yes_ask=0.41, no_bid=0.59, no_ask=0.60
-    )
+    market = _dollars(seconds_left=300, yes_bid=0.40, yes_ask=0.41, no_bid=0.59, no_ask=0.60)
     signal = trader.evaluate(market, live=False)
     assert signal is not None and signal.side
     assert "rv-sigma" in signal.reason
@@ -253,13 +251,9 @@ def test_reason_names_implied_sigma_when_both_curves_exist():
 def test_poly_guard_vetoes_when_the_other_venue_disagrees():
     trader = _trader()
     end = bucket_to_utc(BUCKET)
-    trader.poly._windows = {
-        PolyScanner._bucket_key(end): PolyWindow(end, 0.75, 0.25, "q")
-    }
+    trader.poly._windows = {PolyScanner._bucket_key(end): PolyWindow(end, 0.75, 0.25, "q")}
     trader.poly._updated = time.monotonic()
-    market = _dollars(
-        seconds_left=120, yes_bid=0.40, yes_ask=0.41, no_bid=0.59, no_ask=0.60
-    )
+    market = _dollars(seconds_left=120, yes_bid=0.40, yes_ask=0.41, no_bid=0.59, no_ask=0.60)
     signal = trader.evaluate(market, live=False)
     assert signal is not None
     assert signal.side == ""
@@ -271,13 +265,9 @@ def test_poly_arb_is_logged_when_the_two_venues_undercut_a_dollar():
     trader = _trader_no_momentum()
     end = bucket_to_utc(BUCKET)
     # Kalshi up ~0.41 (ask); Poly down 0.55 -> combined 0.96 -> arb.
-    trader.poly._windows = {
-        PolyScanner._bucket_key(end): PolyWindow(end, 0.44, 0.55, "q")
-    }
+    trader.poly._windows = {PolyScanner._bucket_key(end): PolyWindow(end, 0.44, 0.55, "q")}
     trader.poly._updated = time.monotonic()
-    market = _dollars(
-        seconds_left=120, yes_bid=0.40, yes_ask=0.41, no_bid=0.59, no_ask=0.60
-    )
+    market = _dollars(seconds_left=120, yes_bid=0.40, yes_ask=0.41, no_bid=0.59, no_ask=0.60)
     signal = trader.evaluate(market, live=False)
     assert trader.poly_arb_last is not None
     assert signal is not None
@@ -289,9 +279,7 @@ def test_hedge_plan_is_annotated_when_mark_is_known():
     for i in range(60):
         trader.rv.observe(84000.0 + 0.1 * i + (1.0 if i % 2 else -1.0), now=t0 - 300.0 + i * 5.0)
     trader.hl.mid = 85000.0
-    market = _dollars(
-        seconds_left=120, yes_bid=0.40, yes_ask=0.41, no_bid=0.59, no_ask=0.60
-    )
+    market = _dollars(seconds_left=120, yes_bid=0.40, yes_ask=0.41, no_bid=0.59, no_ask=0.60)
     signal = trader.evaluate(market, live=False)
     assert signal is not None and signal.side
     assert "hl-hedge:" in signal.reason
@@ -300,9 +288,7 @@ def test_hedge_plan_is_annotated_when_mark_is_known():
 def test_vol_edge_disabled_restores_the_plain_reason():
     trader = _trader()
     trader.config.vol_edge_enabled = False
-    market = _dollars(
-        seconds_left=300, yes_bid=0.40, yes_ask=0.41, no_bid=0.59, no_ask=0.60
-    )
+    market = _dollars(seconds_left=300, yes_bid=0.40, yes_ask=0.41, no_bid=0.59, no_ask=0.60)
     signal = trader.evaluate(market, live=False)
     assert signal is not None
     assert "impl-sigma" not in signal.reason

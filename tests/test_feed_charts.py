@@ -14,6 +14,7 @@ Two things made them not:
 These assert the constants and the rule, against the rendered page, because the
 chart code is JavaScript embedded in a Jinja template.
 """
+
 import pytest
 
 import web_dashboard as wd

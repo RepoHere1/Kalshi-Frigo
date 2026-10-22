@@ -13,19 +13,23 @@ TEST_DB = "track_test.db"
 # Mark all tests in this file as async
 pytestmark = pytest.mark.asyncio
 
+
 async def get_position_by_market_id_any_status(db_manager: DatabaseManager, market_id: str):
     """Helper function to get position regardless of status for testing."""
     async with aiosqlite.connect(db_manager.db_path) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM positions WHERE market_id = ? LIMIT 1", (market_id,))
+        cursor = await db.execute(
+            "SELECT * FROM positions WHERE market_id = ? LIMIT 1", (market_id,)
+        )
         row = await cursor.fetchone()
         if row:
             position_dict = dict(row)
-            position_dict['timestamp'] = datetime.fromisoformat(position_dict['timestamp'])
+            position_dict["timestamp"] = datetime.fromisoformat(position_dict["timestamp"])
             return Position(**position_dict)
         return None
 
-@patch('src.jobs.track.KalshiClient')
+
+@patch("src.jobs.track.KalshiClient")
 async def test_run_tracking_closes_position(mock_kalshi_client):
     """
     Test that the tracking job correctly identifies a closed market,
@@ -35,16 +39,17 @@ async def test_run_tracking_closes_position(mock_kalshi_client):
     db_path = TEST_DB
     if os.path.exists(db_path):
         os.remove(db_path)
-    
+
     db_manager = DatabaseManager(db_path=db_path)
     await db_manager.initialize()
     # Set the trading mode to LIVE so run_tracking finds the position.
     import sqlite3
+
     conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE IF NOT EXISTS runtime_config (key TEXT PRIMARY KEY, value TEXT)")
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS runtime_config (key TEXT PRIMARY KEY, value TEXT)"
+        "INSERT OR REPLACE INTO runtime_config (key, value) VALUES ('trading_mode', 'live')"
     )
-    conn.execute("INSERT OR REPLACE INTO runtime_config (key, value) VALUES ('trading_mode', 'live')")
     conn.commit()
     conn.close()
 
@@ -58,19 +63,14 @@ async def test_run_tracking_closes_position(mock_kalshi_client):
         confidence=0.75,
         live=True,
         mode="live",
-        status="open"
+        status="open",
     )
     position_id = await db_manager.add_position(test_position)
     test_position.id = position_id
 
     # Mock the KalshiClient to return a closed market that resolved to 'YES'
     mock_api = mock_kalshi_client.return_value
-    mock_api.get_market = AsyncMock(return_value={
-        "market": {
-            "status": "closed",
-            "result": "YES"
-        }
-    })
+    mock_api.get_market = AsyncMock(return_value={"market": {"status": "closed", "result": "YES"}})
     mock_api.close = AsyncMock()
 
     try:
@@ -86,7 +86,7 @@ async def test_run_tracking_closes_position(mock_kalshi_client):
         # 2. Check if a trade log was created
         trade_logs = await db_manager.get_all_trade_logs()
         assert len(trade_logs) == 1, "A trade log should have been created."
-        
+
         log = trade_logs[0]
         assert log.market_id == "TRACK-TEST-1"
         # LIVE fees are now applied (round-trip fee $0.10)
@@ -95,7 +95,7 @@ async def test_run_tracking_closes_position(mock_kalshi_client):
         # 3. Verify mocks - Updated for new sell limit order functionality
         # The tracking system now calls get_market multiple times:
         # 1. Once for profit-taking check
-        # 2. Once for stop-loss check  
+        # 2. Once for stop-loss check
         # 3. Once for traditional exit strategy check
         assert mock_api.get_market.call_count >= 1, "get_market should be called at least once"
         mock_api.close.assert_called_once()
@@ -106,11 +106,9 @@ async def test_run_tracking_closes_position(mock_kalshi_client):
             os.remove(db_path)
 
 
-@patch('src.jobs.execute.place_sell_limit_order', new_callable=AsyncMock)
-@patch('src.jobs.track.KalshiClient')
-async def test_non_resolution_exit_requires_successful_sell(
-    mock_kalshi_client, mock_place_sell
-):
+@patch("src.jobs.execute.place_sell_limit_order", new_callable=AsyncMock)
+@patch("src.jobs.track.KalshiClient")
+async def test_non_resolution_exit_requires_successful_sell(mock_kalshi_client, mock_place_sell):
     """
     Regression for #49: a take-profit / stop-loss exit on an active market
     must place a real sell order before the DB is updated. If the sell fails,
@@ -141,14 +139,16 @@ async def test_non_resolution_exit_requires_successful_sell(
 
     # Active market; YES price has reached our take-profit target.
     mock_api = mock_kalshi_client.return_value
-    mock_api.get_market = AsyncMock(return_value={
-        "market": {
-            "status": "active",
-            "result": None,
-            "yes_price": 65,   # cents
-            "no_price": 35,
+    mock_api.get_market = AsyncMock(
+        return_value={
+            "market": {
+                "status": "active",
+                "result": None,
+                "yes_price": 65,  # cents
+                "no_price": 35,
+            }
         }
-    })
+    )
     mock_api.close = AsyncMock()
 
     # Sell order placement fails — position must stay open.
@@ -159,26 +159,26 @@ async def test_non_resolution_exit_requires_successful_sell(
 
         position_after = await get_position_by_market_id_any_status(db_manager, "TRACK-NO-RES-1")
         assert position_after is not None
-        assert position_after.status == "open", (
-            "Position must remain open when the sell order failed (regression #49)"
-        )
+        assert (
+            position_after.status == "open"
+        ), "Position must remain open when the sell order failed (regression #49)"
 
         trade_logs = await db_manager.get_all_trade_logs()
-        assert len(trade_logs) == 0, (
-            "No trade log should be written when no sell was placed (regression #49)"
-        )
+        assert (
+            len(trade_logs) == 0
+        ), "No trade log should be written when no sell was placed (regression #49)"
 
         # The take-profit branch must have actually attempted a sell.
-        assert mock_place_sell.await_count >= 1, (
-            "track.py must call place_sell_limit_order on non-resolution exit"
-        )
+        assert (
+            mock_place_sell.await_count >= 1
+        ), "track.py must call place_sell_limit_order on non-resolution exit"
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)
 
 
-@patch('src.jobs.execute.place_sell_limit_order', new_callable=AsyncMock)
-@patch('src.jobs.track.KalshiClient')
+@patch("src.jobs.execute.place_sell_limit_order", new_callable=AsyncMock)
+@patch("src.jobs.track.KalshiClient")
 async def test_non_resolution_exit_closes_after_successful_sell(
     mock_kalshi_client, mock_place_sell
 ):
@@ -210,14 +210,16 @@ async def test_non_resolution_exit_closes_after_successful_sell(
     test_position.id = position_id
 
     mock_api = mock_kalshi_client.return_value
-    mock_api.get_market = AsyncMock(return_value={
-        "market": {
-            "status": "active",
-            "result": None,
-            "yes_price": 65,
-            "no_price": 35,
+    mock_api.get_market = AsyncMock(
+        return_value={
+            "market": {
+                "status": "active",
+                "result": None,
+                "yes_price": 65,
+                "no_price": 35,
+            }
         }
-    })
+    )
     mock_api.close = AsyncMock()
 
     mock_place_sell.return_value = True

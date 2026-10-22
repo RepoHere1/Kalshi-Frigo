@@ -12,6 +12,7 @@ Measured on the live service while the dashboard was showing zeros:
 Neither is a trading fault. Both are the page failing to stay up while the books
 are fine, which is indistinguishable from the books being broken.
 """
+
 import pytest
 
 import web_dashboard as wd

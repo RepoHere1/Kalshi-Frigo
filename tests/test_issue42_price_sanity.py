@@ -11,14 +11,16 @@ Fixes:
   - src/jobs/execute.py: guards that skip non-tradeable / out-of-range prices
   - src/jobs/ingest.py: uses is_tradeable_market() instead of inline check
 """
+
 import asyncio
 import os
-import pytest
 from datetime import datetime
 from unittest.mock import AsyncMock, Mock
 
-from src.utils.market_prices import is_tradeable_market, get_market_prices
+import pytest
+
 from src.utils.database import Position
+from src.utils.market_prices import get_market_prices, is_tradeable_market
 
 pytestmark = pytest.mark.asyncio
 
@@ -26,6 +28,7 @@ pytestmark = pytest.mark.asyncio
 # ---------------------------------------------------------------------------
 # is_tradeable_market() unit tests
 # ---------------------------------------------------------------------------
+
 
 class TestIsTradeableMarket:
     """Unit tests for the is_tradeable_market helper."""
@@ -101,6 +104,7 @@ class TestIsTradeableMarket:
 # ---------------------------------------------------------------------------
 # execute_position() integration tests — price guard paths
 # ---------------------------------------------------------------------------
+
 
 def _make_position(market_id: str = "TEST-MARKET", side: str = "YES") -> Position:
     return Position(
@@ -183,7 +187,7 @@ async def test_execute_skips_zero_price():
 
     zero_market = {
         "yes_bid_dollars": 0.0,
-        "yes_ask_dollars": 0.001,   # rounds to 0¢
+        "yes_ask_dollars": 0.001,  # rounds to 0¢
         "no_bid_dollars": 0.0,
         "no_ask_dollars": 0.50,
     }
@@ -209,9 +213,9 @@ async def test_execute_skips_100_cent_price():
     # The per-side cents guard should catch it.
     boundary_market = {
         "yes_bid_dollars": 0.0,
-        "yes_ask_dollars": 0.995,   # rounds to 100¢ (>= 100 guard)
+        "yes_ask_dollars": 0.995,  # rounds to 100¢ (>= 100 guard)
         "no_bid_dollars": 0.0,
-        "no_ask_dollars": 0.50,     # normal — so is_tradeable_market passes
+        "no_ask_dollars": 0.50,  # normal — so is_tradeable_market passes
     }
     db_mock, kalshi_mock = _mock_clients(boundary_market)
     position = _make_position(side="YES")

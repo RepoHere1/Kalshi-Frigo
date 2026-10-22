@@ -51,6 +51,7 @@ def make_opportunity(**overrides) -> MarketOpportunity:
 # Kernel: kelly_fraction(prob_win, payout_ratio)  [shared canonical kernel]
 # ---------------------------------------------------------------------------
 
+
 class TestKellyKernel:
     def test_even_odds_with_edge(self):
         # f* = (0.6*1 - 0.4) / 1 = 0.2
@@ -87,6 +88,7 @@ class TestKellyKernel:
 # binary_market_payout_odds  [shared odds helper]
 # ---------------------------------------------------------------------------
 
+
 class TestPayoutOdds:
     def test_yes_odds(self):
         # YES at $0.40: profit 0.60 on 0.40 staked -> b = 1.5
@@ -110,6 +112,7 @@ class TestPayoutOdds:
 # ---------------------------------------------------------------------------
 # _calculate_simple_kelly  [portfolio_optimization module function]
 # ---------------------------------------------------------------------------
+
 
 class TestSimpleKelly:
     def test_yes_bet_capped_at_20_percent(self):
@@ -152,6 +155,7 @@ class TestSimpleKelly:
 # PortfolioOptimizer._calculate_kelly_fractions  [KCE pipeline]
 # ---------------------------------------------------------------------------
 
+
 def make_optimizer(market_state: str = "normal") -> AdvancedPortfolioOptimizer:
     opt = AdvancedPortfolioOptimizer(
         db_manager=Mock(),
@@ -173,7 +177,7 @@ class TestKellyFractionsKCE:
         opp = make_opportunity()
         result = opt._calculate_kelly_fractions([opp])
         assert result["TEST-MKT"] == pytest.approx(0.06)
-        assert opp.kelly_fraction == pytest.approx(0.30)       # raw standard Kelly
+        assert opp.kelly_fraction == pytest.approx(0.30)  # raw standard Kelly
         assert opp.fractional_kelly == pytest.approx(0.06)
         assert opp.risk_adjusted_fraction == pytest.approx(0.06)
 
@@ -196,8 +200,11 @@ class TestKellyFractionsKCE:
         # standard = (1*0.7 - 0.3)/1 = 0.4; conf 1.0; decay 1.0 (60d capped); * 0.25 = 0.1
         opt = make_optimizer()
         opp = make_opportunity(
-            predicted_probability=0.7, market_probability=0.0, edge=0.7,
-            confidence=1.0, time_to_expiry=60.0,
+            predicted_probability=0.7,
+            market_probability=0.0,
+            edge=0.7,
+            confidence=1.0,
+            time_to_expiry=60.0,
         )
         result = opt._calculate_kelly_fractions([opp])
         assert result["TEST-MKT"] == pytest.approx(0.1)
@@ -236,7 +243,10 @@ class TestKellyFractionsKCE:
         # push over the cap with trending regime: 0.98 * 1.2 = 1.176 * 0.25 = 0.294 -> clamp 0.25
         opt = make_optimizer(market_state="trending")
         opp = make_opportunity(
-            predicted_probability=0.99, market_probability=0.50, edge=0.49, confidence=1.0,
+            predicted_probability=0.99,
+            market_probability=0.50,
+            edge=0.49,
+            confidence=1.0,
         )
         result = opt._calculate_kelly_fractions([opp])
         assert result["TEST-MKT"] == pytest.approx(0.25)
@@ -245,6 +255,7 @@ class TestKellyFractionsKCE:
 # ---------------------------------------------------------------------------
 # PortfolioOptimizer._calculate_portfolio_metrics  [correlation indexing]
 # ---------------------------------------------------------------------------
+
 
 class TestPortfolioMetricsCorrelationIndexing:
     """The correlation matrix is built over ALL opportunities in input order.

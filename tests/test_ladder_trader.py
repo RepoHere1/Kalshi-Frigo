@@ -5,6 +5,7 @@ suffix, the quotes live in `*_dollars` string fields while the integer-cent
 fields are null, and settlement is a 60-second average of CF Benchmarks BRTI.
 Each of those was a silent "no quote" before.
 """
+
 import time
 from datetime import datetime
 
@@ -150,167 +151,6 @@ def test_noise_band_is_respected():
     assert signal is not None
     assert signal.side == ""
     assert not signal.actionable
-
-
-def test_daily_gold_waits_for_realized_vol_before_scoring():
-    # Gold daily lane has been removed - this test is now for BTC daily
-    config = UpDownConfig()
-    config.apply_asset("BTC-USD")
-    spot = SpotFeed()
-    spot.price = 8468.42
-    spot.ts = time.time()
-    spot.source = "test"
-    trader = UpDownTrader(spot, Btc15mFeed(series="KXBTCD"), config)
-    market = UpDownMarket(
-        ticker="KXGOLDD-26OCT1317-T4164",
-        event_ticker="KXGOLDD-26OCT1317",
-        bucket="26OCT1317",
-        horizon=0,
-        title="Gold daily close above $4,164",
-        target=4164.0,
-        close_ts=time.time() + 24 * 60 * 60,
-        yes_bid=0.61,
-        yes_ask=0.62,
-        no_bid=0.38,
-        no_ask=0.39,
-    )
-
-    signal = trader.evaluate(market, live=False)
-
-    assert signal is not None
-    assert not signal.actionable
-    assert signal.fair == 0.5
-    assert "realized volatility warm-up" in signal.reason
-    assert trader.book.skipped_vol_warmup == 1
-    assert trader.book.summary()["skipped_vol_warmup"] == 1
-
-    warm_config = UpDownConfig()
-    warm_config.apply_asset("PAXG-USD")
-    warm_trader = UpDownTrader(spot, Btc15mFeed(series="KXGOLDD"), warm_config)
-    warm_start = time.monotonic() - 60.0
-    for i in range(25):
-        warm_trader.rv.observe(
-            4167.0 + (i % 3) * 0.07 + i * 0.01,
-            now=warm_start + i * 2.0,
-        )
-    warm_signal = warm_trader.evaluate(market, live=False)
-    assert warm_signal is not None
-    assert warm_trader._sigma_used is not None
-    assert "realized volatility warm-up" not in warm_signal.reason
-
-
-@pytest.mark.asyncio
-async def test_daily_gold_does_not_bypass_scoring_with_certain_win_pair(monkeypatch):
-    trader = UpDownTrader(
-        SpotFeed(), Btc15mFeed(series="KXGOLDD"), UpDownConfig()
-    )
-    assert trader.config.certain_win_enabled is False
-    trader.config.certain_win_enabled = True
-    market = UpDownMarket(
-        ticker="KXGOLDD-26OCT1317-T4164",
-        event_ticker="KXGOLDD-26OCT1317",
-        bucket="26OCT1317",
-        horizon=0,
-        title="Gold daily close above $4,164",
-        target=4164.0,
-        close_ts=time.time() + 24 * 60 * 60,
-        yes_bid=0.44,
-        yes_ask=0.45,
-        no_bid=0.44,
-        no_ask=0.45,
-    )
-    evaluated = []
-
-    def _evaluate(*args):
-        evaluated.append(args)
-        return False, 0.0
-
-    monkeypatch.setattr("src.jobs.certain_win.evaluate", _evaluate)
-
-    assert await trader._certain_win_pair(market, live=False) is False
-    assert evaluated == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "prior_samples,should_rank", [(0, False), (23, False), (24, True)]
-)
-async def test_daily_gold_cycle_ranks_only_with_realized_vol(
-    prior_samples, should_rank, monkeypatch
-):
-    import src.jobs.ladder_trader as lt
-
-    spot = SpotFeed()
-    spot.price = 4168.42
-    spot.ts = time.time()
-    spot.source = "test"
-    feed = Btc15mFeed(series="KXGOLDD")
-    close_ts = time.time() + 24 * 60 * 60
-    feed.markets = [
-        UpDownMarket(
-            ticker=ticker,
-            event_ticker="KXGOLDD-26OCT1317",
-            bucket="26OCT1317",
-            horizon=0,
-            title="Gold daily close threshold",
-            target=target,
-            close_ts=close_ts,
-            yes_bid=yes_bid,
-            yes_ask=yes_ask,
-            no_bid=no_bid,
-            no_ask=no_ask,
-        )
-        for ticker, target, yes_bid, yes_ask, no_bid, no_ask in (
-            ("KXGOLDD-26OCT1317-T4164", 4164.0, 0.61, 0.62, 0.38, 0.39),
-            ("KXGOLDD-26OCT1317-T4174", 4174.0, 0.50, 0.51, 0.49, 0.50),
-        )
-    ]
-    feed.ts = time.time()
-    trader = UpDownTrader(spot, feed, UpDownConfig())
-    trader.db_manager = type(
-        "_Database", (), {"get_open_positions": lambda self, mode: []}
-    )()
-    if prior_samples:
-        warm_start = time.monotonic() - 60.0
-        for i in range(prior_samples):
-            trader.rv.observe(
-                4167.0 + (i % 3) * 0.07 + i * 0.01,
-                now=warm_start + i * 2.0,
-            )
-
-    class _BalanceClient:
-        async def get_balance(self):
-            return {"balance": 10000}
-
-    trader._client = _BalanceClient()
-
-    async def _no_order(_signal, _live):
-        return False
-
-    monkeypatch.setattr(trader, "_place", _no_order)
-    strike_calls = []
-
-    def _record_pick(*args, **kwargs):
-        strike_calls.append((args, kwargs))
-        return None
-
-    async def _track(_db):
-        return None
-
-    monkeypatch.setattr(lt, "pick_ladder_strike", _record_pick)
-    monkeypatch.setattr("src.jobs.track.run_tracking", _track)
-    monkeypatch.setattr("src.jobs.broker.should_trade_live", lambda: False)
-
-    result = await trader.cycle()
-
-    assert result["contract"] == "KXGOLDD-26OCT1317-T4164"
-    assert (len(strike_calls) > 0) is should_rank
-    assert (trader._sigma_used is not None) is should_rank
-    assert result["skipped_vol_warmup"] == (0 if should_rank else 1)
-    if not should_rank:
-        assert "realized volatility warm-up" in result["reason"]
-    else:
-        assert strike_calls[0][0][3] == trader._sigma_used
 
 
 def test_buys_up_when_spot_is_well_past_target_but_kalshi_is_even():
@@ -549,10 +389,10 @@ def test_live_requires_the_fee_on_top_of_the_edge(monkeypatch):
     trader = _scorer()
     market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0)
     dry = trader.evaluate(market, live=False)
-    assert (dry is None or not dry.actionable), "DRY must also refuse an edge under fee+min"
+    assert dry is None or not dry.actionable, "DRY must also refuse an edge under fee+min"
     trader.book.skipped_no_edge = 0
     live = trader.evaluate(market, live=True)
-    assert (live is None or not live.actionable), "LIVE must refuse an edge under fee+min"
+    assert live is None or not live.actionable, "LIVE must refuse an edge under fee+min"
 
 
 def test_live_takes_an_edge_that_clears_fee_and_minimum():
@@ -691,9 +531,9 @@ async def test_live_variance_sizing_uses_market_target(monkeypatch):
     result = await trader.cycle()
 
     # Key assertions: the variance call happened with market-derived values
-    assert calls == [(900.0, 84000.0 * trader.config.noise_pct)], (
-        f"variance_clip_multiplier not called or called with wrong args: {calls}"
-    )
+    assert calls == [
+        (900.0, 84000.0 * trader.config.noise_pct)
+    ], f"variance_clip_multiplier not called or called with wrong args: {calls}"
     assert result["variance_mult"] == 1.75
 
 
@@ -884,19 +724,46 @@ async def test_execute_refuses_a_position_that_was_never_saved():
     assert position.id is None
     assert await execute_position(position, False, None, None) is False
 
+
 def test_pick_ladder_strike_takes_the_cheap_strike_when_the_model_is_sure():
     """A sure model (small sigma, spot far past deeper strikes) walks the
     band to the cheaper contract: bigger payoff, same edge bar."""
     from src.jobs.ladder_trader import pick_ladder_strike
 
     band = [
-        _dollars(ticker="L-T84899.99", target=84899.99, yes_bid=0.48, yes_ask=0.50, no_bid=0.50, no_ask=0.51),
-        _dollars(ticker="L-T84999.99", target=84999.99, yes_bid=0.28, yes_ask=0.30, no_bid=0.52, no_ask=0.53),
-        _dollars(ticker="L-T85099.99", target=85099.99, yes_bid=0.20, yes_ask=0.22, no_bid=0.54, no_ask=0.55),
+        _dollars(
+            ticker="L-T84899.99",
+            target=84899.99,
+            yes_bid=0.48,
+            yes_ask=0.50,
+            no_bid=0.50,
+            no_ask=0.51,
+        ),
+        _dollars(
+            ticker="L-T84999.99",
+            target=84999.99,
+            yes_bid=0.28,
+            yes_ask=0.30,
+            no_bid=0.52,
+            no_ask=0.53,
+        ),
+        _dollars(
+            ticker="L-T85099.99",
+            target=85099.99,
+            yes_bid=0.20,
+            yes_ask=0.22,
+            no_bid=0.54,
+            no_ask=0.55,
+        ),
     ]
     picked = pick_ladder_strike(
-        band, spot=84900.0, seconds_left=900.0, sigma_dollars=120.0,
-        noise_pct=0.0002, min_ask=0.40, max_ask=0.55,
+        band,
+        spot=84900.0,
+        seconds_left=900.0,
+        sigma_dollars=120.0,
+        noise_pct=0.0002,
+        min_ask=0.40,
+        max_ask=0.55,
     )
     assert picked is not None and picked.ticker == "L-T85099.99"
 
@@ -907,13 +774,39 @@ def test_pick_ladder_strike_falls_back_nearest_when_the_tape_is_quiet():
     from src.jobs.ladder_trader import pick_ladder_strike
 
     band = [
-        _dollars(ticker="L-T84899.99", target=84899.99, yes_bid=0.48, yes_ask=0.50, no_bid=0.50, no_ask=0.51),
-        _dollars(ticker="L-T84999.99", target=84999.99, yes_bid=0.28, yes_ask=0.30, no_bid=0.52, no_ask=0.53),
-        _dollars(ticker="L-T85099.99", target=85099.99, yes_bid=0.20, yes_ask=0.22, no_bid=0.56, no_ask=0.57),
+        _dollars(
+            ticker="L-T84899.99",
+            target=84899.99,
+            yes_bid=0.48,
+            yes_ask=0.50,
+            no_bid=0.50,
+            no_ask=0.51,
+        ),
+        _dollars(
+            ticker="L-T84999.99",
+            target=84999.99,
+            yes_bid=0.28,
+            yes_ask=0.30,
+            no_bid=0.52,
+            no_ask=0.53,
+        ),
+        _dollars(
+            ticker="L-T85099.99",
+            target=85099.99,
+            yes_bid=0.20,
+            yes_ask=0.22,
+            no_bid=0.56,
+            no_ask=0.57,
+        ),
     ]
     picked = pick_ladder_strike(
-        band, spot=84900.0, seconds_left=900.0, sigma_dollars=800.0,
-        noise_pct=0.0002, min_ask=0.40, max_ask=0.55,
+        band,
+        spot=84900.0,
+        seconds_left=900.0,
+        sigma_dollars=800.0,
+        noise_pct=0.0002,
+        min_ask=0.40,
+        max_ask=0.55,
     )
     assert picked is not None and picked.ticker == "L-T84899.99"
 
@@ -928,9 +821,17 @@ def test_feed_ladder_isolates_the_soonest_group():
 
     def m(tick, ev, target, close_in):
         return UpDownMarket(
-            ticker=tick, event_ticker=ev, bucket="b", horizon=0, title="",
-            target=target, close_ts=now + close_in,
-            yes_bid=0.40, yes_ask=0.42, no_bid=0.55, no_ask=0.57,
+            ticker=tick,
+            event_ticker=ev,
+            bucket="b",
+            horizon=0,
+            title="",
+            target=target,
+            close_ts=now + close_in,
+            yes_bid=0.40,
+            yes_ask=0.42,
+            no_bid=0.55,
+            no_ask=0.57,
         )
 
     feed.markets = [

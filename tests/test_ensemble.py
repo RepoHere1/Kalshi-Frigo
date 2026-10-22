@@ -7,34 +7,36 @@ from unittest.mock import MagicMock
 from src.agents.ensemble import EnsembleRunner
 from src.agents.debate import DebateRunner
 
-
 # --- Helper: mock completion factories ---
+
 
 async def _mock_completion(prob, conf, side="yes"):
     """Create a mock completion function that returns a fixed agent response."""
+
     async def fn(prompt):
-        return f'''```json
+        return f"""```json
 {{"probability": {prob}, "confidence": {conf}, "base_rate": 0.5, "side": "{side}", "reasoning": "mock"}}
-```'''
+```"""
+
     return fn
 
 
 async def _mock_news_completion(prompt):
-    return '''```json
+    return """```json
 {"sentiment": 0.4, "relevance": 0.7, "key_factors": ["test"], "impact_direction": "up", "reasoning": "mock"}
-```'''
+```"""
 
 
 async def _mock_risk_completion(prompt):
-    return '''```json
+    return """```json
 {"risk_score": 3.5, "recommended_size_pct": 2.5, "ev_estimate": 0.15, "max_loss_pct": 100, "edge_durability_hours": 48, "should_trade": true, "reasoning": "mock"}
-```'''
+```"""
 
 
 async def _mock_trader_completion(prompt):
-    return '''```json
+    return """```json
 {"action": "BUY", "side": "YES", "limit_price": 42, "confidence": 0.75, "position_size_pct": 2.5, "reasoning": "consensus"}
-```'''
+```"""
 
 
 SAMPLE_MARKET = {
@@ -165,9 +167,7 @@ class TestDebateRunner:
             "trader": failing_trader,
         }
 
-        result = await runner.run_debate(
-            SAMPLE_MARKET, completions, context={}
-        )
+        result = await runner.run_debate(SAMPLE_MARKET, completions, context={})
 
         # Should default to SKIP, not crash
         assert result["action"] == "SKIP"

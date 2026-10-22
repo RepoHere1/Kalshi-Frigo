@@ -17,6 +17,7 @@ Two faults kept lanes down:
 An unrecorded trading process is worse than no process: it cannot be stopped from
 the dashboard, and a second copy can be started alongside it.
 """
+
 import inspect
 
 import pytest
@@ -42,7 +43,7 @@ def test_a_spawn_that_cannot_be_recorded_kills_its_own_child():
 def test_the_record_is_attempted_more_than_once():
     assert "for attempt in range(8)" in _src()
     # Exponential backoff between record attempts.
-    assert "backoff = 0.2 * (2.4 ** attempt)" in _src()
+    assert "backoff = 0.2 * (2.4**attempt)" in _src()
     assert "time.sleep(backoff)" in _src()
 
 
@@ -229,8 +230,9 @@ def test_the_dry_page_offers_no_live_controls(monkeypatch, tmp_path):
 
 def test_stopping_still_works_and_is_sticky():
     """The operator's Stop is the only way a lane goes down."""
-    from src.utils.strategy_runtime import StrategyRuntime, key
     import tempfile
+
+    from src.utils.strategy_runtime import StrategyRuntime, key
 
     async def scenario():
         import os
@@ -316,6 +318,8 @@ def test_no_kill_all_button_exists():
     html = wd._TEMPLATE
     assert "killAll" not in html
     assert 'onclick="killAll()"' not in html
+
+
 def test_stop_child_gracefully():
     """Stop is graceful; no hard-kill exists since Kill-all was removed."""
     src = inspect.getsource(wd._stop_child)
@@ -338,7 +342,8 @@ def test_spawn_proceeds_once_the_button_armed(monkeypatch, tmp_path):
     """A Start press (arm) is what unlocks the spawn; the record follows."""
     import asyncio as _aio
 
-    from src.utils.strategy_runtime import StrategyRuntime, key as rk
+    from src.utils.strategy_runtime import StrategyRuntime
+    from src.utils.strategy_runtime import key as rk
 
     db = str(tmp_path / "latch2.db")
     monkeypatch.setattr(wd, "DB_PATH", db)

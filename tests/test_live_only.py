@@ -59,9 +59,7 @@ def test_taker_fee_peaks_at_fifty_cents():
 
 def test_maker_fee_is_a_quarter_of_taker():
     assert live_fees.maker_fee_dollars(0.50, 100) == 0.44
-    assert live_fees.maker_fee_dollars(0.50, 100) < live_fees.taker_fee_dollars(
-        0.50, 100
-    )
+    assert live_fees.maker_fee_dollars(0.50, 100) < live_fees.taker_fee_dollars(0.50, 100)
 
 
 def test_roundtrip_fee_covers_both_sides():
@@ -120,12 +118,21 @@ def test_exit_price_is_098_when_urgent():
 def test_settled_books_are_detected():
     assert live_fees.is_settled_market({"status": "closed"})
     assert live_fees.is_settled_market(
-        {"yes_bid_dollars": "0.99", "yes_ask_dollars": "1.00",
-         "no_bid_dollars": "0.99", "no_ask_dollars": "1.00"}
+        {
+            "yes_bid_dollars": "0.99",
+            "yes_ask_dollars": "1.00",
+            "no_bid_dollars": "0.99",
+            "no_ask_dollars": "1.00",
+        }
     )
     assert not live_fees.is_settled_market(
-        {"status": "open", "yes_bid_dollars": "0.47", "yes_ask_dollars": "0.48",
-         "no_bid_dollars": "0.52", "no_ask_dollars": "0.53"}
+        {
+            "status": "open",
+            "yes_bid_dollars": "0.47",
+            "yes_ask_dollars": "0.48",
+            "no_bid_dollars": "0.52",
+            "no_ask_dollars": "0.53",
+        }
     )
 
 
@@ -170,10 +177,7 @@ def test_settlement_parser_finds_a_receipt():
 def test_settlement_parser_never_invents_a_close():
     assert live_fees.parse_settlement_result({}, "KXBTC15M-OLD") is None
     assert live_fees.parse_settlement_result(None, "KXBTC15M-OLD") is None
-    assert (
-        live_fees.parse_settlement_result({"settlements": []}, "KXBTC15M-OLD")
-        is None
-    )
+    assert live_fees.parse_settlement_result({"settlements": []}, "KXBTC15M-OLD") is None
     assert (
         live_fees.parse_settlement_result(
             {"settlements": [{"ticker": "OTHER", "result": "yes"}]}, "KXBTC15M-OLD"
@@ -186,6 +190,8 @@ def test_settlement_parser_never_invents_a_close():
         )
         is None
     )
+
+
 # ---------------------------------------------------------------------------
 # BRTI truth: Kalshi's own settlement index beats retail spot when fresh
 # ---------------------------------------------------------------------------
@@ -260,9 +266,7 @@ def test_brti_estimate_prefers_windowed_then_avg60_then_value():
 def _brti_fake(price, fresh=True, kind="trailing-avg60"):
     from types import SimpleNamespace
 
-    return SimpleNamespace(
-        fresh=fresh, estimate=lambda: price, estimate_kind=lambda: kind
-    )
+    return SimpleNamespace(fresh=fresh, estimate=lambda: price, estimate_kind=lambda: kind)
 
 
 def test_evaluate_uses_brti_when_fresh():
@@ -294,9 +298,7 @@ def test_evaluate_falls_back_to_coinbase_when_brti_stale():
     spot.ts = _time.time()
     feed = Btc15mFeed()
     feed.ts = _time.time()
-    trader = UpDownTrader(
-        spot, feed, UpDownConfig(), brti=_brti_fake(85000.0, fresh=False)
-    )
+    trader = UpDownTrader(spot, feed, UpDownConfig(), brti=_brti_fake(85000.0, fresh=False))
     market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0)
     feed.markets = [market]
     out = trader.evaluate(market, live=False)
@@ -440,8 +442,8 @@ def test_live_refuses_only_what_the_fee_makes_unprofitable(monkeypatch):
     trader.feed.markets = [market]
     dry = trader.evaluate(market, live=False)
     live = trader.evaluate(market, live=True)
-    assert (dry is None or not dry.actionable), "the fee makes DRY refuse too"
-    assert (live is None or not live.actionable), "the fee is what refuses it"
+    assert dry is None or not dry.actionable, "the fee makes DRY refuse too"
+    assert live is None or not live.actionable, "the fee is what refuses it"
 
     # Maker window (600s): both books take the same quotes, identically.
     market = _quoted_market(yes_ask=0.45, no_ask=0.55, target=84000.0, seconds_left=600)
@@ -541,9 +543,7 @@ def test_maker_unfilled_order_is_cancelled_and_reports_false():
 
     from src.jobs.execute import _confirm_maker_fill
 
-    client = _FakeMakerClient(
-        resting=[{"client_order_id": "cid-1", "order_id": "oid-1"}], held=0
-    )
+    client = _FakeMakerClient(resting=[{"client_order_id": "cid-1", "order_id": "oid-1"}], held=0)
     ok = asyncio.run(
         _confirm_maker_fill(client, _Req(), _pos(), 0.1, logging.getLogger("t"), "oid-1")
     )
@@ -582,6 +582,7 @@ def test_winning_position_rides_the_settlement_window(monkeypatch):
     class _FakeDB:
         async def get_open_positions(self, mode=None):
             return [_pos(qty=10)]
+
         async def get_open_live_positions(self, mode=None):
             return [_pos(qty=10)]
 
@@ -596,9 +597,7 @@ def test_winning_position_rides_the_settlement_window(monkeypatch):
         return True
 
     monkeypatch.setattr(ex, "place_sell_limit_order", _fake_sell)
-    res = asyncio.run(
-        ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=True)
-    )
+    res = asyncio.run(ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=True))
     assert res["orders_placed"] == 0
     assert sells == []
 
@@ -622,14 +621,19 @@ def test_winning_position_with_time_left_still_takes_profit(monkeypatch):
 
         async def get_open_positions(self, mode=None):
             return [_pos(qty=10, pid=1)]
+
         async def get_open_live_positions(self, mode=None):
             return [_pos(qty=10, pid=1)]
+
         async def claim_position_for_close(self, pid):
             return True
+
         async def release_position_claim(self, pid):
             return True
+
         async def add_trade_log(self, trade_log):
             self.closed.append(trade_log)
+
         async def update_position_status(self, pid, status):
             self.closed.append((pid, status))
 
@@ -644,9 +648,7 @@ def test_winning_position_with_time_left_still_takes_profit(monkeypatch):
         return True
 
     monkeypatch.setattr(ex, "place_sell_limit_order", _fake_sell)
-    res = asyncio.run(
-        ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=True)
-    )
+    res = asyncio.run(ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=True))
     assert res["orders_placed"] == 1
     assert len(sells) == 1
 
@@ -719,10 +721,13 @@ def test_live_profit_take_skips_btc15m():
     class _FakeDB:
         async def get_open_positions(self, mode=None):
             return [_btc_pos()]
+
         async def get_open_live_positions(self, mode=None):
             return [_btc_pos()]
+
         async def claim_position_for_close(self, pid):
             return True
+
         async def release_position_claim(self, pid):
             return True
 
@@ -730,11 +735,7 @@ def test_live_profit_take_skips_btc15m():
         async def get_market(self, ticker):
             return {"market": market}
 
-    res = asyncio.run(
-        ex.place_profit_taking_orders(
-            _FakeDB(), _FakeClient(), 0.20, live_mode=True
-        )
-    )
+    res = asyncio.run(ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=True))
     assert res["orders_placed"] == 0
 
 
@@ -759,14 +760,19 @@ def test_btc15m_losers_are_stopped_not_ridden(monkeypatch):
 
         async def get_open_positions(self, mode=None):
             return [_btc_pos()]
+
         async def get_open_live_positions(self, mode=None):
             return [_btc_pos()]
+
         async def claim_position_for_close(self, pid):
             return True
+
         async def release_position_claim(self, pid):
             return True
+
         async def add_trade_log(self, trade_log):
             self.closed.append(trade_log)
+
         async def update_position_status(self, pid, status):
             self.closed.append((pid, status))
 
@@ -781,9 +787,7 @@ def test_btc15m_losers_are_stopped_not_ridden(monkeypatch):
         return True
 
     monkeypatch.setattr(ex, "place_sell_limit_order", _fake_sell)
-    res = asyncio.run(
-        ex.place_stop_loss_orders(_FakeDB(), _FakeClient(), -0.15, live_mode=True)
-    )
+    res = asyncio.run(ex.place_stop_loss_orders(_FakeDB(), _FakeClient(), -0.15, live_mode=True))
     assert res["orders_placed"] == 1
     assert len(sells) == 1
 
@@ -812,10 +816,13 @@ def test_dry_also_skips_btc15m_mid_bucket(monkeypatch):
     class _FakeDB:
         async def get_open_positions(self, mode=None):
             return [_btc_pos()]
+
         async def get_open_live_positions(self, mode=None):
             return [_btc_pos()]
+
         async def claim_position_for_close(self, pid):
             return True
+
         async def release_position_claim(self, pid):
             return True
 
@@ -872,14 +879,19 @@ def test_near_locked_winner_recycles_before_settlement(monkeypatch):
 
         async def get_open_positions(self, mode=None):
             return [_btc_pos()]
+
         async def get_open_live_positions(self, mode=None):
             return [_btc_pos()]
+
         async def claim_position_for_close(self, pid):
             return True
+
         async def release_position_claim(self, pid):
             return True
+
         async def add_trade_log(self, trade_log):
             self.closed.append(trade_log)
+
         async def update_position_status(self, pid, status):
             self.closed.append((pid, status))
 
@@ -894,9 +906,7 @@ def test_near_locked_winner_recycles_before_settlement(monkeypatch):
         return True
 
     monkeypatch.setattr(ex, "place_sell_limit_order", _fake_sell)
-    res = asyncio.run(
-        ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=True)
-    )
+    res = asyncio.run(ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=True))
     assert res["orders_placed"] == 1
     assert len(sells) == 1
 
@@ -918,10 +928,13 @@ def test_uncertain_winner_still_rides(monkeypatch):
     class _FakeDB:
         async def get_open_positions(self, mode=None):
             return [_btc_pos()]
+
         async def get_open_live_positions(self, mode=None):
             return [_btc_pos()]
+
         async def claim_position_for_close(self, pid):
             return True
+
         async def release_position_claim(self, pid):
             return True
 
@@ -936,9 +949,7 @@ def test_uncertain_winner_still_rides(monkeypatch):
         return True
 
     monkeypatch.setattr(ex, "place_sell_limit_order", _fake_sell)
-    res = asyncio.run(
-        ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=True)
-    )
+    res = asyncio.run(ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=True))
     assert res["orders_placed"] == 0
     assert len(sells) == 0
 
@@ -970,10 +981,13 @@ def test_non_btc_updown_lanes_also_ride_winners():
     class _FakeDB:
         async def get_open_positions(self, mode=None):
             return [_xrp_pos()]
+
         async def get_open_live_positions(self, mode=None):
             return [_xrp_pos()]
+
         async def claim_position_for_close(self, pid):
             return True
+
         async def release_position_claim(self, pid):
             return True
 
@@ -981,11 +995,7 @@ def test_non_btc_updown_lanes_also_ride_winners():
         async def get_market(self, ticker):
             return {"market": market}
 
-    res = asyncio.run(
-        ex.place_profit_taking_orders(
-            _FakeDB(), _FakeClient(), 0.20, live_mode=True
-        )
-    )
+    res = asyncio.run(ex.place_profit_taking_orders(_FakeDB(), _FakeClient(), 0.20, live_mode=True))
     assert res["orders_placed"] == 0
 
 
@@ -1010,14 +1020,19 @@ def test_ordinary_strategies_still_take_profit(monkeypatch):
 
         async def get_open_positions(self, mode=None):
             return [_pos(qty=10, pid=1, strategy="ai_directional")]
+
         async def get_open_live_positions(self, mode=None):
             return [_pos(qty=10, pid=1, strategy="ai_directional")]
+
         async def claim_position_for_close(self, pid):
             return True
+
         async def release_position_claim(self, pid):
             return True
+
         async def add_trade_log(self, trade_log):
             self.closed.append(trade_log)
+
         async def update_position_status(self, pid, status):
             self.closed.append((pid, status))
 
@@ -1033,9 +1048,7 @@ def test_ordinary_strategies_still_take_profit(monkeypatch):
 
     monkeypatch.setattr(ex, "place_sell_limit_order", _fake_sell)
     db = _FakeDB()
-    res = asyncio.run(
-        ex.place_profit_taking_orders(db, _FakeClient(), 0.20, live_mode=True)
-    )
+    res = asyncio.run(ex.place_profit_taking_orders(db, _FakeClient(), 0.20, live_mode=True))
     assert res["orders_placed"] == 1
     assert len(sells) == 1
     assert any(isinstance(x, tuple) for x in db.closed)  # status write happened

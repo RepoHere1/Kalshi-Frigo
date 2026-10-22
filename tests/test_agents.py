@@ -12,7 +12,6 @@ from src.agents.bear_researcher import BearResearcher
 from src.agents.risk_manager_agent import RiskManagerAgent
 from src.agents.trader_agent import TraderAgent
 
-
 SAMPLE_MARKET = {
     "title": "Will Bitcoin reach $100k by end of 2025?",
     "yes_price": 45,
@@ -30,11 +29,11 @@ class TestBaseAgent:
     def test_extract_json_from_code_block(self):
         """Extract JSON from markdown code blocks."""
         agent = ForecasterAgent()
-        text = '''Here is my analysis:
+        text = """Here is my analysis:
 ```json
 {"probability": 0.65, "confidence": 0.8, "base_rate": 0.5, "side": "yes", "reasoning": "test"}
 ```
-Done.'''
+Done."""
         result = agent._extract_json(text)
         assert result is not None
         assert result["probability"] == 0.65
@@ -118,9 +117,9 @@ class TestAgentAnalyze:
         agent = ForecasterAgent()
 
         async def mock_completion(prompt):
-            return '''```json
+            return """```json
 {"probability": 0.72, "confidence": 0.85, "base_rate": 0.50, "side": "yes", "reasoning": "Strong trend."}
-```'''
+```"""
 
         result = await agent.analyze(SAMPLE_MARKET, {}, mock_completion)
         assert "error" not in result
@@ -134,9 +133,9 @@ class TestAgentAnalyze:
         agent = BullResearcher()
 
         async def mock_completion(prompt):
-            return '''```json
+            return """```json
 {"probability": 0.80, "probability_floor": 0.60, "confidence": 0.85, "key_arguments": ["momentum", "adoption"], "catalysts": ["ETF"], "reasoning": "Bullish."}
-```'''
+```"""
 
         result = await agent.analyze(SAMPLE_MARKET, {}, mock_completion)
         assert "error" not in result
@@ -149,9 +148,9 @@ class TestAgentAnalyze:
         agent = BearResearcher()
 
         async def mock_completion(prompt):
-            return '''```json
+            return """```json
 {"probability": 0.30, "probability_ceiling": 0.50, "confidence": 0.70, "key_arguments": ["regulation", "crash risk"], "risk_factors": ["macro"], "reasoning": "Bearish."}
-```'''
+```"""
 
         result = await agent.analyze(SAMPLE_MARKET, {}, mock_completion)
         assert "error" not in result
@@ -164,9 +163,9 @@ class TestAgentAnalyze:
         agent = RiskManagerAgent()
 
         async def mock_completion(prompt):
-            return '''```json
+            return """```json
 {"risk_score": 4.0, "recommended_size_pct": 2.5, "ev_estimate": 0.18, "max_loss_pct": 100, "edge_durability_hours": 48, "should_trade": true, "reasoning": "Acceptable risk."}
-```'''
+```"""
 
         result = await agent.analyze(SAMPLE_MARKET, {}, mock_completion)
         assert "error" not in result

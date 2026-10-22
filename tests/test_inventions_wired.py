@@ -19,24 +19,32 @@ from src.jobs.prompt_library import VETO_PROMPT_TEMPLATE
 
 class TestFlowSentinel:
     def test_zero_bid_passthrough(self):
-        m = compute_flow_metrics(yes_ask=0.55, yes_bid=0.0, no_ask=0.45, no_bid=0.0, yes_depth=0, no_depth=0)
+        m = compute_flow_metrics(
+            yes_ask=0.55, yes_bid=0.0, no_ask=0.45, no_bid=0.0, yes_depth=0, no_depth=0
+        )
         passes, reason = flow_sentinel(m)
         assert passes is True
 
     def test_near_certainty_passthrough(self):
-        m = compute_flow_metrics(yes_ask=0.95, yes_bid=0.94, no_ask=0.05, no_bid=0.04, yes_depth=100, no_depth=100)
+        m = compute_flow_metrics(
+            yes_ask=0.95, yes_bid=0.94, no_ask=0.05, no_bid=0.04, yes_depth=100, no_depth=100
+        )
         passes, reason = flow_sentinel(m)
         assert passes is True
 
     def test_tight_book_passes(self):
-        m = compute_flow_metrics(yes_ask=0.51, yes_bid=0.50, no_ask=0.50, no_bid=0.49, yes_depth=100, no_depth=100)
+        m = compute_flow_metrics(
+            yes_ask=0.51, yes_bid=0.50, no_ask=0.50, no_bid=0.49, yes_depth=100, no_depth=100
+        )
         passes, reason = flow_sentinel(m)
         assert passes is True
 
     def test_wide_spread_vetoes(self):
         # Sanitization handles inverted: yes_bid=0.50, yes_ask=0.55, gap=0.05=5c
         # Default max_spread_cents=12, so this still passes. Need bigger gap.
-        m = compute_flow_metrics(yes_ask=0.55, yes_bid=0.40, no_ask=0.50, no_bid=0.35, yes_depth=100, no_depth=100)
+        m = compute_flow_metrics(
+            yes_ask=0.55, yes_bid=0.40, no_ask=0.50, no_bid=0.35, yes_depth=100, no_depth=100
+        )
         passes, reason = flow_sentinel(m, max_spread_cents=3.0)
         assert passes is False
 
@@ -59,9 +67,7 @@ class TestShadowBacktest:
         assert wr == 0.0
 
     def test_low_win_rate_vetoes(self):
-        history = [
-            {"category": "btc", "outcome": "loss"} for _ in range(20)
-        ]
+        history = [{"category": "btc", "outcome": "loss"} for _ in range(20)]
         passes, wr, po = shadow_backtest("BTC-15M", 0.5, 0.5, history)
         assert passes is False
 
@@ -73,8 +79,7 @@ class TestRagPrompt:
 
     def test_find_similar_returns_top_k(self):
         markets = [
-            {"ticker": f"BTC-{i}", "category": "crypto", "outcome": "win"}
-            for i in range(10)
+            {"ticker": f"BTC-{i}", "category": "crypto", "outcome": "win"} for i in range(10)
         ]
         result = find_similar_markets("BTC-9", "crypto", markets, lambda t, c: [1.0, 1.0], top_k=3)
         assert len(result) <= 3

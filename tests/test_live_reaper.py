@@ -14,7 +14,15 @@ from src.jobs import live_reaper
 from src.utils.database import DatabaseManager, Position
 
 
-def _pos(market_id="KXORPHAN-1", side="YES", entry=0.44, qty=9, strategy="immediate_portfolio_optimization", age_h=48.0, mode="live"):
+def _pos(
+    market_id="KXORPHAN-1",
+    side="YES",
+    entry=0.44,
+    qty=9,
+    strategy="immediate_portfolio_optimization",
+    age_h=48.0,
+    mode="live",
+):
     return Position(
         market_id=market_id,
         side=side,
@@ -43,11 +51,14 @@ class _FakeClient:
 
     async def get_positions(self, ticker=None):
         if ticker:
-            return {"market_positions": [{"ticker": ticker, "position_fp": str(self._holdings.get(ticker, 0.0))}]}
+            return {
+                "market_positions": [
+                    {"ticker": ticker, "position_fp": str(self._holdings.get(ticker, 0.0))}
+                ]
+            }
         return {
             "market_positions": [
-                {"ticker": t, "position_fp": str(q)}
-                for t, q in self._holdings.items()
+                {"ticker": t, "position_fp": str(q)} for t, q in self._holdings.items()
             ]
         }
 
@@ -88,6 +99,7 @@ def _seed(db, *rows):
         await db.initialize()
         for r in rows:
             r.id = await db.add_position(r)
+
     asyncio.run(_go())
 
 
@@ -98,6 +110,7 @@ def _open_live(db):
 def _trade_logs(db):
     async def _go():
         return await db.get_all_trade_logs()
+
     return asyncio.run(_go())
 
 
@@ -136,9 +149,7 @@ def test_a_row_kalshi_still_holds_is_never_closed(db):
 
 def test_flat_kalshi_rows_are_counted_but_never_touched(db):
     _seed(db, _pos("KXGONE-1"))
-    client = _FakeClient(
-        {"KXFLAT-1": 0.0, "KXFLAT-2": 0.0, "KXFLAT-3": 0.0}
-    )
+    client = _FakeClient({"KXFLAT-1": 0.0, "KXFLAT-2": 0.0, "KXFLAT-3": 0.0})
     summary = asyncio.run(live_reaper.reap_live_book(db, client))
     assert summary["flat_rows_on_kalshi"] == 3
     assert summary["liquidated"] == []
@@ -150,7 +161,12 @@ def test_orphan_holding_is_sold_at_the_bid(db):
         {"KXORPHAN-1": 9.0},
         fills={
             "KXORPHAN-1": [
-                {"ticker": "KXORPHAN-1", "side": "yes", "action": "buy", "created_time": "2026-10-04T10:00:00Z"}
+                {
+                    "ticker": "KXORPHAN-1",
+                    "side": "yes",
+                    "action": "buy",
+                    "created_time": "2026-10-04T10:00:00Z",
+                }
             ]
         },
     )
@@ -175,7 +191,12 @@ def test_a_negative_position_with_a_no_buy_is_a_long_no_and_is_sold(db):
         {"KX04BUCKET-30": -9.47},
         fills={
             "KX04BUCKET-30": [
-                {"ticker": "KX04BUCKET-30", "side": "no", "action": "buy", "created_time": "2026-10-05T08:16:16Z"}
+                {
+                    "ticker": "KX04BUCKET-30",
+                    "side": "no",
+                    "action": "buy",
+                    "created_time": "2026-10-05T08:16:16Z",
+                }
             ]
         },
     )
@@ -195,7 +216,12 @@ def test_a_naked_short_is_flagged_not_covered_by_default(db):
         {"KXDJIA-SHORT": -4.0},
         fills={
             "KXDJIA-SHORT": [
-                {"ticker": "KXDJIA-SHORT", "side": "yes", "action": "sell", "created_time": "2026-10-04T10:00:00Z"}
+                {
+                    "ticker": "KXDJIA-SHORT",
+                    "side": "yes",
+                    "action": "sell",
+                    "created_time": "2026-10-04T10:00:00Z",
+                }
             ]
         },
     )
@@ -211,7 +237,12 @@ def test_naked_short_is_covered_when_the_operator_opts_in(db):
         {"KXDJIA-SHORT": -4.0},
         fills={
             "KXDJIA-SHORT": [
-                {"ticker": "KXDJIA-SHORT", "side": "yes", "action": "sell", "created_time": "2026-10-04T10:00:00Z"}
+                {
+                    "ticker": "KXDJIA-SHORT",
+                    "side": "yes",
+                    "action": "sell",
+                    "created_time": "2026-10-04T10:00:00Z",
+                }
             ]
         },
     )
@@ -258,6 +289,7 @@ def test_dry_rows_are_never_reaped(db):
         row.mode = "dry"
         row.id = await db.add_position(row)
         return row
+
     row = asyncio.run(_go())
     client = _FakeClient({})
     summary = asyncio.run(live_reaper.reap_live_book(db, client))
@@ -273,13 +305,19 @@ def test_reaper_interval_gate():
     reaper._next_at = 10_000.0
     assert reaper.due(1.0) is False
 
+
 def test_an_unsellable_holding_is_cancelled_and_cooled_down(db):
     """A 0.0000 bid means Kalshi priced it at zero: cancel, do not re-queue."""
     client = _FakeClient(
         {"KXDEAD-1": 9.40},
         fills={
             "KXDEAD-1": [
-                {"ticker": "KXDEAD-1", "side": "yes", "action": "buy", "created_time": "2026-10-04T10:00:00Z"}
+                {
+                    "ticker": "KXDEAD-1",
+                    "side": "yes",
+                    "action": "buy",
+                    "created_time": "2026-10-04T10:00:00Z",
+                }
             ]
         },
         sell_fills=False,
@@ -300,7 +338,12 @@ def test_an_unsellable_holding_is_retried_after_the_cooldown(db, monkeypatch):
         {"KXDEAD-2": 9.40},
         fills={
             "KXDEAD-2": [
-                {"ticker": "KXDEAD-2", "side": "yes", "action": "buy", "created_time": "2026-10-04T10:00:00Z"}
+                {
+                    "ticker": "KXDEAD-2",
+                    "side": "yes",
+                    "action": "buy",
+                    "created_time": "2026-10-04T10:00:00Z",
+                }
             ]
         },
         sell_fills=False,

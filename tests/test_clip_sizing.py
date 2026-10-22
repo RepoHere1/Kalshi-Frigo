@@ -13,6 +13,7 @@ was credited back $2.47 on exit, and accounts for the entire -$73.59: the
 $300 simulated account went to -$73.36 and every realised figure on the page
 stopped agreeing with the others.
 """
+
 import pytest
 
 from src.jobs.ladder_trader import UpDownConfig, UpDownSignal, UpDownTrader
@@ -100,6 +101,5 @@ def test_a_signal_never_advertises_a_clip_larger_than_configured():
             continue
         fill = signal.ask if signal.side == "up" else 1.0 - float(signal.ask)
         assert signal.contracts * fill <= 1.00 + 1e-9, (
-            f"no_ask={no_ask} produced ${signal.contracts * fill:.2f} "
-            "for a $1.00 maximum order"
+            f"no_ask={no_ask} produced ${signal.contracts * fill:.2f} " "for a $1.00 maximum order"
         )

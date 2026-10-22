@@ -30,16 +30,17 @@ and DRY multipliers. The $75 open-book cap still limits aggregate exposure.
 Orders route through the canonical `execute_position` path, so DRY runs
 identical validation and cannot transmit.
 """
+
 import asyncio
 import math
 import time
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation, ROUND_FLOOR
+from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
 from src.config.settings import settings
-from src.jobs.market_data import Btc15mFeed, SpotFeed, UpDownMarket
 from src.jobs.market_context import MarketContext
+from src.jobs.market_data import Btc15mFeed, SpotFeed, UpDownMarket
 
 # A Kalshi quote older than this is not traded against: the book simply has
 # not repriced yet, so any "edge" versus fresh truth is fiction.
@@ -75,22 +76,22 @@ def _series_uses_brti(series: Optional[str]) -> bool:
 # never to reopen the $0.90+ "4%-win" band (that hard block stays global).
 ASSET_TUNING: Dict[str, Dict[str, float]] = {
     "XRP-USD": {
-        "noise_pct": 0.0008,          # ~0.08% of price: XRP/XAU move like BTC/ETH
+        "noise_pct": 0.0008,  # ~0.08% of price: XRP/XAU move like BTC/ETH
         "max_entry_price": 0.60,
         "max_entry_price_maker": 0.75,
         "sweet_band_low": 0.20,
         "sweet_band_high": 0.50,
     },
     "ETH-USD": {
-        "noise_pct": 0.0002,          # ~0.02% of price (~$0.51): ETH/XAU are large
-                                      # asset like BTC; 0.1% was far too wide
+        "noise_pct": 0.0002,  # ~0.02% of price (~$0.51): ETH/XAU are large
+        # asset like BTC; 0.1% was far too wide
         "max_entry_price": 0.60,
         "max_entry_price_maker": 0.75,
         "sweet_band_low": 0.20,
         "sweet_band_high": 0.50,
     },
     "SOL-USD": {
-        "noise_pct": 0.0006,          # ~0.06% of price: tightened, still above BTC
+        "noise_pct": 0.0006,  # ~0.06% of price: tightened, still above BTC
         "max_entry_price": 0.65,
         "max_entry_price_maker": 0.75,
         "sweet_band_low": 0.20,
@@ -116,7 +117,7 @@ class UpDownConfig:
     min_entry_price: float = 0.40  # NEW: block entries below 40¢
     # LIVE log showed entries at 0.80-0.85 YES resolve to zero almost every time
     # (the $0.90+ "4% win" band bleeding lower). Cap maker entries below that.
-    yes_extra_edge: float = 0.03   # YES/UP must beat its bar by +0.03 (NO wins more)
+    yes_extra_edge: float = 0.03  # YES/UP must beat its bar by +0.03 (NO wins more)
     sweet_band_low: float = 0.20
     sweet_band_high: float = 0.50
     out_of_band_extra_edge: float = 0.04  # RAISED: Now out-of-band is 0.50-0.60, needs +4c edge
@@ -146,7 +147,7 @@ class UpDownConfig:
     # the only way $10 compounds into something instead of flatlining.
     kelly_sizing: bool = True
     kelly_scale: float = 0.25
-    kelly_cap: float = 0.35    # never more than 35% of the book in one clip
+    kelly_cap: float = 0.35  # never more than 35% of the book in one clip
     kelly_confidence_pivot: float = 0.70  # fair probability at which kelly_scale begins scaling up
     kelly_confidence_max_mult: float = 2.0  # max multiplier on kelly_scale (capped at 0.50)
     # LADDER STRIKE-BAND (threshold/hourly products): score the strike with
@@ -154,7 +155,7 @@ class UpDownConfig:
     # quiet (win-rate play), a cheaper deeper contract when the model is
     # sure (payoff play). 15m series have one contract per close: no-op.
     strike_band_enabled: bool = True
-    strike_band_n: int = 5              # strikes walked around the money
+    strike_band_n: int = 5  # strikes walked around the money
     # High-probability convergence entries: a resting maker bid at $0.60-$0.85
     # pays a quarter fee and, with the diffusion fair value demanding real
     # edge over it, is the steadiest compounding trade this book has. Taker
@@ -226,10 +227,10 @@ class UpDownConfig:
     # Only takes very certain trades (high edge, sweet spot only), very small clips,
     # quick exit. No unlimited leverage — just faster capture of confirmed edges.
     quick_win_enabled: bool = False  # DEAD: experiment removed 2026-10-09
-    quick_win_edge: float = 0.15     # (kept only for the entry clamp default)
+    quick_win_edge: float = 0.15  # (kept only for the entry clamp default)
     quick_win_max_clip_usd: float = 6.00  # Scaled to $7 account: take $6 wins
     quick_win_profit_target: float = 0.08  # 8% quick profit take
-    quick_win_stop_loss: float = 0.03      # 3% tight stop
+    quick_win_stop_loss: float = 0.03  # 3% tight stop
     quick_win_sweet_low: float = 0.30
     quick_win_sweet_high: float = 0.45
 
@@ -239,8 +240,8 @@ class UpDownConfig:
     # not a prediction. This is the one place size may be larger than an edge
     # clip - bounded by cash and the notional law, never unlimited.
     certain_win_enabled: bool = True
-    certain_win_min_net: float = 0.015   # $ net per pair, after both fees
-    certain_win_max_usd: float = 50.0    # per-pair budget cap
+    certain_win_min_net: float = 0.015  # $ net per pair, after both fees
+    certain_win_max_usd: float = 50.0  # per-pair budget cap
     certain_win_cash_fraction: float = 0.5
 
     # FRESH-BURST (latency capture, new): when the last ~20s of spot moved
@@ -330,9 +331,9 @@ class UpDownConfig:
     # US-EQUITY SESSION BIAS: scale clip size to liquidity. Higher Kalshi
     # volume during the US session means tighter spreads = more edge/trade.
     session_mult_enabled: bool = True
-    session_mult_high: float = 1.30   # 9:30-11:30 AM ET (highest volume)
+    session_mult_high: float = 1.30  # 9:30-11:30 AM ET (highest volume)
     session_mult_normal: float = 1.00  # 11:30 AM-4:00 PM ET
-    session_mult_low: float = 0.70     # 4:00 PM-9:30 AM ET (next day)
+    session_mult_low: float = 0.70  # 4:00 PM-9:30 AM ET (next day)
 
     def __post_init__(self) -> None:
         import os as _os
@@ -435,9 +436,9 @@ class UpDownConfig:
     # survivability, not the steady-state tuning.
     survival_enabled: bool = True
     survival_floor_usd: float = 20.0
-    survival_min_edge: float = 0.25        # only near-certain disagreements
-    survival_min_win_prob: float = 0.90    # 90%+ model probability
-    survival_clip_fraction: float = 0.10   # bet a tenth of the book, max
+    survival_min_edge: float = 0.25  # only near-certain disagreements
+    survival_min_win_prob: float = 0.90  # 90%+ model probability
+    survival_clip_fraction: float = 0.10  # bet a tenth of the book, max
     # Total simulated/live notional the book may hold open across ALL clips,
     # including multiple clips of the same contract. This replaces the old
     # max_open_positions position COUNT, which forbade a second clip of the same
@@ -600,7 +601,7 @@ def _min_viable_notional(cents: float) -> float:
 
 def _get_et_hour() -> int:
     """Current hour in US Eastern Time (EST/EDT), 0-23."""
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
 
     utc_now = datetime.now(timezone.utc)
     month = utc_now.month
@@ -651,9 +652,7 @@ def tiered_edge_bar(win_prob: float, base_edge: float, cfg: Any) -> float:
     return max(base, 0.0)
 
 
-def conviction_scale(
-    clip_usd: Optional[float], win_prob: float, cfg: Any
-) -> Optional[float]:
+def conviction_scale(clip_usd: Optional[float], win_prob: float, cfg: Any) -> Optional[float]:
     """Clip size multiplied by conviction - the money maximizer.
 
     The strong-view discount (tiered bar) finds the trades the model
@@ -715,7 +714,6 @@ def fair_up_probability(
     return float(1.0 / (1.0 + math.exp(-z)))
 
 
-
 def pick_ladder_strike(
     band: List[UpDownMarket],
     spot: float,
@@ -746,9 +744,7 @@ def pick_ladder_strike(
         t = m.target
         if t is None or t <= 0:
             continue
-        fair = fair_up_probability(
-            spot, t, t * noise_pct, seconds_left, sigma_dollars
-        )
+        fair = fair_up_probability(spot, t, t * noise_pct, seconds_left, sigma_dollars)
         for p_win, ask in ((fair, m.yes_ask), (1.0 - fair, m.no_ask)):
             if ask is None or ask < min_ask or ask > max_ask:
                 continue
@@ -759,6 +755,7 @@ def pick_ladder_strike(
     if best_edge < edge_probe:
         return band[0]
     return best
+
 
 class UpDownTrader:
     """Scores a spot-backed binary contract and takes at most one clip."""
@@ -797,9 +794,7 @@ class UpDownTrader:
         # One-venue dislocation guard (Kraken/Bitstamp consensus vs Coinbase).
         from src.jobs.venue_dislocation import VenueDislocation
 
-        self.venue_guard = VenueDislocation(
-            max_dislocation_usd=0.0  # set dynamically per-market
-        )
+        self.venue_guard = VenueDislocation(max_dislocation_usd=0.0)  # set dynamically per-market
         # SCOPE THE GUARD TO THE BTC LANE. The Kraken/Bitstamp feeds inside
         # VenueDislocation are hardcoded BTC pairs; on any other underlying
         # the "dislocation" compared BTC's price (~81,707) against, say,
@@ -926,12 +921,14 @@ class UpDownTrader:
         # Applied identically to BOTH books - DRY rehearses LIVE flow conditions.
         # Skipped if bids are zero (incomplete book or test fixture).
         # Skipped if bids > 25 cents from ask (unrealistic / inverted book).
-        if self.config.flow_sentinel_enabled and market.up_price is not None and market.down_price is not None:
+        if (
+            self.config.flow_sentinel_enabled
+            and market.up_price is not None
+            and market.down_price is not None
+        ):
             try:
-                from src.jobs.flow_sentinel import (
-                    compute_flow_metrics,
-                    flow_sentinel,
-                )
+                from src.jobs.flow_sentinel import compute_flow_metrics, flow_sentinel
+
                 _fm = compute_flow_metrics(
                     yes_ask=float(market.up_price or 0.0),
                     yes_bid=float(getattr(market, "yes_bid", 0) or 0.0),
@@ -1037,9 +1034,7 @@ class UpDownTrader:
 
                 _end = bucket_to_utc(market.bucket)
                 _pdiv = (
-                    self.poly.diverges_from(
-                        _end, market.up_price, self.config.poly_guard_threshold
-                    )
+                    self.poly.diverges_from(_end, market.up_price, self.config.poly_guard_threshold)
                     if _end is not None
                     else None
                 )
@@ -1078,8 +1073,11 @@ class UpDownTrader:
                     if _w is not None:
                         _poly_drift = _w.up - _w.down
                         _our_drift = delta
-                        if (_our_drift > 0 and _poly_drift < -self.config.momentum_agree_threshold) or \
-                           (_our_drift < 0 and _poly_drift > self.config.momentum_agree_threshold):
+                        if (
+                            _our_drift > 0 and _poly_drift < -self.config.momentum_agree_threshold
+                        ) or (
+                            _our_drift < 0 and _poly_drift > self.config.momentum_agree_threshold
+                        ):
                             self.book.skipped_momentum += 1
                             return UpDownSignal(
                                 ticker=market.ticker,
@@ -1133,9 +1131,7 @@ class UpDownTrader:
         # Realized $-vol for exactly the time that is left. Most lanes use the
         # legacy logistic during cold start.
         if sigma_snapshot is _SIGMA_SNAPSHOT_UNSET:
-            self._sigma_used = self.rv.sigma_dollars(
-                horizon_seconds=seconds_left, last_price=spot
-            )
+            self._sigma_used = self.rv.sigma_dollars(horizon_seconds=seconds_left, last_price=spot)
         else:
             self._sigma_used = sigma_snapshot
         # IMPLIED sigma: Kalshi's own price inverted through the diffusion.
@@ -1154,9 +1150,7 @@ class UpDownTrader:
                 if market.up_price is None or target is None:
                     self._impl_sigma = None
                 else:
-                    self._impl_sigma = implied_sigma(
-                        market.up_price, spot, target, seconds_left
-                    )
+                    self._impl_sigma = implied_sigma(market.up_price, spot, target, seconds_left)
                     if self._impl_sigma is not None and self._impl_sigma < (
                         self._sigma_used * self.config.vol_cheap_ratio
                     ):
@@ -1175,9 +1169,10 @@ class UpDownTrader:
                 _rm = self.rv.recent_move(self.config.burst_lookback_sec)
                 if _rm is not None and seconds_left >= self.config.burst_min_seconds_left:
                     _b_delta, _b_span = _rm
-                    _b_sigma = self._sigma_used * (
-                        max(float(_b_span), 1.0) / max(float(seconds_left), 1.0)
-                    ) ** 0.5
+                    _b_sigma = (
+                        self._sigma_used
+                        * (max(float(_b_span), 1.0) / max(float(seconds_left), 1.0)) ** 0.5
+                    )
                     if _b_sigma > 0 and abs(float(_b_delta)) >= (
                         self.config.burst_sigma_mult * _b_sigma
                     ):
@@ -1294,9 +1289,7 @@ class UpDownTrader:
             # Makers may reach 0.85 (quarter fee, real edge required over the
             # resting bid); takers stop at the classic 0.60 - the taker fee up
             # there is a private tax on a tiny account.
-            _cap = (
-                self.config.max_entry_price_maker if maker else self.config.max_entry_price
-            )
+            _cap = self.config.max_entry_price_maker if maker else self.config.max_entry_price
             if fill_price > _cap:
                 return False
             r = req
@@ -1320,9 +1313,7 @@ class UpDownTrader:
         # money, not a tie-breaker. This is the single highest-leverage lever
         # on the win rate: stop the marginal YES entries that bleed.
         if self.config.yes_extra_edge > 0 and up_ok:
-            up_ok = up_edge >= (
-                _required(up_fill, _up_maker, _up_wp) + self.config.yes_extra_edge
-            )
+            up_ok = up_edge >= (_required(up_fill, _up_maker, _up_wp) + self.config.yes_extra_edge)
 
         side = ""
         ask: Optional[float] = None
@@ -1355,7 +1346,8 @@ class UpDownTrader:
                 f"{('%.2f' % up_ask) if up_ask is not None else '--'} / down "
                 f"{('%.2f' % down_ask) if down_ask is not None else '--'} - "
                 f"best edge {max(up_edge, down_edge):+.3f} under {_req:.3f}"
-                f" [{_regime}]")
+                f" [{_regime}]"
+            )
             if (up_fill is not None and up_fill >= self.config.max_entry_price) or (
                 down_fill is not None and down_fill >= self.config.max_entry_price
             ):
@@ -1371,7 +1363,7 @@ class UpDownTrader:
                 reason += f" | rv-sigma ${self._sigma_used:,.0f}"
             if self._impl_sigma:
                 reason += f" | impl-sigma ${self._impl_sigma:,.0f}"
-            _chosen_maker = (_up_maker if side == "up" else _down_maker)
+            _chosen_maker = _up_maker if side == "up" else _down_maker
             if _chosen_maker:
                 reason += " | maker-bar (quarter fee, bid-priced)"
             if self._burst:
@@ -1384,9 +1376,7 @@ class UpDownTrader:
                         f"{self.config.strong_edge_scale:.2f}x edge bar"
                     )
                     if _wp >= self.config.certified_prob:
-                        reason += (
-                            f" | certified: {self.config.certified_mult:.1f}x clip"
-                        )
+                        reason += f" | certified: {self.config.certified_mult:.1f}x clip"
                 elif _wp < self.config.marginal_prob:
                     reason += (
                         f" | marginal view ({_wp:.2f}): "
@@ -1413,20 +1403,14 @@ class UpDownTrader:
             # turns $10 into something: growth-optimal sizing on every edge,
             # not a flat $5 til the account dies of fee drag.
             # Confidence-weighted Kelly: scale up for strong model conviction
-            _conf_kelly_scale = (
-                self.config.kelly_scale
-                + self.config.kelly_scale
-                * max(0.0, fair - self.config.kelly_confidence_pivot)
-                / (1.0 - self.config.kelly_confidence_pivot)
-            )
+            _conf_kelly_scale = self.config.kelly_scale + self.config.kelly_scale * max(
+                0.0, fair - self.config.kelly_confidence_pivot
+            ) / (1.0 - self.config.kelly_confidence_pivot)
             _conf_kelly_scale = min(
                 _conf_kelly_scale,
                 self.config.kelly_scale * self.config.kelly_confidence_max_mult,
             )
-            if (
-                self.config.kelly_sizing
-                and 0.0 < fill_price < 1.0
-            ):
+            if self.config.kelly_sizing and 0.0 < fill_price < 1.0:
                 # Both books use the same balance source:
                 # DRIED uses the simulated cash cache, LIVE uses the real balance.
                 if _bal and _bal > 0.0:
@@ -1479,11 +1463,7 @@ class UpDownTrader:
                 if _buy_x != 1.0:
                     # A None clip means "use the config default clip" - scale
                     # that too, instead of collapsing a None clip to zero.
-                    _base = (
-                        float(_clip)
-                        if _clip is not None
-                        else float(self.config.notional_usd)
-                    )
+                    _base = float(_clip) if _clip is not None else float(self.config.notional_usd)
                     _clip = round(_base * _buy_x, 2)
                     reason += f" | buy-x{_buy_x:.0f}"
             except Exception:  # noqa: BLE001 - sizing must never break an entry
@@ -1503,11 +1483,7 @@ class UpDownTrader:
                 if _buy_x != 1.0:
                     # A None clip means "use the config default clip" - scale
                     # that too, instead of collapsing a None clip to zero.
-                    _base = (
-                        float(_clip)
-                        if _clip is not None
-                        else float(self.config.notional_usd)
-                    )
+                    _base = float(_clip) if _clip is not None else float(self.config.notional_usd)
                     _clip = round(_base * _buy_x, 2)
                     reason += f" | buy-x{_buy_x:.0f}"
             except Exception:  # noqa: BLE001 - sizing must never break an entry
@@ -1600,6 +1576,11 @@ class UpDownTrader:
         target_notional = self.config.notional_usd if clip_usd is None else max(clip_usd, 0.0)
         if target_notional <= 0:
             return 0
+        # Hard per-order cap: a single clip cannot cost more than $1.00. The
+        # Kelly budget and DRY boost may be large, but the order itself is
+        # bounded - this is what stops a 6c NO-ask from buying 81 contracts
+        # on a $0.939 fill.
+        target_notional = min(target_notional, 1.0)
         try:
             price_dec = Decimal(str(price))
             budget_dec = Decimal(str(target_notional))
@@ -1736,9 +1717,7 @@ class UpDownTrader:
                 if _state == "caution":
                     _kalshi_fee = 0.07 * (1.0 - float(signal.ask or 0.5))
                     _r = (
-                        self.config.min_edge
-                        + _kalshi_fee
-                        + self.config.sentinel_caution_extra_edge
+                        self.config.min_edge + _kalshi_fee + self.config.sentinel_caution_extra_edge
                     )
                     _fill = float(signal.ask or 0.0)
                     if not (self.config.sweet_band_low <= _fill <= self.config.sweet_band_high):
@@ -1870,6 +1849,7 @@ class UpDownTrader:
         # so the rehearsal carries the fill risk too.
         _maker_wait = 0.0
         from src.jobs import live_fees as _lf_mk
+
         if _lf_mk.should_use_maker_entry(signal.seconds_left):
             try:
                 from src.jobs import live_fees as _live_fees_mk
@@ -1911,7 +1891,8 @@ class UpDownTrader:
             # the rationale ("fair 0.81 vs Kalshi ... on DOWN") is the chosen
             # side - match it.
             entry_fair=float(
-                signal.fair if str(getattr(signal, "side", "")).lower() == "up"
+                signal.fair
+                if str(getattr(signal, "side", "")).lower() == "up"
                 else 1.0 - signal.fair
             ),
             live=live,
@@ -2060,25 +2041,17 @@ class UpDownTrader:
                 mode="live" if live else "dry",
             )
             try:
-                position_id = await self.db_manager.add_position(
-                    position, allow_duplicate=True
-                )
+                position_id = await self.db_manager.add_position(position, allow_duplicate=True)
             except Exception as exc:  # noqa: BLE001
-                self.book.last_error = (
-                    f"certain_win insert failed: {type(exc).__name__}: {exc}"
-                )
+                self.book.last_error = f"certain_win insert failed: {type(exc).__name__}: {exc}"
                 continue
             if position_id is None:
                 continue
             position.id = position_id
             try:
-                filled = await execute_position(
-                    position, live, self.db_manager, self._client
-                )
+                filled = await execute_position(position, live, self.db_manager, self._client)
             except Exception as exc:  # noqa: BLE001
-                self.book.last_error = (
-                    f"certain_win submit failed: {type(exc).__name__}: {exc}"
-                )
+                self.book.last_error = f"certain_win submit failed: {type(exc).__name__}: {exc}"
                 filled = False
             if filled:
                 placed.append(side)
@@ -2217,9 +2190,7 @@ class UpDownTrader:
                 self.book.last_error = f"series fetch: {_msg}"
                 return self.book.summary()
 
-        market = self.feed.nearest(
-            float(getattr(self.spot, "price", 0.0) or 0.0) or None
-        )
+        market = self.feed.nearest(float(getattr(self.spot, "price", 0.0) or 0.0) or None)
         # LADDER STRIKE-BAND: an hourly/daily ladder expires a whole grid of
         # strikes at once. Score the strike whose modeled edge is widest -
         # nearest the money when the tape is quiet (win-rate play), a
@@ -2299,13 +2270,9 @@ class UpDownTrader:
                     and self._peak_balance > 0
                     and self._peak_balance > self._live_balance
                 ):
-                    from src.jobs.risk_overlays import (
-                        DrawdownFraction,
-                        kelly_scale_for_drawdown,
-                    )
-                    _dd = DrawdownFraction(
-                        peak=self._peak_balance, current=self._live_balance
-                    )
+                    from src.jobs.risk_overlays import DrawdownFraction, kelly_scale_for_drawdown
+
+                    _dd = DrawdownFraction(peak=self._peak_balance, current=self._live_balance)
                     if _dd.fraction() >= self.config.drawdown_peak_floor:
                         # Past drawdown floor: refuse new entries until recovery.
                         self.book.skipped_drawdown += 1
@@ -2387,14 +2354,19 @@ class UpDownTrader:
         # being unable to trade at all, so this cycle demands near-certain wins
         # and sizes down. Applied to the LIVE book only (a DRIED book is
         # expendable rehearsal cash, not the real account that must survive).
-        survival = live and self.config.survival_enabled and self._live_balance is not None and (
-            self._live_balance <= self.config.survival_floor_usd
+        survival = (
+            live
+            and self.config.survival_enabled
+            and self._live_balance is not None
+            and (self._live_balance <= self.config.survival_floor_usd)
         )
         _saved_edge = self.config.min_edge
         _saved_win = self.config.min_win_prob
         if survival:
             self.config.min_edge = max(self.config.min_edge, self.config.survival_min_edge)
-            self.config.min_win_prob = max(self.config.min_win_prob, self.config.survival_min_win_prob)
+            self.config.min_win_prob = max(
+                self.config.min_win_prob, self.config.survival_min_win_prob
+            )
             # Hyper-caution: require a near-certain win, but do NOT flat-cap the
             # bet to a fixed 10%. The Kelly engine already sizes the clip by the
             # edge (near-certain -> bigger), so a flat cap just shrinks the exact
@@ -2479,9 +2451,7 @@ class UpDownTrader:
                 for p in await self.db_manager.get_open_positions(mode=book_mode):
                     _pside = str(p.side or "").upper()
                     if _pside in book_same_side:
-                        book_same_side[_pside] += (
-                            (p.entry_price or 0.0) * (p.quantity or 0)
-                        )
+                        book_same_side[_pside] += (p.entry_price or 0.0) * (p.quantity or 0)
                     if (p.strategy or "") != self.lane:
                         continue
                     # A 15-minute contract that is not the current one has rolled:
@@ -2520,10 +2490,10 @@ class UpDownTrader:
             # SURVIVAL bars must also govern the entry guard (min_win_prob lives
             # there too), so re-raise them for the guard and restore after.
             if survival:
-                self.config.min_win_prob = max(self.config.min_win_prob, self.config.survival_min_win_prob)
-            blocked = self._entry_block(
-                signal, held, live=live, book_same_side=book_same_side
-            )
+                self.config.min_win_prob = max(
+                    self.config.min_win_prob, self.config.survival_min_win_prob
+                )
+            blocked = self._entry_block(signal, held, live=live, book_same_side=book_same_side)
             if not blocked:
                 blocked = await self._ai_guards(signal, live)
             if not blocked and await self._place(signal, live):
@@ -2592,8 +2562,11 @@ class UpDownTrader:
                 "brti_state": _brti_state,
                 "required_edge": round(
                     self.config.min_edge
-                    + (0.07 * (1.0 - float(signal.ask or 0.5))
-                       if (signal and (live or self.config.dry_fee_enabled)) else 0.0)
+                    + (
+                        0.07 * (1.0 - float(signal.ask or 0.5))
+                        if (signal and (live or self.config.dry_fee_enabled))
+                        else 0.0
+                    )
                     + _session_bump,
                     4,
                 ),
@@ -2733,9 +2706,7 @@ async def run_updown_trader(
                     from src.jobs.broker import should_trade_live
 
                     book_word = "live" if should_trade_live() else "paper"
-                await StrategyRuntime(db_path=trader._db_path()).record_heartbeat(
-                    lane, book_word
-                )
+                await StrategyRuntime(db_path=trader._db_path()).record_heartbeat(lane, book_word)
             except Exception as exc:  # noqa: BLE001 - proof must not kill the loop
                 print(f"{series}: heartbeat write failed: {type(exc).__name__}: {exc}", flush=True)
 

@@ -3,13 +3,13 @@ Trade Execution Job
 
 This job takes a position and executes it as a trade.
 """
+
 import asyncio
 import os
 import uuid
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-from typing import Any
 from src.clients.kalshi_client import KalshiAPIError, KalshiClient
 from src.clients.kilo_gateway import KiloGateway
 from src.config.settings import settings
@@ -120,8 +120,9 @@ async def execute_position(
     position: Position,
     live_mode: bool,
     db_manager: DatabaseManager,
-    gateway: KiloGateway,
+    gateway: Optional[KiloGateway] = None,
     maker_wait_seconds: float = 0.0,
+    kalshi_client: Optional[KalshiClient] = None,
 ) -> bool:
     """
     Executes a single trade position.
@@ -149,7 +150,13 @@ async def execute_position(
     mode = MODE_LIVE if live_mode else MODE_DRY
     mode_manager = _mode_manager()
 
-    # Fail closed BEFORE anything is submitted. The order used to go first and the
+    # Resolve the Kalshi client: prefer the caller-supplied one, fall back to
+    # the gateway's live client under LIVE, and stay the gateway itself under DRY
+    # (where the simulated book is the only source of truth and is the client).
+    if kalshi_client is None:
+        kalshi_client = gateway._current_client if live_mode else gateway
+
+    # Fail closed BEFORE anything was submitted. The order used to go first and the
     # id check second, so a caller that forgot to persist its position still got a
     # fill: the DRY ledger was debited (and, under LIVE, real money spent) and only
     # then did this function discover there was no row to record the fill against.
@@ -190,12 +197,16 @@ async def execute_position(
 
     try:
         # Get market data through gateway
-        market_data = await gateway.get_market(position.market_id)
+        # Get market data via gateway or kalshi_client directly.
+        if gateway is not None:
+            market_data = await gateway.get_market(position.market_id)
+        else:
+            market_data = await kalshi_client.get_market(position.market_id)
         market = market_data.get("market", {})
 
         broker = broker_for_mode(
             mode,
-            kalshi_client=gateway._current_client if live_mode else None,
+            kalshi_client=kalshi_client if live_mode else None,
             mode_manager=mode_manager,
         )
 
@@ -238,12 +249,13 @@ async def execute_position(
                     f"{maker_wait_seconds:.0f}s; dropped, nothing simulated"
                 )
                 return False
-            
+
             # Re-price position to actual book price when maker fill occurred
             # This ensures DRY ledger matches what would have happened LIVE
             md = await gateway.get_market(position.market_id)
             market = (md or {}).get("market") or {}
             from src.utils.market_prices import get_market_prices
+
             _yb, ya, _nb, na = get_market_prices(market)
             actual_price = ya if position.side == "YES" else na
             if actual_price is not None:
@@ -269,11 +281,7 @@ async def execute_position(
         # decision-time price was only an estimate; this is what the exchange
         # would actually have done. DRY_EXEC_SIM=0 reverts to the old instant
         # fill at the decision price.
-        _exec_sim = (
-            (not live_mode)
-            and (not _maker)
-            and os.environ.get("DRY_EXEC_SIM", "1") == "1"
-        )
+        _exec_sim = (not live_mode) and (not _maker) and os.environ.get("DRY_EXEC_SIM", "1") == "1"
         if _exec_sim:
             from src.jobs.execution_sim import simulate_taker_fill
 
@@ -289,9 +297,7 @@ async def execute_position(
                 latency_ms=_latency,
             )
             if not sim.filled:
-                logger.warning(
-                    f"🚫 DRY execution refused {position.market_id}: {sim.reason}"
-                )
+                logger.warning(f"🚫 DRY execution refused {position.market_id}: {sim.reason}")
                 return False
             if sim.quantity != request.count or abs(sim.price - float(request.fill_price)) > 1e-9:
                 # Re-price the order to what the book actually gave: the
@@ -311,9 +317,7 @@ async def execute_position(
                 position.entry_price = sim.price
                 position.quantity = sim.quantity
                 if position.id is not None:
-                    await db_manager.update_position_fill(
-                        position.id, sim.price, sim.quantity
-                    )
+                    await db_manager.update_position_fill(position.id, sim.price, sim.quantity)
                 logger.info(
                     f"📉 DRY execution reality on {position.market_id}: "
                     f"{sim.quantity} @ {sim.price:.3f} ({sim.reason})"
@@ -726,7 +730,7 @@ async def _close_after_sell(
     exit_px = float(exit_price or 0.0)
     qty = int(position.quantity or 0)
 
-# YES and NO are both long contracts: buying NO at entry_px and selling
+    # YES and NO are both long contracts: buying NO at entry_px and selling
     # it at exit_px earns (exit_px - entry_px) per contract, exactly like
     # YES. The sign is NOT inverted by the side - only the price that is
     # quoted differs (the NO book instead of the YES book).
@@ -879,7 +883,7 @@ async def place_profit_taking_orders(
                         "winner sold early to free the clip for the next edge"
                     )
 
-# Calculate current profit
+                # Calculate current profit
                 if current_price > 0:
                     profit_pct = (current_price - position.entry_price) / position.entry_price
                     unrealized_pnl = (current_price - position.entry_price) * position.quantity
@@ -904,9 +908,7 @@ async def place_profit_taking_orders(
                         if _close_ts:
                             from datetime import datetime, timezone
 
-                            _ct = datetime.fromisoformat(
-                                str(_close_ts).replace("Z", "+00:00")
-                            )
+                            _ct = datetime.fromisoformat(str(_close_ts).replace("Z", "+00:00"))
                             if _ct.tzinfo is None:
                                 _ct = _ct.replace(tzinfo=timezone.utc)
                             _secs = (_ct - datetime.now(timezone.utc)).total_seconds()
@@ -965,7 +967,7 @@ async def place_profit_taking_orders(
 
             except Exception as e:
                 logger.error(
-                f"Error processing position {position.market_id} for profit taking: {e}"
+                    f"Error processing position {position.market_id} for profit taking: {e}"
                 )
                 continue
             finally:
@@ -1060,7 +1062,7 @@ async def place_stop_loss_orders(
                 else:
                     current_price = (no_bid + no_ask) / 2.0
 
-# Calculate current loss
+                # Calculate current loss
                 if current_price > 0:
                     loss_pct = (current_price - position.entry_price) / position.entry_price
                     unrealized_pnl = (current_price - position.entry_price) * position.quantity
@@ -1099,9 +1101,7 @@ async def place_stop_loss_orders(
                         )
                         logger.info(f"✅ Stop-loss order placed for {position.market_id}")
                     else:
-                        logger.error(
-                            f"❌ Failed to place stop-loss order for {position.market_id}"
-                        )
+                        logger.error(f"❌ Failed to place stop-loss order for {position.market_id}")
 
             except Exception as e:
                 logger.error(f"Error processing position {position.market_id} for stop loss: {e}")

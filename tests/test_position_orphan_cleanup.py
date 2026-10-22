@@ -11,6 +11,7 @@ negative cash balance, and a headline reading "$251.46 deployed of $178.10
 equity" - deployed exceeding equity, which is arithmetically impossible and was
 the clearest signal that the books had stopped agreeing with each other.
 """
+
 from datetime import datetime
 
 import pytest

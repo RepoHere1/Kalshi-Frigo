@@ -3,6 +3,7 @@
 This file tests order validation and submission for the single LIVE broker.
 All DRY book functionality has been removed.
 """
+
 import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
@@ -103,8 +104,12 @@ def test_size_floor_raises_a_sub_minimum_buy():
     """A fractional (sub-contract) buy is rounded up to one whole contract, the
     exchange's only floor. There is no $1.00 notional minimum."""
     req, reason = build_order_request(
-        market_id="KXTEST-26", side="YES", action="buy", quantity=1,
-        market=NORMAL_MARKET, available_cents=300_00,
+        market_id="KXTEST-26",
+        side="YES",
+        action="buy",
+        quantity=1,
+        market=NORMAL_MARKET,
+        available_cents=300_00,
     )
     assert req is not None and reason == ""
     assert req.count == 1, "one whole contract is the floor"
@@ -113,8 +118,12 @@ def test_size_floor_raises_a_sub_minimum_buy():
 
 def test_size_floor_never_reduces_an_adequate_order():
     req, _ = build_order_request(
-        market_id="KXTEST-26", side="YES", action="buy", quantity=50,
-        market=NORMAL_MARKET, available_cents=300_00,
+        market_id="KXTEST-26",
+        side="YES",
+        action="buy",
+        quantity=50,
+        market=NORMAL_MARKET,
+        available_cents=300_00,
     )
     assert req is not None
     assert req.count == 50
@@ -123,8 +132,12 @@ def test_size_floor_never_reduces_an_adequate_order():
 def test_size_floor_still_respects_the_funding_source():
     """The order must not exceed the available cash, even at one contract."""
     req, reason = build_order_request(
-        market_id="KXTEST-26", side="YES", action="buy", quantity=1,
-        market=NORMAL_MARKET, available_cents=0,  # empty account
+        market_id="KXTEST-26",
+        side="YES",
+        action="buy",
+        quantity=1,
+        market=NORMAL_MARKET,
+        available_cents=0,  # empty account
     )
     assert req is None
     assert "available" in reason
@@ -133,8 +146,13 @@ def test_size_floor_still_respects_the_funding_source():
 def test_size_floor_does_not_apply_to_sells():
     """A small remainder must still be sellable so it can be closed out."""
     req, _ = build_order_request(
-        market_id="KXTEST-26", side="YES", action="sell", quantity=1,
-        market=NORMAL_MARKET, available_cents=300_00, limit_price_dollars=0.42,
+        market_id="KXTEST-26",
+        side="YES",
+        action="sell",
+        quantity=1,
+        market=NORMAL_MARKET,
+        available_cents=300_00,
+        limit_price_dollars=0.42,
     )
     assert req is not None and req.count == 1
 
@@ -236,7 +254,9 @@ def test_live_broker_available_cents():
 def test_live_broker_cancel():
     async def run_test():
         client = MagicMock()
-        client.cancel_order = AsyncMock(return_value={"order": {"order_id": "abc", "status": "cancelled"}})
+        client.cancel_order = AsyncMock(
+            return_value={"order": {"order_id": "abc", "status": "cancelled"}}
+        )
         response = await LiveBroker(client).cancel("abc")
         assert response["order"]["order_id"] == "abc"
 

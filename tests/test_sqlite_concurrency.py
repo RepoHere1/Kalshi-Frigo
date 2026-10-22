@@ -12,6 +12,7 @@ Two properties are asserted here:
 2. The supervisor's failure budget counts *consecutive* failures and resets on a
    genuine recovery, so a transient lock cannot permanently disable a strategy.
 """
+
 import os
 
 import pytest

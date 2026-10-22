@@ -1,4 +1,5 @@
 """The ANALYSIS OF panel: stats and recommendations over the forever log."""
+
 import pytest
 
 from src.utils.trade_analytics import analyze_trades
@@ -89,10 +90,18 @@ def test_price_bands_and_sides_are_populated():
 
 def test_hold_time_compares_winners_to_losers():
     rows = [
-        _t(market_id="KXA", pnl=1.0, entry_timestamp="2026-10-04T10:00:00",
-           exit_timestamp="2026-10-04T10:05:00"),
-        _t(market_id="KXB", pnl=-1.0, entry_timestamp="2026-10-04T10:00:00",
-           exit_timestamp="2026-10-04T10:20:00"),
+        _t(
+            market_id="KXA",
+            pnl=1.0,
+            entry_timestamp="2026-10-04T10:00:00",
+            exit_timestamp="2026-10-04T10:05:00",
+        ),
+        _t(
+            market_id="KXB",
+            pnl=-1.0,
+            entry_timestamp="2026-10-04T10:00:00",
+            exit_timestamp="2026-10-04T10:20:00",
+        ),
     ]
     out = analyze_trades(rows)
     assert out["hold_seconds_avg_win"] == pytest.approx(300, abs=1)

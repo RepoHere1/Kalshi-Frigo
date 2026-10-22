@@ -32,6 +32,6 @@ def test_contracts_for_whole_pairs_only():
 
 
 def test_taker_fee_rounds_up_like_the_venue():
-    assert cw.taker_fee(0.50) == 0.02   # 1.75c -> 2c
-    assert cw.taker_fee(0.10) == 0.01   # 0.63c -> 1c
+    assert cw.taker_fee(0.50) == 0.02  # 1.75c -> 2c
+    assert cw.taker_fee(0.10) == 0.01  # 0.63c -> 1c
     assert cw.taker_fee(0.90) == 0.01

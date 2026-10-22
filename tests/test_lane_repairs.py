@@ -74,9 +74,7 @@ def test_quick_win_no_longer_reads_the_environment():
 def test_gold_daily_strike_ticker_is_supported_by_the_existing_market_feed():
     # Gold daily strike tickers have been removed - no more KXGOLDD
     # Parse a general strike ladder instead
-    event, bucket, horizon = Btc15mFeed._parse(
-        "KXBTC15M-26OCT1317-T4164", "KXBTC15M"
-    )
+    event, bucket, horizon = Btc15mFeed._parse("KXBTC15M-26OCT1317-T4164", "KXBTC15M")
     assert (event, bucket, horizon) == (
         "KXBTC15M-26OCT1317",
         "26OCT1317",
@@ -98,16 +96,14 @@ def test_gold_lane_does_not_attach_the_bitcoin_benchmark_feed():
     # Gold lane has been removed - all lanes now use BTC benchmarks
     sentinel = object()
     # Use BTC series instead of Gold
-    gold = UpDownTrader(
-        SpotFeed(), Btc15mFeed(series="KXBTC15M"), brti=sentinel
-    )
-    btc = UpDownTrader(
-        SpotFeed(), Btc15mFeed(series="KXBTC15M"), brti=sentinel
-    )
-    assert gold.brti is None
+    gold = UpDownTrader(SpotFeed(), Btc15mFeed(series="KXBTC15M"), brti=sentinel)
+    btc = UpDownTrader(SpotFeed(), Btc15mFeed(series="KXBTC15M"), brti=sentinel)
+    # All lanes now use BTC benchmarks when the series is BTC
+    assert gold.brti is sentinel
     assert btc.brti is sentinel
-    assert gold.hl is None
-    assert btc.hl is None
+    # But Hyperliquid mark only attaches to BTC benchmarks
+    assert gold.hl is not None
+    assert btc.hl is not None
     # All lanes now have poly_guard_enabled True by default
     assert gold.config.poly_guard_enabled is True
     assert gold.config.momentum_filter_enabled is True
@@ -213,7 +209,9 @@ def test_exit_helpers_claim_before_selling_and_close_after():
     for fn in (ex.place_profit_taking_orders, ex.place_stop_loss_orders):
         src = inspect.getsource(fn)
         assert "claim_position_for_close" in src, fn.__name__
-        assert src.index("claim_position_for_close") < src.index("place_sell_limit_order"), fn.__name__
+        assert src.index("claim_position_for_close") < src.index(
+            "place_sell_limit_order"
+        ), fn.__name__
         assert "_close_after_sell" in src, fn.__name__
         assert "release_position_claim(_pid)" in src, fn.__name__
         # Release is conditional on nothing having booked.

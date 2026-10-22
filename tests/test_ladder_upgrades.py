@@ -11,6 +11,7 @@ Three upgrades, one law: DRY rehearses exactly what LIVE does.
 3. DRY runs the same maker entry LIVE runs - same wait, same real book, and a
    fill only when the book actually crosses the resting price.
 """
+
 import math
 import time
 
@@ -165,9 +166,7 @@ def test_trader_records_the_sigma_it_used():
     t0 = time.monotonic()
     for i in range(60):
         trader.rv.observe(84000.0 + 0.1 * i + (1.0 if i % 2 else -1.0), now=t0 - 300.0 + i * 5.0)
-    market = _dollars(
-        seconds_left=300, yes_bid=0.40, yes_ask=0.41, no_bid=0.59, no_ask=0.60
-    )
+    market = _dollars(seconds_left=300, yes_bid=0.40, yes_ask=0.41, no_bid=0.59, no_ask=0.60)
     signal = trader.evaluate(market, live=False)
     assert signal is not None
     assert signal.side, f"expected a trade, got: {signal.reason}"
@@ -328,7 +327,7 @@ def test_sub_dollar_assets_get_a_realistic_sigma_not_the_btc_floor():
         rv.observe(base * (1.0 + rnd.gauss(0.0, 0.0004)), now=t)
     s = rv.sigma_dollars(900.0, last_price=base)
     assert s is not None
-    assert s < 0.02          # a few tenths of a cent, NOT the old $5 floor
+    assert s < 0.02  # a few tenths of a cent, NOT the old $5 floor
     assert s > 0.00005
 
 

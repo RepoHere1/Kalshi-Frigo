@@ -6,6 +6,7 @@ f* = (p - c) / (1 - c) for YES positions
 f* = (q - c_NO) / (1 - c_NO) for NO positions
 with quarter-Kelly for safety.
 """
+
 import pytest
 from src.jobs.decide import _calculate_kelly_position_size
 
@@ -25,7 +26,7 @@ class TestKellyPositionSizing:
             contract_price=0.50,
             ai_probability=0.60,
             side="YES",
-            confidence=0.70
+            confidence=0.70,
         )
         assert quantity == 2
         assert quantity * 0.50 <= 1.00
@@ -42,7 +43,7 @@ class TestKellyPositionSizing:
             contract_price=0.40,
             ai_probability=0.40,
             side="NO",
-            confidence=0.70
+            confidence=0.70,
         )
         assert quantity == 2
         assert quantity * (1.0 - 0.60) <= 1.00
@@ -56,7 +57,7 @@ class TestKellyPositionSizing:
             contract_price=0.50,
             ai_probability=0.60,
             side="YES",
-            confidence=0.85
+            confidence=0.85,
         )
         qty_low = _calculate_kelly_position_size(
             balance=100.0,
@@ -64,7 +65,7 @@ class TestKellyPositionSizing:
             contract_price=0.50,
             ai_probability=0.60,
             side="YES",
-            confidence=0.50
+            confidence=0.50,
         )
         assert qty_high >= qty_low, "Higher confidence should allow larger position"
 
@@ -76,7 +77,7 @@ class TestKellyPositionSizing:
             contract_price=0.60,
             ai_probability=0.50,
             side="YES",
-            confidence=0.70
+            confidence=0.70,
         )
         assert quantity == 0, "No edge should return 0 contracts"
 
@@ -89,7 +90,7 @@ class TestKellyPositionSizing:
             contract_price=0.10,
             ai_probability=0.90,
             side="YES",
-            confidence=0.95
+            confidence=0.95,
         )
         assert quantity == 10
         assert quantity * 0.10 <= 1.00
@@ -141,7 +142,7 @@ class TestKellyPositionSizing:
             contract_price=0.50,
             ai_probability=0.60,
             side="YES",
-            confidence=0.70
+            confidence=0.70,
         )
         # Quarter-Kelly of $10 = $0.50, at $0.50 = 1 contract minimum
         assert quantity >= 1, "Should get at least 1 contract even with small balance"
@@ -155,7 +156,7 @@ class TestKellyPositionSizing:
             contract_price=0.50,
             ai_probability=0.60,
             side="YES",
-            confidence=0.70
+            confidence=0.70,
         )
         # Maker has lower fees, so should get larger position
         assert qty_maker >= 1, "Maker position should be valid"

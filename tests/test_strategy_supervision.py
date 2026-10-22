@@ -11,6 +11,7 @@ running is stored separately from the pid so a crash is recoverable.
 The runtime store is keyed by (name, mode): DRY and LIVE are separate books
 with separate rows, so stopping one never touches the other.
 """
+
 import os
 
 import pytest
@@ -129,8 +130,7 @@ async def test_the_old_name_keyed_table_is_rebuilt_composite(tmp_path):
 
     path = str(tmp_path / "old.db")
     async with aiosqlite.connect(path) as conn:
-        await conn.executescript(
-            """
+        await conn.executescript("""
             CREATE TABLE strategy_runtime (
                 name TEXT PRIMARY KEY, pid INTEGER, started_at TEXT, mode TEXT,
                 command TEXT, stop_reason TEXT, stopped_at TEXT, instance TEXT,
@@ -139,8 +139,7 @@ async def test_the_old_name_keyed_table_is_rebuilt_composite(tmp_path):
             INSERT INTO strategy_runtime (name, pid, mode, desired)
                 VALUES ('ai_directional', 1234, 'paper', 1),
                        ('beast_mode', NULL, 'dry', 0);
-            """
-        )
+            """)
         await conn.commit()
 
     store = rt.StrategyRuntime(db_path=path)

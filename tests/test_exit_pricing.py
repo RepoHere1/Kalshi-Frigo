@@ -11,6 +11,7 @@ trips `0.0 <= take_profit`, fires a take-profit at exit_price 0.0, and the
 $0 sanity guard then refuses to write the close - so the position is stuck open
 permanently, retrying forever.
 """
+
 from datetime import datetime, timedelta
 
 import pytest

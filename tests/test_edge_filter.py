@@ -3,7 +3,9 @@ Tests for the EdgeFilter module.
 
 Verifies edge calculations, fee adjustments, and filtering logic.
 """
+
 import pytest
+
 from src.utils.edge_filter import EdgeFilter, calculate_edge, passes_edge_filter
 
 
@@ -15,9 +17,7 @@ class TestEdgeFilterBasic:
         # AI thinks 60% probability, market at 40%
         # Edge = 60% - 40% = 20%
         result = EdgeFilter.calculate_edge(
-            ai_probability=0.60,
-            market_probability=0.40,
-            confidence=0.7
+            ai_probability=0.60, market_probability=0.40, confidence=0.7
         )
         assert result.edge_percentage == pytest.approx(0.20)
         assert result.side == "YES"
@@ -27,9 +27,7 @@ class TestEdgeFilterBasic:
         # AI thinks 40% YES (60% NO), market at 60% YES (40% NO)
         # Edge = 40% - 60% = -20%
         result = EdgeFilter.calculate_edge(
-            ai_probability=0.40,
-            market_probability=0.60,
-            confidence=0.7
+            ai_probability=0.40, market_probability=0.60, confidence=0.7
         )
         assert result.edge_percentage == pytest.approx(0.20)
         assert result.side == "NO"
@@ -37,9 +35,7 @@ class TestEdgeFilterBasic:
     def test_edge_calculation_no_edge(self):
         """Test when AI probability equals market price."""
         result = EdgeFilter.calculate_edge(
-            ai_probability=0.50,
-            market_probability=0.50,
-            confidence=0.7
+            ai_probability=0.50, market_probability=0.50, confidence=0.7
         )
         assert result.edge_percentage == 0.0
         assert not result.passes_filter
@@ -59,7 +55,7 @@ class TestEdgeFilterWithFees:
             confidence=0.7,
             price=0.50,
             contracts=100,
-            is_maker=False
+            is_maker=False,
         )
         assert result.edge_percentage == pytest.approx(0.10)
         assert not result.passes_filter  # 6.5% after fees < 8% required for 70% confidence
@@ -75,7 +71,7 @@ class TestEdgeFilterWithFees:
             confidence=0.7,
             price=0.50,
             contracts=100,
-            is_maker=True
+            is_maker=True,
         )
         assert result.passes_filter  # 9.125% >= 8% required for 70% confidence
 
@@ -90,9 +86,7 @@ class TestEdgeFilterThresholds:
     def test_high_confidence_threshold(self):
         """Test high confidence (>=80%) requires 6% edge."""
         result = EdgeFilter.calculate_edge(
-            ai_probability=0.60,
-            market_probability=0.50,
-            confidence=0.85
+            ai_probability=0.60, market_probability=0.50, confidence=0.85
         )
         # 10% edge should pass for high confidence (requires 6%)
         assert result.passes_filter
@@ -100,9 +94,7 @@ class TestEdgeFilterThresholds:
     def test_medium_confidence_threshold(self):
         """Test medium confidence (>=60%) requires 8% edge."""
         result = EdgeFilter.calculate_edge(
-            ai_probability=0.65,
-            market_probability=0.50,
-            confidence=0.70
+            ai_probability=0.65, market_probability=0.50, confidence=0.70
         )
         # 15% edge should pass for medium confidence (requires 8%)
         assert result.passes_filter
@@ -110,9 +102,7 @@ class TestEdgeFilterThresholds:
     def test_low_confidence_threshold(self):
         """Test low confidence (<60%) requires 10% edge."""
         result = EdgeFilter.calculate_edge(
-            ai_probability=0.70,
-            market_probability=0.50,
-            confidence=0.50
+            ai_probability=0.70, market_probability=0.50, confidence=0.50
         )
         # 0.50 confidence >= MIN_CONFIDENCE_FOR_TRADE (0.40), 20% edge >= 10% required -> PASSES
         assert result.passes_filter
@@ -122,7 +112,7 @@ class TestEdgeFilterThresholds:
         result = EdgeFilter.calculate_edge(
             ai_probability=0.70,
             market_probability=0.50,
-            confidence=0.35  # Below MIN_CONFIDENCE_FOR_TRADE (0.40)
+            confidence=0.35,  # Below MIN_CONFIDENCE_FOR_TRADE (0.40)
         )
         assert not result.passes_filter
         assert "Confidence" in result.reason
@@ -139,7 +129,7 @@ class TestEdgeFilterIntegration:
             confidence=0.75,
             price=0.50,
             contracts=100,
-            is_maker=True
+            is_maker=True,
         )
         # 10% raw edge, 0.875% maker fee -> 9.125% after fees >= 8% required for medium confidence (0.75) -> PASSES
         assert should_trade
@@ -152,7 +142,7 @@ class TestEdgeFilterIntegration:
             confidence=0.75,
             price=0.50,
             contracts=100,
-            is_maker=True
+            is_maker=True,
         )
         # 5% edge should fail after fees
         assert not should_trade
