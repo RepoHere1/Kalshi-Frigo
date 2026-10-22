@@ -213,8 +213,9 @@ async def execute_position(
         # The DRY taker simulation below reads the live order book through the
         # gateway's own client. It was passed an undefined name, so every DRY
         # taker entry aborted as a NameError after the order was priced.
-        kalshi_client = gateway._current_client
-
+        # FIX: keep the resolved kalshi_client; don't overwrite it from gateway._current_client
+        # which may be None when gateway itself is not provided.
+        # KalshiClient resolution happens earlier (line 157) if caller-supplied.
         available_cents = await broker.available_cents()
         # Maker entry in BOTH books (THE LAW: DRY rehearses what LIVE does):
         # with time on the clock the buy rests at the side's bid (maker fee,

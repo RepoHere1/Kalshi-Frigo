@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple, cast
 
-from flask import Flask, jsonify, render_template_string, request, redirect
+from flask import Flask, jsonify, render_template, render_template_string, request, redirect
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
@@ -2404,11 +2404,11 @@ _SQL_OPEN_DRY = (
 # needs its own stable baseline it can compound from, and a $250 start keeps
 # the clip sizes legible (see _all_no_buy_amount below).
 ALL_NO_STARTING_BALANCE = 250.0
-ALL_NO_KELLY_MULTIPLIER = 0.25  # quarter-Kelly for ALL NO book
+ALL_NO_KELLY_MULTIPLIER = 1.0  # Full Kelly for ALL NO book
 # Hard cap on one clip: 80% of the book. Fractional Kelly already throttles,
 # but a model fair of 0.999 against a 0.50 price returns a Kelly fraction that
 # would stake the whole account without a ceiling.
-ALL_NO_MAX_CLIP_PCT = 0.20  # 20% cap on any single ALL NO clip
+ALL_NO_MAX_CLIP_PCT = 0.80  # Up to 80% of book on one trade
 # Kalshi takes a whole-contract count and has no dollar floor - the exchange
 # minimum is ONE contract. Never round a clip to zero.
 MIN_ORDER_CONTRACTS = 1
@@ -2568,8 +2568,8 @@ def _row_no_open_tally(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 #
 # The kernel lives in src/utils/position_sizing.py (the one home, pinned by
 # tests/test_position_sizing.py). This is POLICY, which is where a strategy is
-# allowed its own multiplier and caps: full-Kelly, and never more than a
-# fifth of the book on one clip.
+# allowed its own multiplier and caps: full-Kelly, and never more than four
+# fifths of the book on one clip.
 #
 # For a NO contract bought at price P with a model fair of F:
 #   stake P to win (1 - P)   -> net odds b = (1 - P) / P
@@ -2748,6 +2748,44 @@ def _row_no_closed(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             }
         )
     return out
+
+
+def _all_no_open_tally(open_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate the open NO positions for the page's trade tallies."""
+    positions = len(open_rows)
+    cost = round(sum(float(r.get("cost") or 0.0) for r in open_rows), 2)
+    contracts = sum(int(r.get("quantity") or 0) for r in open_rows)
+    sweet = sum(1 for r in open_rows if 0.84 <= float(r.get("entry_price") or 0.0) <= 0.92)
+    return {
+        "positions": positions,
+        "cost": cost,
+        "contracts": contracts,
+        "sweet": sweet,
+    }
+
+
+def _all_no_closed_tally(closed_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate the closed NO trades for the page's trade tallies."""
+    closed = len(closed_rows)
+    wins = sum(1 for r in closed_rows if float(r.get("pnl") or 0.0) > 0)
+    losses = sum(1 for r in closed_rows if float(r.get("pnl") or 0.0) < 0)
+    pnl = round(sum(float(r.get("pnl") or 0.0) for r in closed_rows), 2)
+    fees = round(sum(float(r.get("fee_paid") or 0.0) for r in closed_rows), 2)
+    entries = sum(int(r.get("quantity") or 0) for r in closed_rows)
+    avg_entry = (
+        round(sum(float(r.get("entry_price") or 0.0) for r in closed_rows) / entries, 4)
+        if entries
+        else 0.0
+    )
+    return {
+        "closed": closed,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / closed * 100, 1) if closed else 0.0,
+        "pnl": pnl,
+        "fees": fees,
+        "avg_entry": avg_entry,
+    }
 
 
 def _row_data(
@@ -3697,8 +3735,7 @@ def api_dry_wipe():
             for table, col in (("positions", "timestamp"), ("trade_logs", "entry_timestamp")):
                 try:
                     cur = await conn.execute(
-                        f"SELECT COUNT(*) AS n FROM {table} WHERE {dry_filter}"
-                        f" AND {col} >= ?",
+                        f"SELECT COUNT(*) AS n FROM {table} WHERE {dry_filter}" f" AND {col} >= ?",
                         (cutoff,),
                     )
                     out[table] = (await cur.fetchone())["n"]
@@ -3727,9 +3764,7 @@ def api_dry_wipe():
                 deleted[table] = cur.rowcount
             for table in ("all_no_positions", "all_no_trade_logs"):
                 try:
-                    cur = await conn.execute(
-                        f"DELETE FROM {table} WHERE ts >= ?", (cutoff,)
-                    )
+                    cur = await conn.execute(f"DELETE FROM {table} WHERE ts >= ?", (cutoff,))
                     deleted[table] = cur.rowcount
                 except Exception:  # noqa: BLE001
                     deleted[table] = -1
@@ -4430,15 +4465,49 @@ def build_snapshot_cached() -> Dict[str, Any]:
 
 @app.route("/all-no-markets")
 def all_no_markets():
-    """Redirect to main dashboard with ALL NO MARKETS content visible.
+    """Render the standalone ALL NO MARKETS page over its own book.
 
-    The ALL NO MARKETS functionality is now integrated into the main dashboard
-    at the bottom, so this route redirects users to the main dashboard where
-    the ALL NO MARKETS content can be accessed.
+    This is the dedicated view for the *NO* LANE side: its own fake money
+    ($250 seeded once), its own open positions / closed trades, and its own
+    full-Kelly sizing policy. It is deliberately NOT a view of the up/down
+    lanes - the lanes keep their own clips, tallies and balances.
+
+    Read-only: nothing here places, cancels or modifies an order.
     """
-    # Redirect to main dashboard with hash anchor to ALL NO section
-    # The main dashboard template now includes ALL NO MARKETS content
-    return redirect("/#all-no-panel")
+    from pathlib import Path
+
+    template_path = Path(BASE_DIR) / "static" / "all_no_markets.html"
+    try:
+        html = template_path.read_text(encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 - missing file must not 500 the page
+        _push_error(f"ALL NO template read: {e}")
+        html = ""
+
+    if not html:
+        return "<html><body>ALL NO MARKETS template missing</body></html>", 500
+
+    book = _all_no_book()
+    open_rows = _row_no_open(_db_rows(_SQL_NO_OPEN))
+    closed_rows = _row_no_closed(_db_rows(_SQL_NO_CLOSED))
+    open_tally = _all_no_open_tally(open_rows)
+    tally = _all_no_closed_tally(closed_rows)
+
+    return render_template_string(
+        html,
+        book=book,
+        open_rows=open_rows,
+        closed_rows=closed_rows,
+        open_tally=open_tally,
+        tally=tally,
+        kelly={
+            "multiplier": ALL_NO_KELLY_MULTIPLIER,
+            "max_clip_pct": ALL_NO_MAX_CLIP_PCT,
+            "example": _all_no_buy_amount(0.90, 0.88),
+        },
+        no_lanes_enabled=True,
+        now=_now(),
+        token=_configured_token(),
+    )
 
 
 @app.route("/api/all-no/reset", methods=["POST"])
