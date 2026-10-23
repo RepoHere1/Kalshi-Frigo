@@ -6685,7 +6685,10 @@ button.loading.yellow::after {
   {% if live %}
   <div class="tile">
     <div class="k">Real balance</div>
-    <div class="v" id="tBalance">{{ '$%.2f'|format(s.balance) if s.balance is not none else '-' }}</div>
+    {#- s.balance is the Kalshi balance sync; during an API outage window it can
+        be None even though the gateway's funding read (s.mode.funding.balance)
+        is fresh - fall back so the real account never renders as "-". -#}
+    <div class="v" id="tBalance">{{ '$%.2f'|format(s.balance) if s.balance is not none else ('$%.2f'|format(s.mode.funding.get('balance', 0) or 0) if s.mode and s.mode.funding else '-') }}</div>
     <div class="s">live Kalshi account <span id="tBalanceAge">{% if s.kalshi_age_sec is not none and s.kalshi_age_sec >= 0 %}{% if s.kalshi_age_sec > 180 %}· STALE ({{ s.kalshi_age_sec // 60 }}m old){% else %}· updated {{ s.kalshi_age_sec }}s ago{% endif %}{% else %}· syncing…{% endif %}</span></div>
   </div>
   <div class="tile">
