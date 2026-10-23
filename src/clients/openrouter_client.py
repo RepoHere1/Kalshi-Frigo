@@ -55,8 +55,8 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
         "output_per_1k": 0.0006,
     },
     "deepseek/deepseek-r1": {
-        "input_per_1k": 0.0008,
-        "output_per_1k": 0.002,
+        "input_per_1k": 0.00035,
+        "output_per_1k": 0.0014,
     },
     "google/gemini-3-pro-preview": {
         "input_per_1k": 0.002,
@@ -100,9 +100,22 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
 # bought ~nothing because failures are usually key/quota-wide rather than
 # model-specific, so every model fails anyway.
 DEFAULT_FALLBACK_ORDER: List[str] = [
+    "deepseek/deepseek-r1",
     "anthropic/claude-sonnet-4.5",
+    "google/gemini-2.5-pro-preview",
     "openai/gpt-4.1",
 ]
+
+# ---------------------------------------------------------------------------
+# Free-tier quota configuration
+# ---------------------------------------------------------------------------
+# The free-tier model deepseek/deepseek-r1 is granted a limited number of
+# requests per day before falling back to paid models.  The counter resets
+# at UTC midnight each day.
+FREE_BRAIN_MODEL: str = "deepseek/deepseek-r1"
+FREE_TIER_DAILY_LIMIT: int = 50      # max free requests / day
+FREE_TIER_REQUESTS: int = 0          # running counter (in-memory)
+FREE_TIER_LAST_RESET: str = ""       # date string when counter was reset
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +175,7 @@ class OpenRouterClient(TradingLoggerMixin):
     def __init__(
         self,
         api_key: Optional[str] = None,
-        default_model: str = "anthropic/claude-sonnet-4",
+        default_model: str = "deepseek/deepseek-r1",
         db_manager: Any = None,
         free_only: bool = False,
     ):
@@ -199,6 +212,11 @@ class OpenRouterClient(TradingLoggerMixin):
         self.model_costs: Dict[str, ModelCostTracker] = {
             m: ModelCostTracker(model=m) for m in MODEL_PRICING
         }
+
+        # Free-tier quota tracking: deepseek-r1 gets a limited number of
+        # free requests per day before falling back to paid models.
+        self.free_tier_requests: int = int(FREE_TIER_REQUESTS)
+        self.free_tier_last_reset: str = str(FREE_TIER_LAST_RESET)
 
         # Aggregate cost tracking
         self.total_cost: float = 0.0
@@ -411,25 +429,64 @@ class OpenRouterClient(TradingLoggerMixin):
     # Fallback chain helper
     # ------------------------------------------------------------------
 
+    def _check_free_tier_quota(self) -> bool:
+        """
+        Return True if the free-tier quota (FREE_TIER_DAILY_LIMIT requests)
+        has not been exhausted yet.  The counter resets at UTC midnight.
+        """
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            if self.free_tier_last_reset != today:
+                # New day -- reset counter
+                self.free_tier_requests = 0
+                self.free_tier_last_reset = today
+                self.logger.info(
+                    "Free-tier quota reset for new day",
+                    free_tier_limit=FREE_TIER_DAILY_LIMIT,
+                )
+            return self.free_tier_requests < FREE_TIER_DAILY_LIMIT
+        except Exception as exc:
+            self.logger.warning(f"Failed to check free-tier quota: {exc}")
+            # On error, allow the request and let the normal daily limit handle it
+            return True
+
     def _build_fallback_chain(self, requested_model: Optional[str] = None) -> List[str]:
         """
         Return an ordered list of models to try.  The *requested_model* is
         first, followed by the remaining models from DEFAULT_FALLBACK_ORDER.
 
         A free-only client (the DRY book) short-circuits the whole chain:
-        the single `:free` default is the only model it will ever name. A
-        paid model passed in by an older caller is ignored, and a default
-        that is not a `:free` listing yields NO chain - the call becomes a
-        no-op instead of a bill.
+        the single free model is the only model it will ever name. When the
+        free-tier quota is exhausted, the chain falls through to paid models.
         """
         if self.free_only:
-            if str(self.default_model).endswith(":free"):
-                return [self.default_model]
+            default = str(self.default_model)
+            # Check if the default model is the free-tier deepseek-r1 brain
+            if default == FREE_BRAIN_MODEL:
+                if self._check_free_tier_quota():
+                    # Free quota still available -- use only the free model
+                    return [default]
+                # Free quota exhausted -- fall through to paid models
+                self.logger.info(
+                    "Free-tier quota exhausted, falling back to paid models",
+                    free_tier_requests=self.free_tier_requests,
+                    free_tier_limit=FREE_TIER_DAILY_LIMIT,
+                )
+                # Build chain: free model first, then paid fallback order
+                chain = [default]
+                for model in DEFAULT_FALLBACK_ORDER:
+                    if model not in chain:
+                        chain.append(model)
+                return chain
+            # default model is not the recognized free model
+            if default.endswith(":free"):
+                return [default]
             self.logger.warning(
                 "free-only client refusing a non-free default model",
                 default_model=self.default_model,
             )
             return []
+        # paid client: use requested model or default, followed by fallback order
         first = requested_model or self.default_model
         chain = [first]
         for model in DEFAULT_FALLBACK_ORDER:
@@ -461,7 +518,9 @@ class OpenRouterClient(TradingLoggerMixin):
             Exception -- if all retries are exhausted for this model.
         """
         # PATCHED: never block paid models; only warn if DRY explicitly requires :free.
-        if self.free_only and not str(model).endswith(":free"):
+        if self.free_only and not (
+            str(model).endswith(":free") or str(model) == FREE_BRAIN_MODEL
+        ):
             # free_only=True means DRY book - refuse paid models to avoid billing
             self.logger.warning(
                 "free-only client refusing paid model",
@@ -511,6 +570,16 @@ class OpenRouterClient(TradingLoggerMixin):
                     processing_time=round(elapsed, 2),
                     attempt=attempt + 1,
                 )
+
+                # Track free-tier quota usage
+                if self.free_only and model == FREE_BRAIN_MODEL:
+                    self.free_tier_requests += 1
+                    if self.free_tier_requests >= FREE_TIER_DAILY_LIMIT:
+                        self.logger.warning(
+                            "Free-tier quota exhausted",
+                            free_tier_requests=self.free_tier_requests,
+                            free_tier_limit=FREE_TIER_DAILY_LIMIT,
+                        )
 
                 return content, cost, input_tokens, output_tokens
 
@@ -890,6 +959,35 @@ If you do not recommend trading, use action "SKIP":
             "daily_exhausted": self.daily_tracker.is_exhausted,
             "per_model": per_model,
         }
+
+    def get_free_tier_status(self) -> Dict[str, Any]:
+        """Return free-tier quota status."""
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            if self.free_tier_last_reset != today:
+                free_used = 0
+                free_remaining = FREE_TIER_DAILY_LIMIT
+            else:
+                free_used = self.free_tier_requests
+                free_remaining = max(0, FREE_TIER_DAILY_LIMIT - self.free_tier_requests)
+            return {
+                "free_brain_model": FREE_BRAIN_MODEL,
+                "daily_limit": FREE_TIER_DAILY_LIMIT,
+                "requests_used": free_used,
+                "requests_remaining": free_remaining,
+                "is_exhausted": free_used >= FREE_TIER_DAILY_LIMIT,
+                "last_reset": self.free_tier_last_reset,
+            }
+        except Exception as exc:
+            self.logger.error(f"Failed to get free-tier status: {exc}")
+            return {
+                "free_brain_model": FREE_BRAIN_MODEL,
+                "daily_limit": FREE_TIER_DAILY_LIMIT,
+                "requests_used": 0,
+                "requests_remaining": FREE_TIER_DAILY_LIMIT,
+                "is_exhausted": False,
+                "last_reset": "",
+            }
 
     # ------------------------------------------------------------------
     # Lifecycle

@@ -112,8 +112,8 @@ class TradingConfig:
     
     # AI model configuration — HOT (paid) OpenRouter config for LIVE,
     # matching master.env: KALSHI_LLM_MODEL / KALSHI_LLM_FALLBACK.
-    primary_model: str = "deepseek/deepseek-chat"  # HOT primary via OpenRouter
-    fallback_model: str = "google/gemini-2.5-flash"  # HOT fallback via OpenRouter
+    primary_model: str = "deepseek/deepseek-r1"  # FREE primary via OpenRouter (deepseek-r1), fallback to paid models when quota exhausted
+    fallback_model: str = "google/gemini-2.5-pro-preview"  # HOT fallback via OpenRouter
     ai_temperature: float = 0  # Lower temperature for more consistent JSON output
     ai_max_tokens: int = 8000    # Reasonable limit for reasoning models (grok-4 works better with 8000)
     

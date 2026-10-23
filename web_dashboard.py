@@ -6620,8 +6620,8 @@ button.loading.yellow::after {
          parked outside the control it belongs with. -->
     <!-- Single LIVE button replacing the old DRY/LIVE/ALL NO toggle system -->
     <div class="modeswitch" style="justify-content: center; gap: 12px;">
-      <button id="modeDry" type="button" class="modebtn {{ 'on' if s.mode.mode != 'live' else '' }}" onclick="window.location='/';">DRY</button>
-      <button id="modeLive" type="button" class="modebtn live {{ 'on' if s.mode.mode == 'live' else '' }}" onclick="window.location='/live?mode=live';">LIVE</button>
+      <button id="modeDry" type="button" class="modebtn {{ 'on' if s.mode.mode != 'live' else '' }}" onclick="switchMode('dry'); return false;">DRY</button>
+      <button id="modeLive" type="button" class="modebtn live {{ 'on' if s.mode.mode == 'live' else '' }}" onclick="switchMode('live'); return false;">LIVE</button>
       <button id="noLanesBtn" type="button" class="modebtn nolanes" onclick="toggleNoLanes()">NO LANES {{ 'ON' if s.mode.no_lanes_enabled else 'OFF' }}</button>
       <a href="/all-no-markets" class="modebtn allno" title="ALL NO MARKETS – NO-side only, maker entries, $250 of its own simulated money">ALL NO</a>
     </div>

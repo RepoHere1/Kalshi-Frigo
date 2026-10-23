@@ -207,8 +207,11 @@ async def main() -> None:
         try:
             if _dashboard_running():
                 # Yield: the dashboard's supervisor owns the lanes.
-                await asyncio.sleep(CYCLE_SEC)
-                continue
+                # If the dashboard started this process, we've been killed.
+                # The operator's "i am the only one to turn on/off" requirement
+                # means we should exit so the operator has exclusive control.
+                log("dashboard already running - exiting to give operator exclusive control")
+                return
             await _cycle()
         except Exception as exc:  # noqa: BLE001 - the keeper must never die
             log(f"cycle error: {type(exc).__name__}: {exc}")

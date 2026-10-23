@@ -22,6 +22,7 @@ from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
 from src.clients.xai_client import XAIClient
 from src.clients.kalshi_client import KalshiClient
+from src.jobs import news_ingest
 
 
 def _calculate_kelly_position_size(
@@ -476,7 +477,35 @@ async def make_decision_for_market(
 
         total_analysis_cost += estimated_search_cost
 
-        # NEWS ANALYST AGENT: augment news_summary with structured sentiment analysis
+        # --- NEWS INTERPRETER: augment news_summary with recent signals from DB ---
+        # Poll the news interpreter DB for market-relevant signals; inject into
+        # the LLM prompt so current events influence the AI's probability estimates.
+        try:
+            _news_summary_db = await asyncio.wait_for(
+                news_ingest.get_market_news_summary(market.market_id, hours_back=24),
+                timeout=30.0,
+            )
+            if _news_summary_db.get("signal_count", 0) > 0:
+                # Build a concise news summary string from the top signals
+                bullish = [s for s in _news_summary_db.get("news_signals", []) if s.get("sentiment", 0) > 0.1]
+                bearish = [s for s in _news_summary_db.get("news_signals", []) if s.get("sentiment", 0) < -0.1]
+                relevance = _news_summary_db.get("relevance", 0.0)
+                dirs = []
+                for s in _news_summary_db.get("news_signals", [])[:3]:
+                    _dir = s.get("impact_direction", "neutral")
+                    _sent = s.get("sentiment", 0.0)
+                    _rel = s.get("relevance", 0.0)
+                    dirs.append(f"[{_dir} sat={_sent:.2f} rel={_rel:.2f}]")
+                news_augment = " | ".join(dirs) if dirs else ""
+                if news_augment and sentiment_analysis:
+                    news_summary = f"{news_summary} [NEWS] {news_augment} (rel={relevance:.2f})"
+                elif news_augment:
+                    news_summary = f"{news_summary} [NEWS] {news_augment}"
+        except Exception as e:
+            logger.warning(f"News interpreter DB query failed for {market.market_id}: {e}")
+            # Continue without news augmentation; existing news_summary is intact
+
+        # --- NEWS ANALYST AGENT: augment news_summary with structured sentiment analysis
         # to boost entry conviction when news confirms our direction
         if news_summary:
             try:
