@@ -39,7 +39,7 @@ def _normalize_updown_series(series: str) -> str:
     return s
 
 
-def _lane_config() -> "object":
+def _lane_config():
     """Build the up/down config for this process's book.
 
     DRY is a rehearsal book: the operator wants to SEE the lanes trade, so a
@@ -325,6 +325,7 @@ async def cmd_run(args: argparse.Namespace) -> None:
     spot_product = getattr(args, "spot_product", "XRP-USD")
 
     await run_updown_trader(
+        _lane_config(),
         loop=getattr(args, "loop", True),
         interval=float(getattr(args, "interval", 0) or 0),
         series=series,
@@ -878,6 +879,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="all_no_markets",
         help="ALL NO MARKETS: NO-side only maker entries with separate $250 book",
+    )
+    strategy_group.add_argument(
+        "--beast",
+        action="store_true",
+        dest="beast",
+        help="Beast mode: the main trading bot with aggressive sizing",
     )
     p_run.add_argument(
         "--series",
