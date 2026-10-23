@@ -40,7 +40,7 @@ from src.utils.edge_filter import EdgeFilter, calculate_roundtrip_fees_dollars
 logger = get_trading_logger("all_no_strategy")
 
 # Configuration from web_dashboard.py
-ALL_NO_STARTING_BALANCE = 250.0
+ALL_NO_STARTING_BALANCE = 400.0
 ALL_NO_KELLY_MULTIPLIER = 1.0     # Full Kelly (not quarter) for full blast
 ALL_NO_MAX_CLIP_PCT = 0.80        # Up to 80% of book on one trade
 MIN_ORDER_CONTRACTS = 1
@@ -152,7 +152,7 @@ class AllNoKalshiBook:
         async with aiosqlite.connect(self.db_path) as conn:
             conn.row_factory = aiosqlite.Row
 
-            # ALL NO book ledger (balance tracking)
+            # ALL NO book ledger (balance tracking), mode-aware
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS all_no_book (
@@ -161,7 +161,8 @@ class AllNoKalshiBook:
                     amount REAL NOT NULL,
                     balance_after REAL NOT NULL,
                     note TEXT,
-                    timestamp TEXT NOT NULL
+                    timestamp TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'dry'
                 )
                 """
             )
@@ -220,34 +221,45 @@ class AllNoKalshiBook:
             await conn.commit()
             self.logger.info("ALL NO MARKETS tables initialized (mode-aware)")
 
-    async def seed_book(self) -> None:
-        """Seed the ALL NO book with $250 starting balance once.
+    async def seed_book(self, mode: str = MODE_DRY) -> None:
+        """Seed the ALL NO book for ONE book with its starting balance, once.
 
-        CRITICAL: This is separate from DRY book's $300 seed.
-        Never mixes with main DRY balance.
+        DRY ALL NO and LIVE ALL NO are separate entities: each gets its own
+        $400 seed row (note='seed' + mode), so redeploys never re-fund a book
+        that has already traded and DRY can never read LIVE's balance.
         """
         import aiosqlite
+
+        mode = mode.strip().lower()
+        if mode not in (MODE_DRY, MODE_LIVE):
+            raise ValueError(f"Invalid mode: {mode}")
 
         async with aiosqlite.connect(self.db_path) as conn:
             conn.row_factory = aiosqlite.Row
             cursor = await conn.execute(
-                "SELECT COUNT(*) AS n FROM all_no_book WHERE note = 'seed'"
+                "SELECT COUNT(*) AS n FROM all_no_book"
+                " WHERE note = 'seed' AND COALESCE(NULLIF(mode, ''), 'dry') = ?",
+                (mode,),
             )
             seeded = await cursor.fetchone()
             seeded = int(seeded["n"] or 0)
             if not seeded:
                 stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 await conn.execute(
-                    "INSERT INTO all_no_book (kind, amount, balance_after, note, timestamp) "
-                    "VALUES ('deposit', ?, ?, 'seed', ?)",
-                    (ALL_NO_STARTING_BALANCE, ALL_NO_STARTING_BALANCE, stamp),
+                    "INSERT INTO all_no_book (kind, amount, balance_after, note, timestamp, mode) "
+                    "VALUES ('deposit', ?, ?, 'seed', ?, ?)",
+                    (ALL_NO_STARTING_BALANCE, ALL_NO_STARTING_BALANCE, stamp, mode),
                 )
                 await conn.commit()
                 self.logger.info(
-                    f"ALL NO MARKETS book seeded: ${ALL_NO_STARTING_BALANCE:.2f} (SEPARATE from DRY $300)"
+                    f"ALL NO MARKETS {mode.upper()} book seeded: "
+                    f"${ALL_NO_STARTING_BALANCE:.2f} (SEPARATE book)"
                 )
             else:
-                self.logger.debug(f"ALL NO MARKETS book already seeded: ${ALL_NO_STARTING_BALANCE:.2f}")
+                self.logger.debug(
+                    f"ALL NO MARKETS {mode.upper()} book already seeded: "
+                    f"${ALL_NO_STARTING_BALANCE:.2f}"
+                )
 
     async def get_balance(self, mode: str = MODE_DRY) -> Dict[str, Any]:
         """Get current balance of the ALL NO book for specific mode.
@@ -273,9 +285,11 @@ class AllNoKalshiBook:
         async with aiosqlite.connect(self.db_path) as conn:
             conn.row_factory = aiosqlite.Row
 
-            # Get total deposits (seed only)
+            # Get total deposits (this mode's seed only)
             cursor = await conn.execute(
-                "SELECT COALESCE(SUM(amount), 0.0) AS total FROM all_no_book WHERE note = 'seed'"
+                "SELECT COALESCE(SUM(amount), 0.0) AS total FROM all_no_book"
+                " WHERE note = 'seed' AND COALESCE(NULLIF(mode, ''), 'dry') = ?",
+                (mode,),
             )
             result = await cursor.fetchone()
             total = float(result["total"] or 0.0)
@@ -342,15 +356,17 @@ class AllNoKalshiBook:
         return live_balance.get("separate_from_live_account", False)
 
     async def reset_to_starting_balance(self, mode: str = MODE_DRY) -> Dict[str, Any]:
-        """Reset ALL NO book to $250 starting balance.
+        """Reset ONE ALL NO book to its starting balance.
 
-        Clears all positions, trade logs, and book entries for the given mode,
-        then re-seeds at ALL_NO_STARTING_BALANCE. Useful when the balance
-        goes negative due to double-counting bugs.
+        Clears that mode's positions, trade logs, and book entries only - the
+        other book is untouched - then re-seeds at ALL_NO_STARTING_BALANCE.
+        Useful when the balance goes negative due to double-counting bugs.
         """
         import aiosqlite
 
         mode = mode.strip().lower()
+        if mode not in (MODE_DRY, MODE_LIVE):
+            raise ValueError(f"Invalid mode: {mode}")
         await self.ensure_schema()
 
         async with aiosqlite.connect(self.db_path) as conn:
@@ -365,27 +381,32 @@ class AllNoKalshiBook:
             )
             # Clear all non-seed book entries for this mode
             await conn.execute(
-                "DELETE FROM all_no_book WHERE note != 'seed'"
+                "DELETE FROM all_no_book"
+                " WHERE note != 'seed' AND COALESCE(NULLIF(mode, ''), 'dry') = ?",
+                (mode,),
             )
 
             # Re-insert seed if not present
             cursor = await conn.execute(
-                "SELECT COUNT(*) AS n FROM all_no_book WHERE note = 'seed'"
+                "SELECT COUNT(*) AS n FROM all_no_book"
+                " WHERE note = 'seed' AND COALESCE(NULLIF(mode, ''), 'dry') = ?",
+                (mode,),
             )
             seeded = await cursor.fetchone()
             seeded = int(seeded["n"] or 0)
             if not seeded:
                 stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 await conn.execute(
-                    "INSERT INTO all_no_book (kind, amount, balance_after, note, timestamp) "
-                    "VALUES ('deposit', ?, ?, 'seed', ?)",
-                    (ALL_NO_STARTING_BALANCE, ALL_NO_STARTING_BALANCE, stamp),
+                    "INSERT INTO all_no_book (kind, amount, balance_after, note, timestamp, mode) "
+                    "VALUES ('deposit', ?, ?, 'seed', ?, ?)",
+                    (ALL_NO_STARTING_BALANCE, ALL_NO_STARTING_BALANCE, stamp, mode),
                 )
             else:
                 # Reset seed to full amount
                 await conn.execute(
-                    "UPDATE all_no_book SET amount = ?, balance_after = ? WHERE note = 'seed'",
-                    (ALL_NO_STARTING_BALANCE, ALL_NO_STARTING_BALANCE),
+                    "UPDATE all_no_book SET amount = ?, balance_after = ?"
+                    " WHERE note = 'seed' AND COALESCE(NULLIF(mode, ''), 'dry') = ?",
+                    (ALL_NO_STARTING_BALANCE, ALL_NO_STARTING_BALANCE, mode),
                 )
 
             await conn.commit()
@@ -858,9 +879,12 @@ class AllNoStrategy:
         self.logger.info(f"   Entry criteria: Edge > 2%, confidence > 55%, NO price 70-98c")
         self.logger.info(f"   Exit strategy: Profit at 97c+, stop at -20%, 24h time-based")
 
-        # Ensure schema and seed
+        # Ensure schema and seed BOTH books independently. DRY ALL NO and
+        # LIVE ALL NO are separate entities - each keeps its own $400 seed
+        # and its own trades, and neither can read the other's balance.
         await self.all_no_book.ensure_schema()
-        await self.all_no_book.seed_book()
+        await self.all_no_book.seed_book(MODE_DRY)
+        await self.all_no_book.seed_book(MODE_LIVE)
 
         # Check balance and reset if too low (due to previous bugs that
         # deployed too much of the book). Reset when the balance is below

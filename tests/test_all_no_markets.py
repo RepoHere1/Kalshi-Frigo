@@ -88,33 +88,46 @@ class TestAllNoBuyAmount:
 
 
 # ---------------------------------------------------------------------------
-# The separate $250 book
+# The separate $400 book (DRY ALL NO), plus a separate LIVE ALL NO book
 # ---------------------------------------------------------------------------
 class TestAllNoBook:
-    """The book's own ledger, seeded once at $250 and never re-funded."""
+    """Each ALL NO book's own ledger, seeded once per book at $400."""
 
-    def test_seeds_at_250(self, monkeypatch, tmp_path):
+    def test_seeds_at_400(self, monkeypatch, tmp_path):
         monkeypatch.setattr(wd, "DB_PATH", str(tmp_path / "b.db"))
-        book = wd._all_no_book()
-        assert book["starting"] == 250.0
-        assert book["balance"] == 250.0
+        book = wd._all_no_book("dry")
+        assert book["starting"] == 400.0
+        assert book["balance"] == 400.0
         assert book["entries"] == 0
         assert book["pnl"] == 0.0
+        assert book["mode"] == "dry"
+
+    def test_live_all_no_seeds_its_own_book(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(wd, "DB_PATH", str(tmp_path / "b.db"))
+        dry = wd._all_no_book("dry")
+        live = wd._all_no_book("live")
+        assert live["starting"] == 400.0
+        assert live["balance"] == 400.0
+        assert live["mode"] == "live"
+        # Separate seed rows: DRY ALL NO and LIVE ALL NO never share a balance.
+        rows = wd._db_rows("SELECT note, mode FROM all_no_book")
+        assert sum(1 for r in rows if r["note"] == "seed") == 2
+        assert dry["balance"] == live["balance"] == 400.0
 
     def test_seeding_is_idempotent(self, monkeypatch, tmp_path):
         monkeypatch.setattr(wd, "DB_PATH", str(tmp_path / "b.db"))
-        first = wd._all_no_book()
-        second = wd._all_no_book()
+        first = wd._all_no_book("dry")
+        second = wd._all_no_book("dry")
         assert second["balance"] == first["balance"]
-        # One seed row, not one per read.
+        # One seed row per book, not one per read.
         rows = wd._db_rows("SELECT COUNT(*) AS n FROM all_no_book")
         assert int(rows[0]["n"]) == 1
 
     def test_not_the_dry_books_300(self, monkeypatch, tmp_path):
         # The ALL NO book must not inherit the DRY book's $300 seed.
         monkeypatch.setattr(wd, "DB_PATH", str(tmp_path / "b.db"))
-        assert wd._all_no_book()["starting"] == 250.0
-        assert wd._all_no_book()["starting"] != 300.0
+        assert wd._all_no_book("dry")["starting"] == 400.0
+        assert wd._all_no_book("dry")["starting"] != 300.0
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +158,7 @@ class TestNoBookSeparation:
 
     def test_a_lane_row_is_not_the_all_no_books(self, monkeypatch, tmp_path):
         self._seed_rows(tmp_path, monkeypatch)
-        rows = wd._db_rows(wd._SQL_NO_OPEN)
+        rows = wd._db_rows(wd._SQL_NO_OPEN.format(book=wd._book_filter("dry")))
         assert rows == []
 
     def test_an_all_no_row_is(self, monkeypatch, tmp_path):
@@ -172,9 +185,40 @@ class TestNoBookSeparation:
         )
         conn.commit()
         conn.close()
-        rows = wd._db_rows(wd._SQL_NO_OPEN)
+        rows = wd._db_rows(wd._SQL_NO_OPEN.format(book=wd._book_filter("dry")))
         assert len(rows) == 1
         assert rows[0]["market_id"] == "KXHYPED-26OCT1519-T80.9999"
+
+    def test_a_live_all_no_row_never_shows_in_dry(self, monkeypatch, tmp_path):
+        """Cross-contamination guard: a LIVE ALL NO row must not appear in the
+        DRY ALL NO book's queries, and a DRY row must not appear in LIVE's."""
+        monkeypatch.setattr(wd, "DB_PATH", str(tmp_path / "live.db"))
+        wd._db()
+        import sqlite3
+
+        conn = sqlite3.connect(str(tmp_path / "live.db"))
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS all_no_positions ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " market_id TEXT NOT NULL, side TEXT NOT NULL DEFAULT 'NO',"
+            " entry_price REAL NOT NULL, quantity INTEGER NOT NULL,"
+            " timestamp TEXT NOT NULL, status TEXT DEFAULT 'open',"
+            " strategy TEXT DEFAULT 'all_no', mode TEXT NOT NULL DEFAULT 'dry',"
+            " entry_fair REAL)"
+        )
+        conn.execute(
+            "INSERT INTO all_no_positions (market_id, side, entry_price, quantity,"
+            " timestamp, status, strategy, mode, entry_fair)"
+            " VALUES ('KXHYPED-26OCT1520-T80.9999', 'NO', 0.88, 1,"
+            " '2026-10-15T00:02:00', 'open', 'all_no', 'live', 0.90)"
+        )
+        conn.commit()
+        conn.close()
+        # DRY query sees nothing; LIVE query sees exactly the LIVE row.
+        assert wd._db_rows(wd._SQL_NO_OPEN.format(book=wd._book_filter("dry"))) == []
+        live_rows = wd._db_rows(wd._SQL_NO_OPEN.format(book=wd._book_filter("live")))
+        assert len(live_rows) == 1
+        assert live_rows[0]["market_id"] == "KXHYPED-26OCT1520-T80.9999"
 
     def test_a_yes_row_is_never_included(self, monkeypatch, tmp_path):
         monkeypatch.setattr(wd, "DB_PATH", str(tmp_path / "y.db"))
@@ -190,7 +234,7 @@ class TestNoBookSeparation:
         )
         conn.commit()
         conn.close()
-        assert wd._db_rows(wd._SQL_NO_OPEN) == []
+        assert wd._db_rows(wd._SQL_NO_OPEN.format(book=wd._book_filter("dry"))) == []
 
 
 # ---------------------------------------------------------------------------
@@ -204,10 +248,10 @@ class TestAllNoMarketsPage:
         # White paper, black cards.
         assert "--paper:#ffffff" in html
         assert "--card:#0a0a0a" in html
-        # The separate book, seeded at 250.
+        # The separate book, seeded at 400.
         assert "Book balance" in html
-        assert "250.00" in html
-        assert "seeded at 250 once" in html
+        assert "400.00" in html
+        assert "seeded at 400 once" in html
         # Kelly is on the page, in the policy and in both tables.
         assert "full-Kelly" in html
         assert html.count("Kelly f*") >= 2

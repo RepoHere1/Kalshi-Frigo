@@ -1026,13 +1026,27 @@ def _db():
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS all_no_book (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    starting REAL NOT NULL,
-                    balance REAL NOT NULL,
-                    entries INTEGER DEFAULT 0,
-                    pnl REAL DEFAULT 0.0,
-                    seed_ts TEXT NOT NULL
+                    kind TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    balance_after REAL NOT NULL,
+                    note TEXT,
+                    timestamp TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'dry'
                 )
                 """)
+            # Migration: older databases built all_no_book without the mode
+            # column. ALTER TABLE ADD COLUMN fails if it already exists, so
+            # probe PRAGMA first and only add when missing. PRAGMA rows are
+            # tuples unless row_factory is set, so read by index.
+            pragma_rows = await (await conn.execute("PRAGMA table_info(all_no_book)")).fetchall()
+            cols = [r[1] if isinstance(r, (tuple, list)) else r["name"] for r in pragma_rows]
+            if "mode" not in cols:
+                try:
+                    await conn.execute(
+                        "ALTER TABLE all_no_book ADD COLUMN mode TEXT NOT NULL DEFAULT 'dry'"
+                    )
+                except Exception:
+                    pass  # already migrated under a race - the column exists
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS all_no_trade_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1199,6 +1213,14 @@ STRATEGY_DOCS = {
         "strike contracts expiring together - and walks the near-money band for "
         "the strike with the widest modeled edge. Same engine as the 15-minute "
         "lane, on an hourly clock. Manual control: starts only when you press "
+        "Start in this book, keeps running until you press Stop.",
+    ),
+    "all_no_markets": (
+        "ALL NO MARKETS",
+        "NO-side only maker strategy in its own separate book. DRY ALL NO starts "
+        "at $400 of fake money; LIVE ALL NO trades your real Kalshi account. "
+        "Each book is independent: DRY ALL NO never touches LIVE ALL NO, the DRY "
+        "book or the LIVE account. Manual control: starts only when you press "
         "Start in this book, keeps running until you press Stop.",
     ),
 }
@@ -2399,11 +2421,11 @@ _SQL_OPEN_DRY = (
 # false for it, so a lane that never stamps a strategy cannot leak in.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# Operator order: the ALL NO book starts at $250 of fake money. It is NOT the
-# DRY book's $300 and NOT a mirror of the real LIVE balance - a separate book
-# needs its own stable baseline it can compound from, and a $250 start keeps
-# the clip sizes legible (see _all_no_buy_amount below).
-ALL_NO_STARTING_BALANCE = 250.0
+# Operator order: the DRY ALL NO book starts at $400 of fake money. It is NOT
+# the DRY book's $300 and NOT a mirror of the real LIVE balance - a separate
+# book needs its own stable baseline it can compound from, and a $400 start
+# keeps the clip sizes legible (see _all_no_buy_amount below).
+ALL_NO_STARTING_BALANCE = 400.0
 ALL_NO_KELLY_MULTIPLIER = 1.0  # Full Kelly for ALL NO book
 # Hard cap on one clip: 80% of the book. Fractional Kelly already throttles,
 # but a model fair of 0.999 against a 0.50 price returns a Kelly fraction that
@@ -2424,7 +2446,8 @@ CREATE TABLE IF NOT EXISTS all_no_book (
     price REAL,
     quantity INTEGER,
     note TEXT,
-    timestamp TEXT NOT NULL
+    timestamp TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'dry'
 )
 """
 # The four book-scoped row queries. `strategy = 'all_no'` is the whole point:
@@ -2439,7 +2462,7 @@ _SQL_NO_OPEN = (
     " 0 AS stop_loss_price, 0 AS take_profit_price,"
     " 0 AS confidence,"
     " status, COALESCE(NULLIF(mode, ''), 'dry') AS mode, timestamp"
-    " FROM all_no_positions WHERE side = 'NO' AND status != 'closed'"
+    " FROM all_no_positions WHERE side = 'NO' AND status != 'closed' AND {book}"
     " ORDER BY timestamp DESC LIMIT 300"
 )
 _SQL_NO_CLOSED = (
@@ -2452,7 +2475,7 @@ _SQL_NO_CLOSED = (
     " COALESCE(exit_reason, '') AS exit_reason,"
     " COALESCE(NULLIF(mode, ''), 'dry') AS mode,"
     " entry_timestamp, exit_timestamp FROM all_no_trade_logs"
-    " WHERE side = 'NO'"
+    " WHERE side = 'NO' AND {book}"
     " ORDER BY COALESCE(exit_timestamp, entry_timestamp) DESC LIMIT 300"
 )
 _SQL_NO_TALLY = (
@@ -2463,7 +2486,7 @@ _SQL_NO_TALLY = (
     " COALESCE(SUM(fee_paid), 0.0) AS fees,"
     " COALESCE(AVG(entry_price), 0.0) AS avg_entry,"
     " COALESCE(SUM(quantity * entry_price), 0.0) AS cost"
-    " FROM all_no_trade_logs WHERE side = 'NO'"
+    " FROM all_no_trade_logs WHERE side = 'NO' AND {book}"
 )
 _SQL_NO_OPEN_TALLY = (
     "SELECT COUNT(*) AS positions,"
@@ -2473,7 +2496,7 @@ _SQL_NO_OPEN_TALLY = (
     # underpriced by ~4pp, the clearest statistical edge on the board.
     " COALESCE(SUM(CASE WHEN entry_price >= 0.84 AND entry_price <= 0.92"
     " THEN 1 ELSE 0 END), 0) AS sweet"
-    " FROM all_no_positions WHERE side = 'NO' AND status != 'closed'"
+    " FROM all_no_positions WHERE side = 'NO' AND status != 'closed' AND {book}"
 )
 
 
@@ -2610,45 +2633,101 @@ def _all_no_buy_amount(fair: float, price: float) -> Dict[str, Any]:
     return {"fraction": fraction, "stake": stake, "contracts": contracts}
 
 
-def _all_no_book() -> Dict[str, Any]:
-    """The ALL NO book's own ledger: $250 of fake money, seeded once.
+def _all_no_section(book_mode: str = "dry") -> Dict[str, Any]:
+    """ALL NO section context for the main dashboard, scoped to one book.
 
-    Separate from the DRY book's $300 and not a mirror of the real LIVE
-    balance. The seed is written once and remembered, so a redeploy never
-    re-funds a book that has already traded - the same one-shot latch pattern
-    the DRY top-up uses. Read-only otherwise: this page never moves money.
+    The main template's ALL NO MARKETS panel reads these same names, so one
+    helper feeds both the standalone page and the integrated section. DRY ALL
+    NO and LIVE ALL NO stay separate: the rows, tallies and book are all
+    filtered by `book_mode`, so a LIVE page never quotes DRY ALL NO clips.
+    """
+    book = _all_no_book(book_mode)
+    book_filter = _book_filter(str(book.get("mode") or "dry"))
+    open_rows = _row_no_open(_db_rows(_SQL_NO_OPEN.format(book=book_filter)))
+    closed_rows = _row_no_closed(_db_rows(_SQL_NO_CLOSED.format(book=book_filter)))
+    return {
+        "book": book,
+        "open_rows": open_rows,
+        "closed_rows": closed_rows,
+        "open_tally": _all_no_open_tally(open_rows),
+        "tally": _all_no_closed_tally(closed_rows),
+        "kelly": {
+            "multiplier": ALL_NO_KELLY_MULTIPLIER,
+            "max_clip_pct": ALL_NO_MAX_CLIP_PCT,
+            "example": _all_no_buy_amount(0.90, 0.88),
+        },
+        "no_lanes_enabled": True,
+        "now": _now(),
+        "token": _configured_token(),
+    }
+
+
+def _all_no_book(book: str = "dry") -> Dict[str, Any]:
+    """The ALL NO book's own ledger, scoped to one book.
+
+    DRY ALL NO is $400 of fake money, seeded once per book. LIVE ALL NO is its
+    own book too - separate rows, separate seed, never mixed. Separate from the
+    DRY book's $300 and never a mirror of the real LIVE balance. The seed is
+    written once and remembered, so a redeploy never re-funds a book that has
+    already traded - the same one-shot latch pattern the DRY top-up uses.
+    Read-only otherwise: this page never moves money.
     """
     import aiosqlite
+
+    book_mode = "live" if str(book).strip().lower() == "live" else "dry"
+    book_filter = f"COALESCE(NULLIF(mode, ''), 'dry') = '{book_mode}'"
 
     async def _run() -> Dict[str, Any]:
         async with aiosqlite.connect(DB_PATH) as conn:
             conn.row_factory = aiosqlite.Row
             await conn.execute(_SQL_ALL_NO_BOOK_CREATE)
-            # Seed once. `note` is the latch: a second boot sees the row and
-            # leaves the balance whatever trading made it.
-            cur = await conn.execute("SELECT COUNT(*) AS n FROM all_no_book WHERE note = 'seed'")
+            # Migration: older databases built all_no_book without the mode
+            # column. PRAGMA rows are tuples unless row_factory is set.
+            pragma_rows = await (
+                await conn.execute("PRAGMA table_info(all_no_book)")
+            ).fetchall()
+            cols = [r[1] if isinstance(r, (tuple, list)) else r["name"] for r in pragma_rows]
+            if "mode" not in cols:
+                try:
+                    await conn.execute(
+                        "ALTER TABLE all_no_book ADD COLUMN mode TEXT NOT NULL DEFAULT 'dry'"
+                    )
+                    await conn.commit()
+                except Exception:
+                    pass  # already migrated under a race - the column exists
+            # Seed once per book. `note` plus `mode` is the latch: a second
+            # boot sees the row and leaves the balance whatever trading made it.
+            cur = await conn.execute(
+                "SELECT COUNT(*) AS n FROM all_no_book"
+                " WHERE note = 'seed' AND {bf}".format(bf=book_filter)
+            )
             seeded = int((await cur.fetchone())["n"] or 0)
             if not seeded:
                 stamp = _now()
                 await conn.execute(
                     "INSERT INTO all_no_book"
-                    " (kind, amount, balance_after, note, timestamp)"
-                    " VALUES ('deposit', ?, ?, 'seed', ?)",
-                    (ALL_NO_STARTING_BALANCE, ALL_NO_STARTING_BALANCE, stamp),
+                    " (kind, amount, balance_after, note, timestamp, mode)"
+                    " VALUES ('deposit', ?, ?, 'seed', ?, ?)",
+                    (ALL_NO_STARTING_BALANCE, ALL_NO_STARTING_BALANCE, stamp, book_mode),
                 )
                 await conn.commit()
             cur = await conn.execute(
-                "SELECT amount, balance_after, kind FROM all_no_book" " ORDER BY id DESC LIMIT 1"
+                "SELECT amount, balance_after, kind FROM all_no_book"
+                " WHERE {bf} ORDER BY id DESC LIMIT 1".format(bf=book_filter)
             )
             row = await cur.fetchone()
-            cur = await conn.execute("SELECT COUNT(*) AS n FROM all_no_book WHERE note != 'seed'")
+            cur = await conn.execute(
+                "SELECT COUNT(*) AS n FROM all_no_book"
+                " WHERE note != 'seed' AND {bf}".format(bf=book_filter)
+            )
             entries = int((await cur.fetchone())["n"] or 0)
             cur = await conn.execute(
                 "SELECT COALESCE(SUM(amount), 0.0) AS moved FROM all_no_book"
-                " WHERE kind IN ('buy', 'settle')"
+                " WHERE kind IN ('buy', 'settle') AND {bf}".format(bf=book_filter)
             )
             moved = float((await cur.fetchone())["moved"] or 0.0)
             return {
+                "mode": book_mode,
                 "balance": round(float(row["balance_after"] or 0.0), 2) if row else 0.0,
                 "starting": ALL_NO_STARTING_BALANCE,
                 "entries": entries,
@@ -2662,6 +2741,7 @@ def _all_no_book() -> Dict[str, Any]:
     except Exception as e:  # noqa: BLE001 - a missing ledger must not 500 the page
         _push_error(f"ALL NO book read: {e}")
         return {
+            "mode": book_mode,
             "balance": 0.0,
             "starting": ALL_NO_STARTING_BALANCE,
             "entries": 0,
@@ -3071,6 +3151,7 @@ def _kalshi_account() -> Dict[str, Any]:
         # book. Market rows only - see the double-count note above. It is also not
         # the same quantity as cost basis, so the two are never substituted.
         "exposure": round(total(held_markets, "exposure"), 2),
+        "exposure_known": bool(markets or events),
         "event_exposure": round(total(held_events, "exposure"), 2),
         "cost_basis": round(_held_cost_basis, 2) if _cost_basis_known else 0.0,
         "cost_basis_known": _cost_basis_known,
@@ -4352,6 +4433,7 @@ def live_dashboard():
         lead=context["lead"],
         acct=acct,
         _format_date=_format_date,
+        **_all_no_section(requested),
     )
 
 
@@ -4407,6 +4489,7 @@ def dashboard():
         acct=acct,
         _market_title=_market_title,
         _format_date=_format_date,
+        **_all_no_section(_current_book_mode() or "dry"),
     )
 
 
@@ -4524,27 +4607,18 @@ def all_no_markets():
     if not html:
         return "<html><body>ALL NO MARKETS template missing</body></html>", 500
 
-    book = _all_no_book()
-    open_rows = _row_no_open(_db_rows(_SQL_NO_OPEN))
-    closed_rows = _row_no_closed(_db_rows(_SQL_NO_CLOSED))
-    open_tally = _all_no_open_tally(open_rows)
-    tally = _all_no_closed_tally(closed_rows)
-
+    ctx = _all_no_section("live" if request.args.get("mode") == "live" else "dry")
     return render_template_string(
         html,
-        book=book,
-        open_rows=open_rows,
-        closed_rows=closed_rows,
-        open_tally=open_tally,
-        tally=tally,
-        kelly={
-            "multiplier": ALL_NO_KELLY_MULTIPLIER,
-            "max_clip_pct": ALL_NO_MAX_CLIP_PCT,
-            "example": _all_no_buy_amount(0.90, 0.88),
-        },
-        no_lanes_enabled=True,
-        now=_now(),
-        token=_configured_token(),
+        book=ctx["book"],
+        open_rows=ctx["open_rows"],
+        closed_rows=ctx["closed_rows"],
+        open_tally=ctx["open_tally"],
+        tally=ctx["tally"],
+        kelly=ctx["kelly"],
+        no_lanes_enabled=ctx["no_lanes_enabled"],
+        now=ctx["now"],
+        token=ctx["token"],
     )
 
 
@@ -6400,6 +6474,35 @@ pre{
 }
 .card:hover{border-color:var(--blue);transform:translateY(-1px)}
 .card.hot{border-color:rgba(46,230,168,.45)}
+/* ALL NO MARKETS cards. DRY ALL NO stays on the normal dark card; LIVE ALL NO
+   is a distinct entity: silver (not grey) gradient background with yellow
+   borders around the cards, so the real-money book can never be mistaken for
+   the simulated one. */
+body[data-mode="live"] .card.allno-card{
+  background:linear-gradient(160deg,#dcdce0,#f7f7fa 45%,#e8e9ee 70%,#d3d4da);
+  border:2px solid #ffd700;
+  box-shadow:0 0 0 1px rgba(255,215,0,.35), 0 0 18px rgba(255,215,0,.18), inset 0 0 22px rgba(255,255,255,.45);
+  color:#14161c;
+}
+body[data-mode="live"] .card.allno-card .clabel,
+body[data-mode="live"] .card.allno-card .cname{color:#1a1d26}
+body[data-mode="live"] .card.allno-card .cstats b{color:#10131a}
+body[data-mode="live"] .card.allno-card .cstats span{color:#4a4f5a}
+body[data-mode="live"] .card.allno-card .mono{color:#3a3f4a}
+body[data-mode="live"] .card.allno-card button{
+  background:#14161c;color:#ffd700;border-color:#ffd700;
+}
+body[data-mode="live"] .card.allno-card button:hover{background:#23262e}
+body[data-mode="live"] .all-no-panel{
+  background:linear-gradient(165deg,#d9dade,#f6f6fa 40%,#e7e8ee 65%,#cfd0d8);
+  border:2px solid #ffd700;
+  box-shadow:0 0 0 1px rgba(255,215,0,.30), 0 0 20px rgba(255,215,0,.15);
+  color:#151821;
+}
+body[data-mode="live"] .all-no-panel h2,
+body[data-mode="live"] .all-no-panel th{color:#10131a}
+body[data-mode="live"] .all-no-panel td{color:#1b1e27}
+body[data-mode="live"] .all-no-panel .note{color:#4a4f5a}
 .ctop{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
 .clabel{font-size:15px;font-weight:650}
 .cname{font-size:11.5px;color:var(--dim);margin-top:1px}
@@ -6586,8 +6689,8 @@ button.loading.yellow::after {
   </div>
   <div class="tile">
     <div class="k">Win rate</div>
-    <div class="v" id="tWinRateLive">{{ s.open.win_rate if s.open else 0 }}%</div>
-    <div class="s" id="tWinRateLiveNote">{{ s.open.wins if s.open else 0 }}W / {{ s.open.losses if s.open else 0 }}L</div>
+    <div class="v" id="tWinRateLive">{{ s.mode.live.win_rate if s.mode and s.mode.live and s.mode.live.win_rate is not none else (s.open.win_rate if s.open else 0) }}%</div>
+    <div class="s" id="tWinRateLiveNote">{{ s.mode.live.wins if s.mode and s.mode.live else (s.open.wins if s.open else 0) }}W / {{ s.mode.live.losses if s.mode and s.mode.live else (s.open.losses if s.open else 0) }}L</div>
   </div>
   <div class="tile">
     <div class="k">Live positions</div>
@@ -6701,7 +6804,7 @@ button.loading.yellow::after {
   <div class="pb">
     <div class="cards">
       {%- for c in s.strategy_cards %}
-      <div class="card{{ ' hot' if c.running else '' }}" id="card-{{ c.name }}" onclick="openStrategy('{{ c.name }}')">
+      <div class="card{{ ' hot' if c.running else '' }}{{ ' allno-card' if c.name == 'all_no_markets' }}" id="card-{{ c.name }}" onclick="openStrategy('{{ c.name }}')">
         <div class="ctop">
           <div>
             <div class="clabel">{{ c.label }}</div>

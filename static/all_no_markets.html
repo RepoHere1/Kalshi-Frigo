@@ -185,7 +185,7 @@ Every row below is a *NO* LANE contract
    and capped at <span class="mono">{{ '%.0f'|format(kelly.max_clip_pct * 100) }}%</span>
    of the book per clip, rounded to whole contracts with a floor of one.
    <span class="mono">f*</span> is the share of the book at risk, so a
-   <span class="mono">${{ '%.2f'|format(kelly.example.stake * 250 if kelly.example.stake else 0) }}</span>
+    <span class="mono">${{ '%.2f'|format(kelly.example.stake * 400 if kelly.example.stake else 0) }}</span>
    clip at fair <span class="mono">0.90</span> against a
    <span class="mono">88&cent;</span> limit is the worked example.
    <b>Read-only</b> &mdash; nothing here places, cancels or modifies an order.
@@ -193,7 +193,9 @@ Every row below is a *NO* LANE contract
 
 <!-- ============ TALLIES ============ -->
 <!-- The book tiles come FIRST because this page is its own book, not a view of
-     the lanes'. $250 of fake money, seeded once, never re-funded. -->
+     the lanes'. $400 of fake money per book (DRY ALL NO), seeded once per book,
+     never re-funded. LIVE ALL NO is its own silver book wired to the real
+     account. -->
 <div class="tiles">
 
   <div class="card tile">
