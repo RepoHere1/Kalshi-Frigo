@@ -4432,6 +4432,7 @@ def live_dashboard():
         },
         lead=context["lead"],
         acct=acct,
+        _market_title=_market_title,
         _format_date=_format_date,
         **_all_no_section(requested),
     )
