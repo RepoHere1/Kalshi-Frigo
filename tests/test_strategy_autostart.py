@@ -129,16 +129,17 @@ def test_a_restart_resumes_only_what_the_button_armed():
 
 
 def test_the_supervisor_never_spawns_on_an_unreadable_book():
-    """A guessed book armed the wrong book once; None means NO book.
+    """A guessed book armed the wrong book once; an invalid mode means NO spawn.
 
-    `_current_book_mode` failing open to 'dry' let one worker answer 'dry'
-    while another read 'live' during boot contention, and strategy processes
-    got armed in a book the operator never pushed. The supervisor must skip
-    its cycle entirely when the book cannot be read.
+    The supervisor now resumes rows in their own recorded book (both books at
+    once), so the page's current book is irrelevant. What must never happen is
+    spawning a row whose mode is missing/invalid: it is skipped, never guessed.
     """
     src = inspect.getsource(wd._strategy_supervisor_loop)
-    assert "if book_mode is None:" in src
+    assert 'mode not in ("paper", "live")' in src
     assert "continue" in src
+    # The active-book skip is gone; each row carries its own book.
+    assert '(row.get("mode") or "") != book_mode' not in src
 
 
 def test_the_toggle_refuses_to_act_on_an_unreadable_book():

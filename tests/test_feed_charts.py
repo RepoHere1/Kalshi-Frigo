@@ -155,20 +155,20 @@ def test_live_lanes_are_resumed_like_any_other_lane():
 
 
 def test_the_supervisor_manages_all_books():
-    """The supervisor reads and writes ALL books, not just the current one.
+    """The supervisor resumes desired=1 rows in BOTH books, in their own book.
 
-    A Stop on the LIVE page must never clear DRY's intent or kill DRY's
-    process, and vice versa. The supervisor checks every strategy row
-    regardless of which book mode it is in, so the operator's stop
-    button is permanent law for that lane only.
+    The operator can arm LIVE BTC 1H and every DRY lane and sleep; both sets
+    keep running because each row carries the book it was armed in. A Stop
+    disarms only that row, so the other book's lane is untouched. Nothing is
+    spawned for a row whose mode is invalid - never on a guess.
     """
     src = _supervisor_source()
-    assert "book_mode = _runtime_mode()" in src
     assert "store.desired()" in src
-    assert "store.desired(mode=book_mode)" not in src
-    # Per-row scoping: a row recorded for the other book is skipped, never
-    # spawned or killed from here.
-    assert '(row.get("mode") or "") != book_mode' in src
+    # Both books are resumed: the old active-book skip is gone.
+    assert '(row.get("mode") or "") != book_mode' not in src
+    # Each row is spawned in its own recorded book.
+    assert 'mode = row.get("mode") or book_mode' in src
+    assert 'mode not in ("paper", "live")' in src
 
 
 def test_a_recovered_strategy_resets_the_failure_budget():

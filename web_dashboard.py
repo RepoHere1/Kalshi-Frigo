@@ -1736,21 +1736,14 @@ def _strategy_supervisor_loop():
     while True:
         try:
             store = _runtime_store()
-            # ALL BOOKS — the operator's button is permanent law.
-            # Stopping a strategy in LIVE must never affect DRY, and
-            # vice versa. The supervisor must manage BOTH books so
-            # that a button push is respected regardless of which
-            # book the page is currently viewing. If the page reads
-            # LIVE and the operator pressed Stop, the LIVE lane stays
-            # off even if the page is viewing DRIED.
-            #
-            # An unreadable book means NO book: spawn nothing rather
-            # than guess, because a guessed book is how LIVE lanes got
-            # armed without a single operator push.
+            # ALL BOOKS — the operator's button is permanent law, in BOTH
+            # books. Each desired row carries the book it was armed in, so the
+            # supervisor resumes it in THAT book. A Stop disarms that row and it
+            # is never fetched again. The page's current book is irrelevant: the
+            # operator may arm LIVE BTC 1H and every DRY lane and then sleep,
+            # and both sets keep running. Nothing here arms a lane; only a Start
+            # press writes desired=1.
             book_mode = _runtime_mode()
-            if book_mode is None:
-                time.sleep(10)
-                continue
             wanted = _run_async(store.desired())
             # NO AUTO-START, EVER (operator order). The only thing that may
             # arm a lane is a Start press; _spawn_strategy refuses any lane
@@ -1759,13 +1752,6 @@ def _strategy_supervisor_loop():
             for _ck, row in wanted.items():
                 name = row.get("name") or ""
                 if name not in strategy_state:
-                    continue
-                # BOOK-SCOPED: each pass manages only the book the page is
-                # in. A desired=1 row recorded in the other book is left
-                # untouched - it resumes the next time that book is active.
-                # This is what keeps a DRY child from being spawned while
-                # LIVE is on screen, and vice versa.
-                if (row.get("mode") or "") != book_mode:
                     continue
                 row_pid = row.get("pid")
                 if row_pid and _pid_alive(row_pid, row):
@@ -1843,7 +1829,10 @@ def _strategy_supervisor_loop():
                 if not _creds_present():
                     continue  # nothing to start with; wait for configuration
 
-                mode = row.get("mode", book_mode)
+                mode = row.get("mode") or book_mode
+                if mode not in ("paper", "live"):
+                    # A row with no valid book is never spawned on a guess.
+                    continue
                 backoff = failures.get(name, 0.0)
 
                 # IRONCLAD PERMANENT FIX: NEVER GIVE UP ON desired=True

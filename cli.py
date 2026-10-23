@@ -39,6 +39,33 @@ def _normalize_updown_series(series: str) -> str:
     return s
 
 
+def _lane_config() -> "object":
+    """Build the up/down config for this process's book.
+
+    DRY is a rehearsal book: the operator wants to SEE the lanes trade, so a
+    DRY child runs a wider, cheaper bar (more entries) while LIVE keeps the
+    canonical fee-aware edge. The book is stamped by the dashboard spawner in
+    STRATEGY_BOOK_MODE; a manual run with no stamp keeps canonical defaults.
+    """
+    from src.jobs.ladder_trader import UpDownConfig
+
+    cfg = UpDownConfig()
+    book = os.environ.get("STRATEGY_BOOK_MODE", "").strip().lower()
+    if book in ("dry", "paper"):
+        # MAXIMIZE DRY TRADING (operator order): cheaper edge bar, narrower
+        # noise band, wider admitted price band, so the lanes actually fire
+        # instead of sitting idle. Fake money only - LIVE is untouched.
+        cfg.min_edge = 0.03
+        cfg.noise_pct = 0.0003
+        cfg.max_entry_price = 0.75
+        cfg.max_entry_price_maker = 0.90
+        cfg.sweet_band_low = 0.10
+        cfg.sweet_band_high = 0.85
+        cfg.strong_edge_scale = 0.35
+        cfg.certified_edge_scale = 0.30
+    return cfg
+
+
 async def cmd_run(args: argparse.Namespace) -> None:
     """Start the trading bot (disciplined mode by default)."""
     from src.utils.logging_setup import setup_logging
@@ -124,7 +151,7 @@ async def cmd_run(args: argparse.Namespace) -> None:
         while True:
             try:
                 await run_updown_trader(
-                    UpDownConfig(),
+                    _lane_config(),
                     loop=getattr(args, "loop", True),
                     interval=float(getattr(args, "interval", 0) or 0),
                     series=series,
@@ -170,7 +197,7 @@ async def cmd_run(args: argparse.Namespace) -> None:
         while True:
             try:
                 await run_updown_trader(
-                    UpDownConfig(),
+                    _lane_config(),
                     loop=getattr(args, "loop", True),
                     interval=float(getattr(args, "interval", 0) or 0),
                     series=series,
