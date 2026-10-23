@@ -149,6 +149,9 @@ strategy_state = {
     # inspect or refuse them. They have NO cards and are never auto-spawned by
     # the dashboard or keep-alive; only the operator's explicit Start/Stop can
     # touch them, and heavy API abusers are locked OFF at the toggle latch.
+    # Their strategies were removed from the source tree, so a stale desired=1
+    # row must never be spawned - RETIRED_LANES stops the supervisor from
+    # crash-looping a process that cannot exist.
     "ai_directional": {"running": False, "pid": None, "mode": "paper"},
     "market_making": {"running": False, "pid": None, "mode": "paper"},
     "safe_compounder": {"running": False, "pid": None, "mode": "paper"},
@@ -197,6 +200,12 @@ STRATEGY_ALIASES = {
 # so the operator can see they exist, but Start is refused with 403 and Stop is
 # always honoured if one is already running.
 HEAVY_API_ABUSERS = ("safe_compounder",)
+
+# Lanes whose strategy source no longer exists. Their stale desired=1 rows must
+# never be spawned: the supervisor would crash-loop a process that cannot
+# exist (argparse rejects the flag, the child dies, respawn, repeat). They stay
+# in strategy_state so the toggle can refuse them cleanly.
+RETIRED_LANES = ("market_making", "safe_compounder", "quick_flip")
 
 # The command each strategy is actually run with. Every one is a distinct
 # process and writes its own log.
@@ -1752,6 +1761,9 @@ def _strategy_supervisor_loop():
             for _ck, row in wanted.items():
                 name = row.get("name") or ""
                 if name not in strategy_state:
+                    continue
+                # Retired lanes have no strategy source; never crash-loop them.
+                if name in RETIRED_LANES:
                     continue
                 row_pid = row.get("pid")
                 if row_pid and _pid_alive(row_pid, row):
@@ -5428,6 +5440,20 @@ def api_strategy_toggle(name):
             403,
         )
 
+    # RETIRED LANES: their strategy source was removed, so Start can only
+    # crash-loop a process that cannot exist. Stop still works above (to clear
+    # stale intent); Start is refused here with a clear message.
+    if name in RETIRED_LANES:
+        return (
+            jsonify(
+                {
+                    "error": f"{name} is retired: its strategy source was removed. "
+                    "Start refused; press Stop to clear any stale intent."
+                }
+            ),
+            409,
+        )
+
     # LAW: the operator's last button push is permanent truth. This point is
     # reached only when the DB says the lane is NOT running, so this is a
     # START request. Never clear intent here: a Start that fails validation
@@ -5633,6 +5659,14 @@ def _spawn_strategy(name: str, mode: str) -> Dict[str, Any]:
     Shared by the Start button and the supervisor so both paths produce an
     identical child: same command, same environment, same persisted record.
     """
+    # Retired lanes have no strategy source. Refuse loudly rather than letting
+    # argparse kill the child and the supervisor respawn it forever.
+    if name in RETIRED_LANES:
+        raise RuntimeError(
+            f"{name} is retired: its strategy source was removed, so it cannot "
+            "be spawned. Press Stop to clear the stale intent."
+        )
+
     store = _runtime_store()
 
     # THE LATCH (operator order): only a Start press may arm a lane, and a

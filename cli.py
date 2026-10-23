@@ -886,6 +886,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="beast",
         help="Beast mode: the main trading bot with aggressive sizing",
     )
+    strategy_group.add_argument(
+        "--directional",
+        action="store_true",
+        dest="directional",
+        help="AI directional mode: the main bot (default)",
+    )
     p_run.add_argument(
         "--series",
         type=str,

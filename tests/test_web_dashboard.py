@@ -2167,6 +2167,12 @@ def test_every_strategy_command_is_paper(client, auth, monkeypatch, tmp_path):
             assert r.status_code == 403, f"{name} abuser lockout bypassed"
             assert _RecordingPopen.instances == []
             continue
+        if name in wd.RETIRED_LANES:
+            # Source removed: Start is refused and nothing is spawned, so the
+            # supervisor can never crash-loop a process that cannot exist.
+            assert r.status_code == 409, f"{name} retired lane was not refused"
+            assert _RecordingPopen.instances == []
+            continue
         args = list(_RecordingPopen.instances[-1].args[0])
         assert "--live" not in args, f"{name} was spawned with --live"
         assert "--paper" in args, f"{name} was spawned without --paper"
@@ -2538,6 +2544,12 @@ def test_every_strategy_command_is_paper(client, auth, monkeypatch, tmp_path):
             # quick_flip is locked OFF as the #1 OpenRouter spender: the API
             # refuses Start with 403 and spawns nothing.
             assert r.status_code == 403, f"{name} abuser lockout bypassed"
+            assert _RecordingPopen.instances == []
+            continue
+        if name in wd.RETIRED_LANES:
+            # Source removed: Start is refused and nothing is spawned, so the
+            # supervisor can never crash-loop a process that cannot exist.
+            assert r.status_code == 409, f"{name} retired lane was not refused"
             assert _RecordingPopen.instances == []
             continue
         args = list(_RecordingPopen.instances[-1].args[0])
