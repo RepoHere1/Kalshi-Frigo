@@ -97,6 +97,17 @@ ASSET_TUNING: Dict[str, Dict[str, float]] = {
         "sweet_band_low": 0.20,
         "sweet_band_high": 0.65,
     },
+    "HYPE-USD": {
+        # HYPE's favored (near-certain) side quotes 0.78-0.88, above BTC's
+        # maker cap; without this override the HYPE lane blocks every real
+        # edge and sits idle. Admit the maker band with real edge; the $0.90+
+        # hard block still stands.
+        "noise_pct": 0.0012,  # ~0.12% of price: HYPE is a fast mover
+        "max_entry_price": 0.60,
+        "max_entry_price_maker": 0.85,
+        "sweet_band_low": 0.20,
+        "sweet_band_high": 0.65,
+    },
 }
 
 

@@ -3549,6 +3549,8 @@ def api_mode_set():
             )
         if target == MODE_LIVE:
             funding = run(mgr.funding(materialize_private_key()))
+            # An unreachable Kalshi is a genuine blocker. LIVE could not
+            # function without it, so the switch is refused outright.
             if not funding.get("connected"):
                 return (
                     jsonify(
@@ -3559,13 +3561,13 @@ def api_mode_set():
                     ),
                     400,
                 )
-            # An unreachable Kalshi is a genuine blocker. An empty balance is not:
-            # it used to refuse the switch outright, which trapped the operator in
-            # DRY and made the only way into LIVE a top-up. Affordability is
-            # enforced per order in build_order_request, which refuses anything the
-            # funding source cannot cover, so nothing unfunded can be sent by
-            # dropping the check here. The balance is still reported, loudly, on
-            # the LIVE page and in this response.
+            # An empty balance is not a blocker: it used to refuse the
+            # switch outright, which trapped the operator in DRY and made
+            # the only way into LIVE a top-up. Affordability is enforced
+            # per order in build_order_request, which refuses anything the
+            # funding source cannot cover, so nothing unfunded can be sent
+            # by dropping the check here. The balance is still reported,
+            # loudly, on the LIVE page and in this response.
             if not funding.get("can_fund"):
                 _push_error(
                     "LIVE mode entered with an unfunded balance: "
@@ -4315,6 +4317,42 @@ def api_live_flatten():
 # ---------------------------------------------------------------------------
 # ALL NO MARKETS section is now integrated into the main dashboard template at the bottom
 # The ALL NO functionality is accessible via the dashboard interface
+
+
+@app.route("/live")
+def live_dashboard():
+    """Render LIVE mode dashboard: red border, real-money tiles, balance from Kalshi."""
+    requested = (
+        "dry" if not request.args.get("mode") or request.args.get("mode") == "dry" else "live"
+    )
+    snap = build_snapshot_cached()
+    snap["mode"]["mode"] = requested
+    snap["token"] = _configured_token()
+    acct = _account_payload(requested)
+    context = _market_context()
+
+    def _format_date(date_str):
+        try:
+            from datetime import datetime
+
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            return dt.strftime("%b %d, %Y").upper()
+        except:
+            return date_str
+
+    return render_template_string(
+        _TEMPLATE,
+        s=snap,
+        m={
+            "spot": context["spot"],
+            "kalshi": context["kalshi"],
+            "series": context["series"],
+            "feed_error": context["feed_error"],
+        },
+        lead=context["lead"],
+        acct=acct,
+        _format_date=_format_date,
+    )
 
 
 @app.route("/")
@@ -6202,7 +6240,7 @@ body::before{
   transition:border-color .18s ease, box-shadow .18s ease;
 }
 body[data-mode="dry"]{--mode-color:var(--up);--mode-glow:rgba(46,230,168,.32)}
-body[data-mode="live"]{--mode-color:var(--up);--mode-glow:rgba(46,230,168,.32)}
+body[data-mode="live"]{--mode-color:var(--down);--mode-glow:rgba(161,0,0,.32)}
 /* Red border on every card when LIVE - real money is leaving the account. */
 body[data-mode="live"] .card{border:1px solid var(--down)}
 body[data-mode="live"] .card:hover{border-color:var(--down)}
@@ -6453,11 +6491,12 @@ button.loading.yellow::after {
          the SAME styling as the two mode buttons: it is the third book of the
          three, it opens its own page, and it must not read as a stray link
          parked outside the control it belongs with. -->
-    <div class="modeswitch">
-      <button id="modeDry"  class="modebtn {{ 'on' if s.mode.mode != 'live' else '' }}" onclick="setMode('dry')">DRY</button>
-      <button id="modeLive" class="modebtn live {{ 'on' if s.mode.mode == 'live' else '' }}" onclick="setMode('live')">LIVE</button>
-      <button id="noLanesBtn" class="modebtn nolanes {{ 'on' if s.mode.no_lanes_enabled else '' }}" onclick="toggleNoLanes()">NO LANES {{ 'ON' if s.mode.no_lanes_enabled else 'OFF' }}</button>
-      <a href="/all-no-markets" class="modebtn allno" id="allNoBtn" title="ALL NO MARKETS — NO-side only, maker entries, $250 of its own simulated money">ALL NO</a>
+    <!-- Single LIVE button replacing the old DRY/LIVE/ALL NO toggle system -->
+    <div class="modeswitch" style="justify-content: center; gap: 12px;">
+      <button id="modeDry" type="button" class="modebtn {{ 'on' if s.mode.mode != 'live' else '' }}" onclick="window.location='/';">DRY</button>
+      <button id="modeLive" type="button" class="modebtn live {{ 'on' if s.mode.mode == 'live' else '' }}" onclick="window.location='/live?mode=live';">LIVE</button>
+      <button id="noLanesBtn" type="button" class="modebtn nolanes" onclick="toggleNoLanes()">NO LANES {{ 'ON' if s.mode.no_lanes_enabled else 'OFF' }}</button>
+      <a href="/all-no-markets" class="modebtn allno" title="ALL NO MARKETS – NO-side only, maker entries, $250 of its own simulated money">ALL NO</a>
     </div>
   </div>
   <div class="stamp">Rendered {{ s.generated_at }}</div>
@@ -7500,184 +7539,448 @@ function authHeaders(extra) {
     { 'X-Auth-Token': WRITE_TOKEN }, extra || {});
 }
 
-function setMode(mode) {
-  // One-click switch. The operator is already authenticated behind the write
-  // token; the "type LIVE" gate was a speed bump that only annoyed people.
-  postMode(mode, mode === 'live');
-}
-
-async function postMode(mode, confirmLive) {
-  try {
-    const r = await fetch('/api/mode', {
-      method: 'POST',
-      headers: authHeaders(),
-      body: JSON.stringify({ mode: mode, confirm: !!confirmLive }),
-    });
-    const d = await r.json().catch(() => ({}));
-    if (d.error) {
-      // The request may have failed *after* the mode was already persisted, so
-      // never repaint from the snapshot this page booted with - that stale object
-      // says DRY, and trusting it is what threw the operator back to DRY after a
-      // switch that had actually taken. Ask the server what mode is in force.
-      note('mode switch blocked: ' + d.error);
-      await syncModeFromServer('switch refused: ' + d.error);
-      return;
-    }
-    note('trading mode is now ' + String(d.mode).toUpperCase());
-    paintMode(d);
-    flashBanner(d.mode === 'live'
-      ? 'LIVE MODE - REAL ORDERS ARE NOW LEAVING THE ACCOUNT'
-      : 'DRY MODE - simulated fills only, no real money', d.mode === 'live');
-  } catch (e) {
-    note('mode switch failed: ' + e.message);
-    await syncModeFromServer('switch failed: ' + e.message);
-  }
-}
-
-// Toggle the NO LANES ON/OFF switch. Persisted to runtime_config so both the
-// DRY/LIVE dashboard and the ALL NO MARKETS page see the same state. The button
-// is black by default and turns YELLOW when ON.
-async function toggleNoLanes() {
-  try {
-    // Read current state from the button class
-    const btn = $('noLanesBtn');
-    const currentlyOn = btn.classList.contains('on');
-    const next = !currentlyOn;
-    const r = await fetch('/api/no-lanes', {
-      method: 'POST',
-      headers: authHeaders(),
-      body: JSON.stringify({ enabled: next }),
-    });
-    const d = await r.json().catch(() => ({}));
-    if (d.error) {
-      note('NO LANES toggle failed: ' + d.error);
-      return;
-    }
-    note('NO LANES is now ' + (next ? 'ON' : 'OFF'));
-    paintNoLanes(next);
-    flashBanner('NO LANES ' + (next ? 'ON' : 'OFF'), false);
-  } catch (e) {
-    note('NO LANES toggle failed: ' + e.message);
-  }
-}
-
-// Paint the NO LANES button state. Called after a toggle and after a mode
-// switch reload. The button reads its state from SNAPSHOT (which carries
-// no_lanes_enabled from _mode_payload).
-function paintNoLanes(enabled) {
-  const btn = $('noLanesBtn');
-  if (!btn) return;
-  btn.classList.toggle('on', !!enabled);
-  btn.textContent = 'NO LANES ' + (enabled ? 'ON' : 'OFF');
-}
-
-// Re-read the authoritative NO LANES state after any ambiguous toggle attempt.
-async function syncNoLanesFromServer(why) {
-  try {
-    const d = await fetch('/api/no-lanes').then(r => r.json());
-    paintNoLanes(d.no_lanes_enabled === true);
-    if (why) note('NO LANES resynced from server' + (why ? ' - ' + why : ''));
-  } catch (_) {
-    paintNoLanes(SNAPSHOT.no_lanes_enabled === true);
-  }
-}
-
-// Re-read the authoritative mode after any ambiguous switch attempt. SNAPSHOT is
-// a rendering of the page as it was served; it cannot describe a mode change that
-// happened after that.
-async function syncModeFromServer(why) {
-  try {
-    const d = await fetch('/api/mode').then(r => r.json());
-    const m = d.mode || 'dry';
-    SNAPSHOT.mode = d;
-    paintMode(d);
-    flashBanner(
-      'MODE IS ' + String(m).toUpperCase() + (why ? ' - ' + why : ''),
-      m === 'live');
-  } catch (_) {
-    paintMode(SNAPSHOT.mode);
-  }
-}
-
-// A temporary full-width banner so a mode change is impossible to miss even if
-// you looked away at the moment it happened.
-let bannerTimer = null;
-function flashBanner(text, isLive) {
-  let el = $('modeBanner');
-  if (!el) {
-    el = document.createElement('div');
-    el.id = 'modeBanner';
-    el.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:10000;' +
-      'padding:14px 18px;text-align:center;font-weight:800;letter-spacing:.12em;' +
-      'font-size:14px;box-shadow:0 6px 24px rgba(0,0,0,.5)';
-    document.body.appendChild(el);
-  }
-  el.textContent = text;
-  el.style.background = isLive ? '#a30808' : '#2ee6a8';
-  el.style.color = '#000';
-  clearTimeout(bannerTimer);
-  bannerTimer = setTimeout(() => { el.remove(); }, 6000);
-}
-
 function money(v) { return '$' + Number(v || 0).toFixed(2); }
 
-// One function owns every mode indicator: frame colour, body attribute, flag
-// text, button state, title and favicon. They cannot drift apart.
-let lastMode = document.body.dataset.mode || 'dry';
+// Paint the page state for DRY mode only (the single-button mode system).
+// Paint the page for the requested mode: DRY or LIVE. One function owns every
+// mode indicator - frame colour, body attribute, flag text, button state, title
+// and favicon. They cannot drift apart. Both entry points (call from HTML onclick
+// or from /api/mode) feed here so a switch reload or live poll paints identically.
 function paintMode(d) {
   if (!d) return;
-  // Missing mode must read as LIVE, never as an ambiguous third state.
-  const m = d.mode === undefined ? 'live' : d.mode;
-  const live = m === 'live';
+  const m = d.mode === undefined ? 'dry' : String(d.mode);
+  const isLive = m === 'live';
 
-  document.body.dataset.mode = live ? 'live' : 'dry';
-  $('modeDry').classList.toggle('on', !live);
-  $('modeLive').classList.toggle('on', live);
-  const flag = $('modeFlag');
-  flag.className = 'modeflag ' + (live ? 'live' : 'dry');
-  $('modeFlagText').textContent = live ? 'LIVE MODE' : 'DRY MODE';
+  document.body.dataset.mode = isLive ? 'live' : 'dry';
 
-  document.title = 'Kalshi-Frigo — ' + (live ? 'LIVE' : 'DRY') + ' Trading Dashboard';
-  const f = $('favicon');
+  // Update button active states
+  const dryBtn = document.getElementById('modeDry');
+  const liveBtn = document.getElementById('modeLive');
+  if (dryBtn) dryBtn.classList.toggle('on', !isLive);
+  if (liveBtn) liveBtn.classList.toggle('on', isLive);
+
+  // Flag + banner + title
+  const flag = document.getElementById('modeFlag');
+  if (flag) {
+    flag.className = 'modeflag ' + (isLive ? 'live' : 'dry');
+    const ft = document.getElementById('modeFlagText');
+    if (ft) ft.textContent = isLive ? 'LIVE MODE' : 'DRY MODE';
+  }
+  document.title = 'Kalshi-Frigo \u00b7 ' + (isLive ? 'LIVE' : 'DRY') + ' Trading Dashboard';
+
+  // Favicon: green "D" or red "L"
+  const f = document.getElementById('favicon');
   if (f) {
-    const bg = live ? '%23a30808' : '%232ee6a8';
-    const ch = live ? 'L' : 'D';
+    const bg = isLive ? '%23a30808' : '%232ee6a8';
+    const ch = isLive ? 'L' : 'D';
     f.href = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">' +
       '<rect width="32" height="32" rx="8" fill="' + bg + '"/>' +
       '<text x="16" y="23" font-size="19" font-weight="bold" text-anchor="middle" fill="#000">' +
       ch + '</text></svg>';
   }
 
-  // The headline tiles are different markup per mode - DRY shows the simulated
-  // book, LIVE the real account - so they cannot be patched in place. Repaint the
-  // safety indicators immediately, then reload for correct tiles. This also
-  // catches a mode change made from another browser.
-  if (m !== lastMode) {
-    lastMode = m;
-    setTimeout(() => location.reload(), 450);
-    return;
+  // Tiles differ per mode - set all of them, each branch reads what it needs
+  const dry = (d.dry || {});
+  const live = d.live || {};
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+
+  if (isLive) {
+    // LIVE tiles
+    const bal = live.balance || live.account_balance || 0;
+    set('dCashTile', money(bal));
+    set('dPosTile', live.open_positions || 0);
+    set('dDepTile', money(live.deployable_capital || 0));
+    set('dAvailTile', bal >= 0.01 ? 'funded' : 'empty');
+    const realDr = document.getElementById('dRealTile');
+    if (realDr) realDr.className = 'v ' + sgn(live.total_pnl || 0);
+    set('fBalance', money(bal));
+    set('liveBalance', money(bal));
+    set('fRealToken', '');
+    const sab = document.getElementById('startAllBtn');
+    if (sab) sab.textContent = 'Start all in LIVE';
+  } else {
+    // DRY tiles
+    set('dCashTile', money(dry.cash));
+    set('dPosTile', dry.open_positions || 0);
+    set('dDepTile', money((d.open_dry || {}).capital));
+    set('dAvailTile', dry.cash >= 0.01 ? 'funded' : 'empty');
+    set('dRealTile', money(dry.total_pnl || 0));
+    const realDr = document.getElementById('dRealTile');
+    if (realDr) realDr.className = 'v ' + sgn(dry.total_pnl || 0);
+    set('fBalance', money(dry.cash));
+    const sab = document.getElementById('startAllBtn');
+    if (sab) sab.textContent = 'Start all in DRY';
   }
 
-  const dry = d.dry || {};
-  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
-  set('dCashTile', money(dry.cash));
-  set('dPosTile', dry.open_positions || 0);
-  set('dDepTile', money((d.open_dry || {}).capital));
-  set('dAvailTile', dry.cash >= 0.01 ? 'funded' : 'empty');
-  set('dRealTile', money(dry.total_pnl || 0));
-  const dr = $('dRealTile');
-  if (dr) dr.className = 'v ' + sgn(dry.total_pnl || 0);
-  // The funding card answers with the money the CURRENT book can actually spend:
-  // the real Kalshi balance in LIVE, the simulated book in DRY. Reading the
-  // real balance into the DRY card is what made DRY "pose" the live account.
-  set('fBalance', money(live ? (d.funding || {}).balance : dry.cash));
-  set('liveBalance', money((d.funding || {}).balance));
-  // The bulk-start button must say - and do - what the switch says.
-  const sab = $('startAllBtn');
-  if (sab) sab.textContent = d.mode === 'live' ? 'Start all in LIVE' : 'Start all in DRY';
-  // Keep the NO LANES toggle in sync with the server state (it is mode-independent,
-  // so it can be flipped from either book without reloading).
+  // NO LANES toggle syncs regardless of mode
   paintNoLanes(d.no_lanes_enabled === true);
+
+  // Banner flashes briefly to signal the switch
+  flashBanner(isLive ? 'LIVE MODE - REAL ORDERS ARE NOW LEAVING THE ACCOUNT'
+                      : 'DRY MODE - simulated fills only, no real money', isLive);
+
+  // Reload only on an actual mode change - not on every poller paint, or the
+  // dashboard would reload itself on every poll cycle.
+  const prevMode = window.__lastPaintedMode;
+  if ((prevMode || 'dry') !== m) {
+    window.__lastPaintedMode = m;
+    setTimeout(() => location.reload(), 450);
+  }
+}function money(v) { return '$' + Number(v || 0).toFixed(2); }
+
+function mktTitle(ticker) {
+  return (SNAPSHOT.market_titles || {})[ticker] || ticker || '';
+}
+
+async function loadRecentTrades(page) {
+  const requestId = ++recentTradesRequest;
+  const requestedPage = Math.max(1, Number.parseInt(page, 10) || 1);
+  try {
+    const response = await fetch('/api/recent-trades?page=' + requestedPage + '&per_page=25');
+    const data = await response.json().catch(() => ({}));
+    if (requestId !== recentTradesRequest) return;
+    if (!response.ok || data.error) {
+      note('Closed trades: ' + (data.error || ('request failed (' + response.status + ')')));
+      return;
+    }
+
+    recentTradesPage = Number(data.page) || 1;
+    const body = $('recentTradesBody');
+    if (body) {
+      body.replaceChildren();
+      const trades = data.trades || [];
+      if (!trades.length) {
+        const row = document.createElement('tr');
+        const empty = document.createElement('td');
+        empty.colSpan = 10;
+        empty.className = 'empty';
+        empty.textContent = 'No closed trades recorded yet.';
+        row.appendChild(empty);
+        body.appendChild(row);
+      } else {
+        for (const trade of trades) {
+          const row = document.createElement('tr');
+          const addCell = (value, className, title) => {
+            const cell = document.createElement('td');
+            cell.textContent = value == null ? '' : String(value);
+            if (className) cell.className = className;
+            if (title) cell.title = title;
+            row.appendChild(cell);
+            return cell;
+          };
+          const market = String(trade.market_id || '?');
+          addCell(market.slice(0, 24), 'mono', market);
+          addCell(mktTitle(market));
+          addCell(trade.side);
+          addCell(trade.entry_price == null ? '-' : Number(trade.entry_price).toFixed(3), 'num');
+          addCell(trade.exit_price == null ? '-' : Number(trade.exit_price).toFixed(3), 'num');
+          addCell(trade.quantity, 'num');
+          addCell(money(trade.cost_basis), 'num');
+          addCell(money(trade.pnl), 'num ' + sgn(trade.pnl));
+          const strategyCell = addCell('');
+          const strategyTag = document.createElement('span');
+          strategyTag.className = 'tag';
+          strategyTag.textContent = trade.strategy || 'unattributed';
+          strategyCell.appendChild(strategyTag);
+          const exited = addCell(String(trade.exit_timestamp || '').slice(0, 16), 'mono');
+          exited.style.color = 'var(--faint)';
+          body.appendChild(row);
+        }
+      }
+    }
+
+    const pages = Math.max(1, Number(data.pages) || 1);
+    const pageLabel = $('recentTradesPageLabel');
+    if (pageLabel) pageLabel.textContent = 'Page ' + recentTradesPage + ' of ' + pages;
+    const summary = $('recentTradesSummary');
+    if (summary) {
+      const total = Number(data.total) || 0;
+      const first = total ? ((recentTradesPage - 1) * Number(data.per_page || 25) + 1) : 0;
+      const last = Math.min(recentTradesPage * Number(data.per_page || 25), total);
+      summary.textContent = 'Showing ' + first + '-' + last + ' of ' + total +
+        ' closed trades (' + String(data.book || '').toUpperCase() + ')';
+    }
+    const previous = $('recentTradesPrev');
+    const next = $('recentTradesNext');
+    if (previous) previous.disabled = recentTradesPage <= 1;
+    if (next) next.disabled = recentTradesPage >= pages;
+  } catch (error) {
+    note('Closed trades: ' + error.message);
+  }
+}
+
+function paint(s) {
+  if (!s) return;
+  loadRecentTrades(recentTradesPage);
+  const k = s.kalshi || {};
+
+  const mk = k.markets || [], ev = k.events || [];
+  const mkBody = document.getElementById('kalshiMarkets');
+  const evBody = document.getElementById('kalshiEvents');
+  if (mkBody) {
+    mkBody.innerHTML = rows(mk.map(r =>
+      '<td class="mono">' + esc(r.ticker) + '</td>' +
+      '<td>' + esc(mktTitle(r.ticker)) + '</td>' +
+      '<td class="num">' + num(r.shares) + '</td>' +
+      '<td class="num">' + num(r.exposure) + '</td>' +
+      '<td class="num">' + num(r.traded) + '</td>' +
+      '<td class="num ' + sgn(r.realized) + '">' + num(r.realized) + '</td>' +
+      '<td class="num" style="color:var(--faint)">' + num(r.fees) + '</td>'
+    ), 'No market positions.', 7);
+  }
+  if (evBody) {
+    evBody.innerHTML = rows(ev.map(r =>
+      '<td class="mono">' + esc(r.event || r.ticker) + '</td>' +
+      '<td>' + esc(mktTitle(r.event || r.ticker)) + '</td>' +
+      '<td class="num">' + num(r.shares) + '</td>' +
+      '<td class="num">' + num(r.cost) + '</td>' +
+      '<td class="num">' + num(r.exposure) + '</td>' +
+      '<td class="num ' + sgn(r.realized) + '">' + num(r.realized) + '</td>' +
+      '<td class="num" style="color:var(--faint)">' + num(r.fees) + '</td>'
+    ), 'No event positions.', 7);
+  }
+
+  const posBody = document.getElementById('posBody');
+  if (posBody) {
+    posBody.innerHTML = rows((s.positions || []).map(p =>
+      '<td class="mono">' + esc(String(p.market_id || '?').slice(0, 26)) + '</td>' +
+      '<td>' + esc(mktTitle(p.market_id)) + '</td>' +
+      '<td><span class="tag">' + esc(p.side) + '</span></td>' +
+      '<td class="num">' + (p.entry_price == null ? '-' : Number(p.entry_price).toFixed(3)) + '</td>' +
+      '<td class="num">' + num(p.quantity) + '</td>' +
+      '<td><span class="tag">' + esc(p.strategy) + '</span></td>' +
+      '<td class="num">' + num(p.stop_loss) + '</td>' +
+      '<td class="num">' + num(p.take_profit) + '</td>'
+    ), 'No open positions.', 8);
+  }
+
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+
+  // The headline tiles are mode-specific markup, and each set of ids is written
+  // from its OWN book. The DRY and LIVE tiles previously shared element ids, so
+  // this line wrote the real Kalshi balance, position count, exposure and
+  // realized P&L into the DRY tiles ten seconds after load - the page
+  // contradicting its own DRY MODE flag. Live ids do not exist in DRY and vice
+  // versa, so each write is a no-op in the other mode rather than a leak.
+  if (s.mode && s.mode.mode === 'live') {
+    set('tBalance', s.balance == null ? '-' : money(s.balance));
+    // Freshness truth under the balance: a number with no age is how a dead
+    // $0.29 reads as the live truth forever. Over 3 minutes old means the
+    // Kalshi sync is failing, and the errors panel says why.
+    var ageEl = $('tBalanceAge');
+    if (ageEl) {
+      var age = s.kalshi_age_sec;
+      if (age == null || age < 0) { ageEl.textContent = '· syncing…'; ageEl.style.color = ''; }
+      else if (age > 180) { ageEl.textContent = '· STALE (' + Math.round(age / 60) + 'm old) — sync failing'; ageEl.style.color = '#ff5555'; }
+      else { ageEl.textContent = '· updated ' + age + 's ago'; ageEl.style.color = ''; }
+    }
+    // Held contracts, not raw rows: Kalshi keeps a zero-share row per ticker the
+    // account ever touched, and summing those reported 31 "positions" when 3
+    // were held.
+    const held = k.held_count != null
+      ? k.held_count : (k.market_count || 0) + (k.event_count || 0);
+    set('tLivePos', held);
+    set('tLivePosNote',
+          (k.held_count || 0) + ' held · ' + (k.ghost_count || 0) +
+          ' flat rows on Kalshi\'s side (no shares, cannot be deleted)');
+    set('tExposure', money(k.exposure));
+    set('tExposureNote',
+      'mark-to-market · ' + (k.cost_basis_known
+        ? 'cost ' + money(k.cost_basis)
+        : (k.realized_known
+          ? 'cost unknown (' + (k.cost_basis_missing || 0) + ' holding' +
+            (k.cost_basis_missing === 1 ? '' : 's') + ' predate fill history)'
+          : 'cost n/a')));
+    set('tKalshiPnl', money(k.realized));
+    const kr = document.getElementById('tKalshiPnl');
+    if (kr) kr.className = 'v ' + sgn(k.realized || 0);
+    const led = k.ledger || {};
+    set('tKalshiPnlNote',
+      'sales ' + money(led.sales_realized) +
+      ' · settled ' + money(led.settlement_realized) +
+      ' · fees ' + money(k.fees) +
+      (led.window_start ? ' · since ' + String(led.window_start).slice(0, 10) : ''));
+  }
+
+  const t = s.trades || {}, d = s.data || {};
+  const fb = document.getElementById('fairBandsBody');
+  if (fb && t.by_fair_band) {
+    fb.innerHTML = t.by_fair_band.length
+      ? t.by_fair_band.map(function (b) {
+          return '<tr><td>' + b.band + '</td><td class="num">' + b.trades + '</td><td class="num">' + b.wins + '</td><td class="num">' + b.win_rate + '%</td><td class="num ' + sgn(b.pnl) + '">' + money(b.pnl) + '</td></tr>';
+        }).join('')
+      : '<tr><td colspan="5" class="empty">No closed trades yet</td></tr>';
+  }
+  set('tWinRate', (t.win_rate || 0) + '%');
+  set('tWinRateNote', (t.wins || 0) + 'W / ' + (t.losses || 0) + 'L');
+  set('tWinRateLive', (t.win_rate || 0) + '%');
+  set('tWinRateLiveNote', (t.wins || 0) + 'W / ' + (t.losses || 0) + 'L');
+  set('dRet', (d.dry && d.dry.win_rate ? d.dry.win_rate : 0) + '%');
+  set('tAiSpend', money(d.ai_cost_today));
+  set('tRunning', s.running_count || 0);
+  set('tUptime', Math.floor((s.uptime_sec || 0) / 60) + 'm');
+
+  SNAPSHOT.equity = s.equity || SNAPSHOT.equity;
+  paintCards(s.strategy_cards);
+  const eq = SNAPSHOT.equity || {};
+  const closes = (eq.pnl || []).length;
+  set('pnlSummary', closes
+    ? closes + ' closed trades'
+    : 'no closed trades yet');
+}
+
+function paintCards(cards) {
+  if (!cards) return;
+  SNAPSHOT.strategy_cards = cards;
+  cards.forEach(c => {
+    const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  set('c-' + c.name + '-trades', c.trades);
+  set('c-' + c.name + '-win', c.win_rate + '%');
+  set('c-' + c.name + '-open', c.open_positions);
+  set('c-' + c.name + '-dep', Number(c.deployed || 0).toFixed(2));
+    const pnl = $('c-' + c.name + '-pnl');
+    if (pnl) {
+      pnl.textContent = money(c.realized);
+      pnl.className = c.realized > 0 ? 'up' : (c.realized < 0 ? 'down' : 'flat');
+    }
+    const card = $('card-' + c.name);
+    if (card) card.classList.toggle('hot', !!c.running);
+    const pill = $('pill-' + c.name);
+    if (pill) {
+      // Constant live proof: running means the strategy's own process stamped
+      // a heartbeat this cycle - not merely that a pid exists. A stuck
+      // strategy (pid alive, no recent heartbeat) is named as such.
+      if (c.stuck) {
+        pill.className = 'pill warn';
+        pill.innerHTML = '<span class="dot"></span>stuck';
+      } else {
+        pill.className = 'pill ' + (c.running ? 'ok' : 'no');
+        pill.innerHTML = c.running
+          ? '<span class="dot pulse"></span>running'
+          : (c.stop_reason ? 'stopped' : 'not started');
+      }
+    }
+    const hb = $('hb-' + c.name);
+    if (hb) {
+      hb.textContent = c.running && c.heartbeat_age_sec != null
+        ? ('proof: cycle ' + c.heartbeat_age_sec + 's ago')
+        : (c.stuck ? ('stuck: last cycle ' + c.heartbeat_age_sec + 's ago') : '');
+    }
+    const btn = $('btn-' + c.name);
+    if (btn) btn.textContent = c.running ? 'Stop' : 'Start';
+  });
+  drawSparks(cards);
+}
+
+async function refresh() {
+  try {
+    paint(await fetch('/api/snapshot').then(r => r.json()));
+    drawChart();
+    // Keep an open detail view current without yanking the page around.
+    if (openName) openStrategy(openName, true);
+    try { paintMode(await fetch('/api/mode').then(r => r.json())); } catch (_) {}
+  } catch (e) {
+    note('snapshot refresh failed: ' + e.message);
+  }
+  // The market feed and the account card are NOT in the snapshot - they live on
+  // their own background threads and their own endpoints. A 30s snapshot poll
+  // that never called them left both frozen at the server-rendered first byte:
+  // "connecting..." and "no tick yet" forever, with the Kalshi contract card
+  // showing "--" for every field even though /api/marketdata was answering.
+  try { refreshFeeds(); } catch (_) {}
+  try { refreshLlmUsage(); } catch (_) {}
+}
+
+// ---------------------------------------------------------------------------
+// OpenRouter usage - who is eating the key, itemised from the lifetime log
+// ---------------------------------------------------------------------------
+let llmUsageReq = 0;
+
+function toggleLlmUsage() {
+  const wrap = $('llmUsageBodyWrap');
+  const t = $('llmToggle');
+  if (!wrap || !t) return;
+  if (wrap.style.display === 'none') {
+    wrap.style.display = '';
+    t.textContent = 'hide';
+    refreshLlmUsage();
+  } else {
+    wrap.style.display = 'none';
+    t.textContent = 'show';
+  }
+}
+
+function toggleCalib() {
+  const wrap = $('calibBodyWrap');
+  const t = $('calibToggle');
+  if (!wrap || !t) return;
+  const hidden = wrap.style.display === 'none';
+  wrap.style.display = hidden ? '' : 'none';
+  t.textContent = hidden ? 'hide' : 'show';
+}
+
+async function refreshLlmUsage() {
+  const wrap = $('llmUsageBodyWrap');
+  if (wrap && wrap.style.display === 'none') return;
+  const req = ++llmUsageReq;
+  const r = await fetch('/api/llm/usage');
+  const d = await r.json().catch(() => null);
+  if (!d || req !== llmUsageReq) return;
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  set('llmCalls', d.total_calls.toLocaleString());
+  set('llmTokens', d.total_tokens.toLocaleString());
+  const c = $('llmCost');
+  if (c) c.textContent = '$' + d.total_cost.toFixed(2);
+  set('llmConsumers', (d.consumers || []).length);
+  const body = $('llmUsageBody');
+  if (!body) return;
+  if (!d.consumers || !d.consumers.length) {
+    body.innerHTML = '<tr><td colspan="6" class="empty">No LLM calls logged yet.</td></tr>';
+    return;
+  }
+  body.innerHTML = d.consumers.map(x =>
+    '<tr><td><span class="tag">' + esc(x.strategy) + '</span></td>'
+    + '<td class="mono" style="color:var(--dim)">' + esc(x.query_type) + '</td>'
+    + '<td class="num">' + x.calls.toLocaleString() + '</td>'
+    + '<td class="num">' + x.tokens.toLocaleString() + '</td>'
+    + '<td class="num down">$' + x.cost.toFixed(2) + '</td>'
+    + '<td class="mono" style="color:var(--faint)">' + esc(x.last_at) + '</td></tr>'
+  ).join('');
+}
+
+// --- DRY / LIVE mode -----------------------------------------------------
+// The write token is embedded server-side so the controls work without a
+// prompt. WARNING: this dashboard is on a public hostname, so anyone who can
+// load the page can also read this value out of view-source and therefore use
+// every write endpoint (mode switch, strategy start/stop, config). The token
+// gate still stops drive-by POSTs from scripts that never loaded the page; it
+// is no longer a boundary against a determined visitor.
+const WRITE_TOKEN = {{ s.token | tojson }};
+sessionStorage.setItem('frigoToken', WRITE_TOKEN);
+
+function authHeaders(extra) {
+  return Object.assign({ 'Content-Type': 'application/json' },
+    { 'X-Auth-Token': WRITE_TOKEN }, extra || {});
+}
+
+
+async function switchMode(mode) {
+  try {
+    const r = await fetch('/api/mode', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ mode: mode, confirm: true }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (d.error) {
+      note('mode switch blocked: ' + d.error);
+      return;
+    }
+    note('trading mode is now ' + String(d.mode).toUpperCase());
+    paintMode(d);
+  } catch (e) {
+    note('mode switch failed: ' + e.message);
+  }
 }
 
 // --- DRY book controls ---
@@ -7794,6 +8097,7 @@ async function toggleStrategy(name, quiet) {
     refresh();
   }
 }
+
 async function saveAlerts() {
   const r = await fetch('/api/alerts', {
     method: 'POST',
@@ -7807,6 +8111,7 @@ async function saveAlerts() {
   const d = await r.json().catch(() => ({}));
   $('alertStatus').textContent = d.ok ? 'saved' : 'error';
 }
+
 async function saveConfig() {
   const obj = {};
   document.querySelectorAll('.pb input[data-key]').forEach(i => {
@@ -7823,14 +8128,87 @@ async function saveConfig() {
   const d = await r.json().catch(() => ({}));
   $('configStatus').textContent = d.ok ? 'saved ' + (d.updated || []).length + ' field(s)' : 'error';
 }
+
 async function loadLogs() {
   const n = $('logLines').value || 100;
   const r = await fetch('/api/logs?lines=' + encodeURIComponent(n)).then(r => r.json());
   $('logOutput').textContent = (r.lines || []).join('\n') || 'No log files yet.';
 }
 
-// --- equity chart, drawn from server-rendered data ---
-let chart;
+// Toggle the NO LANES ON/OFF switch. Persisted to runtime_config so both the
+// DRY/LIVE dashboard and the ALL NO MARKETS page see the same state. The button
+// is black by default and turns YELLOW when ON.
+async function toggleNoLanes() {
+  try {
+    // Read current state from the button class
+    const btn = $('noLanesBtn');
+    const currentlyOn = btn.classList.contains('on');
+    const next = !currentlyOn;
+    const r = await fetch('/api/no-lanes', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ enabled: next }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (d.error) {
+      note('NO LANES toggle failed: ' + d.error);
+      return;
+    }
+    note('NO LANES is now ' + (next ? 'ON' : 'OFF'));
+    paintNoLanes(next);
+    flashBanner('NO LANES ' + (next ? 'ON' : 'OFF'), false);
+  } catch (e) {
+    note('NO LANES toggle failed: ' + e.message);
+  }
+}
+
+// Paint the NO LANES button state. Called after a toggle and after a mode
+// switch reload. The button reads its state from SNAPSHOT (which carries
+// no_lanes_enabled from _mode_payload).
+function paintNoLanes(enabled) {
+  const btn = $('noLanesBtn');
+  if (!btn) return;
+  btn.classList.toggle('on', !!enabled);
+  btn.textContent = 'NO LANES ' + (enabled ? 'ON' : 'OFF');
+}
+
+
+  try {
+    const d = await fetch('/api/no-lanes').then(r => r.json());
+    paintNoLanes(d.no_lanes_enabled === true);
+    if (why) note('NO LANES resynced from server' + (why ? ' - ' + why : ''));
+  } catch (_) {
+    paintNoLanes(SNAPSHOT.no_lanes_enabled === true);
+  }
+}
+
+
+
+// A temporary full-width banner so a mode change is impossible to miss even if
+// you looked away at the moment it happened.
+let bannerTimer = null;
+function flashBanner(text, isLive) {
+  let el = $('modeBanner');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'modeBanner';
+    el.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:10000;' +
+      'padding:14px 18px;text-align:center;font-weight:800;letter-spacing:.12em;' +
+      'font-size:14px;box-shadow:0 6px 24px rgba(0,0,0,.5)';
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  el.style.background = isLive ? '#a30808' : '#2ee6a8';
+  el.style.color = '#000';
+  clearTimeout(bannerTimer);
+  bannerTimer = setTimeout(() => { el.remove(); }, 6000);
+}
+
+function money(v) { return '$' + Number(v || 0).toFixed(2); }
+
+// One function owns every mode indicator: frame colour, body attribute, flag
+// text, button state, title and favicon. They cannot drift apart.
+
 function drawChart() {
   if (typeof Chart === 'undefined') return;
   const ctx = $('pnlChart');
