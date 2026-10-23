@@ -51,7 +51,7 @@ def setup_logging(log_level: str = "INFO") -> None:
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
             structlog.processors.UnicodeDecoder(),
-            structlog.dev.ConsoleRenderer(colors=True, exception_formatter=structlog.dev.rich_traceback),
+            structlog.dev.ConsoleRenderer(colors=False, exception_formatter=structlog.dev.rich_traceback),
         ],
         context_class=dict,
         logger_factory=structlog.stdlib.LoggerFactory(),
