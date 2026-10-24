@@ -232,3 +232,6 @@ backups/
 # Archive artifacts
 archive-RUePI3/
 crush.json
+# Ignoring all HERMES cache files
+.hermes/
+hermes.log

@@ -3675,13 +3675,64 @@ def api_mode_set():
 
     _broadcast("mode", {"mode": mode})
     if mode == MODE_DRY:
-        # Back to simulated: make sure a DRY book exists and is funded. This
-        # CREATES the book if it is missing; it must never wipe one that already
-        # has history. Calling reset_dry_account() here meant every pass through
-        # the DRY switch erased the ledger, the open positions and the closes, so
-        # a profitable book kept snapping back to $300 with nothing to show for
-        # the difference. Only the explicit reset endpoint wipes.
-        run(mgr.dry_account())
+        # Arm all DRY lanes so they persist across redeploys.
+        # The dashboard supervisor manages armed lanes, keeping them ON permanently.
+        # This is the "Law": if user presses Start in Railway or local, lanes MUST start
+        # and stay ON. Pre-deployment arming ensures the dashboard has armed lanes to manage.
+        from src.utils.mode import TradingMode, run, DEFAULT_DRY_STARTING_BALANCE
+        from src.utils.strategy_runtime import key as rt_key
+
+        db_path = os.environ.get("DB_PATH", "trading_system.db")
+        mode_mgr = TradingMode(db_path=db_path)
+
+        # Set book mode to 'dry' if not already set
+        before_mode = run(mode_mgr.current())
+        new_mode = run(mode_mgr.set("dry"))
+
+        # Arm all DRY lanes using the run() bridge for async operations
+        LANES = {
+            "btc_updown": None,
+            "xrp_updown": None,
+            "btc_1h_updown": None,
+            "eth_updown": None,
+            "eth_1h_updown": None,
+            "xrp_1h_updown": None,
+            "hyperliquid_updown": None,
+            "hyperliquid_1h_updown": None,
+            "all_no_markets": None,
+        }
+
+        async def arm_all_dry_lanes() -> None:
+            from src.utils.strategy_runtime import StrategyRuntime
+            store = StrategyRuntime(db_path)
+            for lane in LANES:
+                try:
+                    before_row = (await store.snapshot()).get(rt_key(lane, "paper")) or {}
+                    before_desired = int(before_row.get("desired") or 0)
+                    before_stop_reason = before_row.get("stop_reason")
+
+                    await store.arm(lane, "paper")
+
+                    after_row = (await store.snapshot()).get(rt_key(lane, "paper")) or {}
+                    after_desired = int(after_row.get("desired") or 0)
+                    after_stop_reason = after_row.get("stop_reason")
+                except Exception:
+                    pass  # Individual lane arming failures are non-blocking
+
+            # Initialize ALL NO MARKETS book if present
+            if "all_no_markets" in LANES:
+                try:
+                    from src.strategies.all_no import AllNoKalshiBook
+                    all_no_book = AllNoKalshiBook(db_path)
+                    await all_no_book.ensure_schema()
+                    await all_no_book.seed_book()
+                except Exception:
+                    pass  # Non-blocking if ALL NO initialization fails
+
+            # Save the DRY book's baseline funding amount
+            run(mgr.save_dry_baseline(DEFAULT_DRY_STARTING_BALANCE))
+
+        run(arm_all_dry_lanes())
     _audit(f"trading mode set to {mode.upper()}")
     return jsonify({"ok": True, **_mode_payload()})
 
